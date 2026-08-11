@@ -29,7 +29,6 @@ import type {
 
 const MAX_REPAIR_ATTEMPTS = 5;
 const MAX_PROMPT_DIFF_LENGTH = 30_000;
-const MAX_DELETED_PATCH_LENGTH = MAX_PROMPT_DIFF_LENGTH;
 const MAX_GOAL_CONDITION_LENGTH = 4_000;
 const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
@@ -142,6 +141,12 @@ function isSafeGlobPattern(pattern: string): boolean {
   return true;
 }
 
+function isSafeResolvedPath(cwd: string, candidate: string): boolean {
+  const root = resolve(cwd);
+  const resolved = resolve(candidate);
+  return isWithinRepository(cwd, resolved) && !isGitMetadataPath(relative(root, resolved));
+}
+
 async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boolean> {
   if (isGitMetadataPath(candidate)) return false;
   if (!isWithinRepository(cwd, candidate)) return false;
@@ -154,13 +159,13 @@ async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boo
     const separatorIndex = Math.max(prefix.lastIndexOf("/"), prefix.lastIndexOf("\\"));
     const parent = separatorIndex < 0 ? "." : prefix.slice(0, separatorIndex) || sep;
     try {
-      return isWithinRepository(cwd, await realpath(resolve(cwd, parent)));
+      return isSafeResolvedPath(cwd, await realpath(resolve(cwd, parent)));
     } catch {
       return true;
     }
   }
   try {
-    return isWithinRepository(cwd, await realpath(resolve(cwd, candidate)));
+    return isSafeResolvedPath(cwd, await realpath(resolve(cwd, candidate)));
   } catch {
     return true;
   }
@@ -257,11 +262,14 @@ function isDeletedFile(file: ChangedFile): boolean {
   return file.status === "removed" || file.status === "deleted";
 }
 
-function unavailableDeletedDiffs(files: readonly ChangedFile[]): readonly string[] {
-  let remainingPatchLength = MAX_DELETED_PATCH_LENGTH;
+function orderedChangedFiles(files: readonly ChangedFile[]): readonly ChangedFile[] {
+  return [...files.filter(isDeletedFile), ...files.filter((file) => !isDeletedFile(file))];
+}
+
+function unavailableDiffs(files: readonly ChangedFile[]): readonly string[] {
+  let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
   const unavailable: string[] = [];
-  for (const file of files) {
-    if (!isDeletedFile(file)) continue;
+  for (const file of orderedChangedFiles(files)) {
     if (file.patch === undefined || file.patch.length > remainingPatchLength) {
       unavailable.push(file.path);
       continue;
@@ -273,33 +281,27 @@ function unavailableDeletedDiffs(files: readonly ChangedFile[]): readonly string
 
 function changedFilePrompt(files: readonly ChangedFile[]): string {
   let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
-  let remainingDeletedPatchLength = MAX_DELETED_PATCH_LENGTH;
-  const orderedFiles = [
-    ...files.filter(isDeletedFile),
-    ...files.filter((file) => !isDeletedFile(file)),
-  ];
-  const entries = orderedFiles.map((file) => {
+  const entries = orderedChangedFiles(files).map((file) => {
     const patch =
       file.patch === undefined ? "(patch unavailable; inspect the checked-out file)" : file.patch;
     let patchExcerpt = patch;
-    if (isDeletedFile(file)) {
-      if (file.patch === undefined) {
-        patchExcerpt = "(deleted-file patch unavailable; the review will fail closed)";
-      } else if (file.patch.length > remainingDeletedPatchLength) {
-        patchExcerpt =
-          "(deleted-file patch exceeds the reserved review budget; the review will fail closed)";
-      } else {
-        remainingDeletedPatchLength -= file.patch.length;
-      }
-    } else if (file.patch !== undefined) {
-      if (remainingPatchLength <= 0) {
-        patchExcerpt = "(patch excerpt omitted; inspect the checked-out file)";
-      } else if (patch.length > remainingPatchLength) {
-        patchExcerpt = `${patch.slice(0, remainingPatchLength)}\n(patch excerpt truncated; inspect the checked-out file)`;
-        remainingPatchLength = 0;
-      } else {
-        remainingPatchLength -= patch.length;
-      }
+    if (file.patch === undefined) {
+      patchExcerpt = isDeletedFile(file)
+        ? "(deleted-file patch unavailable; the review will fail closed)"
+        : "(patch unavailable; the review will fail closed)";
+    } else if (remainingPatchLength <= 0) {
+      patchExcerpt = isDeletedFile(file)
+        ? "(deleted-file patch omitted; the review will fail closed)"
+        : "(patch excerpt omitted; the review will fail closed)";
+    } else if (patch.length > remainingPatchLength) {
+      patchExcerpt = `${patch.slice(0, remainingPatchLength)}\n${
+        isDeletedFile(file)
+          ? "(deleted-file patch truncated; the review will fail closed)"
+          : "(patch excerpt truncated; the review will fail closed)"
+      }`;
+      remainingPatchLength = 0;
+    } else {
+      remainingPatchLength -= patch.length;
     }
     return `### ${file.path} [${file.status}]\n${patchExcerpt}`;
   });
@@ -405,12 +407,12 @@ export async function runReviewGoal(
   config: ReviewConfig,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
 ): Promise<GoalResult> {
-  const unavailableDeletedFiles = unavailableDeletedDiffs(files);
-  if (unavailableDeletedFiles.length > 0) {
+  const unavailableFiles = unavailableDiffs(files);
+  if (unavailableFiles.length > 0) {
     return {
       prompt: goal,
       status: "failed",
-      error: `Deleted-file diffs are unavailable for: ${unavailableDeletedFiles.join(", ")}. Refusing to complete a review without their evidence.`,
+      error: `Changed-file diffs are unavailable for: ${unavailableFiles.join(", ")}. Refusing to complete a review without their evidence.`,
     };
   }
   let submission: GoalSubmission | undefined;
@@ -579,9 +581,11 @@ export const agentInternals = {
   changedFilePrompt,
   goalCommand,
   isDeletedFile,
-  unavailableDeletedDiffs,
+  orderedChangedFiles,
+  unavailableDiffs,
   isSafeGlobPattern,
   isGitMetadataPath,
+  isSafeResolvedPath,
   isWithinRepository,
   makeUserMessage,
   repairPrompt,

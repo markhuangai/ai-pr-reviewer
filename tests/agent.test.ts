@@ -58,7 +58,7 @@ test("preserves deleted-file patches ahead of the ordinary patch budget", () => 
 
 test("reports deleted diffs that cannot be supplied to a read-only reviewer", () => {
   assert.deepEqual(
-    agentInternals.unavailableDeletedDiffs([
+    agentInternals.unavailableDiffs([
       {
         path: "src/binary.bin",
         status: "removed",
@@ -78,6 +78,32 @@ test("reports deleted diffs that cannot be supplied to a read-only reviewer", ()
       },
     ]),
     ["src/binary.bin", "src/large.bin"],
+  );
+});
+
+test("fails closed when an ordinary changed-file patch is omitted", () => {
+  assert.deepEqual(
+    agentInternals.unavailableDiffs([
+      {
+        path: "src/changed.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: "x".repeat(29_999),
+        addedLines: new Set([1]),
+      },
+      {
+        path: "src/later.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: "+later",
+        addedLines: new Set([1]),
+      },
+    ]),
+    ["src/later.ts"],
   );
 });
 
@@ -110,4 +136,9 @@ test("blocks Git metadata paths from the reviewer", () => {
   assert.equal(agentInternals.isGitMetadataPath(".git/config"), true);
   assert.equal(agentInternals.isGitMetadataPath("src/.git/objects"), true);
   assert.equal(agentInternals.isGitMetadataPath(".github/workflows/ci.yml"), false);
+  assert.equal(
+    agentInternals.isSafeResolvedPath("/workspace/repo", "/workspace/repo/.git/config"),
+    false,
+  );
+  assert.equal(agentInternals.isSafeResolvedPath("/workspace/repo", "/workspace/repo/src"), true);
 });

@@ -107,7 +107,7 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
 test("does not include secrets in duplicate markers", () => {
   const marker = reviewMarker(context, config);
   assert.doesNotMatch(marker, /github-secret|ai-secret/);
-  assert.match(marker, /ai-pr-reviewer:v1/);
+  assert.match(marker, /ai-pr-reviewer:v2/);
   assert.notEqual(
     marker,
     reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),

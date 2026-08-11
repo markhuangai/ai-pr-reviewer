@@ -189,13 +189,20 @@ async function extract(archive: string, destination: string): Promise<void> {
   });
 }
 
-async function runRuntime(runtimeDirectory: string): Promise<number> {
+async function runRuntime(
+  runtimeDirectory: string,
+  buildId = process.env.AI_PR_REVIEWER_BUILD_ID ?? "source",
+): Promise<number> {
   const entry = join(runtimeDirectory, "runtime", "index.js");
   const entryStats = await stat(entry).catch(() => undefined);
   if (!entryStats?.isFile()) throw new Error("Runtime bundle is missing runtime/index.js.");
   const child = spawn(process.execPath, [entry], {
     stdio: "inherit",
-    env: { ...process.env, AI_PR_REVIEWER_RUNTIME_DIR: runtimeDirectory },
+    env: {
+      ...process.env,
+      AI_PR_REVIEWER_BUILD_ID: buildId,
+      AI_PR_REVIEWER_RUNTIME_DIR: runtimeDirectory,
+    },
     windowsHide: false,
   });
   return new Promise<number>((resolve, reject) => {
@@ -253,11 +260,14 @@ async function main(): Promise<void> {
     manifest.asset !== assetName ||
     manifest.nodeMajor !== 24 ||
     typeof manifest.sdkVersion !== "string" ||
-    typeof manifest.cliVersion !== "string"
+    typeof manifest.cliVersion !== "string" ||
+    typeof manifest.sourceCommit !== "string" ||
+    manifest.sourceCommit.length === 0
   ) {
     throw new Error("Runtime bundle manifest verification failed.");
   }
-  const code = await runRuntime(extracted);
+  const sourceCommit = manifest.sourceCommit;
+  const code = await runRuntime(extracted, sourceCommit);
   if (code !== 0) process.exitCode = code;
 }
 
