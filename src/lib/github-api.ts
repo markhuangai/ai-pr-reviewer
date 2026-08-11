@@ -41,6 +41,13 @@ function readLogin(value: unknown): string | undefined {
   return value.login;
 }
 
+function readHeadSha(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.head) || typeof value.head.sha !== "string") {
+    return undefined;
+  }
+  return value.head.sha.length > 0 ? value.head.sha : undefined;
+}
+
 function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
   const addedLines = new Set<number>();
   if (!patch) return addedLines;
@@ -108,7 +115,11 @@ function parsePatchCounts(patch: string | undefined): {
 
 export function isPatchComplete(file: ChangedFile): boolean {
   if (file.patch === undefined) {
-    return file.additions === 0 && file.deletions === 0;
+    return (
+      (file.status === "added" || file.status === "removed" || file.status === "renamed") &&
+      file.additions === 0 &&
+      file.deletions === 0
+    );
   }
   const counts = parsePatchCounts(file.patch);
   return (
@@ -176,6 +187,15 @@ export class GitHubApi {
     const login = readLogin(await this.request<unknown>("/user"));
     if (login === undefined) throw new Error("GitHub returned no authenticated user login.");
     return login;
+  }
+
+  async getPullRequestHeadSha(context: PullRequestContext): Promise<string> {
+    const payload = await this.request<unknown>(
+      `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}`,
+    );
+    const headSha = readHeadSha(payload);
+    if (headSha === undefined) throw new Error("GitHub returned no pull request head SHA.");
+    return headSha;
   }
 
   private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
@@ -302,5 +322,6 @@ export const githubApiInternals = {
   parsePatchCounts,
   isPatchComplete,
   nextPagePath,
+  readHeadSha,
   readLogin,
 };

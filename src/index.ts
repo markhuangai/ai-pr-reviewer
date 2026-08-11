@@ -7,6 +7,7 @@ import { readReviewConfig } from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
 import type {
   GoalResult,
+  PullRequestContext,
   PullRequestReviewRequest,
   ReviewConfig,
   ReviewRunResult,
@@ -79,12 +80,22 @@ function isApprovalRejection(error: unknown): error is GitHubApiError {
   );
 }
 
+async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): Promise<void> {
+  const currentHead = await api.getPullRequestHeadSha(context);
+  if (currentHead !== context.headSha) {
+    throw new Error(
+      `Pull request head changed during review (event ${context.headSha}, current ${currentHead}); refusing to review a stale checkout.`,
+    );
+  }
+}
+
 export async function runAction(): Promise<ReviewRunResult> {
   const config = readReviewConfig({ get: (name) => core.getInput(name) });
   const secrets = reviewSecrets(config);
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
+  await assertCurrentHead(api, context);
   const authenticatedLogin = await api.getAuthenticatedUserLogin();
   const marker = reviewMarker(context, config);
   const existingReviews = await api.listReviews(context);
@@ -101,6 +112,7 @@ export async function runAction(): Promise<ReviewRunResult> {
     return { skipped: true };
   }
 
+  await assertCurrentHead(api, context);
   const files = await api.getPullRequestFiles(context);
   core.info(
     `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
@@ -113,6 +125,7 @@ export async function runAction(): Promise<ReviewRunResult> {
   }
 
   const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
+  await assertCurrentHead(api, context);
   try {
     await api.createReview(context, request);
   } catch (error) {

@@ -75,6 +75,17 @@ test("detects server-truncated patches from GitHub change counts", () => {
     }),
     true,
   );
+  assert.equal(
+    githubApiInternals.isPatchComplete({
+      path: "image.png",
+      status: "modified",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      addedLines: new Set(),
+    }),
+    false,
+  );
 });
 
 test("extracts the next API page from a GitHub Link header", () => {
@@ -92,4 +103,13 @@ test("reads review authors without accepting malformed identities", () => {
   assert.equal(githubApiInternals.readLogin({ login: "review-owner" }), "review-owner");
   assert.equal(githubApiInternals.readLogin({ login: "" }), undefined);
   assert.equal(githubApiInternals.readLogin({}), undefined);
+});
+
+test("reads the live pull request head SHA", () => {
+  assert.equal(
+    githubApiInternals.readHeadSha({ head: { sha: "0123456789abcdef" } }),
+    "0123456789abcdef",
+  );
+  assert.equal(githubApiInternals.readHeadSha({ head: { sha: "" } }), undefined);
+  assert.equal(githubApiInternals.readHeadSha({}), undefined);
 });
