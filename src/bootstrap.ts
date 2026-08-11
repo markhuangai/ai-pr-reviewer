@@ -41,19 +41,11 @@ function platformAssetName(): string {
   return `runtime-${platform}-${arch}.tar.gz`;
 }
 
-function token(): string | undefined {
-  const value = (process.env["INPUT_GITHUB-PAT"] ?? process.env.INPUT_GITHUB_PAT)?.trim();
-  return value && value.length > 0 ? value : undefined;
-}
-
 function requestHeaders(): Headers {
-  const headers = new Headers({
+  return new Headers({
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   });
-  const secret = token();
-  if (secret) headers.set("Authorization", `Bearer ${secret}`);
-  return headers;
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
