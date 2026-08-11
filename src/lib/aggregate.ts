@@ -65,7 +65,13 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
         {
           type: server.type,
           url: server.url,
-          tools: server.tools?.map((tool) => tool.name).sort(),
+          tools: server.tools
+            ?.map((tool) => ({
+              name: tool.name,
+              permission_policy: tool.permission_policy,
+              org_max_permission: tool.org_max_permission,
+            }))
+            .sort((left, right) => left.name.localeCompare(right.name)),
           timeout: server.timeout,
           alwaysLoad: server.alwaysLoad,
           headerNames:

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -205,7 +205,7 @@ async function main() {
     const actualDigest = sha256(bytes);
     if (actualDigest !== expectedDigest(asset, checksum))
         throw new Error("Runtime asset SHA-256 verification failed.");
-    const extracted = join(cacheRoot, "bundle");
+    const extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
     await extract(archive, extracted);
     const manifestPath = join(extracted, "runtime", "manifest.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));

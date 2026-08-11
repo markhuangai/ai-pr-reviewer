@@ -117,6 +117,19 @@ test("does not include secrets in duplicate markers", () => {
     marker,
     reviewMarker({ ...context, baseSha: "1111111111111111111111111111111111111111" }, config),
   );
+  assert.notEqual(
+    marker,
+    reviewMarker(context, {
+      ...config,
+      mcpServers: {
+        security: {
+          type: "http",
+          url: "https://mcp.example.test",
+          tools: [{ name: "dependency_advice", permission_policy: "always_deny" }],
+        },
+      },
+    }),
+  );
 });
 
 test("maps verified multi-line findings to GitHub review ranges", () => {
