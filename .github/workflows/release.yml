@@ -202,9 +202,15 @@ jobs:
           fi
           old_assets_dir="$(mktemp -d)"
           old_target=""
+          release_created=false
           restore_needed=false
           restore_release() {
-            if [[ "$restore_needed" == true ]]; then
+            if [[ "$release_created" == true ]]; then
+              echo "Stable branch update failed; deleting the newly created release." >&2
+              if ! gh release delete "$RELEASE_TAG" --yes --cleanup-tag --repo "$GH_REPO"; then
+                echo "New release cleanup failed; inspect the release before promotion." >&2
+              fi
+            elif [[ "$restore_needed" == true ]]; then
               echo "Release upload failed; restoring the previous asset set." >&2
               old_assets=("$old_assets_dir"/*)
               current_assets="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name')"
@@ -249,7 +255,9 @@ jobs:
             restore_needed=false
           elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
+            release_created=true
             git push origin "$GITHUB_SHA:refs/heads/v1"
+            release_created=false
           else
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi

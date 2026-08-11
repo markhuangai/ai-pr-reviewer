@@ -94,13 +94,13 @@ function parsePatchCounts(patch: string | undefined): {
       deletions += 1;
       if (remainingOld === 0) complete = false;
       else remainingOld -= 1;
-    } else {
+    } else if (line.startsWith(" ")) {
       if (remainingOld === 0 || remainingNew === 0) complete = false;
       else {
         remainingOld -= 1;
         remainingNew -= 1;
       }
-    }
+    } else complete = false;
   }
   if (!hasHunk || remainingOld !== 0 || remainingNew !== 0) complete = false;
   return { additions, deletions, complete };
@@ -108,7 +108,7 @@ function parsePatchCounts(patch: string | undefined): {
 
 export function isPatchComplete(file: ChangedFile): boolean {
   if (file.patch === undefined) {
-    return file.status === "renamed" && file.additions === 0 && file.deletions === 0;
+    return file.additions === 0 && file.deletions === 0;
   }
   const counts = parsePatchCounts(file.patch);
   return (

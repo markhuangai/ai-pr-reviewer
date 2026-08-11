@@ -160,12 +160,37 @@ function sameFinding(left: AggregatedFinding, right: AggregatedFinding): boolean
   );
 }
 
+function findingKeys(finding: AggregatedFinding): readonly string[] {
+  if (finding.locationVerified && finding.path !== undefined && finding.line !== undefined) {
+    const line = finding.line;
+    return Array.from({ length: 5 }, (_, index) => {
+      return `${finding.path}:${line + index - 2}`;
+    });
+  }
+  return [`body:${normalizeText(finding.title)}`];
+}
+
 function mergeFindings(findings: readonly AggregatedFinding[]): readonly AggregatedFinding[] {
   const merged: AggregatedFinding[] = [];
+  const candidatesByKey = new Map<string, number[]>();
   for (const finding of findings) {
-    const duplicate = merged.findIndex((existing) => sameFinding(existing, finding));
+    const candidateIndexes = new Set<number>();
+    for (const key of findingKeys(finding)) {
+      for (const index of candidatesByKey.get(key) ?? []) candidateIndexes.add(index);
+    }
+    const duplicate =
+      [...candidateIndexes].find((index) => {
+        const existing = merged[index];
+        return existing !== undefined && sameFinding(existing, finding);
+      }) ?? -1;
     if (duplicate < 0) {
+      const index = merged.length;
       merged.push(finding);
+      for (const key of findingKeys(finding)) {
+        const indexes = candidatesByKey.get(key) ?? [];
+        indexes.push(index);
+        candidatesByKey.set(key, indexes);
+      }
       continue;
     }
     const existing = merged[duplicate];

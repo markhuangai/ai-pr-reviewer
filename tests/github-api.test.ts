@@ -64,6 +64,17 @@ test("detects server-truncated patches from GitHub change counts", () => {
     }),
     true,
   );
+  assert.equal(
+    githubApiInternals.isPatchComplete({
+      path: ".gitkeep",
+      status: "added",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      addedLines: new Set(),
+    }),
+    true,
+  );
 });
 
 test("extracts the next API page from a GitHub Link header", () => {
