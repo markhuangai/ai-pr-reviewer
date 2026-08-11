@@ -14,6 +14,7 @@ import type {
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
+const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
 const MAX_GOAL_STATUS_LENGTH = 8_000;
 const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
@@ -118,7 +119,7 @@ function verifyLocation(finding: ReviewFinding, files: readonly ChangedFile[]): 
   const file = changedFileFor(finding.path, files);
   if (!file || file.addedLines.size === 0) return false;
   const endLine = finding.endLine ?? finding.line;
-  if (endLine < finding.line) return false;
+  if (endLine < finding.line || endLine - finding.line + 1 > MAX_FINDING_RANGE_LENGTH) return false;
   for (let line = finding.line; line <= endLine; line += 1) {
     if (!file.addedLines.has(line)) return false;
   }

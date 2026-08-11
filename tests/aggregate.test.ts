@@ -195,6 +195,31 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
   });
 });
 
+test("rejects oversized finding ranges before location verification", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "range",
+      status: "completed",
+      submission: {
+        summary: "range",
+        findings: [
+          {
+            title: "Oversized range",
+            severity: "MEDIUM",
+            body: "The reported range is too large to verify safely.",
+            path: "src/change.ts",
+            line: 1,
+            endLine: 1_000_000,
+          },
+        ],
+      },
+    },
+  ]);
+  assert.equal(review.findings[0]?.locationVerified, false);
+  assert.equal(review.inlineFindings.length, 0);
+  assert.match(review.bodyFindings[0]?.body ?? "", /Location could not be verified/);
+});
+
 test("keeps verified findings at separate locations distinct", () => {
   const review = aggregateReview(
     context,
