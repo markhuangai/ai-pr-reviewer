@@ -142,11 +142,12 @@ function isSafeGlobPattern(pattern: string): boolean {
   return true;
 }
 
-function isSafeGrepGlob(cwd: string, pathCandidate: unknown, pattern: string): boolean {
-  const normalized = pattern.replace(/^!/, "");
-  if (isGitMetadataPath(normalized)) return false;
+function isSafeGrepGlob(cwd: string, pathCandidate: unknown, pattern: string | undefined): boolean {
   const searchRoot =
     typeof pathCandidate !== "string" || resolve(cwd, pathCandidate) === resolve(cwd);
+  if (pattern === undefined) return !searchRoot;
+  const normalized = pattern.replace(/^!/, "");
+  if (isGitMetadataPath(normalized)) return false;
   const firstSegment = normalized.split(/[\\/]/, 1)[0] ?? "";
   return (
     !searchRoot ||
@@ -199,14 +200,17 @@ const repositoryReadHook: HookCallback = async (input: HookInput) => {
         ? toolInput.glob
         : undefined;
   const globPath = typeof globPattern === "string" ? globPattern.replace(/^!/, "") : globPattern;
+  const grepScopeAllowed =
+    input.tool_name !== "Grep" ||
+    isSafeGrepGlob(input.cwd, pathCandidate, typeof globPath === "string" ? globPath : undefined);
   const patternAllowed =
     globPattern === undefined ||
     (typeof globPath === "string" &&
       isSafeGlobPattern(globPath) &&
-      (input.tool_name !== "Grep" || isSafeGrepGlob(input.cwd, pathCandidate, globPath)) &&
       (await allowsRepositoryPath(input.cwd, globPath)));
   if (
     !pathAllowed ||
+    !grepScopeAllowed ||
     !patternAllowed ||
     (input.tool_name === "Glob" && typeof globPattern !== "string")
   ) {

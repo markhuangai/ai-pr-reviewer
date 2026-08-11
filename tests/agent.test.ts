@@ -152,6 +152,8 @@ test("rejects traversal and absolute alternatives in Glob braces", () => {
 });
 
 test("blocks root Grep globs that can reach Git metadata", () => {
+  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", undefined), false);
+  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", "src", undefined), true);
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/*"), false);
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", "src", "**/*"), true);
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "src/**/*.ts"), true);
