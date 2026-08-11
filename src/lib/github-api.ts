@@ -79,6 +79,27 @@ export interface ExistingReview {
   readonly commitId: string;
 }
 
+interface RequestPage<T> {
+  readonly payload: T;
+  readonly headers: Headers;
+}
+
+function nextPagePath(link: string | null, apiUrl: string): string | undefined {
+  if (!link) return undefined;
+  const next = link
+    .split(",")
+    .map((part) => /<([^>]+)>;\s*rel="next"/.exec(part)?.[1])
+    .find((value): value is string => value !== undefined);
+  if (!next) return undefined;
+  const absolute = new URL(next);
+  const base = new URL(apiUrl);
+  const basePath = base.pathname.replace(/\/$/, "");
+  const path = absolute.pathname.startsWith(basePath)
+    ? absolute.pathname.slice(basePath.length) || "/"
+    : absolute.pathname;
+  return `${path}${absolute.search}`;
+}
+
 export class GitHubApi {
   private readonly apiUrl: string;
   private readonly token: string;
@@ -88,7 +109,7 @@ export class GitHubApi {
     this.token = token;
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
     const headers = new Headers(init.headers);
     headers.set("Accept", "application/vnd.github+json");
     headers.set("Authorization", `Bearer ${this.token}`);
@@ -114,35 +135,64 @@ export class GitHubApi {
         `GitHub API request failed (${response.status}): ${message}`,
       );
     }
-    return payload as T;
+    return { payload: payload as T, headers: response.headers };
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    return (await this.requestPage<T>(path, init)).payload;
   }
 
   async getPullRequestFiles(context: PullRequestContext): Promise<readonly ChangedFile[]> {
     const files: ChangedFile[] = [];
-    for (let page = 1; page <= 10; page += 1) {
-      const payload = await this.request<unknown>(
-        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`,
-      );
+    let page = 1;
+    let path = `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`;
+    let hasNext = true;
+    while (hasNext) {
+      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
+      const payload = response.payload;
       if (!Array.isArray(payload))
         throw new Error("GitHub returned an invalid pull request files response.");
       files.push(...payload.map((item, index) => readFilePayload(item, files.length + index)));
-      if (payload.length < 100) break;
+      if (payload.length < 100) {
+        hasNext = false;
+        continue;
+      }
+      page += 1;
+      path =
+        nextPagePath(response.headers.get("link"), this.apiUrl) ??
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`;
     }
     return files;
   }
 
   async listReviews(context: PullRequestContext): Promise<readonly ExistingReview[]> {
-    const payload = await this.request<unknown>(
-      `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100`,
-    );
-    if (!Array.isArray(payload))
-      throw new Error("GitHub returned an invalid pull request reviews response.");
-    return payload.flatMap((item): ExistingReview[] => {
-      if (!isRecord(item)) return [];
-      const review = item as ReviewPayload;
-      if (typeof review.body !== "string" || typeof review.commit_id !== "string") return [];
-      return [{ body: review.body, commitId: review.commit_id }];
-    });
+    const reviews: ExistingReview[] = [];
+    let page = 1;
+    let path = `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`;
+    let hasNext = true;
+    while (hasNext) {
+      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
+      const payload = response.payload;
+      if (!Array.isArray(payload))
+        throw new Error("GitHub returned an invalid pull request reviews response.");
+      reviews.push(
+        ...payload.flatMap((item): ExistingReview[] => {
+          if (!isRecord(item)) return [];
+          const review = item as ReviewPayload;
+          if (typeof review.body !== "string" || typeof review.commit_id !== "string") return [];
+          return [{ body: review.body, commitId: review.commit_id }];
+        }),
+      );
+      if (payload.length < 100) {
+        hasNext = false;
+        continue;
+      }
+      page += 1;
+      path =
+        nextPagePath(response.headers.get("link"), this.apiUrl) ??
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`;
+    }
+    return reviews;
   }
 
   async createReview(
@@ -158,4 +208,5 @@ export class GitHubApi {
 
 export const githubApiInternals = {
   parseAddedLines,
+  nextPagePath,
 };

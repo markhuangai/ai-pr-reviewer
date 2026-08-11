@@ -16,3 +16,14 @@ test("does not treat file headers as added lines", () => {
   );
   assert.deepEqual([...lines], [1]);
 });
+
+test("extracts the next API page from a GitHub Link header", () => {
+  assert.equal(
+    githubApiInternals.nextPagePath(
+      '<https://api.github.com/repos/owner/repo/pulls/1/files?page=2>; rel="next", <https://api.github.com/repos/owner/repo/pulls/1/files?page=4>; rel="last"',
+      "https://api.github.com",
+    ),
+    "/repos/owner/repo/pulls/1/files?page=2",
+  );
+  assert.equal(githubApiInternals.nextPagePath(null, "https://api.github.com"), undefined);
+});

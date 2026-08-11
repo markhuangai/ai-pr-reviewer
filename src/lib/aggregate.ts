@@ -70,6 +70,8 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
 export function reviewMarker(context: PullRequestContext, config: ReviewConfig): string {
   const fingerprint = JSON.stringify({
     model: config.model,
+    aiBaseUrl: config.aiBaseUrl,
+    aiAuthMode: config.aiAuthMode,
     prompts: config.reviewPrompts,
     parallelCount: config.parallelCount,
     maxTurns: config.maxTurns,
@@ -287,8 +289,11 @@ export function buildReviewRequest(
       return [
         {
           path: finding.path,
-          line: finding.line,
+          line: finding.endLine ?? finding.line,
           side: "RIGHT" as const,
+          ...(finding.endLine !== undefined && finding.endLine > finding.line
+            ? { start_line: finding.line, start_side: "RIGHT" as const }
+            : {}),
           body: inlineCommentBody(finding),
         },
       ];

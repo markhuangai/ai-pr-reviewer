@@ -3,7 +3,7 @@ import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 const [
   destination = "release",
   asset = "runtime-unknown.tar.gz",
-  releaseTag = "v1",
+  releaseTag = "runtime-v1",
   sourceCommit = "unknown",
 ] = process.argv.slice(2);
 const sdkPackage = JSON.parse(

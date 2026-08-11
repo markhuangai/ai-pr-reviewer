@@ -89,6 +89,7 @@ function deferred<T>(): Deferred<T> {
     resolvePromise = resolve;
     rejectPromise = reject;
   });
+  void promise.catch(() => undefined);
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
@@ -111,10 +112,10 @@ function toSubmission(input: SubmissionInput): GoalSubmission {
 
 function safeAgentEnvironment(config: ReviewConfig): Record<string, string | undefined> {
   const environment: Record<string, string | undefined> = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith("INPUT_")) Reflect.deleteProperty(environment, key);
+  }
   for (const key of [
-    "INPUT_GITHUB_PAT",
-    "INPUT_AI_SECRET",
-    "INPUT_AI_BASE_URL",
     "GITHUB_TOKEN",
     "GH_TOKEN",
     "ACTIONS_RUNTIME_TOKEN",
@@ -152,12 +153,24 @@ function toSdkMcpServer(server: HttpMcpServer): McpServerConfig {
 }
 
 function changedFilePrompt(files: readonly ChangedFile[]): string {
+  let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
   const entries = files.map((file) => {
     const patch =
       file.patch === undefined ? "(patch unavailable; inspect the checked-out file)" : file.patch;
-    return `### ${file.path} [${file.status}]\n${patch}`;
+    let patchExcerpt = patch;
+    if (file.patch !== undefined) {
+      if (remainingPatchLength <= 0) {
+        patchExcerpt = "(patch excerpt omitted; inspect the checked-out file)";
+      } else if (patch.length > remainingPatchLength) {
+        patchExcerpt = `${patch.slice(0, remainingPatchLength)}\n(patch excerpt truncated; inspect the checked-out file)`;
+        remainingPatchLength = 0;
+      } else {
+        remainingPatchLength -= patch.length;
+      }
+    }
+    return `### ${file.path} [${file.status}]\n${patchExcerpt}`;
   });
-  return entries.join("\n\n").slice(0, MAX_PROMPT_DIFF_LENGTH);
+  return entries.join("\n\n");
 }
 
 function buildGoalPrompt(

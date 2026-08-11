@@ -61,7 +61,7 @@ The action infers the repository, pull request number, base SHA, and head SHA fr
 
 ## HTTP MCP configuration
 
-Only the Claude Agent SDK HTTP transport is accepted. Unknown keys, duplicate YAML keys, URL credentials, non-HTTP URLs, and unsupported transports fail input validation. Header values are never written to logs or the review marker.
+Only the Claude Agent SDK HTTP transport is accepted. Unknown keys, duplicate YAML keys, URL credentials, non-HTTPS URLs, and unsupported transports fail input validation. Header values are never written to logs or the review marker.
 
 ```yaml
 mcp-servers: |
@@ -89,13 +89,13 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Security and release model
 
-The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `v1` GitHub Release, verifies the GitHub asset SHA-256 digest (or a matching checksum asset), validates the bundle manifest, and then starts the bundled Node runtime. Supported bundles are Linux x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies the GitHub asset SHA-256 digest (or a matching checksum asset), validates the bundle manifest, and then starts the bundled Node runtime. The release workflow advances the consumer-facing `v1` source branch only by fast-forward, so the checked-in bootstrap and runtime release commit stay aligned without force-pushing a tag. Supported bundles are Linux x64/arm64, Windows x64/arm64, and macOS x64/arm64.
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 
 - executable npm packages, transitive packages, SDK/platform packages, toolchains, and third-party actions must be at least 168 hours old;
 - exact lockfile versions, SHA-512 integrity, npm signature checks, lifecycle-script disabling, and no `npx` downloads;
-- dependency review, CodeQL, npm audit, OSV scanning, secret scanning, SBOM/provenance checks, and a high/critical vulnerability promotion gate;
+- dependency review when the repository's dependency-graph compare API is available, CodeQL, npm audit, OSV scanning, secret scanning, SBOM/provenance checks, and a high/critical vulnerability promotion gate; npm audit and OSV remain hard gates when dependency review is unsupported;
 - exact version tags are resolved through the GitHub API and rejected when their commit is younger than seven days; immutable commit-SHA pinning is stronger, but this project uses exact version tags for workflow readability;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
@@ -113,7 +113,7 @@ npm run build
 npm run bundle:bootstrap
 ```
 
-The release workflow builds the runtime for all supported runner platforms, records the SDK and native CLI versions in each manifest, runs the security gates, and uploads only fully tested candidates to the stable `v1` release. Failed candidates remain prereleases.
+The release workflow builds the runtime for all supported runner platforms, records the SDK and native CLI versions in each manifest, runs the security gates, and uploads only fully tested candidates to the stable `runtime-v1` release. Failed candidates remain prereleases.
 
 ## License
 

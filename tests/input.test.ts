@@ -47,6 +47,10 @@ test("rejects unsupported MCP transports and unknown keys", () => {
       ),
     /only HTTP MCP is allowed/,
   );
+  assert.throws(
+    () => inputInternals.parseMcpServers("server:\n  type: http\n  url: http://example.test"),
+    /must use https/,
+  );
 });
 
 test("rejects invalid numeric and boolean inputs", () => {

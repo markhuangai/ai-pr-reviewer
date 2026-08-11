@@ -29,7 +29,8 @@ for (const { repository, reference, file } of references.values()) {
     throw new Error(`Could not read ${repository}@${reference} (${response.status}).`);
   const payload = await response.json();
   const date = payload.commit?.committer?.date ?? payload.commit?.author?.date;
-  if (typeof date !== "string" || Date.parse(date) > cutoff)
+  const publishedAt = typeof date === "string" ? Date.parse(date) : Number.NaN;
+  if (!Number.isFinite(publishedAt) || publishedAt > cutoff)
     failures.push(
       `${file}: ${repository}@${reference} is newer than ${quarantineHours} hours (${date ?? "unknown"}).`,
     );

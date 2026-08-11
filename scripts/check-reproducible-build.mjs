@@ -1,12 +1,29 @@
 import { cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 
-const execFileAsync = promisify(execFile);
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const snapshotRoot = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-repro-"));
+
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: "inherit", windowsHide: true });
+    let settled = false;
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (code === 0) resolve();
+      else
+        reject(new Error(`${command} ${args.join(" ")} failed (${code ?? signal ?? "unknown"}).`));
+    });
+  });
+}
 
 async function files(root, current = root) {
   const result = [];
@@ -25,10 +42,10 @@ async function snapshot(root) {
   return result;
 }
 
-await execFileAsync(npmCommand, ["run", "build"], { stdio: "inherit" });
+await run(npmCommand, ["run", "build"]);
 await cp("build", join(snapshotRoot, "first"), { recursive: true });
 const first = await snapshot(join(snapshotRoot, "first"));
-await execFileAsync(npmCommand, ["run", "build"], { stdio: "inherit" });
+await run(npmCommand, ["run", "build"]);
 const second = await snapshot("build");
 if (
   first.size !== second.size ||

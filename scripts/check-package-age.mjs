@@ -22,7 +22,7 @@ for (const [key, value] of entries) {
   const id = `${name}@${value.version}`;
   if (seen.has(id)) continue;
   seen.add(id);
-  const encoded = name.startsWith("@") ? name.replace("/", "%2f") : name;
+  const encoded = name.startsWith("@") ? name.replaceAll("/", "%2F") : name;
   const response = await fetch(`https://registry.npmjs.org/${encoded}`);
   if (!response.ok) throw new Error(`Could not read npm metadata for ${id} (${response.status}).`);
   const metadata = await response.json();

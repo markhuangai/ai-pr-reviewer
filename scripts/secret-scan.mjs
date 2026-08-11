@@ -8,6 +8,7 @@ const paths = stdout.split("\0").filter(Boolean);
 const patterns = [
   { name: "private key", expression: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/ },
   { name: "GitHub token", expression: /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/ },
+  { name: "GitHub fine-grained token", expression: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/ },
   { name: "AWS access key", expression: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "Anthropic key", expression: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
 ];

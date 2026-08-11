@@ -5,8 +5,10 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
-const RELEASE_TAG = "v1";
+const RELEASE_TAG = "runtime-v1";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES = 10_000;
 
 interface ReleaseAsset {
   readonly name?: unknown;
@@ -110,7 +112,7 @@ async function readChecksum(url: string): Promise<string | undefined> {
 async function extract(archive: string, destination: string): Promise<void> {
   await mkdir(destination, { recursive: true });
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("tar", ["-tzf", archive], {
+    const child = spawn("tar", ["-tvzf", archive], {
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
     });
@@ -125,8 +127,36 @@ async function extract(archive: string, destination: string): Promise<void> {
         reject(new Error("Runtime archive listing failed."));
         return;
       }
-      for (const entry of listing.split(/\r?\n/).filter((item) => item.length > 0)) {
-        const normalized = entry.replaceAll("\\", "/");
+      let extractedBytes = 0;
+      const entries = listing.split(/\r?\n/).filter((item) => item.length > 0);
+      if (entries.length > MAX_ARCHIVE_ENTRIES) {
+        reject(new Error("Runtime archive contains too many entries."));
+        return;
+      }
+      for (const entry of entries) {
+        const fields = entry.trim().split(/\s+/);
+        const dateIndex = fields.findIndex(
+          (field) =>
+            /^\d{4}-\d{2}-\d{2}$/.test(field) ||
+            /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/.test(field),
+        );
+        if (dateIndex < 1) {
+          reject(new Error("Runtime archive contains invalid listing metadata."));
+          return;
+        }
+        const size = Number(fields[dateIndex - 1]);
+        if (!Number.isSafeInteger(size) || size < 0 || size > MAX_EXTRACTED_BYTES) {
+          reject(new Error("Runtime archive contains an oversized entry."));
+          return;
+        }
+        extractedBytes += size;
+        if (extractedBytes > MAX_EXTRACTED_BYTES) {
+          reject(new Error("Runtime archive exceeds the extracted-size safety limit."));
+          return;
+        }
+        const dateField = fields[dateIndex] ?? "";
+        const pathIndex = dateIndex + (/^\d{4}-\d{2}-\d{2}$/.test(dateField) ? 2 : 3);
+        const normalized = fields.slice(pathIndex).join(" ").replaceAll("\\", "/");
         if (normalized.startsWith("/") || normalized.split("/").includes("..")) {
           reject(new Error("Runtime archive contains an unsafe path."));
           return;

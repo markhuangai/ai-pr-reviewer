@@ -95,6 +95,8 @@ export interface PullRequestReviewComment {
   readonly path: string;
   readonly line: number;
   readonly side: "RIGHT";
+  readonly start_line?: number;
+  readonly start_side?: "RIGHT";
   readonly body: string;
 }
 

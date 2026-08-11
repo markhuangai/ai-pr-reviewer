@@ -5,7 +5,7 @@ import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import { readPullRequestContext } from "./lib/github-event.js";
 import { readReviewConfig } from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
-import type { GoalResult, ReviewRunResult } from "./lib/types.js";
+import type { GoalResult, PullRequestReviewRequest, ReviewRunResult } from "./lib/types.js";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -24,11 +24,44 @@ function redactGoals(
   return goals.map((goal) => ({
     ...goal,
     ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
+    ...(goal.submission === undefined
+      ? {}
+      : {
+          submission: {
+            summary: redact(goal.submission.summary, secrets),
+            findings: goal.submission.findings.map((finding) => ({
+              ...finding,
+              title: redact(finding.title, secrets),
+              body: redact(finding.body, secrets),
+              ...(finding.path === undefined ? {} : { path: redact(finding.path, secrets) }),
+            })),
+          },
+        }),
   }));
+}
+
+function redactRequest(
+  request: PullRequestReviewRequest,
+  secrets: readonly string[],
+): PullRequestReviewRequest {
+  return {
+    ...request,
+    body: redact(request.body, secrets),
+    comments: request.comments.map((comment) => ({
+      ...comment,
+      body: redact(comment.body, secrets),
+    })),
+  };
 }
 
 export async function runAction(): Promise<ReviewRunResult> {
   const config = readReviewConfig({ get: (name) => core.getInput(name) });
+  const secrets = [
+    config.githubToken,
+    config.aiSecret,
+    ...Object.values(config.mcpServers).flatMap((server) => Object.values(server.headers ?? {})),
+  ];
+  for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
   const marker = reviewMarker(context, config);
@@ -57,7 +90,7 @@ export async function runAction(): Promise<ReviewRunResult> {
     throw new Error("All review goals failed; no pull request review was posted.");
   }
 
-  const request = buildReviewRequest(context, review, goals);
+  const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
   try {
     await api.createReview(context, request);
   } catch (error) {
@@ -78,11 +111,9 @@ export async function main(): Promise<void> {
   try {
     await runAction();
   } catch (error) {
-    core.setFailed(
-      redact(errorMessage(error), [
-        process.env.INPUT_GITHUB_PAT ?? "",
-        process.env.INPUT_AI_SECRET ?? "",
-      ]),
-    );
+    const inputSecrets = Object.entries(process.env)
+      .filter(([key]) => key.startsWith("INPUT_"))
+      .map(([, value]) => value ?? "");
+    core.setFailed(redact(errorMessage(error), [...inputSecrets]));
   }
 }

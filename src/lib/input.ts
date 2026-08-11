@@ -69,7 +69,7 @@ function readOptionalInteger(
   return value;
 }
 
-function readUrl(value: unknown, path: string): string {
+function readUrl(value: unknown, path: string, requireHttps = false): string {
   const text = readString(value, path, 2_000);
   let url: URL;
   try {
@@ -79,6 +79,9 @@ function readUrl(value: unknown, path: string): string {
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(`${path} must use http:// or https://.`);
+  }
+  if (requireHttps && url.protocol !== "https:") {
+    throw new Error(`${path} must use https://.`);
   }
   if (url.username !== "" || url.password !== "") {
     throw new Error(`${path} must not contain URL credentials.`);
@@ -168,7 +171,7 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
         `mcp-servers.${name}.type must be 'http'; stdio and SSE servers are disabled.`,
       );
     }
-    const url = readUrl(rawServer.url, `mcp-servers.${name}.url`);
+    const url = readUrl(rawServer.url, `mcp-servers.${name}.url`, true);
     const headers = parseHeaders(rawServer.headers, `mcp-servers.${name}.headers`);
     const tools = parseToolPolicies(rawServer.tools, `mcp-servers.${name}.tools`);
     const timeout = readOptionalInteger(

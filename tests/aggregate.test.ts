@@ -103,6 +103,60 @@ test("does not include secrets in duplicate markers", () => {
   const marker = reviewMarker(context, config);
   assert.doesNotMatch(marker, /github-secret|ai-secret/);
   assert.match(marker, /ai-pr-reviewer:v1/);
+  assert.notEqual(
+    marker,
+    reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),
+  );
+  assert.notEqual(marker, reviewMarker(context, { ...config, aiAuthMode: "auth-token" }));
+});
+
+test("maps verified multi-line findings to GitHub review ranges", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "range",
+      status: "completed",
+      submission: {
+        summary: "range",
+        findings: [
+          {
+            title: "Range",
+            severity: "MEDIUM",
+            body: "The whole changed block is affected.",
+            path: "src/change.ts",
+            line: 1,
+            endLine: 2,
+          },
+        ],
+      },
+    },
+  ]);
+  const request = buildReviewRequest(context, review, [
+    {
+      prompt: "range",
+      status: "completed",
+      submission: {
+        summary: "range",
+        findings: [
+          {
+            title: "Range",
+            severity: "MEDIUM",
+            body: "The whole changed block is affected.",
+            path: "src/change.ts",
+            line: 1,
+            endLine: 2,
+          },
+        ],
+      },
+    },
+  ]);
+  assert.deepEqual(request.comments[0], {
+    path: "src/change.ts",
+    line: 2,
+    side: "RIGHT",
+    start_line: 1,
+    start_side: "RIGHT",
+    body: request.comments[0]?.body,
+  });
 });
 
 test("partial goals force a comment and remain actionable", () => {

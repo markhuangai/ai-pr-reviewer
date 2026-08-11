@@ -1,5 +1,18 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 
+function npmPurlName(name) {
+  if (!name.startsWith("@")) return encodeURIComponent(name);
+  const separator = name.indexOf("/");
+  if (separator < 2) return encodeURIComponent(name);
+  return `${encodeURIComponent(name.slice(0, separator))}/${encodeURIComponent(name.slice(separator + 1))}`;
+}
+
+function integrityHash(integrity) {
+  const match = /^sha512-(.+)$/.exec(integrity);
+  if (!match?.[1]) return undefined;
+  return Buffer.from(match[1], "base64").toString("hex");
+}
+
 const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
 const components = [];
 for (const [key, value] of Object.entries(lock.packages)) {
@@ -9,14 +22,14 @@ for (const [key, value] of Object.entries(lock.packages)) {
     typeof value.name === "string" && !value.name.startsWith("node_modules/")
       ? value.name
       : keyName;
+  const integrity =
+    typeof value.integrity === "string" ? integrityHash(value.integrity) : undefined;
   components.push({
     type: "library",
     name,
     version: value.version,
-    purl: `pkg:npm/${name.startsWith("@") ? name.replace("/", "%2f") : name}@${value.version}`,
-    hashes: value.integrity
-      ? [{ alg: "SHA-512", content: value.integrity.replace(/^sha512-/, "") }]
-      : [],
+    purl: `pkg:npm/${npmPurlName(name)}@${encodeURIComponent(value.version)}`,
+    hashes: integrity === undefined ? [] : [{ alg: "SHA-512", content: integrity }],
   });
 }
 components.sort((left, right) =>

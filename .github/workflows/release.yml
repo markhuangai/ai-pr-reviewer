@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release-tag:
-        description: Release tag to create or update (v1 is the stable action runtime).
+        description: Release tag to create or update (runtime-v1 is the stable runtime release).
         required: true
-        default: v1
+        default: runtime-v1
 
 permissions:
   contents: read
@@ -25,11 +25,12 @@ jobs:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
         run: node scripts/check-action-age.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Set up Node 24
         uses: actions/setup-node@v4.4.0
         with:
           node-version: 24
-          cache: npm
       - name: Enforce dependency age quarantine before install
         run: node scripts/check-package-age.mjs
       - name: Install locked dependencies without lifecycle scripts
@@ -80,11 +81,12 @@ jobs:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
         run: node scripts/check-action-age.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Set up Node 24
         uses: actions/setup-node@v4.4.0
         with:
           node-version: 24
-          cache: npm
       - name: Enforce dependency age quarantine before install
         run: node scripts/check-package-age.mjs
       - name: Install locked dependencies without lifecycle scripts
@@ -97,13 +99,26 @@ jobs:
       - name: Prepare runtime bundle
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.inputs.release-tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
         run: node scripts/prepare-runtime.mjs release "${{ matrix.asset }}" "$RELEASE_TAG" "$GITHUB_SHA"
       - name: Archive runtime bundle
         shell: bash
         run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=0
+          export TZ=UTC
           mkdir -p release/assets
-          tar -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
+          if tar --help | grep -q -- '--sort'; then
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
+          else
+            (
+              cd release/bundle
+              find . -print0 | LC_ALL=C sort -z | tar --null --no-recursion \
+                --mtime='1970-01-01' --uid=0 --gid=0 --uname=root --gname=root \
+                -czf "../assets/${{ matrix.asset }}" -T -
+            )
+          fi
           node scripts/write-checksum.mjs "release/assets/${{ matrix.asset }}"
       - name: Upload runtime bundle
         uses: actions/upload-artifact@v4.6.2
@@ -121,7 +136,14 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
     steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Download runtime bundles
         uses: actions/download-artifact@v4.3.0
         with:
@@ -147,18 +169,35 @@ jobs:
       - name: Attest runtime bundles
         uses: actions/attest-build-provenance@v2.2.3
         with:
-          subject-path: release-assets/*.tar.gz
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.tar.gz.sha256
+            release-assets/sbom.cdx.json
+      - name: Advance stable action branch
+        if: env.RELEASE_TAG == 'runtime-v1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
+            if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
+              echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing a non-fast-forward update." >&2
+              exit 1
+            fi
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/v1"
       - name: Publish stable or prerelease assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.inputs.release-tag || github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber
-          elif [[ "$RELEASE_TAG" == "v1" ]]; then
-            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA"
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
+          elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
           else
-            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA"
+            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi
