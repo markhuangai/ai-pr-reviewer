@@ -29,6 +29,9 @@ import type {
 
 const MAX_REPAIR_ATTEMPTS = 5;
 const MAX_PROMPT_DIFF_LENGTH = 30_000;
+const MAX_GOAL_CONDITION_LENGTH = 4_000;
+const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
+const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 
 const findingSchema = z
   .object({
@@ -270,6 +273,18 @@ function changedFilePrompt(files: readonly ChangedFile[]): string {
   return entries.join("\n\n");
 }
 
+function goalCommand(goal: string): string {
+  const normalized = goal.replace(/\s+/gu, " ").trim();
+  const availableLength = MAX_GOAL_CONDITION_LENGTH - GOAL_CONDITION_PREFIX.length;
+  const condition =
+    normalized.length <= availableLength
+      ? `${GOAL_CONDITION_PREFIX}${normalized}`
+      : `${GOAL_CONDITION_PREFIX}${normalized
+          .slice(0, availableLength - GOAL_CONDITION_SUFFIX.length)
+          .trimEnd()}${GOAL_CONDITION_SUFFIX}`;
+  return `/goal ${condition}`;
+}
+
 function buildGoalPrompt(
   goal: string,
   context: PullRequestContext,
@@ -358,12 +373,18 @@ export async function runReviewGoal(
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
 ): Promise<GoalResult> {
   let submission: GoalSubmission | undefined;
+  let reviewPromptActive = false;
   let toolCallCount = 0;
   const outputTool = tool(
     "submit_review",
     "Submit the validated findings for this isolated review goal.",
     submissionSchema.shape,
     (input): Promise<CallToolResult> => {
+      if (!reviewPromptActive) {
+        return Promise.resolve({
+          content: [{ type: "text", text: "Wait for the full review prompt before submitting." }],
+        });
+      }
       toolCallCount += 1;
       if (toolCallCount === 1) submission = toSubmission(input);
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
@@ -407,9 +428,24 @@ export async function runReviewGoal(
         turn.reject(readerFailure);
       }
     })();
+    input.push(makeUserMessage(goalCommand(goal)));
     input.push(makeUserMessage(buildGoalPrompt(goal, context, files)));
-    for (let attempt = 0; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    let repairAttempts = 0;
+    for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS + 1; turnIndex += 1) {
       const result = await turn.promise;
+      if (!reviewPromptActive) {
+        if (result.subtype !== "success") {
+          input.finish();
+          await reader;
+          return {
+            prompt: goal,
+            status: "failed",
+            error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
+          };
+        }
+        reviewPromptActive = true;
+        continue;
+      }
       if (submission !== undefined) {
         const mcpFailures = (await session.mcpServerStatus()).filter(
           (status) =>
@@ -441,7 +477,17 @@ export async function runReviewGoal(
           error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
         };
       }
-      if (attempt < MAX_REPAIR_ATTEMPTS) input.push(makeUserMessage(repairPrompt(attempt + 1)));
+      if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
+        input.finish();
+        await reader;
+        return {
+          prompt: goal,
+          status: "failed",
+          error: "Claude did not submit a valid review after five repair attempts.",
+        };
+      }
+      repairAttempts += 1;
+      input.push(makeUserMessage(repairPrompt(repairAttempts)));
     }
     input.finish();
     await reader;
@@ -490,6 +536,7 @@ export async function runReviewGoals(
 
 export const agentInternals = {
   changedFilePrompt,
+  goalCommand,
   isSafeGlobPattern,
   isGitMetadataPath,
   isWithinRepository,

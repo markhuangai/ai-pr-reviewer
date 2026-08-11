@@ -82,7 +82,8 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Review behavior
 
-- A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The initial turn can be followed by at most five same-session repair attempts.
+- Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
+- A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
 - A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - If GitHub rejects an approval, the action retries once as a comment review.

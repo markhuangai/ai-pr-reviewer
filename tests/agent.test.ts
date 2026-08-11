@@ -31,6 +31,18 @@ test("keeps every changed-file header when patch excerpts exceed the budget", ()
   assert.match(prompt, /patch excerpt truncated/);
 });
 
+test("starts each review with a bounded Claude goal command", () => {
+  const command = agentInternals.goalCommand("Check authentication paths and failure handling.");
+  assert.equal(
+    command,
+    "/goal Complete the pull-request review goal: Check authentication paths and failure handling.",
+  );
+  assert.ok(command.slice("/goal ".length).length <= 4_000);
+  const longCommand = agentInternals.goalCommand("x".repeat(5_000));
+  assert.ok(longCommand.slice("/goal ".length).length <= 4_000);
+  assert.match(longCommand, /full goal is in the review prompt/);
+});
+
 test("recognizes only paths under the checked-out repository", () => {
   assert.equal(agentInternals.isWithinRepository("/workspace/repo", "src/index.ts"), true);
   assert.equal(agentInternals.isWithinRepository("/workspace/repo", "/workspace/repo/src"), true);
