@@ -4,23 +4,27 @@ import test from "node:test";
 import { agentInternals } from "../src/runtime/agent.js";
 import type { ChangedFile } from "../src/lib/types.js";
 
+function patchWithLength(length: number): string {
+  return `@@ -1 +1 @@\n-old\n+new\n${" context\n".repeat(length)}`.slice(0, length);
+}
+
 test("keeps every changed-file header when patch excerpts exceed the budget", () => {
   const files: readonly ChangedFile[] = [
     {
       path: "src/large.ts",
       status: "modified",
       additions: 1,
-      deletions: 0,
-      changes: 1,
-      patch: "x".repeat(30_001),
+      deletions: 1,
+      changes: 2,
+      patch: patchWithLength(30_001),
       addedLines: new Set([1]),
     },
     {
       path: "src/later.ts",
       status: "added",
       additions: 1,
-      deletions: 0,
-      changes: 1,
+      deletions: 1,
+      changes: 2,
       patch: "+later",
       addedLines: new Set([1]),
     },
@@ -37,9 +41,9 @@ test("preserves deleted-file patches ahead of the ordinary patch budget", () => 
       path: "src/large.ts",
       status: "modified",
       additions: 1,
-      deletions: 0,
-      changes: 1,
-      patch: "x".repeat(30_001),
+      deletions: 1,
+      changes: 2,
+      patch: patchWithLength(30_001),
       addedLines: new Set([1]),
     },
     {
@@ -90,7 +94,7 @@ test("fails closed when an ordinary changed-file patch is omitted", () => {
         additions: 1,
         deletions: 1,
         changes: 2,
-        patch: "x".repeat(29_999),
+        patch: patchWithLength(29_999),
         addedLines: new Set([1]),
       },
       {

@@ -64,6 +64,32 @@ function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
   return addedLines;
 }
 
+function parsePatchCounts(patch: string | undefined): {
+  readonly additions: number;
+  readonly deletions: number;
+} {
+  if (!patch) return { additions: 0, deletions: 0 };
+  let inHunk = false;
+  let additions = 0;
+  let deletions = 0;
+  for (const line of patch.split("\n")) {
+    if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line)) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return { additions, deletions };
+}
+
+export function isPatchComplete(file: ChangedFile): boolean {
+  if (file.patch === undefined) return false;
+  const counts = parsePatchCounts(file.patch);
+  return counts.additions === file.additions && counts.deletions === file.deletions;
+}
+
 function readFilePayload(value: unknown, index: number): ChangedFile {
   if (!isRecord(value))
     throw new Error(`GitHub returned an invalid changed-file record at index ${index}.`);
@@ -247,6 +273,8 @@ export class GitHubApi {
 
 export const githubApiInternals = {
   parseAddedLines,
+  parsePatchCounts,
+  isPatchComplete,
   nextPagePath,
   readLogin,
 };

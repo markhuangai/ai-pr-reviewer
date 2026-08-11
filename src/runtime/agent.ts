@@ -17,6 +17,7 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { isPatchComplete } from "../lib/github-api.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -270,7 +271,11 @@ function unavailableDiffs(files: readonly ChangedFile[]): readonly string[] {
   let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
   const unavailable: string[] = [];
   for (const file of orderedChangedFiles(files)) {
-    if (file.patch === undefined || file.patch.length > remainingPatchLength) {
+    if (
+      file.patch === undefined ||
+      !isPatchComplete(file) ||
+      file.patch.length > remainingPatchLength
+    ) {
       unavailable.push(file.path);
       continue;
     }
@@ -282,13 +287,14 @@ function unavailableDiffs(files: readonly ChangedFile[]): readonly string[] {
 function changedFilePrompt(files: readonly ChangedFile[]): string {
   let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
   const entries = orderedChangedFiles(files).map((file) => {
-    const patch =
-      file.patch === undefined ? "(patch unavailable; inspect the checked-out file)" : file.patch;
+    const patch = !isPatchComplete(file)
+      ? "(patch unavailable or truncated; the review will fail closed)"
+      : (file.patch ?? "");
     let patchExcerpt = patch;
-    if (file.patch === undefined) {
+    if (!isPatchComplete(file)) {
       patchExcerpt = isDeletedFile(file)
-        ? "(deleted-file patch unavailable; the review will fail closed)"
-        : "(patch unavailable; the review will fail closed)";
+        ? "(deleted-file patch unavailable or truncated; the review will fail closed)"
+        : "(patch unavailable or truncated; the review will fail closed)";
     } else if (remainingPatchLength <= 0) {
       patchExcerpt = isDeletedFile(file)
         ? "(deleted-file patch omitted; the review will fail closed)"

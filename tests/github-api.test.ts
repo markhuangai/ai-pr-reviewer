@@ -22,6 +22,31 @@ test("counts added lines whose content starts with plus signs", () => {
   assert.deepEqual([...lines], [1]);
 });
 
+test("detects server-truncated patches from GitHub change counts", () => {
+  const complete = {
+    path: "src/change.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+    changes: 2,
+    patch: "@@ -1 +1 @@\n-old\n+new",
+    addedLines: new Set([1]),
+  };
+  assert.deepEqual(githubApiInternals.parsePatchCounts(complete.patch), {
+    additions: 1,
+    deletions: 1,
+  });
+  assert.equal(githubApiInternals.isPatchComplete(complete), true);
+  assert.equal(
+    githubApiInternals.isPatchComplete({
+      ...complete,
+      additions: 2,
+      changes: 3,
+    }),
+    false,
+  );
+});
+
 test("extracts the next API page from a GitHub Link header", () => {
   assert.equal(
     githubApiInternals.nextPagePath(

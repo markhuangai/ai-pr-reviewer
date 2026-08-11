@@ -201,6 +201,7 @@ jobs:
             fi
           fi
           old_assets_dir="$(mktemp -d)"
+          old_target=""
           restore_needed=false
           restore_release() {
             if [[ "$restore_needed" == true ]]; then
@@ -209,10 +210,14 @@ jobs:
               if ! gh release upload "$RELEASE_TAG" "${old_assets[@]}" --clobber --repo "$GH_REPO"; then
                 echo "Previous release asset restoration also failed; inspect the release before promotion." >&2
               fi
+              if [[ -n "$old_target" ]] && ! gh release edit "$RELEASE_TAG" --target "$old_target" --repo "$GH_REPO"; then
+                echo "Previous release target restoration also failed; inspect the release before promotion." >&2
+              fi
             fi
           }
           trap restore_release EXIT
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            old_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq .targetCommitish)"
             gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir "$old_assets_dir"
             old_assets=("$old_assets_dir"/*)
             test "${#old_assets[@]}" -gt 0
@@ -229,24 +234,14 @@ jobs:
               fi
             done
             gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
+            if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+              git push origin "$GITHUB_SHA:refs/heads/v1"
+            fi
             restore_needed=false
           elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
+            git push origin "$GITHUB_SHA:refs/heads/v1"
           else
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi
           trap - EXIT
-      - name: Advance stable action branch
-        if: env.RELEASE_TAG == 'runtime-v1'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
-            if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
-              echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing a non-fast-forward update." >&2
-              exit 1
-            fi
-          fi
-          git push origin "$GITHUB_SHA:refs/heads/v1"
