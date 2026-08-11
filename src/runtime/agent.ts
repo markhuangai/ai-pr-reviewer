@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { relative, resolve, sep } from "node:path";
 
 import {
   createSdkMcpServer,
@@ -6,6 +8,8 @@ import {
   tool,
   type McpServerConfig,
   type Options,
+  type HookCallback,
+  type HookInput,
   type SDKMessage,
   type SDKResultMessage,
   type SDKUserMessage,
@@ -96,6 +100,62 @@ function deferred<T>(): Deferred<T> {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isWithinRepository(cwd: string, candidate: string): boolean {
+  const root = resolve(cwd);
+  const target = resolve(root, candidate);
+  const relativePath = relative(root, target);
+  return (
+    relativePath.length === 0 ||
+    (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !relativePath.startsWith(sep))
+  );
+}
+
+async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boolean> {
+  if (!isWithinRepository(cwd, candidate)) return false;
+  const wildcardIndex = ["*", "?", "[", "]", "{", "}", "!"]
+    .map((character) => candidate.indexOf(character))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  if (wildcardIndex !== undefined) {
+    const prefix = candidate.slice(0, wildcardIndex);
+    const separatorIndex = Math.max(prefix.lastIndexOf("/"), prefix.lastIndexOf("\\"));
+    const parent = separatorIndex < 0 ? "." : prefix.slice(0, separatorIndex) || sep;
+    try {
+      return isWithinRepository(cwd, await realpath(resolve(cwd, parent)));
+    } catch {
+      return true;
+    }
+  }
+  try {
+    return isWithinRepository(cwd, await realpath(resolve(cwd, candidate)));
+  } catch {
+    return true;
+  }
+}
+
+const repositoryReadHook: HookCallback = async (input: HookInput) => {
+  if (input.hook_event_name !== "PreToolUse") return { continue: true };
+  const toolInput = isRecord(input.tool_input) ? input.tool_input : undefined;
+  if (!toolInput) return { continue: true };
+  const candidate = input.tool_name === "Read" ? toolInput.file_path : toolInput.path;
+  if (candidate === undefined) return { continue: true };
+  if (typeof candidate !== "string" || !(await allowsRepositoryPath(input.cwd, candidate))) {
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse" as const,
+        permissionDecision: "deny" as const,
+        permissionDecisionReason: "Read access is limited to the checked-out repository.",
+      },
+    };
+  }
+  return { continue: true };
+};
 
 function toSubmission(input: SubmissionInput): GoalSubmission {
   const findings: ReviewFinding[] = input.findings.map((finding) => ({
@@ -242,6 +302,9 @@ function makeOptions(
     settingSources: [],
     strictMcpConfig: true,
     mcpServers,
+    hooks: {
+      PreToolUse: [{ matcher: "^(Read|Glob|Grep)$", hooks: [repositoryReadHook] }],
+    },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
     systemPrompt:
@@ -390,6 +453,7 @@ export async function runReviewGoals(
 
 export const agentInternals = {
   changedFilePrompt,
+  isWithinRepository,
   makeUserMessage,
   repairPrompt,
 };

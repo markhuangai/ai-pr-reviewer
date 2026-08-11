@@ -44,7 +44,7 @@ function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
     }
     if (newLine < 1 || line.startsWith("\\")) continue;
     if (line.startsWith("+")) {
-      if (!line.startsWith("+++")) addedLines.add(newLine);
+      addedLines.add(newLine);
       newLine += 1;
     } else if (line.startsWith("-")) {
       continue;
@@ -153,6 +153,12 @@ export class GitHubApi {
       if (!Array.isArray(payload))
         throw new Error("GitHub returned an invalid pull request files response.");
       files.push(...payload.map((item, index) => readFilePayload(item, files.length + index)));
+      if (files.length > 3_000) {
+        throw new Error("GitHub returned more than the pull request file API limit.");
+      }
+      if (context.changedFiles !== undefined && files.length > context.changedFiles) {
+        throw new Error("GitHub returned more files than the pull request metadata reports.");
+      }
       if (payload.length < 100) {
         hasNext = false;
         continue;
@@ -161,6 +167,9 @@ export class GitHubApi {
       path =
         nextPagePath(response.headers.get("link"), this.apiUrl) ??
         `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`;
+    }
+    if (context.changedFiles !== undefined && context.changedFiles > files.length) {
+      throw new Error("GitHub returned an incomplete pull request file list.");
     }
     return files;
   }

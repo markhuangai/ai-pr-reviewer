@@ -17,6 +17,11 @@ test("does not treat file headers as added lines", () => {
   assert.deepEqual([...lines], [1]);
 });
 
+test("counts added lines whose content starts with plus signs", () => {
+  const lines = githubApiInternals.parseAddedLines("@@ -0,0 +1 @@\n+++counter");
+  assert.deepEqual([...lines], [1]);
+});
+
 test("extracts the next API page from a GitHub Link header", () => {
   assert.equal(
     githubApiInternals.nextPagePath(

@@ -121,7 +121,7 @@ jobs:
             fi
             (
               cd release/bundle
-              find . -print0 | LC_ALL=C sort -z | tar --null --no-recursion \
+              node ../../scripts/list-archive-files.mjs . | tar --null --no-recursion \
                 "${metadata_flags[@]}" \
                 -czf "../assets/${{ matrix.asset }}" -T -
             )

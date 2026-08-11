@@ -131,6 +131,9 @@ function normalizeFinding(
 }
 
 function sameFinding(left: AggregatedFinding, right: AggregatedFinding): boolean {
+  const leftLocated = left.locationVerified && left.path !== undefined && left.line !== undefined;
+  const rightLocated =
+    right.locationVerified && right.path !== undefined && right.line !== undefined;
   if (left.path && right.path && left.path === right.path) {
     const leftLine = left.line ?? -1;
     const rightLine = right.line ?? -1;
@@ -138,6 +141,7 @@ function sameFinding(left: AggregatedFinding, right: AggregatedFinding): boolean
       return overlap(`${left.title} ${left.body}`, `${right.title} ${right.body}`) >= 0.55;
     }
   }
+  if (leftLocated || rightLocated) return false;
   return (
     normalizeText(left.title) === normalizeText(right.title) &&
     overlap(left.body, right.body) >= 0.65

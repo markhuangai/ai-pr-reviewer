@@ -30,3 +30,10 @@ test("keeps every changed-file header when patch excerpts exceed the budget", ()
   assert.match(prompt, /### src\/later\.ts \[added\]/);
   assert.match(prompt, /patch excerpt truncated/);
 });
+
+test("recognizes only paths under the checked-out repository", () => {
+  assert.equal(agentInternals.isWithinRepository("/workspace/repo", "src/index.ts"), true);
+  assert.equal(agentInternals.isWithinRepository("/workspace/repo", "/workspace/repo/src"), true);
+  assert.equal(agentInternals.isWithinRepository("/workspace/repo", "/workspace/secret"), false);
+  assert.equal(agentInternals.isWithinRepository("/workspace/repo", "../secret"), false);
+});

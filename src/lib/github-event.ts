@@ -19,6 +19,10 @@ function numberAt(value: unknown, path: string): number {
   return value;
 }
 
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 export async function readPullRequestContext(
   eventPath: string | undefined = process.env.GITHUB_EVENT_PATH,
   repository: string | undefined = process.env.GITHUB_REPOSITORY,
@@ -35,6 +39,7 @@ export async function readPullRequestContext(
   const pullRequest = parsed.pull_request;
   const head = isRecord(pullRequest.head) ? pullRequest.head : undefined;
   const base = isRecord(pullRequest.base) ? pullRequest.base : undefined;
+  const changedFiles = optionalNonNegativeInteger(pullRequest.changed_files);
   const [owner, name] = repository.split("/");
   if (!owner || !name) throw new Error("GITHUB_REPOSITORY is invalid.");
   return {
@@ -44,6 +49,7 @@ export async function readPullRequestContext(
     number: numberAt(parsed.number ?? pullRequest.number, "number"),
     headSha: stringAt(head?.sha, "pull_request.head.sha"),
     baseSha: stringAt(base?.sha, "pull_request.base.sha"),
+    ...(changedFiles === undefined ? {} : { changedFiles }),
     title: stringAt(pullRequest.title, "pull_request.title"),
     htmlUrl: stringAt(pullRequest.html_url, "pull_request.html_url"),
   };

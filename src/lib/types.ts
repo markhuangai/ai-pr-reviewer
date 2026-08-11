@@ -39,6 +39,7 @@ export interface PullRequestContext {
   readonly number: number;
   readonly headSha: string;
   readonly baseSha: string;
+  readonly changedFiles?: number;
   readonly title: string;
   readonly htmlUrl: string;
 }

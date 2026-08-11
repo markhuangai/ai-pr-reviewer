@@ -113,6 +113,10 @@ test("does not include secrets in duplicate markers", () => {
     reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),
   );
   assert.notEqual(marker, reviewMarker(context, { ...config, aiAuthMode: "auth-token" }));
+  assert.notEqual(
+    marker,
+    reviewMarker({ ...context, baseSha: "1111111111111111111111111111111111111111" }, config),
+  );
 });
 
 test("maps verified multi-line findings to GitHub review ranges", () => {
@@ -162,6 +166,51 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
     start_side: "RIGHT",
     body: request.comments[0]?.body,
   });
+});
+
+test("keeps verified findings at separate locations distinct", () => {
+  const review = aggregateReview(
+    context,
+    config,
+    [
+      ...files,
+      {
+        path: "src/other.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 0,
+        changes: 1,
+        patch: "@@ -1,0 +1 @@\n+two",
+        addedLines: new Set([1]),
+      },
+    ],
+    [
+      {
+        prompt: "locations",
+        status: "completed",
+        submission: {
+          summary: "two locations",
+          findings: [
+            {
+              title: "Unchecked result",
+              severity: "HIGH",
+              body: "The result is ignored.",
+              path: "src/change.ts",
+              line: 1,
+            },
+            {
+              title: "Unchecked result",
+              severity: "HIGH",
+              body: "The result is ignored.",
+              path: "src/other.ts",
+              line: 1,
+            },
+          ],
+        },
+      },
+    ],
+  );
+  assert.equal(review.findings.length, 2);
 });
 
 test("partial goals force a comment and remain actionable", () => {
