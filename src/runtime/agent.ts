@@ -29,6 +29,7 @@ import type {
 
 const MAX_REPAIR_ATTEMPTS = 5;
 const MAX_PROMPT_DIFF_LENGTH = 30_000;
+const MAX_DELETED_PATCH_LENGTH = MAX_PROMPT_DIFF_LENGTH;
 const MAX_GOAL_CONDITION_LENGTH = 4_000;
 const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
@@ -252,13 +253,45 @@ function toSdkMcpServer(server: HttpMcpServer): McpServerConfig {
   };
 }
 
+function isDeletedFile(file: ChangedFile): boolean {
+  return file.status === "removed" || file.status === "deleted";
+}
+
+function unavailableDeletedDiffs(files: readonly ChangedFile[]): readonly string[] {
+  let remainingPatchLength = MAX_DELETED_PATCH_LENGTH;
+  const unavailable: string[] = [];
+  for (const file of files) {
+    if (!isDeletedFile(file)) continue;
+    if (file.patch === undefined || file.patch.length > remainingPatchLength) {
+      unavailable.push(file.path);
+      continue;
+    }
+    remainingPatchLength -= file.patch.length;
+  }
+  return unavailable;
+}
+
 function changedFilePrompt(files: readonly ChangedFile[]): string {
   let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
-  const entries = files.map((file) => {
+  let remainingDeletedPatchLength = MAX_DELETED_PATCH_LENGTH;
+  const orderedFiles = [
+    ...files.filter(isDeletedFile),
+    ...files.filter((file) => !isDeletedFile(file)),
+  ];
+  const entries = orderedFiles.map((file) => {
     const patch =
       file.patch === undefined ? "(patch unavailable; inspect the checked-out file)" : file.patch;
     let patchExcerpt = patch;
-    if (file.patch !== undefined) {
+    if (isDeletedFile(file)) {
+      if (file.patch === undefined) {
+        patchExcerpt = "(deleted-file patch unavailable; the review will fail closed)";
+      } else if (file.patch.length > remainingDeletedPatchLength) {
+        patchExcerpt =
+          "(deleted-file patch exceeds the reserved review budget; the review will fail closed)";
+      } else {
+        remainingDeletedPatchLength -= file.patch.length;
+      }
+    } else if (file.patch !== undefined) {
       if (remainingPatchLength <= 0) {
         patchExcerpt = "(patch excerpt omitted; inspect the checked-out file)";
       } else if (patch.length > remainingPatchLength) {
@@ -372,6 +405,14 @@ export async function runReviewGoal(
   config: ReviewConfig,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
 ): Promise<GoalResult> {
+  const unavailableDeletedFiles = unavailableDeletedDiffs(files);
+  if (unavailableDeletedFiles.length > 0) {
+    return {
+      prompt: goal,
+      status: "failed",
+      error: `Deleted-file diffs are unavailable for: ${unavailableDeletedFiles.join(", ")}. Refusing to complete a review without their evidence.`,
+    };
+  }
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   let toolCallCount = 0;
@@ -537,6 +578,8 @@ export async function runReviewGoals(
 export const agentInternals = {
   changedFilePrompt,
   goalCommand,
+  isDeletedFile,
+  unavailableDeletedDiffs,
   isSafeGlobPattern,
   isGitMetadataPath,
   isWithinRepository,

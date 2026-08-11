@@ -13,6 +13,7 @@ interface ReviewPayload {
   readonly body?: unknown;
   readonly commit_id?: unknown;
   readonly state?: unknown;
+  readonly user?: unknown;
 }
 
 export class GitHubApiError extends Error {
@@ -31,6 +32,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function integerOrZero(value: unknown): number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function readLogin(value: unknown): string | undefined {
+  if (!isRecord(value) || typeof value.login !== "string" || value.login.length === 0) {
+    return undefined;
+  }
+  return value.login;
 }
 
 function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
@@ -76,6 +84,7 @@ function readFilePayload(value: unknown, index: number): ChangedFile {
 }
 
 export interface ExistingReview {
+  readonly authorLogin: string;
   readonly body: string;
   readonly commitId: string;
   readonly state: string;
@@ -109,6 +118,12 @@ export class GitHubApi {
   constructor(token: string, apiUrl = process.env.GITHUB_API_URL ?? "https://api.github.com") {
     this.apiUrl = apiUrl.replace(/\/$/, "");
     this.token = token;
+  }
+
+  async getAuthenticatedUserLogin(): Promise<string> {
+    const login = readLogin(await this.request<unknown>("/user"));
+    if (login === undefined) throw new Error("GitHub returned no authenticated user login.");
+    return login;
   }
 
   private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
@@ -190,9 +205,16 @@ export class GitHubApi {
         ...payload.flatMap((item): ExistingReview[] => {
           if (!isRecord(item)) return [];
           const review = item as ReviewPayload;
-          if (typeof review.body !== "string" || typeof review.commit_id !== "string") return [];
+          const authorLogin = readLogin(review.user);
+          if (
+            authorLogin === undefined ||
+            typeof review.body !== "string" ||
+            typeof review.commit_id !== "string"
+          )
+            return [];
           return [
             {
+              authorLogin,
               body: review.body,
               commitId: review.commit_id,
               state: typeof review.state === "string" ? review.state : "UNKNOWN",
@@ -226,4 +248,5 @@ export class GitHubApi {
 export const githubApiInternals = {
   parseAddedLines,
   nextPagePath,
+  readLogin,
 };

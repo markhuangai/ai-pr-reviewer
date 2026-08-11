@@ -71,11 +71,13 @@ export async function runAction(): Promise<ReviewRunResult> {
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
+  const authenticatedLogin = await api.getAuthenticatedUserLogin();
   const marker = reviewMarker(context, config);
   const existingReviews = await api.listReviews(context);
   if (
     existingReviews.some(
       (review) =>
+        review.authorLogin.toLowerCase() === authenticatedLogin.toLowerCase() &&
         review.state !== "DISMISSED" &&
         review.commitId === context.headSha &&
         review.body.includes(marker),

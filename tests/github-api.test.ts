@@ -32,3 +32,9 @@ test("extracts the next API page from a GitHub Link header", () => {
   );
   assert.equal(githubApiInternals.nextPagePath(null, "https://api.github.com"), undefined);
 });
+
+test("reads review authors without accepting malformed identities", () => {
+  assert.equal(githubApiInternals.readLogin({ login: "review-owner" }), "review-owner");
+  assert.equal(githubApiInternals.readLogin({ login: "" }), undefined);
+  assert.equal(githubApiInternals.readLogin({}), undefined);
+});

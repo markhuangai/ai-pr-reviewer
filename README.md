@@ -85,6 +85,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
+- Deleted-file patches are reserved before ordinary diff excerpts; if a deleted diff is unavailable or exceeds the reserved budget, every goal fails closed instead of producing a complete or approving review.
 - A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - If GitHub rejects an approval, the action retries once as a comment review.
 - Review bodies are capped at approximately 60 KB. No report artifact is uploaded.

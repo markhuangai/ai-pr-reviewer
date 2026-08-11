@@ -31,6 +31,56 @@ test("keeps every changed-file header when patch excerpts exceed the budget", ()
   assert.match(prompt, /patch excerpt truncated/);
 });
 
+test("preserves deleted-file patches ahead of the ordinary patch budget", () => {
+  const prompt = agentInternals.changedFilePrompt([
+    {
+      path: "src/large.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      patch: "x".repeat(30_001),
+      addedLines: new Set([1]),
+    },
+    {
+      path: "src/removed.ts",
+      status: "removed",
+      additions: 0,
+      deletions: 1,
+      changes: 1,
+      patch: "@@ -1 +0,0 @@\n-removed",
+      addedLines: new Set(),
+    },
+  ]);
+  assert.match(prompt, /### src\/removed\.ts \[removed\][\s\S]*-removed/);
+  assert.match(prompt, /### src\/large\.ts \[modified\][\s\S]*patch excerpt truncated/);
+});
+
+test("reports deleted diffs that cannot be supplied to a read-only reviewer", () => {
+  assert.deepEqual(
+    agentInternals.unavailableDeletedDiffs([
+      {
+        path: "src/binary.bin",
+        status: "removed",
+        additions: 0,
+        deletions: 1,
+        changes: 1,
+        addedLines: new Set(),
+      },
+      {
+        path: "src/large.bin",
+        status: "deleted",
+        additions: 0,
+        deletions: 1,
+        changes: 1,
+        patch: "x".repeat(30_001),
+        addedLines: new Set(),
+      },
+    ]),
+    ["src/binary.bin", "src/large.bin"],
+  );
+});
+
 test("starts each review with a bounded Claude goal command", () => {
   const command = agentInternals.goalCommand("Check authentication paths and failure handling.");
   assert.equal(
