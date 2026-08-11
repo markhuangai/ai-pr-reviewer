@@ -12,6 +12,7 @@ interface PullRequestFilePayload {
 interface ReviewPayload {
   readonly body?: unknown;
   readonly commit_id?: unknown;
+  readonly state?: unknown;
 }
 
 export class GitHubApiError extends Error {
@@ -77,6 +78,7 @@ function readFilePayload(value: unknown, index: number): ChangedFile {
 export interface ExistingReview {
   readonly body: string;
   readonly commitId: string;
+  readonly state: string;
 }
 
 interface RequestPage<T> {
@@ -189,7 +191,13 @@ export class GitHubApi {
           if (!isRecord(item)) return [];
           const review = item as ReviewPayload;
           if (typeof review.body !== "string" || typeof review.commit_id !== "string") return [];
-          return [{ body: review.body, commitId: review.commit_id }];
+          return [
+            {
+              body: review.body,
+              commitId: review.commit_id,
+              state: typeof review.state === "string" ? review.state : "UNKNOWN",
+            },
+          ];
         }),
       );
       if (payload.length < 100) {

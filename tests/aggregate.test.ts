@@ -130,6 +130,19 @@ test("does not include secrets in duplicate markers", () => {
       },
     }),
   );
+  assert.notEqual(
+    marker,
+    reviewMarker(context, {
+      ...config,
+      mcpServers: {
+        security: {
+          type: "http",
+          url: "https://mcp.example.test",
+          headers: { Authorization: "tenant-a" },
+        },
+      },
+    }),
+  );
 });
 
 test("maps verified multi-line findings to GitHub review ranges", () => {

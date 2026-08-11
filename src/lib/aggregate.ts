@@ -13,6 +13,7 @@ import type {
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_INLINE_COMMENT_LENGTH = 60_000;
+const MARKER_KEY = "ai-pr-reviewer-marker-v1";
 const MAX_INLINE_COMMENTS = 25;
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 5,
@@ -74,8 +75,12 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
             .sort((left, right) => left.name.localeCompare(right.name)),
           timeout: server.timeout,
           alwaysLoad: server.alwaysLoad,
-          headerNames:
-            server.headers === undefined ? undefined : Object.keys(server.headers).sort(),
+          headerFingerprints:
+            server.headers === undefined
+              ? undefined
+              : Object.entries(server.headers)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([name, value]) => [name, stableDigest(`${MARKER_KEY}:${name}:${value}`)]),
         },
       ]),
   );

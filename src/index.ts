@@ -75,7 +75,10 @@ export async function runAction(): Promise<ReviewRunResult> {
   const existingReviews = await api.listReviews(context);
   if (
     existingReviews.some(
-      (review) => review.commitId === context.headSha && review.body.includes(marker),
+      (review) =>
+        review.state !== "DISMISSED" &&
+        review.commitId === context.headSha &&
+        review.body.includes(marker),
     )
   ) {
     core.info("An identical review already exists for this pull request head; skipping.");

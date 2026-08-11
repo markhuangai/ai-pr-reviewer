@@ -216,6 +216,7 @@ jobs:
                 test "$actual_digest" = "sha256:$expected_digest"
               fi
             done
+            gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
             restore_needed=false
           elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
