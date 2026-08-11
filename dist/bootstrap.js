@@ -22,7 +22,7 @@ function platformAssetName() {
     return `runtime-${platform}-${arch}.tar.gz`;
 }
 function token() {
-    const value = process.env.INPUT_GITHUB_PAT?.trim();
+    const value = (process.env["INPUT_GITHUB-PAT"] ?? process.env.INPUT_GITHUB_PAT)?.trim();
     return value && value.length > 0 ? value : undefined;
 }
 function requestHeaders() {

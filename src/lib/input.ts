@@ -160,6 +160,9 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
       throw new Error(`mcp-servers.${name} is not a valid server name.`);
     }
+    if (name === "review_output") {
+      throw new Error("mcp-servers.review_output is reserved for the internal review output tool.");
+    }
     if (!isRecord(rawServer)) throw new Error(`mcp-servers.${name} must be a mapping.`);
     const allowed = new Set(["type", "url", "headers", "tools", "timeout", "alwaysLoad"]);
     for (const key of Object.keys(rawServer)) {

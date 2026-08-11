@@ -82,7 +82,10 @@ jobs:
             "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}")"
           case "$status" in
             2*) echo 'enabled=true' >> "$GITHUB_OUTPUT" ;;
-            404) echo 'enabled=false' >> "$GITHUB_OUTPUT" ;;
+            403|404)
+              echo 'enabled=false' >> "$GITHUB_OUTPUT"
+              echo "Dependency graph comparison is unavailable; dependency review will be skipped." >&2
+              ;;
             *) echo "Dependency graph capability probe failed with HTTP ${status}." >&2; exit 1 ;;
           esac
 

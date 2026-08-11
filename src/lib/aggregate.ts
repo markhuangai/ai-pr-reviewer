@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
 
 import type {
   AggregatedFinding,
@@ -78,7 +78,10 @@ export function reviewMarker(context: PullRequestContext, config: ReviewConfig):
     autoApprove: config.autoApprove,
     mcpServers: stableMcpShape(config.mcpServers),
   });
-  const digest = createHash("sha256").update(fingerprint).digest("hex").slice(0, 20);
+  const digest = createHmac("sha256", "ai-pr-reviewer-marker-v1")
+    .update(fingerprint)
+    .digest("hex")
+    .slice(0, 20);
   return `<!-- ai-pr-reviewer:v1:${context.headSha}:${digest} -->`;
 }
 

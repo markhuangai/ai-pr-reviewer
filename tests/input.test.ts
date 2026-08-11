@@ -51,6 +51,11 @@ test("rejects unsupported MCP transports and unknown keys", () => {
     () => inputInternals.parseMcpServers("server:\n  type: http\n  url: http://example.test"),
     /must use https/,
   );
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers("review_output:\n  type: http\n  url: https://example.test"),
+    /review_output.*reserved/,
+  );
 });
 
 test("rejects invalid numeric and boolean inputs", () => {

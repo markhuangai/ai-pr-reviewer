@@ -40,7 +40,7 @@ function platformAssetName(): string {
 }
 
 function token(): string | undefined {
-  const value = process.env.INPUT_GITHUB_PAT?.trim();
+  const value = (process.env["INPUT_GITHUB-PAT"] ?? process.env.INPUT_GITHUB_PAT)?.trim();
   return value && value.length > 0 ? value : undefined;
 }
 

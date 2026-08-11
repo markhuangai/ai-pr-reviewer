@@ -173,20 +173,6 @@ jobs:
             release-assets/*.tar.gz
             release-assets/*.tar.gz.sha256
             release-assets/sbom.cdx.json
-      - name: Advance stable action branch
-        if: env.RELEASE_TAG == 'runtime-v1'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
-            if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
-              echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing a non-fast-forward update." >&2
-              exit 1
-            fi
-          fi
-          git push origin "$GITHUB_SHA:refs/heads/v1"
       - name: Publish stable or prerelease assets
         shell: bash
         env:
@@ -201,3 +187,17 @@ jobs:
           else
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi
+      - name: Advance stable action branch
+        if: env.RELEASE_TAG == 'runtime-v1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
+            if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
+              echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing a non-fast-forward update." >&2
+              exit 1
+            fi
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/v1"
