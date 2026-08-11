@@ -11,6 +11,10 @@ on:
         required: true
         default: runtime-v1
 
+concurrency:
+  group: ai-pr-reviewer-release-${{ github.event.inputs.release-tag || 'runtime-v1' }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

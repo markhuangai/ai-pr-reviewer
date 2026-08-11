@@ -86,7 +86,8 @@ function readUrl(value: unknown, path: string, requireHttps = false): string {
   if (url.username !== "" || url.password !== "") {
     throw new Error(`${path} must not contain URL credentials.`);
   }
-  return url.toString().replace(/\/$/, "");
+  if (url.pathname !== "/") url.pathname = url.pathname.replace(/\/+$/, "");
+  return url.toString();
 }
 
 function parseHeaders(value: unknown, path: string): Readonly<Record<string, string>> | undefined {

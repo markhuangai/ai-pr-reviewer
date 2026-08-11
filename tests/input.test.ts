@@ -29,6 +29,12 @@ security:
   assert.equal(config.aiBaseUrl, "https://ai.example.test/v1");
   assert.equal(config.mcpServers.security?.type, "http");
   assert.equal(config.mcpServers.security?.headers?.Authorization, "Bearer token");
+  assert.equal(
+    inputInternals.parseMcpServers(
+      "server:\n  type: http\n  url: https://mcp.example.test/review?tenant=foo/",
+    ).server?.url,
+    "https://mcp.example.test/review?tenant=foo/",
+  );
 });
 
 test("accepts JSON goal arrays", () => {
