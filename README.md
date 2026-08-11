@@ -54,7 +54,7 @@ jobs:
 | `model`          | yes      |           | Model name understood by the endpoint.                                                               |
 | `review-prompts` | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                           |
 | `parallel-count` | no       | `5`       | Integer from 1 to 10.                                                                                |
-| `max-turns`      | no       | `50`      | Integer from 1 to 100 per goal session.                                                              |
+| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including the initial `/goal` setup turn.                    |
 | `auto-approve`   | no       | `false`   | An approval is attempted only when every goal completes and no finding is Medium, High, or Critical. |
 | `mcp-servers`    | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                      |
 
@@ -62,7 +62,7 @@ The action infers the repository, pull request number, base SHA, and head SHA fr
 
 ## HTTP MCP configuration
 
-Only the Claude Agent SDK HTTP transport is accepted. Unknown keys, duplicate YAML keys, URL credentials, non-HTTPS URLs, and unsupported transports fail input validation. Header values are never written to logs or the review marker.
+Only the Claude Agent SDK HTTP transport is accepted. Unknown keys, duplicate YAML keys, URL credentials, non-HTTPS URLs, and unsupported transports fail input validation. Header values are never written to logs or the review marker; only header names participate in the marker identity.
 
 ```yaml
 mcp-servers: |

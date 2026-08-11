@@ -1,5 +1,3 @@
-import { createHmac } from "node:crypto";
-
 import type {
   AggregatedFinding,
   AggregatedReview,
@@ -15,7 +13,6 @@ import type {
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_INLINE_COMMENT_LENGTH = 60_000;
-const MARKER_KEY = "ai-pr-reviewer-marker-v2";
 const MAX_INLINE_COMMENTS = 25;
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 5,
@@ -32,10 +29,6 @@ function stableDigest(value: string): string {
     hash = BigInt.asUintN(64, hash * 1_099_511_628_211n);
   }
   return hash.toString(16).padStart(16, "0");
-}
-
-function keyedDigest(key: string, value: string): string {
-  return createHmac("sha256", key).update(value).digest("hex");
 }
 
 function normalizeText(value: string): string {
@@ -63,10 +56,7 @@ function overlap(left: string, right: string): number {
   return intersection / (a.size + b.size - intersection);
 }
 
-function stableMcpShape(
-  servers: Readonly<Record<string, HttpMcpServer>>,
-  fingerprintKey: string,
-): unknown {
+function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unknown {
   return Object.fromEntries(
     Object.entries(servers)
       .sort(([left], [right]) => left.localeCompare(right))
@@ -84,15 +74,12 @@ function stableMcpShape(
             .sort((left, right) => left.name.localeCompare(right.name)),
           timeout: server.timeout,
           alwaysLoad: server.alwaysLoad,
-          headerFingerprints:
+          headerNames:
             server.headers === undefined
               ? undefined
               : Object.entries(server.headers)
                   .sort(([left], [right]) => left.localeCompare(right))
-                  .map(([name, value]) => [
-                    name,
-                    keyedDigest(fingerprintKey, `${MARKER_KEY}:${name}:${value}`),
-                  ]),
+                  .map(([name]) => name),
         },
       ]),
   );
@@ -109,7 +96,7 @@ export function reviewMarker(context: PullRequestContext, config: ReviewConfig):
     maxTurns: config.maxTurns,
     autoApprove: config.autoApprove,
     buildId: process.env.AI_PR_REVIEWER_BUILD_ID?.trim() || "source",
-    mcpServers: stableMcpShape(config.mcpServers, config.githubToken),
+    mcpServers: stableMcpShape(config.mcpServers),
   });
   const digest = stableDigest(fingerprint);
   return `<!-- ai-pr-reviewer:v2:${context.headSha}:${digest} -->`;

@@ -235,7 +235,7 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     model: required(reader.get("model"), "model"),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
-    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 1, 100),
+    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 100),
     autoApprove: parseBoolean(reader.get("auto-approve"), "auto-approve", false),
     mcpServers: parseMcpServers(reader.get("mcp-servers")),
   };

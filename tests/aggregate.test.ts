@@ -113,6 +113,7 @@ test("does not include secrets in duplicate markers", () => {
     reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),
   );
   assert.notEqual(marker, reviewMarker(context, { ...config, aiAuthMode: "auth-token" }));
+  assert.equal(marker, reviewMarker(context, { ...config, githubToken: "another-github-token" }));
   assert.notEqual(
     marker,
     reviewMarker({ ...context, baseSha: "1111111111111111111111111111111111111111" }, config),

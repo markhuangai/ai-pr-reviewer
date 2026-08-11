@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "5"
   max-turns:
-    description: Maximum Claude Agent SDK turns per goal session.
+    description: Maximum Claude Agent SDK turns per goal session, including the initial /goal setup turn.
     required: false
     default: "50"
   auto-approve:

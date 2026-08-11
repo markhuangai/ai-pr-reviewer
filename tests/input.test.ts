@@ -79,4 +79,8 @@ test("rejects invalid numeric and boolean inputs", () => {
       readReviewConfig(reader({ ...values, "parallel-count": "1", "auto-approve": "sometimes" })),
     /auto-approve.*true.*false/,
   );
+  assert.throws(
+    () => readReviewConfig(reader({ ...values, "parallel-count": "1", "max-turns": "1" })),
+    /max-turns.*between 2 and 100/,
+  );
 });
