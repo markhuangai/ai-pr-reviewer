@@ -53,6 +53,14 @@ function redactRequest(
   };
 }
 
+function isApprovalRejection(error: unknown): error is GitHubApiError {
+  return (
+    error instanceof GitHubApiError &&
+    error.status === 422 &&
+    /\bapprov(?:e|al|ed|ing)\b/i.test(error.message)
+  );
+}
+
 export async function runAction(): Promise<ReviewRunResult> {
   const config = readReviewConfig({ get: (name) => core.getInput(name) });
   const secrets = [
@@ -93,7 +101,7 @@ export async function runAction(): Promise<ReviewRunResult> {
   try {
     await api.createReview(context, request);
   } catch (error) {
-    if (request.event !== "APPROVE" || !(error instanceof GitHubApiError)) throw error;
+    if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
     core.warning("GitHub rejected the approval review; retrying as a comment review.");
     await api.createReview(context, {
       ...request,

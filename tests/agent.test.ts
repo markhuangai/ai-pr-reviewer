@@ -43,3 +43,9 @@ test("rejects traversal and absolute alternatives in Glob braces", () => {
   assert.equal(agentInternals.isSafeGlobPattern("{../*,src/*}"), false);
   assert.equal(agentInternals.isSafeGlobPattern("{/etc,src}/*"), false);
 });
+
+test("blocks Git metadata paths from the reviewer", () => {
+  assert.equal(agentInternals.isGitMetadataPath(".git/config"), true);
+  assert.equal(agentInternals.isGitMetadataPath("src/.git/objects"), true);
+  assert.equal(agentInternals.isGitMetadataPath(".github/workflows/ci.yml"), false);
+});

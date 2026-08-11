@@ -115,6 +115,10 @@ function isWithinRepository(cwd: string, candidate: string): boolean {
   );
 }
 
+function isGitMetadataPath(candidate: string): boolean {
+  return /(?:^|[\\/{,])\.git(?:$|[\\/},])/.test(candidate);
+}
+
 function isSafeGlobPattern(pattern: string): boolean {
   const normalized = pattern.replace(/^!/, "");
   if (normalized.includes("..")) return false;
@@ -135,6 +139,7 @@ function isSafeGlobPattern(pattern: string): boolean {
 }
 
 async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boolean> {
+  if (isGitMetadataPath(candidate)) return false;
   if (!isWithinRepository(cwd, candidate)) return false;
   const wildcardIndex = ["*", "?", "[", "]", "{", "}", "!"]
     .map((character) => candidate.indexOf(character))
@@ -486,6 +491,7 @@ export async function runReviewGoals(
 export const agentInternals = {
   changedFilePrompt,
   isSafeGlobPattern,
+  isGitMetadataPath,
   isWithinRepository,
   makeUserMessage,
   repairPrompt,
