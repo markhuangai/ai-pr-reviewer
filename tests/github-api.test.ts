@@ -112,4 +112,9 @@ test("reads the live pull request head SHA", () => {
   );
   assert.equal(githubApiInternals.readHeadSha({ head: { sha: "" } }), undefined);
   assert.equal(githubApiInternals.readHeadSha({}), undefined);
+  assert.equal(
+    githubApiInternals.readBaseSha({ base: { sha: "fedcba9876543210" } }),
+    "fedcba9876543210",
+  );
+  assert.equal(githubApiInternals.readBaseSha({ base: { sha: "" } }), undefined);
 });

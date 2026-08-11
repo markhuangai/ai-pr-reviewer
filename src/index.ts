@@ -98,10 +98,10 @@ function isApprovalRejection(error: unknown): error is GitHubApiError {
 }
 
 async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): Promise<void> {
-  const currentHead = await api.getPullRequestHeadSha(context);
-  if (currentHead !== context.headSha) {
+  const currentRefs = await api.getPullRequestRefs(context);
+  if (currentRefs.headSha !== context.headSha || currentRefs.baseSha !== context.baseSha) {
     throw new Error(
-      `Pull request head changed during review (event ${context.headSha}, current ${currentHead}); refusing to review a stale checkout.`,
+      `Pull request refs changed during review (event ${context.baseSha}...${context.headSha}, current ${currentRefs.baseSha}...${currentRefs.headSha}); refusing to review a stale checkout.`,
     );
   }
 }

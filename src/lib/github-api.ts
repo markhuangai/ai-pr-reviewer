@@ -49,6 +49,13 @@ function readHeadSha(value: unknown): string | undefined {
   return value.head.sha.length > 0 ? value.head.sha : undefined;
 }
 
+function readBaseSha(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.base) || typeof value.base.sha !== "string") {
+    return undefined;
+  }
+  return value.base.sha.length > 0 ? value.base.sha : undefined;
+}
+
 function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
   const addedLines = new Set<number>();
   if (!patch) return addedLines;
@@ -193,13 +200,22 @@ export class GitHubApi {
     return login;
   }
 
-  async getPullRequestHeadSha(context: PullRequestContext): Promise<string> {
+  async getPullRequestRefs(
+    context: PullRequestContext,
+  ): Promise<{ readonly headSha: string; readonly baseSha: string }> {
     const payload = await this.request<unknown>(
       `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}`,
     );
     const headSha = readHeadSha(payload);
-    if (headSha === undefined) throw new Error("GitHub returned no pull request head SHA.");
-    return headSha;
+    const baseSha = readBaseSha(payload);
+    if (headSha === undefined || baseSha === undefined) {
+      throw new Error("GitHub returned incomplete pull request ref metadata.");
+    }
+    return { headSha, baseSha };
+  }
+
+  async getPullRequestHeadSha(context: PullRequestContext): Promise<string> {
+    return (await this.getPullRequestRefs(context)).headSha;
   }
 
   private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
@@ -326,6 +342,7 @@ export const githubApiInternals = {
   parsePatchCounts,
   isPatchComplete,
   nextPagePath,
+  readBaseSha,
   readHeadSha,
   readLogin,
 };
