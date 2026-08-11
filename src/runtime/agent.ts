@@ -115,6 +115,25 @@ function isWithinRepository(cwd: string, candidate: string): boolean {
   );
 }
 
+function isSafeGlobPattern(pattern: string): boolean {
+  const normalized = pattern.replace(/^!/, "");
+  if (normalized.includes("..")) return false;
+  let braceDepth = 0;
+  for (const character of normalized) {
+    if (character === "{") braceDepth += 1;
+    if (character === "}") braceDepth -= 1;
+    if (braceDepth < 0 || braceDepth > 1) return false;
+  }
+  if (braceDepth !== 0) return false;
+  for (const match of normalized.matchAll(/\{([^{}]*)\}/g)) {
+    for (const alternative of (match[1] ?? "").split(",")) {
+      if (alternative.startsWith("/") || alternative.startsWith("\\")) return false;
+      if (/^[A-Za-z]:[\\/]/.test(alternative)) return false;
+    }
+  }
+  return true;
+}
+
 async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boolean> {
   if (!isWithinRepository(cwd, candidate)) return false;
   const wildcardIndex = ["*", "?", "[", "]", "{", "}", "!"]
@@ -150,7 +169,9 @@ const repositoryReadHook: HookCallback = async (input: HookInput) => {
   const globPath = typeof globPattern === "string" ? globPattern.replace(/^!/, "") : globPattern;
   const patternAllowed =
     globPattern === undefined ||
-    (typeof globPath === "string" && (await allowsRepositoryPath(input.cwd, globPath)));
+    (typeof globPath === "string" &&
+      isSafeGlobPattern(globPath) &&
+      (await allowsRepositoryPath(input.cwd, globPath)));
   if (
     !pathAllowed ||
     !patternAllowed ||
@@ -464,6 +485,7 @@ export async function runReviewGoals(
 
 export const agentInternals = {
   changedFilePrompt,
+  isSafeGlobPattern,
   isWithinRepository,
   makeUserMessage,
   repairPrompt,

@@ -1,4 +1,4 @@
-import { chmod, lstat, readdir, utimes } from "node:fs/promises";
+import { chmod, lstat, lutimes, readdir, utimes } from "node:fs/promises";
 import { join } from "node:path";
 
 const root = process.argv[2];
@@ -6,7 +6,10 @@ if (!root) throw new Error("Usage: node scripts/normalize-archive.mjs <directory
 
 async function normalize(path) {
   const stats = await lstat(path);
-  if (stats.isSymbolicLink()) return;
+  if (stats.isSymbolicLink()) {
+    await lutimes(path, 0, 0);
+    return;
+  }
   await utimes(path, 0, 0);
   if (stats.isDirectory()) {
     await chmod(path, 0o755);

@@ -37,3 +37,9 @@ test("recognizes only paths under the checked-out repository", () => {
   assert.equal(agentInternals.isWithinRepository("/workspace/repo", "/workspace/secret"), false);
   assert.equal(agentInternals.isWithinRepository("/workspace/repo", "../secret"), false);
 });
+
+test("rejects traversal and absolute alternatives in Glob braces", () => {
+  assert.equal(agentInternals.isSafeGlobPattern("src/{lib,test}/**/*.ts"), true);
+  assert.equal(agentInternals.isSafeGlobPattern("{../*,src/*}"), false);
+  assert.equal(agentInternals.isSafeGlobPattern("{/etc,src}/*"), false);
+});
