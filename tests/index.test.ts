@@ -41,4 +41,8 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
     ]),
     "[REDACTED]",
   );
+  assert.equal(
+    indexInternals.redact("a data a prod production prod-prod", ["a", "prod"]),
+    "[REDACTED] data [REDACTED] [REDACTED] production [REDACTED]-[REDACTED]",
+  );
 });
