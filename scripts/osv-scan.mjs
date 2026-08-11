@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 
+import { severityLabel } from "./osv-score.mjs";
+
 const OSV_BATCH_SIZE = 1_000;
 const OSV_TIMEOUT_MS = 30_000;
 
@@ -26,30 +28,6 @@ async function fetchJson(url, init = {}) {
   });
   if (!response.ok) throw new Error(`OSV request failed (${response.status}) for ${url}.`);
   return response.json();
-}
-
-function severityLabel(vulnerability) {
-  const databaseSeverity = vulnerability.database_specific?.severity;
-  if (typeof databaseSeverity === "string") {
-    const normalized = databaseSeverity.toUpperCase();
-    if (normalized === "CRITICAL") return "CRITICAL";
-    if (normalized === "HIGH") return "HIGH";
-    if (normalized === "MODERATE" || normalized === "MEDIUM") return "MEDIUM";
-    if (normalized === "LOW") return "LOW";
-  }
-  const scores = Array.isArray(vulnerability.severity)
-    ? vulnerability.severity
-        .map((item) => (typeof item?.score === "string" ? Number(item.score) : Number.NaN))
-        .filter((score) => Number.isFinite(score))
-    : [];
-  const score = scores.length > 0 ? Math.max(...scores) : Number.NaN;
-  if (Number.isFinite(score)) {
-    if (score >= 9) return "CRITICAL";
-    if (score >= 7) return "HIGH";
-    if (score >= 4) return "MEDIUM";
-    return "LOW";
-  }
-  return "UNKNOWN";
 }
 
 const vulnerabilityFindings = [];

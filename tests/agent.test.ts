@@ -134,6 +134,7 @@ test("rejects traversal and absolute alternatives in Glob braces", () => {
 
 test("blocks Git metadata paths from the reviewer", () => {
   assert.equal(agentInternals.isGitMetadataPath(".git/config"), true);
+  assert.equal(agentInternals.isGitMetadataPath(".GIT/config"), true);
   assert.equal(agentInternals.isGitMetadataPath("src/.git/objects"), true);
   assert.equal(agentInternals.isGitMetadataPath(".github/workflows/ci.yml"), false);
   assert.equal(

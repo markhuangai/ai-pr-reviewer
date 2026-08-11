@@ -119,7 +119,7 @@ function isWithinRepository(cwd: string, candidate: string): boolean {
 }
 
 function isGitMetadataPath(candidate: string): boolean {
-  return /(?:^|[\\/{,])\.git(?:$|[\\/},])/.test(candidate);
+  return /(?:^|[\\/{,])\.git(?:$|[\\/},])/i.test(candidate);
 }
 
 function isSafeGlobPattern(pattern: string): boolean {

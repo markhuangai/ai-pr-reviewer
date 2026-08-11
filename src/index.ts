@@ -5,7 +5,12 @@ import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import { readPullRequestContext } from "./lib/github-event.js";
 import { readReviewConfig } from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
-import type { GoalResult, PullRequestReviewRequest, ReviewRunResult } from "./lib/types.js";
+import type {
+  GoalResult,
+  PullRequestReviewRequest,
+  ReviewConfig,
+  ReviewRunResult,
+} from "./lib/types.js";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -15,6 +20,18 @@ function redact(value: string, secrets: readonly string[]): string {
   return secrets
     .filter((secret) => secret.length > 0)
     .reduce((result, secret) => result.split(secret).join("[REDACTED]"), value);
+}
+
+function reviewSecrets(config: ReviewConfig): readonly string[] {
+  return [
+    config.githubToken,
+    config.aiSecret,
+    config.aiBaseUrl,
+    ...Object.values(config.mcpServers).flatMap((server) => [
+      server.url,
+      ...Object.values(server.headers ?? {}),
+    ]),
+  ];
 }
 
 function redactGoals(
@@ -63,11 +80,7 @@ function isApprovalRejection(error: unknown): error is GitHubApiError {
 
 export async function runAction(): Promise<ReviewRunResult> {
   const config = readReviewConfig({ get: (name) => core.getInput(name) });
-  const secrets = [
-    config.githubToken,
-    config.aiSecret,
-    ...Object.values(config.mcpServers).flatMap((server) => Object.values(server.headers ?? {})),
-  ];
+  const secrets = reviewSecrets(config);
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
@@ -92,11 +105,7 @@ export async function runAction(): Promise<ReviewRunResult> {
     `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
   );
   const rawGoals = await runReviewGoals(context, files, config);
-  const goals = redactGoals(rawGoals, [
-    config.githubToken,
-    config.aiSecret,
-    ...Object.values(config.mcpServers).flatMap((server) => Object.values(server.headers ?? {})),
-  ]);
+  const goals = redactGoals(rawGoals, secrets);
   const review = aggregateReview(context, config, files, goals);
   if (review.allGoalsFailed) {
     throw new Error("All review goals failed; no pull request review was posted.");
@@ -129,3 +138,5 @@ export async function main(): Promise<void> {
     core.setFailed(redact(errorMessage(error), [...inputSecrets]));
   }
 }
+
+export const indexInternals = { redact, reviewSecrets };

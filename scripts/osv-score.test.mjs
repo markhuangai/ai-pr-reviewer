@@ -1,0 +1,15 @@
+import { strict as assert } from "node:assert";
+import test from "node:test";
+
+import { parseCvssBaseScore, severityLabel } from "./osv-score.mjs";
+
+test("parses CVSS v3 vectors before applying severity thresholds", () => {
+  const vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H";
+  assert.equal(parseCvssBaseScore(vector), 9.8);
+  assert.equal(severityLabel({ severity: [{ score: vector }] }), "CRITICAL");
+});
+
+test("keeps malformed or unsupported CVSS values fail-closed", () => {
+  assert.equal(parseCvssBaseScore("CVSS:4.0/AV:N"), undefined);
+  assert.equal(severityLabel({ severity: [{ score: "not-a-score" }] }), "UNKNOWN");
+});
