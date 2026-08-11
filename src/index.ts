@@ -6,7 +6,7 @@ import * as core from "@actions/core";
 import { aggregateReview, buildReviewRequest, reviewMarker } from "./lib/aggregate.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import { readPullRequestContext } from "./lib/github-event.js";
-import { readReviewConfig } from "./lib/input.js";
+import { inputSecretCandidates, readReviewConfig, type InputReader } from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
 import type {
   GoalResult,
@@ -118,20 +118,34 @@ async function assertWorkspace(context: PullRequestContext): Promise<void> {
       `Workspace HEAD ${head.trim()} does not match pull request head ${context.headSha}; refusing to review a mismatched checkout.`,
     );
   }
-  const { stdout: status } = await execFileAsync(
-    "git",
-    ["status", "--porcelain", "--untracked-files=no"],
-    { cwd, encoding: "utf8", maxBuffer: 64 * 1024 },
-  );
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024,
+  });
   if (status.trim().length > 0) {
-    throw new Error("The checked-out workspace has tracked changes; refusing to review it.");
+    throw new Error(
+      "The checked-out workspace has tracked or untracked changes; refusing to review it.",
+    );
   }
 }
 
-export async function runAction(): Promise<ReviewRunResult> {
-  const config = readReviewConfig({ get: (name) => core.getInput(name) });
-  const secrets = reviewSecrets(config);
+function actionInputReader(): InputReader {
+  return { get: (name) => core.getInput(name) };
+}
+
+function registerInputSecrets(secrets: readonly string[]): void {
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
+}
+
+export async function runAction(
+  reader: InputReader = actionInputReader(),
+  inputSecrets: readonly string[] = inputSecretCandidates(reader),
+): Promise<ReviewRunResult> {
+  registerInputSecrets(inputSecrets);
+  const config = readReviewConfig(reader);
+  const secrets = reviewSecrets(config);
+  registerInputSecrets(secrets);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
   await assertCurrentHead(api, context);
@@ -185,14 +199,17 @@ export async function runAction(): Promise<ReviewRunResult> {
 }
 
 export async function main(): Promise<void> {
+  let inputSecrets: readonly string[] = [];
   try {
-    await runAction();
+    const reader = actionInputReader();
+    inputSecrets = inputSecretCandidates(reader);
+    await runAction(reader, inputSecrets);
   } catch (error) {
-    const inputSecrets = Object.entries(process.env)
+    const environmentInputSecrets = Object.entries(process.env)
       .filter(([key]) => key.startsWith("INPUT_"))
       .map(([, value]) => value ?? "");
-    core.setFailed(redact(errorMessage(error), [...inputSecrets]));
+    core.setFailed(redact(errorMessage(error), [...inputSecrets, ...environmentInputSecrets]));
   }
 }
 
-export const indexInternals = { redact, reviewSecrets };
+export const indexInternals = { inputSecretCandidates, redact, reviewSecrets };

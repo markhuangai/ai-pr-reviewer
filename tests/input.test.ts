@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
-import { inputInternals, readReviewConfig } from "../src/lib/input.js";
+import { inputInternals, inputSecretCandidates, readReviewConfig } from "../src/lib/input.js";
 
 function reader(values: Record<string, string>) {
   return { get: (name: string): string => values[name] ?? "" };
@@ -39,6 +39,18 @@ security:
 
 test("accepts JSON goal arrays", () => {
   assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), ["one", "two"]);
+});
+
+test("extracts nested MCP secrets before malformed YAML is reported", () => {
+  const values = {
+    "github-pat": "ghp_test",
+    "ai-secret": "ai-secret",
+    "ai-base-url": "https://ai.example.test",
+    "mcp-servers": `root: [\n  headers:\n    Authorization: Bearer nested-header-secret\n`,
+  };
+  const candidates = inputSecretCandidates(reader(values));
+  assert.ok(candidates.includes("Bearer nested-header-secret"));
+  assert.ok(candidates.includes("https://ai.example.test"));
 });
 
 test("rejects unsupported MCP transports and unknown keys", () => {

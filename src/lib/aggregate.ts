@@ -13,8 +13,10 @@ import type {
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_INLINE_COMMENT_LENGTH = 60_000;
+const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_INLINE_COMMENTS = 25;
 const MAX_GOAL_STATUS_LENGTH = 8_000;
+const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 5,
   HIGH: 4,
@@ -161,6 +163,21 @@ function sameFinding(left: AggregatedFinding, right: AggregatedFinding): boolean
   );
 }
 
+function mergeFindingBodies(existing: string, incoming: string): string {
+  if (normalizeText(existing) === normalizeText(incoming)) return existing;
+  if (existing.endsWith(MERGED_FINDING_TRUNCATION_NOTICE)) return existing;
+  const separator = "\n\n";
+  const available = MAX_MERGED_FINDING_BODY_LENGTH - existing.length - separator.length;
+  if (incoming.length <= available) return `${existing}${separator}${incoming}`;
+  const notice = `${separator}${MERGED_FINDING_TRUNCATION_NOTICE}`;
+  const excerptLength =
+    MAX_MERGED_FINDING_BODY_LENGTH - existing.length - separator.length - notice.length;
+  if (excerptLength > 0) {
+    return `${existing}${separator}${incoming.slice(0, excerptLength)}${notice}`;
+  }
+  return `${existing.slice(0, MAX_MERGED_FINDING_BODY_LENGTH - notice.length)}${notice}`;
+}
+
 function findingKeys(finding: AggregatedFinding): readonly string[] {
   if (finding.locationVerified && finding.path !== undefined && finding.line !== undefined) {
     const line = finding.line;
@@ -200,10 +217,7 @@ function mergeFindings(findings: readonly AggregatedFinding[]): readonly Aggrega
       SEVERITY_ORDER[finding.severity] > SEVERITY_ORDER[existing.severity]
         ? finding.severity
         : existing.severity;
-    const body =
-      normalizeText(existing.body) === normalizeText(finding.body)
-        ? existing.body
-        : `${existing.body}\n\n${finding.body}`;
+    const body = mergeFindingBodies(existing.body, finding.body);
     merged[duplicate] = {
       ...existing,
       severity,

@@ -263,6 +263,62 @@ test("bounds an oversized merged inline comment", () => {
   assert.ok((request.comments[0]?.body.length ?? 0) <= 60_000);
 });
 
+test("bounds merged evidence so later body findings remain visible", () => {
+  const duplicateGoals: readonly GoalResult[] = Array.from({ length: 50 }, (_, index) => ({
+    prompt: `duplicate-${index}`,
+    status: "completed",
+    submission: {
+      summary: "duplicate",
+      findings: [
+        {
+          title: "Repeated issue",
+          severity: "LOW",
+          body: `shared evidence context security ${index}`.repeat(1_000),
+        },
+      ],
+    },
+  }));
+  const review = aggregateReview(
+    context,
+    config,
+    [
+      ...files,
+      {
+        path: "src/other.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 0,
+        changes: 1,
+        patch: "@@ -1,0 +1 @@\n+other",
+        addedLines: new Set([1]),
+      },
+    ],
+    [
+      ...duplicateGoals,
+      {
+        prompt: "later",
+        status: "completed",
+        submission: {
+          summary: "later",
+          findings: [
+            {
+              title: "Later body finding",
+              severity: "LOW",
+              body: "This distinct finding must remain in the review body.",
+              path: "src/other.ts",
+              line: 2,
+            },
+          ],
+        },
+      },
+    ],
+  );
+  const repeated = review.findings.find((finding) => finding.title === "Repeated issue");
+  assert.ok(repeated);
+  assert.ok(repeated.body.length <= 16_000);
+  assert.match(buildReviewBody(review, duplicateGoals), /Later body finding/);
+});
+
 test("keeps body findings ahead of oversized goal status", () => {
   const review = aggregateReview(context, config, files, [
     {
