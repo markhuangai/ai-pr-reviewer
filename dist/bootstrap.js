@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -210,23 +210,28 @@ async function main() {
     if (actualDigest !== expectedDigest(asset, checksum))
         throw new Error("Runtime asset SHA-256 verification failed.");
     const extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
-    await extract(archive, extracted);
-    const manifestPath = join(extracted, "runtime", "manifest.json");
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    if (!isRecord(manifest) ||
-        manifest.releaseTag !== RELEASE_TAG ||
-        manifest.asset !== assetName ||
-        manifest.nodeMajor !== 24 ||
-        typeof manifest.sdkVersion !== "string" ||
-        typeof manifest.cliVersion !== "string" ||
-        typeof manifest.sourceCommit !== "string" ||
-        manifest.sourceCommit.length === 0) {
-        throw new Error("Runtime bundle manifest verification failed.");
+    try {
+        await extract(archive, extracted);
+        const manifestPath = join(extracted, "runtime", "manifest.json");
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        if (!isRecord(manifest) ||
+            manifest.releaseTag !== RELEASE_TAG ||
+            manifest.asset !== assetName ||
+            manifest.nodeMajor !== 24 ||
+            typeof manifest.sdkVersion !== "string" ||
+            typeof manifest.cliVersion !== "string" ||
+            typeof manifest.sourceCommit !== "string" ||
+            manifest.sourceCommit.length === 0) {
+            throw new Error("Runtime bundle manifest verification failed.");
+        }
+        const sourceCommit = manifest.sourceCommit;
+        const code = await runRuntime(extracted, sourceCommit);
+        if (code !== 0)
+            process.exitCode = code;
     }
-    const sourceCommit = manifest.sourceCommit;
-    const code = await runRuntime(extracted, sourceCommit);
-    if (code !== 0)
-        process.exitCode = code;
+    finally {
+        await rm(extracted, { recursive: true, force: true });
+    }
 }
 main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));

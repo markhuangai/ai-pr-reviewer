@@ -192,6 +192,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+            if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
+              if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
+                echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing to replace stable assets." >&2
+                exit 1
+              fi
+            fi
+          fi
           old_assets_dir="$(mktemp -d)"
           restore_needed=false
           restore_release() {
