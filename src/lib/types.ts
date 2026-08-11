@@ -46,6 +46,7 @@ export interface PullRequestContext {
 
 export interface ChangedFile {
   readonly path: string;
+  readonly previousPath?: string;
   readonly status: string;
   readonly additions: number;
   readonly deletions: number;

@@ -60,6 +60,21 @@ test("preserves deleted-file patches ahead of the ordinary patch budget", () => 
   assert.match(prompt, /### src\/large\.ts \[modified\][\s\S]*patch excerpt truncated/);
 });
 
+test("preserves the source path for renamed files", () => {
+  const prompt = agentInternals.changedFilePrompt([
+    {
+      path: "src/new.ts",
+      previousPath: "src/old.ts",
+      status: "renamed",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      addedLines: new Set(),
+    },
+  ]);
+  assert.match(prompt, /src\/new\.ts \(renamed from src\/old\.ts\) \[renamed\]/);
+});
+
 test("reports deleted diffs that cannot be supplied to a read-only reviewer", () => {
   assert.deepEqual(
     agentInternals.unavailableDiffs([

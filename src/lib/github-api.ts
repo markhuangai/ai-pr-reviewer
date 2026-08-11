@@ -2,6 +2,7 @@ import type { ChangedFile, PullRequestContext, PullRequestReviewRequest } from "
 
 interface PullRequestFilePayload {
   readonly filename?: unknown;
+  readonly previous_filename?: unknown;
   readonly status?: unknown;
   readonly additions?: unknown;
   readonly deletions?: unknown;
@@ -137,6 +138,9 @@ function readFilePayload(value: unknown, index: number): ChangedFile {
   const patch = typeof payload.patch === "string" ? payload.patch : undefined;
   return {
     path: payload.filename,
+    ...(typeof payload.previous_filename === "string" && payload.previous_filename.length > 0
+      ? { previousPath: payload.previous_filename }
+      : {}),
     status: typeof payload.status === "string" ? payload.status : "modified",
     additions: integerOrZero(payload.additions),
     deletions: integerOrZero(payload.deletions),

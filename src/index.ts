@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import * as core from "@actions/core";
 
 import { aggregateReview, buildReviewRequest, reviewMarker } from "./lib/aggregate.js";
@@ -12,6 +15,8 @@ import type {
   ReviewConfig,
   ReviewRunResult,
 } from "./lib/types.js";
+
+const execFileAsync = promisify(execFile);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -101,6 +106,28 @@ async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): P
   }
 }
 
+async function assertWorkspace(context: PullRequestContext): Promise<void> {
+  const cwd = process.env.GITHUB_WORKSPACE ?? process.cwd();
+  const { stdout: head } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024,
+  });
+  if (head.trim() !== context.headSha) {
+    throw new Error(
+      `Workspace HEAD ${head.trim()} does not match pull request head ${context.headSha}; refusing to review a mismatched checkout.`,
+    );
+  }
+  const { stdout: status } = await execFileAsync(
+    "git",
+    ["status", "--porcelain", "--untracked-files=no"],
+    { cwd, encoding: "utf8", maxBuffer: 64 * 1024 },
+  );
+  if (status.trim().length > 0) {
+    throw new Error("The checked-out workspace has tracked changes; refusing to review it.");
+  }
+}
+
 export async function runAction(): Promise<ReviewRunResult> {
   const config = readReviewConfig({ get: (name) => core.getInput(name) });
   const secrets = reviewSecrets(config);
@@ -108,6 +135,7 @@ export async function runAction(): Promise<ReviewRunResult> {
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
   await assertCurrentHead(api, context);
+  await assertWorkspace(context);
   const authenticatedLogin = await api.getAuthenticatedUserLogin();
   const marker = reviewMarker(context, config);
   const existingReviews = await api.listReviews(context);
@@ -125,6 +153,7 @@ export async function runAction(): Promise<ReviewRunResult> {
   }
 
   await assertCurrentHead(api, context);
+  await assertWorkspace(context);
   const files = await api.getPullRequestFiles(context);
   core.info(
     `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
@@ -138,6 +167,7 @@ export async function runAction(): Promise<ReviewRunResult> {
 
   const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
   await assertCurrentHead(api, context);
+  await assertWorkspace(context);
   try {
     await api.createReview(context, request);
   } catch (error) {

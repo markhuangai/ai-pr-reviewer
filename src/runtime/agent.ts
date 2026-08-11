@@ -327,7 +327,8 @@ function changedFilePrompt(files: readonly ChangedFile[]): string {
     } else {
       remainingPatchLength -= patch.length;
     }
-    return `### ${file.path} [${file.status}]\n${patchExcerpt}`;
+    const rename = file.previousPath === undefined ? "" : ` (renamed from ${file.previousPath})`;
+    return `### ${file.path}${rename} [${file.status}]\n${patchExcerpt}`;
   });
   return entries.join("\n\n");
 }
