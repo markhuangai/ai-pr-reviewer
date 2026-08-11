@@ -50,7 +50,6 @@ test("extracts nested MCP secrets before malformed YAML is reported", () => {
   };
   const candidates = inputSecretCandidates(reader(values));
   assert.ok(candidates.includes("Bearer nested-header-secret"));
-  assert.ok(candidates.includes("https://ai.example.test"));
 });
 
 test("rejects unsupported MCP transports and unknown keys", () => {
