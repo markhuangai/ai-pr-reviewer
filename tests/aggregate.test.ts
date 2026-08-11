@@ -265,6 +265,23 @@ test("keeps verified findings at separate locations distinct", () => {
   assert.equal(review.findings.length, 2);
 });
 
+test("keeps distinct non-Latin findings separate", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "中文",
+      status: "completed",
+      submission: {
+        summary: "中文",
+        findings: [
+          { title: "安全问题", severity: "HIGH", body: "这里存在安全缺陷。" },
+          { title: "性能问题", severity: "HIGH", body: "这里存在性能缺陷。" },
+        ],
+      },
+    },
+  ]);
+  assert.equal(review.findings.length, 2);
+});
+
 test("bounds an oversized merged inline comment", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 10 }, (_, index) => ({
     prompt: `goal-${index}`,

@@ -38,16 +38,20 @@ function stableDigest(value: string): string {
 function normalizeText(value: string): string {
   return value
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+function hasNonAscii(value: string): boolean {
+  return Array.from(value).some((character) => (character.codePointAt(0) ?? 0) > 0x7f);
 }
 
 function tokenSet(value: string): ReadonlySet<string> {
   return new Set(
     normalizeText(value)
       .split(" ")
-      .filter((token) => token.length > 2),
+      .filter((token) => token.length > 2 || hasNonAscii(token)),
   );
 }
 

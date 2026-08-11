@@ -75,13 +75,14 @@ export function parseCvssBaseScore(value) {
 }
 
 export function severityLabel(vulnerability) {
+  const labels = [];
   const databaseSeverity = vulnerability.database_specific?.severity;
   if (typeof databaseSeverity === "string") {
     const normalized = databaseSeverity.toUpperCase();
-    if (normalized === "CRITICAL") return "CRITICAL";
-    if (normalized === "HIGH") return "HIGH";
-    if (normalized === "MODERATE" || normalized === "MEDIUM") return "MEDIUM";
-    if (normalized === "LOW") return "LOW";
+    if (normalized === "CRITICAL") labels.push("CRITICAL");
+    else if (normalized === "HIGH") labels.push("HIGH");
+    else if (normalized === "MODERATE" || normalized === "MEDIUM") labels.push("MEDIUM");
+    else if (normalized === "LOW") labels.push("LOW");
   }
   const scores = Array.isArray(vulnerability.severity)
     ? vulnerability.severity
@@ -89,11 +90,10 @@ export function severityLabel(vulnerability) {
         .filter((score) => score !== undefined)
     : [];
   const score = scores.length > 0 ? Math.max(...scores) : Number.NaN;
-  if (Number.isFinite(score)) {
-    if (score >= 9) return "CRITICAL";
-    if (score >= 7) return "HIGH";
-    if (score >= 4) return "MEDIUM";
-    return "LOW";
-  }
-  return "UNKNOWN";
+  if (Number.isFinite(score))
+    labels.push(score >= 9 ? "CRITICAL" : score >= 7 ? "HIGH" : score >= 4 ? "MEDIUM" : "LOW");
+  return (
+    ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"].findLast((label) => labels.includes(label)) ??
+    "UNKNOWN"
+  );
 }
