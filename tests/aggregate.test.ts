@@ -1,7 +1,12 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
-import { aggregateReview, buildReviewRequest, reviewMarker } from "../src/lib/aggregate.js";
+import {
+  aggregateReview,
+  buildReviewBody,
+  buildReviewRequest,
+  reviewMarker,
+} from "../src/lib/aggregate.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -166,5 +171,12 @@ test("partial goals force a comment and remain actionable", () => {
   ]);
   assert.equal(review.partial, true);
   assert.equal(review.event, "COMMENT");
+  assert.doesNotMatch(
+    buildReviewBody(review, [
+      { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },
+      { prompt: "security", status: "failed", error: "timeout" },
+    ]),
+    /ai-pr-reviewer:v1:/,
+  );
   assert.equal(review.allGoalsFailed, false);
 });

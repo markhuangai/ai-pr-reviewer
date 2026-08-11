@@ -108,14 +108,21 @@ jobs:
           export SOURCE_DATE_EPOCH=0
           export TZ=UTC
           mkdir -p release/assets
+          node scripts/normalize-archive.mjs release/bundle
           if tar --help | grep -q -- '--sort'; then
             tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
               -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
           else
+            metadata_flags=()
+            if tar --help | grep -q -- '--uid'; then
+              metadata_flags+=(--uid=0 --gid=0 --uname=root --gname=root)
+            elif tar --help | grep -q -- '--owner'; then
+              metadata_flags+=(--owner=0 --group=0 --numeric-owner)
+            fi
             (
               cd release/bundle
               find . -print0 | LC_ALL=C sort -z | tar --null --no-recursion \
-                --mtime='1970-01-01' --uid=0 --gid=0 --uname=root --gname=root \
+                "${metadata_flags[@]}" \
                 -czf "../assets/${{ matrix.asset }}" -T -
             )
           fi
@@ -180,13 +187,42 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          old_assets_dir="$(mktemp -d)"
+          restore_needed=false
+          restore_release() {
+            if [[ "$restore_needed" == true ]]; then
+              echo "Release upload failed; restoring the previous asset set." >&2
+              old_assets=("$old_assets_dir"/*)
+              if ! gh release upload "$RELEASE_TAG" "${old_assets[@]}" --clobber --repo "$GH_REPO"; then
+                echo "Previous release asset restoration also failed; inspect the release before promotion." >&2
+              fi
+            fi
+          }
+          trap restore_release EXIT
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir "$old_assets_dir"
+            old_assets=("$old_assets_dir"/*)
+            test "${#old_assets[@]}" -gt 0
+            restore_needed=true
             gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
+            remote_assets="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets)"
+            for local_asset in release-assets/*; do
+              asset_name="$(basename "$local_asset")"
+              jq -e --arg name "$asset_name" '.assets[] | select(.name == $name)' <<< "$remote_assets" >/dev/null
+              if [[ "$local_asset" == *.tar.gz ]]; then
+                expected_digest="$(sha256sum "$local_asset" | cut -d ' ' -f 1)"
+                actual_digest="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest // empty' <<< "$remote_assets")"
+                test "$actual_digest" = "sha256:$expected_digest"
+              fi
+            done
+            restore_needed=false
           elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
           else
             gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi
+          trap - EXIT
       - name: Advance stable action branch
         if: env.RELEASE_TAG == 'runtime-v1'
         shell: bash

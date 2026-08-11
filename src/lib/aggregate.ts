@@ -1,5 +1,3 @@
-import { createHmac } from "node:crypto";
-
 import type {
   AggregatedFinding,
   AggregatedReview,
@@ -22,6 +20,15 @@ const SEVERITY_ORDER: Record<Severity, number> = {
   LOW: 2,
   INFO: 1,
 };
+
+function stableDigest(value: string): string {
+  let hash = 14_695_981_039_346_656_037n;
+  for (const character of value) {
+    hash ^= BigInt(character.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(64, hash * 1_099_511_628_211n);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
 
 function normalizeText(value: string): string {
   return value
@@ -69,6 +76,7 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
 
 export function reviewMarker(context: PullRequestContext, config: ReviewConfig): string {
   const fingerprint = JSON.stringify({
+    baseSha: context.baseSha,
     model: config.model,
     aiBaseUrl: config.aiBaseUrl,
     aiAuthMode: config.aiAuthMode,
@@ -78,10 +86,7 @@ export function reviewMarker(context: PullRequestContext, config: ReviewConfig):
     autoApprove: config.autoApprove,
     mcpServers: stableMcpShape(config.mcpServers),
   });
-  const digest = createHmac("sha256", "ai-pr-reviewer-marker-v1")
-    .update(fingerprint)
-    .digest("hex")
-    .slice(0, 20);
+  const digest = stableDigest(fingerprint);
   return `<!-- ai-pr-reviewer:v1:${context.headSha}:${digest} -->`;
 }
 
@@ -249,7 +254,7 @@ function goalStatusMarkdown(goals: readonly GoalResult[]): string {
 
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const sections = [
-    review.marker,
+    ...(review.partial ? [] : [review.marker]),
     "## AI pull request review",
     `\n${review.summary}`,
     "",
