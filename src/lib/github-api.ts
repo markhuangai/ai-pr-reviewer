@@ -42,6 +42,19 @@ function readLogin(value: unknown): string | undefined {
   return value.login;
 }
 
+function errorDetails(payload: unknown, statusText: string): string {
+  if (!isRecord(payload)) return statusText;
+  const details: string[] = [];
+  if (typeof payload.message === "string") details.push(payload.message);
+  if (Array.isArray(payload.errors)) {
+    for (const error of payload.errors) {
+      if (typeof error === "string") details.push(error);
+      else if (isRecord(error) && typeof error.message === "string") details.push(error.message);
+    }
+  }
+  return details.join("; ") || statusText;
+}
+
 function readHeadSha(value: unknown): string | undefined {
   if (!isRecord(value) || !isRecord(value.head) || typeof value.head.sha !== "string") {
     return undefined;
@@ -235,13 +248,9 @@ export class GitHubApi {
       }
     }
     if (!response.ok) {
-      const message =
-        isRecord(payload) && typeof payload.message === "string"
-          ? payload.message
-          : response.statusText;
       throw new GitHubApiError(
         response.status,
-        `GitHub API request failed (${response.status}): ${message}`,
+        `GitHub API request failed (${response.status}): ${errorDetails(payload, response.statusText)}`,
       );
     }
     return { payload: payload as T, headers: response.headers };
@@ -343,6 +352,7 @@ export const githubApiInternals = {
   isPatchComplete,
   nextPagePath,
   readBaseSha,
+  errorDetails,
   readHeadSha,
   readLogin,
 };

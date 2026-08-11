@@ -105,6 +105,17 @@ test("reads review authors without accepting malformed identities", () => {
   assert.equal(githubApiInternals.readLogin({}), undefined);
 });
 
+test("preserves structured GitHub validation errors", () => {
+  assert.equal(
+    githubApiInternals.errorDetails(
+      { message: "Validation Failed", errors: [{ message: "Reviews may not be approved" }] },
+      "Unprocessable Entity",
+    ),
+    "Validation Failed; Reviews may not be approved",
+  );
+  assert.equal(githubApiInternals.errorDetails({}, "Unprocessable Entity"), "Unprocessable Entity");
+});
+
 test("reads the live pull request head SHA", () => {
   assert.equal(
     githubApiInternals.readHeadSha({ head: { sha: "0123456789abcdef" } }),

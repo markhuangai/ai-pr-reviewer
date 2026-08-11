@@ -236,10 +236,16 @@ jobs:
               if [[ -n "$old_target" ]] && ! gh release edit "$RELEASE_TAG" --target "$old_target" --repo "$GH_REPO"; then
                 echo "Previous release target restoration also failed; inspect the release before promotion." >&2
               fi
+              if [[ -n "$old_tag_sha" ]] && ! gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$old_tag_sha" -F force=true; then
+                echo "Previous stable tag restoration also failed; inspect the tag before promotion." >&2
+              fi
             fi
           }
           trap restore_release EXIT
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+              old_tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha 2>/dev/null || true)"
+            fi
             old_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq .targetCommitish)"
             gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir "$old_assets_dir"
             old_assets=("$old_assets_dir"/*)
@@ -258,6 +264,7 @@ jobs:
             done
             gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
             if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$GITHUB_SHA" -F force=true
               git push origin "$GITHUB_SHA:refs/heads/v1"
             fi
             restore_needed=false
