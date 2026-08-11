@@ -1,7 +1,9 @@
+.git
 .codex
 node_modules
 build
 build-test
 coverage
 release
-.runtime-cache
+dist
+.npmrc

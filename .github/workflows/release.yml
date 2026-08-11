@@ -1,0 +1,164 @@
+name: Release runtime bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Release tag to create or update (v1 is the stable action runtime).
+        required: true
+        default: v1
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: Release security gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Enforce action pin age quarantine
+        run: node scripts/check-action-age.mjs
+      - name: Set up Node 24
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Enforce dependency age quarantine before install
+        run: node scripts/check-package-age.mjs
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify npm signatures
+        run: npm audit signatures
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Run OSV scan
+        run: npm run security:osv
+      - name: Scan tracked files for secrets
+        run: node scripts/secret-scan.mjs
+      - name: Run complete checks
+        run: npm run check && npm run build && npm run bundle:bootstrap && npm run security:repro
+      - name: Generate SBOM
+        run: npm run security:sbom
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: release-sbom
+          path: build/sbom.cdx.json
+          if-no-files-found: error
+
+  build-runtime:
+    name: Build ${{ matrix.asset }}
+    needs: security
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: runtime-linux-x64.tar.gz
+            runner: ubuntu-latest
+          - asset: runtime-linux-arm64.tar.gz
+            runner: ubuntu-24.04-arm
+          - asset: runtime-win32-x64.tar.gz
+            runner: windows-latest
+          - asset: runtime-win32-arm64.tar.gz
+            runner: windows-11-arm
+          - asset: runtime-darwin-x64.tar.gz
+            runner: macos-15-intel
+          - asset: runtime-darwin-arm64.tar.gz
+            runner: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Enforce action pin age quarantine
+        run: node scripts/check-action-age.mjs
+      - name: Set up Node 24
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Enforce dependency age quarantine before install
+        run: node scripts/check-package-age.mjs
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build and prune development dependencies
+        shell: bash
+        run: |
+          npm run build
+          npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Prepare runtime bundle
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release-tag || github.ref_name }}
+        run: node scripts/prepare-runtime.mjs release "${{ matrix.asset }}" "$RELEASE_TAG" "$GITHUB_SHA"
+      - name: Archive runtime bundle
+        shell: bash
+        run: |
+          mkdir -p release/assets
+          tar -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
+          node scripts/write-checksum.mjs "release/assets/${{ matrix.asset }}"
+      - name: Upload runtime bundle
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: release/assets/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified release
+    needs: [security, build-runtime]
+    runs-on: ubuntu-latest
+    if: needs.security.result == 'success' && needs.build-runtime.result == 'success'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download runtime bundles
+        uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: runtime-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Download SBOM
+        uses: actions/download-artifact@v4.3.0
+        with:
+          name: release-sbom
+          path: release-assets
+      - name: Verify all release assets have checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release-assets/*.tar.gz)
+          test "${#archives[@]}" -eq 6
+          for archive in "${archives[@]}"; do
+            test -f "${archive}.sha256"
+            (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
+          done
+      - name: Attest runtime bundles
+        uses: actions/attest-build-provenance@v2.2.3
+        with:
+          subject-path: release-assets/*.tar.gz
+      - name: Publish stable or prerelease assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.release-tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          elif [[ "$RELEASE_TAG" == "v1" ]]; then
+            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA"
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA"
+          fi

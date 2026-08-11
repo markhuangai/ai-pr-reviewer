@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "build",
+    "noEmit": false,
+    "sourceMap": false,
+    "declaration": false,
+    "types": ["node"]
+  },
+  "include": ["src/bootstrap.ts", "src/lib/bootstrap/**/*.ts"]
+}
