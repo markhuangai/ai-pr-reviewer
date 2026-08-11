@@ -11,5 +11,9 @@ test("parses CVSS v3 vectors before applying severity thresholds", () => {
 
 test("keeps malformed or unsupported CVSS values fail-closed", () => {
   assert.equal(parseCvssBaseScore("CVSS:4.0/AV:N"), undefined);
+  assert.equal(parseCvssBaseScore("-1"), undefined);
+  assert.equal(parseCvssBaseScore("11"), undefined);
+  assert.equal(parseCvssBaseScore("   "), undefined);
   assert.equal(severityLabel({ severity: [{ score: "not-a-score" }] }), "UNKNOWN");
+  assert.equal(severityLabel({ severity: [{ score: "-1" }] }), "UNKNOWN");
 });

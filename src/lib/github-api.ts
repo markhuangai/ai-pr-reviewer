@@ -67,27 +67,53 @@ function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
 function parsePatchCounts(patch: string | undefined): {
   readonly additions: number;
   readonly deletions: number;
+  readonly complete: boolean;
 } {
-  if (!patch) return { additions: 0, deletions: 0 };
-  let inHunk = false;
+  if (!patch) return { additions: 0, deletions: 0, complete: false };
+  let remainingOld = 0;
+  let remainingNew = 0;
+  let hasHunk = false;
+  let complete = true;
   let additions = 0;
   let deletions = 0;
   for (const line of patch.split("\n")) {
-    if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line)) {
-      inHunk = true;
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (header) {
+      if (hasHunk && (remainingOld !== 0 || remainingNew !== 0)) complete = false;
+      remainingOld = Number(header[2] ?? 1);
+      remainingNew = Number(header[4] ?? 1);
+      hasHunk = true;
       continue;
     }
-    if (!inHunk || line.startsWith("\\")) continue;
-    if (line.startsWith("+")) additions += 1;
-    else if (line.startsWith("-")) deletions += 1;
+    if (!hasHunk || line.length === 0 || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) {
+      additions += 1;
+      if (remainingNew === 0) complete = false;
+      else remainingNew -= 1;
+    } else if (line.startsWith("-")) {
+      deletions += 1;
+      if (remainingOld === 0) complete = false;
+      else remainingOld -= 1;
+    } else {
+      if (remainingOld === 0 || remainingNew === 0) complete = false;
+      else {
+        remainingOld -= 1;
+        remainingNew -= 1;
+      }
+    }
   }
-  return { additions, deletions };
+  if (!hasHunk || remainingOld !== 0 || remainingNew !== 0) complete = false;
+  return { additions, deletions, complete };
 }
 
 export function isPatchComplete(file: ChangedFile): boolean {
-  if (file.patch === undefined) return false;
+  if (file.patch === undefined) {
+    return file.status === "renamed" && file.additions === 0 && file.deletions === 0;
+  }
   const counts = parsePatchCounts(file.patch);
-  return counts.additions === file.additions && counts.deletions === file.deletions;
+  return (
+    counts.complete && counts.additions === file.additions && counts.deletions === file.deletions
+  );
 }
 
 function readFilePayload(value: unknown, index: number): ChangedFile {

@@ -45,6 +45,8 @@ for (let start = 0; start < queries.length; start += OSV_BATCH_SIZE) {
   });
   if (!Array.isArray(payload.results))
     throw new Error("OSV query returned an invalid results list.");
+  if (payload.results.length !== batch.length)
+    throw new Error("OSV query returned an incomplete results list.");
   for (let index = 0; index < payload.results.length; index += 1) {
     const vulnerabilities = Array.isArray(payload.results[index]?.vulns)
       ? payload.results[index].vulns

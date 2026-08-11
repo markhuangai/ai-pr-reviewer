@@ -35,6 +35,7 @@ test("detects server-truncated patches from GitHub change counts", () => {
   assert.deepEqual(githubApiInternals.parsePatchCounts(complete.patch), {
     additions: 1,
     deletions: 1,
+    complete: true,
   });
   assert.equal(githubApiInternals.isPatchComplete(complete), true);
   assert.equal(
@@ -44,6 +45,24 @@ test("detects server-truncated patches from GitHub change counts", () => {
       changes: 3,
     }),
     false,
+  );
+  assert.equal(
+    githubApiInternals.isPatchComplete({
+      ...complete,
+      patch: "@@ -1,2 +1,2 @@\n-old\n+new",
+    }),
+    false,
+  );
+  assert.equal(
+    githubApiInternals.isPatchComplete({
+      path: "renamed.ts",
+      status: "renamed",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      addedLines: new Set(),
+    }),
+    true,
   );
 });
 

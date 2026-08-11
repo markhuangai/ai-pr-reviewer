@@ -16,12 +16,17 @@ function roundup(value) {
 }
 
 export function parseCvssBaseScore(value) {
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 && value <= 10 ? value : undefined;
+  }
   if (typeof value !== "string") return undefined;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric)) return numeric;
+  const trimmed = value.trim();
+  const numeric = Number(trimmed);
+  if (trimmed !== "" && Number.isFinite(numeric) && numeric >= 0 && numeric <= 10) {
+    return numeric;
+  }
 
-  const parts = value.trim().split("/");
+  const parts = trimmed.split("/");
   if (!/^CVSS:3\.[01]$/.test(parts[0] ?? "")) return undefined;
   const metrics = {};
   for (const part of parts.slice(1)) {

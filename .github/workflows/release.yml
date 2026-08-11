@@ -207,6 +207,15 @@ jobs:
             if [[ "$restore_needed" == true ]]; then
               echo "Release upload failed; restoring the previous asset set." >&2
               old_assets=("$old_assets_dir"/*)
+              current_assets="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name')"
+              while IFS= read -r asset_name; do
+                [[ -z "$asset_name" ]] && continue
+                if [[ ! -f "$old_assets_dir/$asset_name" ]]; then
+                  if ! gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes --repo "$GH_REPO"; then
+                    echo "Failed to remove newly published asset $asset_name; inspect the release before promotion." >&2
+                  fi
+                fi
+              done <<< "$current_assets"
               if ! gh release upload "$RELEASE_TAG" "${old_assets[@]}" --clobber --repo "$GH_REPO"; then
                 echo "Previous release asset restoration also failed; inspect the release before promotion." >&2
               fi

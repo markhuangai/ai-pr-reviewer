@@ -4,8 +4,8 @@ import test from "node:test";
 import { agentInternals } from "../src/runtime/agent.js";
 import type { ChangedFile } from "../src/lib/types.js";
 
-function patchWithLength(length: number): string {
-  return `@@ -1 +1 @@\n-old\n+new\n${" context\n".repeat(length)}`.slice(0, length);
+function patchWithContextLines(count: number): string {
+  return `@@ -1,${count + 1} +1,${count + 1} @@\n-old\n+new\n${" context\n".repeat(count)}`;
 }
 
 test("keeps every changed-file header when patch excerpts exceed the budget", () => {
@@ -16,7 +16,7 @@ test("keeps every changed-file header when patch excerpts exceed the budget", ()
       additions: 1,
       deletions: 1,
       changes: 2,
-      patch: patchWithLength(30_001),
+      patch: patchWithContextLines(4_000),
       addedLines: new Set([1]),
     },
     {
@@ -43,7 +43,7 @@ test("preserves deleted-file patches ahead of the ordinary patch budget", () => 
       additions: 1,
       deletions: 1,
       changes: 2,
-      patch: patchWithLength(30_001),
+      patch: patchWithContextLines(4_000),
       addedLines: new Set([1]),
     },
     {
@@ -94,7 +94,7 @@ test("fails closed when an ordinary changed-file patch is omitted", () => {
         additions: 1,
         deletions: 1,
         changes: 2,
-        patch: patchWithLength(29_999),
+        patch: patchWithContextLines(3_000),
         addedLines: new Set([1]),
       },
       {
