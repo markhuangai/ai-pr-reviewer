@@ -282,6 +282,36 @@ test("keeps distinct non-Latin findings separate", () => {
   assert.equal(review.findings.length, 2);
 });
 
+test("preserves distinct claimed locations for unverified findings", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "locations",
+      status: "completed",
+      submission: {
+        summary: "locations",
+        findings: [
+          {
+            title: "Unverified issue",
+            severity: "MEDIUM",
+            body: "The same issue was reported at two different paths.",
+            path: "src/missing-a.ts",
+            line: 10,
+          },
+          {
+            title: "Unverified issue",
+            severity: "MEDIUM",
+            body: "The same issue was reported at two different paths.",
+            path: "src/missing-b.ts",
+            line: 20,
+          },
+        ],
+      },
+    },
+  ]);
+  assert.equal(review.findings.length, 2);
+  assert.match(review.bodyFindings[0]?.body ?? "", /src\/missing-/);
+});
+
 test("bounds an oversized merged inline comment", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 10 }, (_, index) => ({
     prompt: `goal-${index}`,
@@ -347,8 +377,6 @@ test("bounds merged evidence so later body findings remain visible", () => {
               title: "Later body finding",
               severity: "LOW",
               body: "This distinct finding must remain in the review body.",
-              path: "src/other.ts",
-              line: 2,
             },
           ],
         },

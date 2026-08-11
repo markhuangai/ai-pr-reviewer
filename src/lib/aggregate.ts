@@ -137,13 +137,20 @@ function normalizeFinding(
 ): AggregatedFinding {
   const locationVerified = verifyLocation(finding, files);
   if (locationVerified) return { ...finding, goals: [goalIndex], locationVerified: true };
+  const claimedLocation =
+    finding.path === undefined
+      ? finding.line === undefined
+        ? "the submitted location"
+        : `line ${finding.line}`
+      : finding.line === undefined
+        ? finding.path
+        : `${finding.path}:${finding.line}${finding.endLine === undefined ? "" : `-${finding.endLine}`}`;
   const body =
     finding.path === undefined && finding.line === undefined
       ? finding.body
-      : `**Location could not be verified against the pull request diff.**\n\n${finding.body}`;
+      : `**Location could not be verified against the pull request diff (claimed: ${claimedLocation}).**\n\n${finding.body}`;
   return {
-    title: finding.title,
-    severity: finding.severity,
+    ...finding,
     body,
     goals: [goalIndex],
     locationVerified: false,
@@ -160,7 +167,10 @@ function sameFinding(left: AggregatedFinding, right: AggregatedFinding): boolean
     if (leftLine >= 0 && rightLine >= 0 && Math.abs(leftLine - rightLine) <= 2) {
       return overlap(`${left.title} ${left.body}`, `${right.title} ${right.body}`) >= 0.55;
     }
+    return false;
   }
+  if ((left.path !== undefined || right.path !== undefined) && left.path !== right.path)
+    return false;
   if (leftLocated || rightLocated) return false;
   return (
     normalizeText(left.title) === normalizeText(right.title) &&
