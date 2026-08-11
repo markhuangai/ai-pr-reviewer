@@ -11,9 +11,9 @@ for (const file of files.filter((name) => name.endsWith(".yml") || name.endsWith
   for (const match of text.matchAll(/uses:\s*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@([^\s#]+)/g)) {
     const repository = match[1];
     const reference = match[2];
-    if (!/^[a-f0-9]{40}$/i.test(reference) && !/^v\d+\.\d+\.\d+$/.test(reference))
+    if (!/^[a-f0-9]{40}$/i.test(reference) && !/^v\d+(?:\.\d+\.\d+)?$/.test(reference))
       throw new Error(
-        `${file}: ${repository}@${reference} must use an exact version tag or full commit SHA.`,
+        `${file}: ${repository}@${reference} must use a major or exact version tag or full commit SHA.`,
       );
     references.set(`${repository}@${reference}`, { repository, reference, file });
   }
@@ -36,7 +36,7 @@ for (const { repository, reference, file } of references.values()) {
     );
 }
 console.log(
-  `Checked ${references.size} pinned GitHub Actions against a ${quarantineHours}-hour quarantine.`,
+  `Checked ${references.size} GitHub Action references against a ${quarantineHours}-hour quarantine.`,
 );
 if (failures.length > 0) {
   console.error(failures.join("\n"));

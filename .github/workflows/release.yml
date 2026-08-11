@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
@@ -32,7 +32,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Set up Node 24
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: 24
       - name: Enforce dependency age quarantine before install
@@ -52,7 +52,7 @@ jobs:
       - name: Generate SBOM
         run: npm run security:sbom
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v4
         with:
           name: release-sbom
           path: build/sbom.cdx.json
@@ -80,7 +80,7 @@ jobs:
             runner: macos-15
     steps:
       - name: Check out source
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
@@ -88,7 +88,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Set up Node 24
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: 24
       - name: Enforce dependency age quarantine before install
@@ -132,7 +132,7 @@ jobs:
           fi
           node scripts/write-checksum.mjs "release/assets/${{ matrix.asset }}"
       - name: Upload runtime bundle
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: release/assets/${{ matrix.asset }}*
@@ -151,18 +151,18 @@ jobs:
       RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
     steps:
       - name: Check out release commit
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Download runtime bundles
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v4
         with:
           pattern: runtime-*.tar.gz
           path: release-assets
           merge-multiple: true
       - name: Download SBOM
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v4
         with:
           name: release-sbom
           path: release-assets
@@ -178,7 +178,7 @@ jobs:
             (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
           done
       - name: Attest runtime bundles
-        uses: actions/attest-build-provenance@v2.2.3
+        uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             release-assets/*.tar.gz

@@ -20,7 +20,7 @@ jobs:
         node: [24, 25]
     steps:
       - name: Check out source
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
@@ -28,7 +28,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Set up Node
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -99,7 +99,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4.6.0
+        uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
 
@@ -112,7 +112,7 @@ jobs:
       actions: read
     steps:
       - name: Check out source
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Enforce action pin age quarantine
@@ -120,11 +120,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3.28.17
+        uses: github/codeql-action/init@v3
         with:
           languages: javascript-typescript
       - name: Set up Node 24
-        uses: actions/setup-node@v4.4.0
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
@@ -135,4 +135,4 @@ jobs:
       - name: Build for CodeQL
         run: npm run build
       - name: Analyze
-        uses: github/codeql-action/analyze@v3.28.17
+        uses: github/codeql-action/analyze@v3

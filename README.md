@@ -23,7 +23,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -97,7 +97,7 @@ The lockfile and release workflow enforce the project's supply-chain policy:
 - executable npm packages, transitive packages, SDK/platform packages, toolchains, and third-party actions must be at least 168 hours old;
 - exact lockfile versions, SHA-512 integrity, npm signature checks, lifecycle-script disabling, and no `npx` downloads;
 - dependency review when the repository's dependency-graph compare API is available, CodeQL, npm audit, OSV scanning, secret scanning, SBOM/provenance checks, and a high/critical vulnerability promotion gate; npm audit and OSV remain hard gates when dependency review is unsupported;
-- exact version tags are resolved through the GitHub API and rejected when their commit is younger than seven days; immutable commit-SHA pinning is stronger, but this project uses exact version tags for workflow readability;
+- major version tags are resolved through the GitHub API and rejected when their commit is younger than seven days; immutable commit-SHA pinning is stronger, but this project uses readable version tags as requested;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
 Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
