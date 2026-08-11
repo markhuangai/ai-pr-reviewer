@@ -33,7 +33,6 @@ function redactGoals(
               ...finding,
               title: redact(finding.title, secrets),
               body: redact(finding.body, secrets),
-              ...(finding.path === undefined ? {} : { path: redact(finding.path, secrets) }),
             })),
           },
         }),

@@ -12,6 +12,7 @@ import type {
 } from "./types.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
+const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_INLINE_COMMENTS = 25;
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 5,
@@ -284,7 +285,9 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
 
 function inlineCommentBody(finding: AggregatedFinding): string {
   const goals = finding.goals.map((goal) => `goal ${goal + 1}`).join(", ");
-  return `**[${finding.severity}] ${finding.title}**\n\n${finding.body}\n\n_Found by ${goals}._`;
+  const body = `**[${finding.severity}] ${finding.title}**\n\n${finding.body}\n\n_Found by ${goals}._`;
+  if (body.length <= MAX_INLINE_COMMENT_LENGTH) return body;
+  return `${body.slice(0, MAX_INLINE_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
 }
 
 export function buildReviewRequest(

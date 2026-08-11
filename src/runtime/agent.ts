@@ -142,9 +142,20 @@ const repositoryReadHook: HookCallback = async (input: HookInput) => {
   if (input.hook_event_name !== "PreToolUse") return { continue: true };
   const toolInput = isRecord(input.tool_input) ? input.tool_input : undefined;
   if (!toolInput) return { continue: true };
-  const candidate = input.tool_name === "Read" ? toolInput.file_path : toolInput.path;
-  if (candidate === undefined) return { continue: true };
-  if (typeof candidate !== "string" || !(await allowsRepositoryPath(input.cwd, candidate))) {
+  const pathCandidate = input.tool_name === "Read" ? toolInput.file_path : toolInput.path;
+  const pathAllowed =
+    pathCandidate === undefined ||
+    (typeof pathCandidate === "string" && (await allowsRepositoryPath(input.cwd, pathCandidate)));
+  const globPattern = input.tool_name === "Glob" ? toolInput.pattern : undefined;
+  const globPath = typeof globPattern === "string" ? globPattern.replace(/^!/, "") : globPattern;
+  const patternAllowed =
+    globPattern === undefined ||
+    (typeof globPath === "string" && (await allowsRepositoryPath(input.cwd, globPath)));
+  if (
+    !pathAllowed ||
+    !patternAllowed ||
+    (input.tool_name === "Glob" && typeof globPattern !== "string")
+  ) {
     return {
       continue: true,
       hookSpecificOutput: {

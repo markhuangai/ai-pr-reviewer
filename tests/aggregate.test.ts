@@ -213,6 +213,29 @@ test("keeps verified findings at separate locations distinct", () => {
   assert.equal(review.findings.length, 2);
 });
 
+test("bounds an oversized merged inline comment", () => {
+  const goals: readonly GoalResult[] = Array.from({ length: 10 }, (_, index) => ({
+    prompt: `goal-${index}`,
+    status: "completed",
+    submission: {
+      summary: "large",
+      findings: [
+        {
+          title: "Large finding",
+          severity: "HIGH",
+          body: String.fromCharCode(97 + index).repeat(8_000),
+          path: "src/change.ts",
+          line: 1,
+        },
+      ],
+    },
+  }));
+  const review = aggregateReview(context, config, files, goals);
+  const request = buildReviewRequest(context, review, goals);
+  assert.ok(request.comments.length <= 25);
+  assert.ok((request.comments[0]?.body.length ?? 0) <= 60_000);
+});
+
 test("partial goals force a comment and remain actionable", () => {
   const review = aggregateReview(context, config, files, [
     { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },
