@@ -325,6 +325,18 @@ function goalStatusMarkdown(goals: readonly GoalResult[]): string {
   return `${body.slice(0, MAX_GOAL_STATUS_LENGTH - 80)}\n\n> Goal status truncated; findings are listed above.`;
 }
 
+function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
+  return findings
+    .map((finding, index) => {
+      const location =
+        finding.path === undefined
+          ? ""
+          : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
+      return `${index + 1}. [${finding.severity}] ${finding.title}${location}`;
+    })
+    .join("\n");
+}
+
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const sections = [
     ...(review.partial ? [] : [review.marker]),
@@ -334,7 +346,13 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
     "### Findings",
   ];
   if (review.bodyFindings.length > 0) {
-    sections.push(review.bodyFindings.map(formatFinding).join("\n\n"));
+    sections.push(
+      "#### Index",
+      findingIndexMarkdown(review.bodyFindings),
+      "",
+      "#### Details",
+      review.bodyFindings.map(formatFinding).join("\n\n"),
+    );
   } else if (review.findings.length === 0) {
     sections.push("No actionable findings were reported.");
   } else {

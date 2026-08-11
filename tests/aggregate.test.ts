@@ -430,6 +430,28 @@ test("keeps body findings ahead of oversized goal status", () => {
   assert.match(body, /Goal status truncated/);
 });
 
+test("indexes every body finding before truncating details", () => {
+  const goals: readonly GoalResult[] = Array.from({ length: 9 }, (_, index) => ({
+    prompt: `goal-${index}`,
+    status: "completed",
+    submission: {
+      summary: "large body finding",
+      findings: [
+        {
+          title: `Body finding ${index + 1}`,
+          severity: "LOW",
+          body: String(index).repeat(8_000),
+        },
+      ],
+    },
+  }));
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+  assert.match(body, /Body finding 1/);
+  assert.match(body, /Body finding 9/);
+  assert.ok(body.length <= 60_000);
+});
+
 test("partial goals force a comment and remain actionable", () => {
   const review = aggregateReview(context, config, files, [
     { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },

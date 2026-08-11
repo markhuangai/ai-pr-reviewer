@@ -41,15 +41,21 @@ test("accepts JSON goal arrays", () => {
   assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), ["one", "two"]);
 });
 
-test("extracts nested MCP secrets before malformed YAML is reported", () => {
+test("registers direct secret inputs before configuration parsing", () => {
   const values = {
     "github-pat": "ghp_test",
     "ai-secret": "ai-secret",
     "ai-base-url": "https://ai.example.test",
-    "mcp-servers": `root: [\n  headers:\n    Authorization: Bearer nested-header-secret\n`,
   };
   const candidates = inputSecretCandidates(reader(values));
-  assert.ok(candidates.includes("Bearer nested-header-secret"));
+  assert.deepEqual(candidates, ["ghp_test", "ai-secret", "https://ai.example.test"]);
+  assert.throws(
+    () => inputInternals.parseMcpServers("root: [\n  Authorization: nested-header-secret\n"),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message === "Input 'mcp-servers' is invalid YAML." &&
+      !error.message.includes("nested-header-secret"),
+  );
 });
 
 test("rejects unsupported MCP transports and unknown keys", () => {

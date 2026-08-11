@@ -1,5 +1,4 @@
 import eslint from "@eslint/js";
-import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
@@ -36,15 +35,6 @@ export default tseslint.config(
       "@typescript-eslint/no-unsafe-call": "error",
       "@typescript-eslint/no-unsafe-member-access": "error",
       "@typescript-eslint/no-unsafe-return": "error",
-    },
-  },
-  {
-    files: ["scripts/**/*.mjs"],
-    languageOptions: {
-      globals: {
-        ...globals.node,
-        fetch: "readonly",
-      },
     },
   },
   {

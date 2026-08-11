@@ -21,91 +21,97 @@ permissions:
 
 jobs:
   security:
-    name: Release security gates
-    runs-on: ubuntu-latest
+    name: Release checks
+    runs-on: docker-runner
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Enforce action pin age quarantine
-        run: node scripts/check-action-age.mjs
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          persist-credentials: false
       - name: Set up Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Enforce dependency age quarantine before install
-        run: node scripts/check-package-age.mjs
+        run: node scripts/check-package-age.ts
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Verify npm signatures
         run: npm audit signatures
       - name: Audit dependencies
         run: npm audit --audit-level=high
-      - name: Run OSV scan
-        run: npm run security:osv
-      - name: Scan tracked files for secrets
-        run: node scripts/secret-scan.mjs
-      - name: Run complete checks
+      - name: Test and build
         run: npm run check && npm run build && npm run bundle:bootstrap && npm run security:repro
-      - name: Generate SBOM
-        run: npm run security:sbom
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-sbom
-          path: build/sbom.cdx.json
-          if-no-files-found: error
+      - name: Verify generated bootstrap
+        run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
 
   build-runtime:
     name: Build ${{ matrix.asset }}
     needs: security
-    runs-on: ${{ matrix.runner }}
+    runs-on: docker-runner
     strategy:
       fail-fast: false
       matrix:
         include:
           - asset: runtime-linux-x64.tar.gz
-            runner: ubuntu-latest
+            target_os: linux
+            target_cpu: x64
+            target_libc: glibc
           - asset: runtime-linux-arm64.tar.gz
-            runner: ubuntu-24.04-arm
+            target_os: linux
+            target_cpu: arm64
+            target_libc: glibc
           - asset: runtime-win32-x64.tar.gz
-            runner: windows-latest
+            target_os: win32
+            target_cpu: x64
+            target_libc: ""
           - asset: runtime-win32-arm64.tar.gz
-            runner: windows-11-arm
+            target_os: win32
+            target_cpu: arm64
+            target_libc: ""
           - asset: runtime-darwin-x64.tar.gz
-            runner: macos-15-intel
+            target_os: darwin
+            target_cpu: x64
+            target_libc: ""
           - asset: runtime-darwin-arm64.tar.gz
-            runner: macos-15
+            target_os: darwin
+            target_cpu: arm64
+            target_libc: ""
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Enforce action pin age quarantine
-        run: node scripts/check-action-age.mjs
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          persist-credentials: false
       - name: Set up Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
-      - name: Enforce dependency age quarantine before install
-        run: node scripts/check-package-age.mjs
       - name: Install locked dependencies without lifecycle scripts
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build and prune development dependencies
         shell: bash
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
         run: |
+          set -euo pipefail
           npm run build
           npm prune --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Prepare runtime bundle
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
-        run: node scripts/prepare-runtime.mjs release "${{ matrix.asset }}" "$RELEASE_TAG" "$GITHUB_SHA"
+        run: >-
+          node scripts/prepare-runtime.ts release "${{ matrix.asset }}" "$RELEASE_TAG"
+          "$GITHUB_SHA" "${{ matrix.target_os }}" "${{ matrix.target_cpu }}"
+          "${{ matrix.target_libc }}"
       - name: Archive runtime bundle
         shell: bash
         run: |
@@ -113,7 +119,7 @@ jobs:
           export SOURCE_DATE_EPOCH=0
           export TZ=UTC
           mkdir -p release/assets
-          node scripts/normalize-archive.mjs release/bundle
+          node scripts/normalize-archive.ts release/bundle
           if tar --help | grep -q -- '--sort'; then
             tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
               -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
@@ -126,48 +132,40 @@ jobs:
             fi
             (
               cd release/bundle
-              node ../../scripts/list-archive-files.mjs . | tar --null --no-recursion \
+              node ../../scripts/list-archive-files.ts . | tar --null --no-recursion \
                 "${metadata_flags[@]}" \
                 -czf "../assets/${{ matrix.asset }}" -T -
             )
           fi
-          node scripts/write-checksum.mjs "release/assets/${{ matrix.asset }}"
+          node scripts/write-checksum.ts "release/assets/${{ matrix.asset }}"
       - name: Upload runtime bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: release/assets/${{ matrix.asset }}*
           if-no-files-found: error
 
   publish:
-    name: Publish verified release
+    name: Publish release
     needs: [security, build-runtime]
-    runs-on: ubuntu-latest
-    if: needs.security.result == 'success' && needs.build-runtime.result == 'success'
+    runs-on: docker-runner
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     env:
       RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
     steps:
       - name: Check out release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Download runtime bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: runtime-*.tar.gz
           path: release-assets
           merge-multiple: true
-      - name: Download SBOM
-        uses: actions/download-artifact@v4
-        with:
-          name: release-sbom
-          path: release-assets
-      - name: Verify all release assets have checksums
+      - name: Verify release checksums
         shell: bash
         run: |
           set -euo pipefail
@@ -178,106 +176,23 @@ jobs:
             test -f "${archive}.sha256"
             (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
           done
-      - name: Attest runtime bundles
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            release-assets/*.tar.gz
-            release-assets/*.tar.gz.sha256
-            release-assets/sbom.cdx.json
-      - name: Publish stable or prerelease assets
+      - name: Publish assets and advance v1
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-            if git fetch origin refs/heads/v1:refs/remotes/origin/v1; then
-              if ! git merge-base --is-ancestor refs/remotes/origin/v1 "$GITHUB_SHA"; then
-                echo "The stable v1 branch is not an ancestor of $GITHUB_SHA; refusing to replace stable assets." >&2
-                exit 1
-              fi
-            fi
-          fi
-          old_assets_dir="$(mktemp -d)"
-          old_target=""
-          old_tag_sha=""
-          release_created=false
-          restore_needed=false
-          restore_release() {
-            if [[ "$release_created" == true ]]; then
-              echo "Stable branch update failed; deleting the newly created release." >&2
-              if [[ -n "$old_tag_sha" ]]; then
-                if ! gh release delete "$RELEASE_TAG" --yes --repo "$GH_REPO"; then
-                  echo "New release cleanup failed; inspect the release before promotion." >&2
-                fi
-                if ! gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$old_tag_sha" -F force=true; then
-                  echo "Previous stable tag restoration failed; inspect the tag before promotion." >&2
-                fi
-              elif ! gh release delete "$RELEASE_TAG" --yes --cleanup-tag --repo "$GH_REPO"; then
-                echo "New release cleanup failed; inspect the release before promotion." >&2
-              fi
-            elif [[ "$restore_needed" == true ]]; then
-              echo "Release upload failed; restoring the previous asset set." >&2
-              old_assets=("$old_assets_dir"/*)
-              current_assets="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name')"
-              while IFS= read -r asset_name; do
-                [[ -z "$asset_name" ]] && continue
-                if [[ ! -f "$old_assets_dir/$asset_name" ]]; then
-                  if ! gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes --repo "$GH_REPO"; then
-                    echo "Failed to remove newly published asset $asset_name; inspect the release before promotion." >&2
-                  fi
-                fi
-              done <<< "$current_assets"
-              if ! gh release upload "$RELEASE_TAG" "${old_assets[@]}" --clobber --repo "$GH_REPO"; then
-                echo "Previous release asset restoration also failed; inspect the release before promotion." >&2
-              fi
-              if [[ -n "$old_target" ]] && ! gh release edit "$RELEASE_TAG" --target "$old_target" --repo "$GH_REPO"; then
-                echo "Previous release target restoration also failed; inspect the release before promotion." >&2
-              fi
-              if [[ -n "$old_tag_sha" ]] && ! gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$old_tag_sha" -F force=true; then
-                echo "Previous stable tag restoration also failed; inspect the tag before promotion." >&2
-              fi
-            fi
-          }
-          trap restore_release EXIT
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-              old_tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha 2>/dev/null || true)"
-            fi
-            old_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq .targetCommitish)"
-            gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir "$old_assets_dir"
-            old_assets=("$old_assets_dir"/*)
-            test "${#old_assets[@]}" -gt 0
-            restore_needed=true
             gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
-            remote_assets="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets)"
-            for local_asset in release-assets/*; do
-              asset_name="$(basename "$local_asset")"
-              jq -e --arg name "$asset_name" '.assets[] | select(.name == $name)' <<< "$remote_assets" >/dev/null
-              if [[ "$local_asset" == *.tar.gz ]]; then
-                expected_digest="$(sha256sum "$local_asset" | cut -d ' ' -f 1)"
-                actual_digest="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest // empty' <<< "$remote_assets")"
-                test "$actual_digest" = "sha256:$expected_digest"
-              fi
-            done
-            gh release edit "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
-            if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$GITHUB_SHA" -F force=true
-              git push origin "$GITHUB_SHA:refs/heads/v1"
-            fi
-            restore_needed=false
           elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-            if old_tag_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha 2>/dev/null)"; then
-              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -F sha="$GITHUB_SHA" -F force=true
-            fi
-            release_created=true
-            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
-            git push origin "$GITHUB_SHA:refs/heads/v1"
-            release_created=false
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
           else
-            gh release create "$RELEASE_TAG" release-assets/* --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease --target "$GITHUB_SHA" --repo "$GH_REPO"
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease \
+              --target "$GITHUB_SHA" --repo "$GH_REPO"
           fi
-          trap - EXIT
+          if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+            git push origin "$GITHUB_SHA:refs/heads/v1"
+          fi

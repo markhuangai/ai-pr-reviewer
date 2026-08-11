@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 
 const archive = process.argv[2];
-if (!archive) throw new Error("Usage: node scripts/write-checksum.mjs <archive>");
+if (!archive) throw new Error("Usage: node scripts/write-checksum.ts <archive>");
 const digest = createHash("sha256")
   .update(await readFile(archive))
   .digest("hex");

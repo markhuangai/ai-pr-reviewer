@@ -23,7 +23,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -92,14 +92,14 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Security and release model
 
-The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies the GitHub asset SHA-256 digest (or a matching checksum asset), validates the bundle manifest, and then starts the bundled Node runtime. The release workflow advances the consumer-facing `v1` source branch only by fast-forward, so the checked-in bootstrap and runtime release commit stay aligned without force-pushing a tag. Supported bundles are Linux x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies its SHA-256 digest, validates the bundle manifest, and starts the bundled Node runtime. After publishing the runtime assets, the release workflow advances the consumer-facing `v1` branch. Supported bundles are Linux x64/arm64, Windows x64/arm64, and macOS x64/arm64.
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 
-- executable npm packages, transitive packages, SDK/platform packages, toolchains, and third-party actions must be at least 168 hours old;
-- exact lockfile versions, SHA-512 integrity, npm signature checks, lifecycle-script disabling, and no `npx` downloads;
-- dependency review when the repository's dependency-graph compare API is available, CodeQL, npm audit, OSV scanning, secret scanning, SBOM/provenance checks, and a high/critical vulnerability promotion gate; npm audit and OSV remain hard gates when dependency review is unsupported;
-- major version tags are resolved through the GitHub API and rejected when their commit is younger than seven days; immutable commit-SHA pinning is stronger, but this project uses readable version tags as requested;
+- every locked npm dependency must be at least 168 hours old before installation;
+- exact lockfile versions, integrity hashes, npm signature checks, lifecycle-script disabling, and no runtime package installation;
+- `npm audit --audit-level=high` blocks vulnerable releases;
+- workflows use readable major action versions whose current releases run on Node 24;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
 Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
@@ -116,7 +116,7 @@ npm run build
 npm run bundle:bootstrap
 ```
 
-The release workflow builds the runtime for all supported runner platforms, records the SDK and native CLI versions in each manifest, runs the security gates, and uploads only fully tested candidates to the stable `runtime-v1` release. Failed candidates remain prereleases.
+Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. The release workflow uses npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, records the SDK and native CLI versions in each manifest, verifies archive checksums, and publishes the assets to the selected release. No container build is required.
 
 ## License
 

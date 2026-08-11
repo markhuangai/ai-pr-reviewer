@@ -6,8 +6,8 @@ import { spawn } from "node:child_process";
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const snapshotRoot = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-repro-"));
 
-function run(command, args) {
-  return new Promise((resolve, reject) => {
+function run(command: string, args: string[]): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, { stdio: "inherit", windowsHide: true });
     let settled = false;
     child.once("error", (error) => {
@@ -25,8 +25,8 @@ function run(command, args) {
   });
 }
 
-async function files(root, current = root) {
-  const result = [];
+async function files(root: string, current = root): Promise<string[]> {
+  const result: string[] = [];
   for (const entry of await readdir(current, { withFileTypes: true })) {
     const path = join(current, entry.name);
     if (entry.isDirectory()) result.push(...(await files(root, path)));
@@ -35,8 +35,8 @@ async function files(root, current = root) {
   return result.sort();
 }
 
-async function snapshot(root) {
-  const result = new Map();
+async function snapshot(root: string): Promise<ReadonlyMap<string, string>> {
+  const result = new Map<string, string>();
   for (const path of await files(root))
     result.set(path, (await readFile(join(root, path))).toString("base64"));
   return result;

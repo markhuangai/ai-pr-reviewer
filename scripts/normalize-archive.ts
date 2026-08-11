@@ -2,9 +2,9 @@ import { chmod, lstat, lutimes, readdir, utimes } from "node:fs/promises";
 import { join } from "node:path";
 
 const root = process.argv[2];
-if (!root) throw new Error("Usage: node scripts/normalize-archive.mjs <directory>");
+if (!root) throw new Error("Usage: node scripts/normalize-archive.ts <directory>");
 
-async function normalize(path) {
+async function normalize(path: string): Promise<void> {
   const stats = await lstat(path);
   if (stats.isSymbolicLink()) {
     await lutimes(path, 0, 0);

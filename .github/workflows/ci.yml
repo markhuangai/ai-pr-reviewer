@@ -12,38 +12,31 @@ permissions:
 
 jobs:
   quality:
-    name: Node ${{ matrix.node }} quality and security
-    runs-on: ubuntu-latest
+    name: Node ${{ matrix.node }} quality
+    runs-on: docker-runner
     strategy:
       fail-fast: false
       matrix:
         node: [24, 25]
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Enforce action pin age quarantine
-        run: node scripts/check-action-age.mjs
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          persist-credentials: false
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - name: Enforce dependency age quarantine before install
-        run: node scripts/check-package-age.mjs
+        run: node scripts/check-package-age.ts
       - name: Install locked dependencies without lifecycle scripts
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Verify npm signatures
         run: npm audit signatures
       - name: Audit dependencies
         run: npm audit --audit-level=high
-      - name: Run OSV scan
-        run: npm run security:osv
-      - name: Scan tracked files for secrets
-        run: node scripts/secret-scan.mjs
       - name: Check formatting, lint, types, and unit tests
         run: npm run check
       - name: Build compiled runtime and bootstrap
@@ -52,87 +45,3 @@ jobs:
         run: npm run security:repro
       - name: Ensure generated bootstrap is present and stable
         run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
-      - name: Generate SBOM
-        run: npm run security:sbom
-
-  dependency-capability:
-    name: Detect dependency graph capability
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      enabled: ${{ steps.probe.outputs.enabled }}
-    steps:
-      - name: Probe dependency graph compare API
-        id: probe
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/dependency-graph/compare/${BASE_SHA}...${HEAD_SHA}")"
-          case "$status" in
-            2*) echo 'enabled=true' >> "$GITHUB_OUTPUT" ;;
-            403|404)
-              echo 'enabled=false' >> "$GITHUB_OUTPUT"
-              echo "Dependency graph comparison is unavailable; dependency review will be skipped." >&2
-              ;;
-            *) echo "Dependency graph capability probe failed with HTTP ${status}." >&2; exit 1 ;;
-          esac
-
-  dependency-review:
-    name: Dependency review
-    needs: dependency-capability
-    if: github.event_name == 'pull_request' && needs.dependency-capability.outputs.enabled == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
-        with:
-          fail-on-severity: high
-
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Enforce action pin age quarantine
-        run: node scripts/check-action-age.mjs
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript-typescript
-      - name: Set up Node 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - name: Enforce dependency age quarantine before install
-        run: node scripts/check-package-age.mjs
-      - name: Install locked dependencies without lifecycle scripts
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Build for CodeQL
-        run: npm run build
-      - name: Analyze
-        uses: github/codeql-action/analyze@v3

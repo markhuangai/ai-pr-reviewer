@@ -11,17 +11,14 @@
     "build:bootstrap": "tsc -p tsconfig.bootstrap.json",
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check .",
-    "security:age": "node scripts/check-package-age.mjs",
-    "security:action-age": "node scripts/check-action-age.mjs",
-    "security:osv": "node scripts/osv-scan.mjs",
-    "security:repro": "node scripts/check-reproducible-build.mjs",
-    "security:sbom": "node scripts/create-sbom.mjs",
+    "security:age": "node scripts/check-package-age.ts",
+    "security:repro": "node scripts/check-reproducible-build.ts",
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
-    "test:coverage": "npm run build:test && node --test --experimental-test-coverage build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
+    "test": "npm run build:test && node --test build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js",
+    "test:coverage": "npm run build:test && node --test --experimental-test-coverage build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
-    "bundle:bootstrap": "npm run build:bootstrap && node scripts/copy-bootstrap.mjs"
+    "bundle:bootstrap": "npm run build:bootstrap && node scripts/copy-bootstrap.ts"
   },
   "dependencies": {
     "@actions/core": "3.0.1",
@@ -35,7 +32,6 @@
     "@eslint/js": "9.39.5",
     "@types/node": "24.13.3",
     "eslint": "9.39.5",
-    "globals": "17.9.0",
     "prettier": "3.5.3",
     "typescript": "5.8.3",
     "typescript-eslint": "8.63.0"

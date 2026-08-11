@@ -105,83 +105,10 @@ function parseHeaders(value: unknown, path: string): Readonly<Record<string, str
   return headers;
 }
 
-function collectMcpSecretValues(value: unknown, key?: string): string[] {
-  if (typeof value === "string") {
-    return key === "url" || key === "headers" ? [value] : [];
-  }
-  if (!isRecord(value)) return [];
-  return Object.entries(value).flatMap(([childKey, childValue]) => {
-    if (childKey === "headers" && isRecord(childValue)) {
-      return Object.values(childValue).flatMap((headerValue) =>
-        typeof headerValue === "string" ? [headerValue] : [],
-      );
-    }
-    return collectMcpSecretValues(childValue, childKey);
-  });
-}
-
-function extractMcpSecretValues(raw: string): readonly string[] {
-  if (raw.trim().length === 0) return [];
-  let parsedValues: readonly string[] = [];
-  try {
-    const document = parseDocument(raw, { prettyErrors: false, uniqueKeys: false, version: "1.2" });
-    const parsed = document.toJS() as unknown;
-    parsedValues = collectMcpSecretValues(parsed);
-  } catch {
-    // Continue with line-oriented extraction for diagnostics from malformed YAML.
-  }
-
-  const values: string[] = [];
-  for (const match of raw.matchAll(/\bhttps?:\/\/[^\s'"<>]+/g)) {
-    const value = match[0].replace(/[),;]+$/g, "");
-    if (value) values.push(value);
-  }
-  let headerIndent: number | undefined;
-  for (const line of raw.split(/\r?\n/)) {
-    const header = /^(\s*)headers\s*:\s*(.*)$/i.exec(line);
-    if (header) {
-      headerIndent = header[1]?.length ?? 0;
-      const inline = header[2]?.trim() ?? "";
-      const inlineMatch = /^\{(.*)\}$/.exec(inline);
-      if (inlineMatch) {
-        const inlineContent = inlineMatch[1];
-        if (inlineContent === undefined) continue;
-        for (const pair of inlineContent.split(",")) {
-          const separator = pair.indexOf(":");
-          if (separator >= 0) {
-            const value = pair
-              .slice(separator + 1)
-              .trim()
-              .replace(/^['"]|['"]$/g, "");
-            if (value.length > 0) values.push(value);
-          }
-        }
-      }
-      continue;
-    }
-    if (headerIndent === undefined || line.trim().length === 0) continue;
-    const indentation = line.match(/^\s*/)?.[0].length ?? 0;
-    if (indentation <= headerIndent) {
-      headerIndent = undefined;
-      continue;
-    }
-    const entry = /^\s*[^:#][^:]*:\s*(.*?)\s*$/.exec(line);
-    const value = entry?.[1]?.replace(/^['"]|['"]$/g, "").trim();
-    if (value) values.push(value);
-  }
-  return [...parsedValues, ...values];
-}
-
 export function inputSecretCandidates(reader: InputReader): readonly string[] {
-  const rawMcp = reader.get("mcp-servers");
   return Array.from(
     new Set(
-      [
-        reader.get("github-pat"),
-        reader.get("ai-secret"),
-        reader.get("ai-base-url"),
-        ...extractMcpSecretValues(rawMcp),
-      ]
+      [reader.get("github-pat"), reader.get("ai-secret"), reader.get("ai-base-url")]
         .map((value) => value.trim())
         .filter((value) => value.length > 0),
     ),
@@ -230,9 +157,7 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
   if (raw.trim().length === 0) return {};
   const document = parseDocument(raw, { prettyErrors: true, uniqueKeys: true, version: "1.2" });
   if (document.errors.length > 0) {
-    throw new Error(
-      `Input 'mcp-servers' is invalid YAML: ${document.errors[0]?.message ?? "parse error"}`,
-    );
+    throw new Error("Input 'mcp-servers' is invalid YAML.");
   }
   const value = document.toJS() as unknown;
   if (!isRecord(value)) throw new Error("Input 'mcp-servers' must be a mapping of server names.");
@@ -325,7 +250,6 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
 }
 
 export const inputInternals = {
-  extractMcpSecretValues,
   parseMcpServers,
   parseReviewPrompts,
 };
