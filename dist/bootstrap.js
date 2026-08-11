@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
 const RELEASE_TAG = "runtime-v1";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
@@ -133,7 +134,11 @@ async function extract(archive, destination) {
                 const dateField = fields[dateIndex] ?? "";
                 const pathIndex = dateIndex + (/^\d{4}-\d{2}-\d{2}$/.test(dateField) ? 2 : 3);
                 const normalized = fields.slice(pathIndex).join(" ").replaceAll("\\", "/");
-                if (normalized.startsWith("/") || normalized.split("/").includes("..")) {
+                const linkSeparator = normalized.indexOf(" -> ");
+                const entryPath = linkSeparator < 0 ? normalized : normalized.slice(0, linkSeparator);
+                const linkTarget = linkSeparator < 0 ? undefined : normalized.slice(linkSeparator + 4);
+                if (!isSafeArchiveEntryPath(entryPath) ||
+                    (linkTarget !== undefined && !isSafeArchiveSymlink(entryPath, linkTarget))) {
                     reject(new Error("Runtime archive contains an unsafe path."));
                     return;
                 }
