@@ -17,8 +17,8 @@
     "security:repro": "node scripts/check-reproducible-build.mjs",
     "security:sbom": "node scripts/create-sbom.mjs",
     "build:test": "tsc -p tsconfig.test.json",
-    "test": "npm run build:test && node --test build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
-    "test:coverage": "npm run build:test && node --test --experimental-test-coverage build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
+    "test": "npm run build:test && node --test build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
+    "test:coverage": "npm run build:test && node --test --experimental-test-coverage build-test/tests/agent.test.js build-test/tests/aggregate.test.js build-test/tests/bootstrap.test.js build-test/tests/github-api.test.js build-test/tests/index.test.js build-test/tests/input.test.js scripts/osv-score.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
     "bundle:bootstrap": "npm run build:bootstrap && node scripts/copy-bootstrap.mjs"
