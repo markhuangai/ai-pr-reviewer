@@ -92,7 +92,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Security and release model
 
-The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies its SHA-256 digest, validates the bundle manifest, and starts the bundled Node runtime. After publishing the runtime assets, the release workflow advances the consumer-facing `v1` branch. Supported bundles are Linux x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies its SHA-256 digest, validates the bundle manifest, and starts the bundled Node runtime. After publishing the runtime assets, the release workflow advances the consumer-facing `v1` branch. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 

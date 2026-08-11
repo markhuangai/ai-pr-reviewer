@@ -166,7 +166,6 @@ async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER
         env: {
             ...process.env,
             AI_PR_REVIEWER_BUILD_ID: buildId,
-            AI_PR_REVIEWER_RUNTIME_DIR: runtimeDirectory,
         },
         windowsHide: false,
     });
@@ -178,13 +177,6 @@ async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER
     });
 }
 async function main() {
-    const override = process.env.AI_PR_REVIEWER_RUNTIME_DIR?.trim();
-    if (override) {
-        const code = await runRuntime(override);
-        if (code !== 0)
-            process.exitCode = code;
-        return;
-    }
     const assetName = platformAssetName();
     const release = await fetchJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}`);
     if (release.tag_name !== RELEASE_TAG ||

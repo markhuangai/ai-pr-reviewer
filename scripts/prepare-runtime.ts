@@ -28,9 +28,7 @@ const supportedTargets = new Set([
   "darwin/arm64/",
   "darwin/x64/",
   "linux/arm64/glibc",
-  "linux/arm64/musl",
   "linux/x64/glibc",
-  "linux/x64/musl",
   "win32/arm64/",
   "win32/x64/",
 ]);
@@ -45,10 +43,7 @@ const expectedAsset = `runtime-${rawTargetOs}-${rawTargetCpu}.tar.gz`;
 if (asset !== expectedAsset) {
   throw new Error(`Runtime asset ${asset} does not match target ${rawTargetOs}/${rawTargetCpu}.`);
 }
-const platformSuffix =
-  rawTargetOs === "linux" && targetLibc === "musl"
-    ? `${rawTargetOs}-${rawTargetCpu}-musl`
-    : `${rawTargetOs}-${rawTargetCpu}`;
+const platformSuffix = `${rawTargetOs}-${rawTargetCpu}`;
 const platformPackage = readPackage(
   await readFile(
     `node_modules/@anthropic-ai/claude-agent-sdk-${platformSuffix}/package.json`,
@@ -73,7 +68,7 @@ await mkdir(`${bundle}/runtime`, { recursive: true });
 await cp("build/index.js", `${bundle}/index.js`);
 await cp("build/lib", `${bundle}/lib`, { recursive: true });
 await cp("build/runtime", `${bundle}/runtime`, { recursive: true });
-await cp("node_modules", `${bundle}/node_modules`, { recursive: true, dereference: false });
+await cp("node_modules", `${bundle}/node_modules`, { recursive: true, dereference: true });
 await writeFile(
   `${bundle}/package.json`,
   `${JSON.stringify({ type: "module", engines: { node: ">=24" } }, null, 2)}\n`,
