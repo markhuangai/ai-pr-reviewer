@@ -263,6 +263,47 @@ test("bounds an oversized merged inline comment", () => {
   assert.ok((request.comments[0]?.body.length ?? 0) <= 60_000);
 });
 
+test("keeps body findings ahead of oversized goal status", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "goal".repeat(30_000),
+      status: "completed",
+      submission: {
+        summary: "body finding",
+        findings: [
+          {
+            title: "Unverified finding",
+            severity: "LOW",
+            body: "This finding must remain visible in the review body.",
+            path: "src/other.ts",
+            line: 1,
+          },
+        ],
+      },
+    },
+  ]);
+  const body = buildReviewBody(review, [
+    {
+      prompt: "goal".repeat(30_000),
+      status: "completed",
+      submission: {
+        summary: "body finding",
+        findings: [
+          {
+            title: "Unverified finding",
+            severity: "LOW",
+            body: "This finding must remain visible in the review body.",
+            path: "src/other.ts",
+            line: 1,
+          },
+        ],
+      },
+    },
+  ]);
+  assert.match(body, /Unverified finding/);
+  assert.match(body, /Goal status truncated/);
+});
+
 test("partial goals force a comment and remain actionable", () => {
   const review = aggregateReview(context, config, files, [
     { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },

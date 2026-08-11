@@ -34,4 +34,11 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
     ),
     "AI failed at [REDACTED]; MCP failed at [REDACTED].",
   );
+  assert.equal(
+    indexInternals.redact(`${config.aiBaseUrl}/mcp?signature=leaked`, [
+      config.aiBaseUrl,
+      `${config.aiBaseUrl}/mcp?signature=leaked`,
+    ]),
+    "[REDACTED]",
+  );
 });

@@ -19,6 +19,7 @@ function errorMessage(error: unknown): string {
 function redact(value: string, secrets: readonly string[]): string {
   return secrets
     .filter((secret) => secret.length > 0)
+    .sort((left, right) => right.length - left.length)
     .reduce((result, secret) => result.split(secret).join("[REDACTED]"), value);
 }
 

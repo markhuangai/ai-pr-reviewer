@@ -14,6 +14,7 @@ import type {
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_INLINE_COMMENTS = 25;
+const MAX_GOAL_STATUS_LENGTH = 8_000;
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 5,
   HIGH: 4,
@@ -284,13 +285,15 @@ export function aggregateReview(
 }
 
 function goalStatusMarkdown(goals: readonly GoalResult[]): string {
-  return goals
+  const body = goals
     .map((goal, index) => {
       const status =
         goal.status === "completed" ? "completed" : `failed: ${goal.error ?? "unknown error"}`;
       return `${index + 1}. ${status} — ${goal.prompt}`;
     })
     .join("\n");
+  if (body.length <= MAX_GOAL_STATUS_LENGTH) return body;
+  return `${body.slice(0, MAX_GOAL_STATUS_LENGTH - 80)}\n\n> Goal status truncated; findings are listed above.`;
 }
 
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
@@ -299,16 +302,16 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
     "## AI pull request review",
     `\n${review.summary}`,
     "",
-    "### Goals",
-    goalStatusMarkdown(goals),
+    "### Findings",
   ];
   if (review.bodyFindings.length > 0) {
-    sections.push("", "### Findings", review.bodyFindings.map(formatFinding).join("\n\n"));
+    sections.push(review.bodyFindings.map(formatFinding).join("\n\n"));
   } else if (review.findings.length === 0) {
-    sections.push("", "### Findings", "No actionable findings were reported.");
+    sections.push("No actionable findings were reported.");
   } else {
-    sections.push("", "### Findings", "All findings are attached to changed lines above.");
+    sections.push("All findings are attached to changed lines above.");
   }
+  sections.push("", "### Goals", goalStatusMarkdown(goals));
   if (review.partial)
     sections.push(
       "",
