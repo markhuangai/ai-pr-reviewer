@@ -25,7 +25,11 @@ const config: ReviewConfig = {
     security: {
       type: "http",
       url: "https://mcp.example.test/review?signature=mcp-url-secret",
-      headers: { Authorization: "mcp-header-secret" },
+      headers: {
+        Authorization: "Bearer mcp-header-secret",
+        "Proxy-Authorization": "Basic proxy-credentials",
+        "X-Label": "public value",
+      },
     },
   },
 };
@@ -34,6 +38,10 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
   assert.ok(secrets.includes(config.aiBaseUrl));
   assert.ok(secrets.includes(config.mcpServers.security?.url ?? ""));
+  assert.ok(secrets.includes("Bearer mcp-header-secret"));
+  assert.ok(secrets.includes("mcp-header-secret"));
+  assert.ok(secrets.includes("proxy-credentials"));
+  assert.equal(secrets.includes("value"), false);
   assert.equal(
     indexInternals.redact(
       `AI failed at ${config.aiBaseUrl}; MCP failed at ${config.mcpServers.security?.url}.`,
@@ -47,6 +55,10 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
       `${config.aiBaseUrl}/mcp?signature=leaked`,
     ]),
     "[REDACTED]",
+  );
+  assert.equal(
+    indexInternals.redact("MCP returned mcp-header-secret.", secrets),
+    "MCP returned [REDACTED].",
   );
   assert.equal(
     indexInternals.redact("a data a prod production prod-prod", ["a", "prod"]),

@@ -115,6 +115,30 @@ export function inputSecretCandidates(reader: InputReader): readonly string[] {
   );
 }
 
+function authorizationCredential(name: string, value: string): string | undefined {
+  if (name.toLowerCase() !== "authorization" && name.toLowerCase() !== "proxy-authorization") {
+    return undefined;
+  }
+  return /^[A-Za-z][A-Za-z0-9+.-]*\s+(.+)$/u.exec(value)?.[1]?.trim();
+}
+
+export function reviewSecretCandidates(config: ReviewConfig): readonly string[] {
+  return Array.from(
+    new Set([
+      config.githubToken,
+      config.aiSecret,
+      config.aiBaseUrl,
+      ...Object.values(config.mcpServers).flatMap((server) => [
+        server.url,
+        ...Object.entries(server.headers ?? {}).flatMap(([name, value]) => [
+          value,
+          authorizationCredential(name, value) ?? "",
+        ]),
+      ]),
+    ]),
+  ).filter((value) => value.length > 0);
+}
+
 function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error(`${path} must be a sequence.`);

@@ -6,13 +6,17 @@ import * as core from "@actions/core";
 import { aggregateReview, buildReviewRequest, reviewMarker } from "./lib/aggregate.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import { readPullRequestContext } from "./lib/github-event.js";
-import { inputSecretCandidates, readReviewConfig, type InputReader } from "./lib/input.js";
+import {
+  inputSecretCandidates,
+  readReviewConfig,
+  reviewSecretCandidates,
+  type InputReader,
+} from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
 import type {
   GoalResult,
   PullRequestContext,
   PullRequestReviewRequest,
-  ReviewConfig,
   ReviewRunResult,
 } from "./lib/types.js";
 
@@ -39,18 +43,6 @@ function redact(value: string, secrets: readonly string[]): string {
     .filter((secret) => secret.length > 0)
     .sort((left, right) => right.length - left.length)
     .reduce((result, secret) => redactSecret(result, secret), value);
-}
-
-function reviewSecrets(config: ReviewConfig): readonly string[] {
-  return [
-    config.githubToken,
-    config.aiSecret,
-    config.aiBaseUrl,
-    ...Object.values(config.mcpServers).flatMap((server) => [
-      server.url,
-      ...Object.values(server.headers ?? {}),
-    ]),
-  ];
 }
 
 function redactGoals(
@@ -146,7 +138,7 @@ export async function runAction(
 ): Promise<ReviewRunResult> {
   registerInputSecrets(inputSecrets);
   const config = readReviewConfig(reader);
-  const secrets = reviewSecrets(config);
+  const secrets = reviewSecretCandidates(config);
   registerInputSecrets(secrets);
   const context = await readPullRequestContext();
   const api = new GitHubApi(config.githubToken);
@@ -216,4 +208,9 @@ export async function main(): Promise<void> {
   }
 }
 
-export const indexInternals = { assertWorkspace, inputSecretCandidates, redact, reviewSecrets };
+export const indexInternals = {
+  assertWorkspace,
+  inputSecretCandidates,
+  redact,
+  reviewSecrets: reviewSecretCandidates,
+};

@@ -309,6 +309,66 @@ test("serializes bounded agent log values without throwing on circular input", (
   assert.match(value, /\[\d+ chars\]/u);
 });
 
+test("logs plain MCP tool-use blocks and parent-linked fallback results", () => {
+  const toolUses = new Map<string, { readonly kind: "agent" | "mcp"; readonly label: string }>();
+  const lines: string[] = [];
+  const messages: SDKMessage[] = [
+    {
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "mcp-tool-1",
+            name: "mcp__project_memory__search",
+            input: { query: "release policy" },
+          },
+        ],
+      },
+    } as unknown as SDKMessage,
+    {
+      type: "user",
+      parent_tool_use_id: "mcp-tool-1",
+      tool_use_result: { content: "Memory result" },
+      message: { role: "user", content: [] },
+    } as unknown as SDKMessage,
+  ];
+
+  for (const message of messages)
+    agentInternals.logAgentMessage(message, 0, [], toolUses, (line) => lines.push(line));
+
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? "", /MCP tool use mcp__project_memory__search input/u);
+  assert.match(lines[1] ?? "", /MCP tool result mcp__project_memory__search output/u);
+  assert.match(lines[1] ?? "", /Memory result/u);
+});
+
+test("contains agent logging failures without failing the review turn", () => {
+  const secret = "mcp-header-secret";
+  const warnings: string[] = [];
+  const message = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Reviewing the change" }] },
+  } as unknown as SDKMessage;
+
+  assert.doesNotThrow(() => {
+    agentInternals.logAgentMessageSafely(
+      message,
+      0,
+      [secret],
+      new Map(),
+      () => {
+        throw new Error(`${secret}-${"x".repeat(260)}`);
+      },
+      (line) => warnings.push(line),
+    );
+  });
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0]?.includes(secret), false);
+  assert.match(warnings[0] ?? "", /agent event log warning/u);
+  assert.match(warnings[0] ?? "", /\[\d+ chars\]$/u);
+});
+
 test("rejects review submission until the prompt is active and the diff reaches EOF", () => {
   assert.equal(
     agentInternals.reviewSubmissionRejection(false, false),

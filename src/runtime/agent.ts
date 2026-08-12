@@ -24,6 +24,7 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { reviewSecretCandidates } from "../lib/input.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -279,16 +280,27 @@ function logAgentMessage(
   }
 }
 
-function agentLogSecrets(config: ReviewConfig): readonly string[] {
-  return [
-    config.githubToken,
-    config.aiBaseUrl,
-    config.aiSecret,
-    ...Object.values(config.mcpServers).flatMap((server) => [
-      server.url,
-      ...Object.values(server.headers ?? {}),
-    ]),
-  ];
+function logAgentMessageSafely(
+  message: SDKMessage,
+  goalIndex: number,
+  secrets: readonly string[],
+  toolUses: Map<string, AgentToolUse>,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+  warn: AgentLogWriter = (line) => {
+    core.warning(line);
+  },
+): void {
+  try {
+    logAgentMessage(message, goalIndex, secrets, toolUses, write);
+  } catch (error) {
+    try {
+      warn(agentLogLine(goalIndex, "agent event log", "", "warning", errorMessage(error), secrets));
+    } catch {
+      // Logging is diagnostic and must not change the review result.
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -810,7 +822,7 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   let toolCallCount = 0;
-  const logSecrets = agentLogSecrets(config);
+  const logSecrets = reviewSecretCandidates(config);
   const toolUses = new Map<string, AgentToolUse>();
   const diffReader = diff.createReader();
   const diffTool = tool(
@@ -872,7 +884,7 @@ export async function runReviewGoal(
     reader = (async () => {
       try {
         for await (const message of session as AsyncIterable<SDKMessage>) {
-          logAgentMessage(message, goalIndex, logSecrets, toolUses);
+          logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
           if (message.type === "result") {
             const completedTurn = turn;
             turn = deferred<SDKResultMessage>();
@@ -1004,6 +1016,7 @@ export const agentInternals = {
   createPullRequestDiff,
   goalCommand,
   logAgentMessage,
+  logAgentMessageSafely,
   PullRequestDiffReader,
   redactAgentLog,
   reviewSubmissionRejection,
