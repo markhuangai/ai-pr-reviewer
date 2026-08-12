@@ -55,8 +55,8 @@ jobs:
 | `ai-auth-mode`   | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                        |
 | `model`          | yes      |           | Model name understood by the endpoint.                                                               |
 | `review-prompts` | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                           |
-| `parallel-count` | no       | `5`       | Integer from 1 to 10.                                                                                |
-| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including the initial `/goal` setup turn.                    |
+| `parallel-count` | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                     |
+| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.          |
 | `auto-approve`   | no       | `false`   | An approval is attempted only when every goal completes and no finding is Medium, High, or Critical. |
 | `mcp-servers`    | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                      |
 
@@ -85,9 +85,12 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 ## Review behavior
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
+- Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
+- The action streams one immutable merge-base-to-head Git text diff outside the checkout. Every goal reads the complete diff through its own ordered, bounded internal reader before `submit_review` is accepted; there is no fixed aggregate character limit.
+- Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
-- Changed-file patches are ordered with deleted files first and bounded as a complete set; if any diff is unavailable or exceeds the budget, every goal fails closed instead of producing a complete or approving review.
+- If a goal cannot read the text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
 - A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - If GitHub rejects an approval, the action retries once as a comment review.
 - Review bodies are capped at approximately 60 KB. No report artifact is uploaded.
@@ -104,7 +107,7 @@ The lockfile and release workflow enforce the project's supply-chain policy:
 - workflows use readable major action versions whose current releases run on Node 24;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
-CI also runs CodeQL JavaScript/TypeScript analysis for every pull request and push to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
+CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` or `dev` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
 
 Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
 
