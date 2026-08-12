@@ -8,6 +8,8 @@ Each review prompt runs one isolated Claude Agent SDK session. Sessions use auto
 
 The action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required because the action creates the review through the GitHub API.
 
+Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review.
+
 ```yaml
 name: AI review
 
