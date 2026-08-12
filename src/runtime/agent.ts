@@ -286,15 +286,14 @@ function serializeAgentLogValue(
 
 function boundedAgentLogValue(value: unknown, secrets: readonly string[]): string {
   const result = serializeAgentLogValue(value, secrets);
-  const redacted = result.serialized;
+  const display = typeof value === "string" ? JSON.stringify(result.serialized) : result.serialized;
   const preview =
-    redacted.length > MAX_AGENT_LOG_PREVIEW_LENGTH
-      ? `${redacted.slice(0, MAX_AGENT_LOG_PREVIEW_LENGTH - 1)}…`
-      : redacted;
-  const display = typeof value === "string" ? JSON.stringify(preview) : preview;
+    display.length > MAX_AGENT_LOG_PREVIEW_LENGTH
+      ? `${display.slice(0, MAX_AGENT_LOG_PREVIEW_LENGTH - 1)}…`
+      : display;
   const length =
     result.originalLength === undefined ? "payload truncated" : `${result.originalLength} chars`;
-  return `${display} [${length}]`;
+  return `${preview} [${length}]`;
 }
 
 type AgentToolKind = "agent" | "mcp";

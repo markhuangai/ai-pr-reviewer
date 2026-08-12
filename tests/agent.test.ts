@@ -309,6 +309,14 @@ test("serializes bounded agent log values without throwing on circular input", (
   assert.match(value, /\[\d+ chars\]/u);
 });
 
+test("caps string previews after JSON escaping", () => {
+  const value = agentInternals.boundedAgentLogValue("\n".repeat(200), []);
+  const preview = value.match(/^(.+) \[200 chars\]$/u)?.[1];
+  assert.ok(preview);
+  assert.equal(preview.length, 200);
+  assert.match(preview, /…$/u);
+});
+
 test("redacts JSON-escaped secrets before formatting structured values", () => {
   const secret = 'token"with\\escapes\nand-newline';
   const value = agentInternals.boundedAgentLogValue({ token: secret }, [secret]);
