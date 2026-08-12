@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile);
 
 const config: ReviewConfig = {
   githubToken: "github-secret",
-  aiBaseUrl: "https://ai.example.test/signed?token=ai-url-secret",
+  aiBaseUrl: "https://ai.example.test/signed?api-version=2023-06-01&token=ai-url%2Fsecret",
   aiSecret: "ai-secret",
   aiAuthMode: "api-key",
   model: "review-model",
@@ -24,7 +24,7 @@ const config: ReviewConfig = {
   mcpServers: {
     security: {
       type: "http",
-      url: "https://mcp.example.test/review?signature=mcp-url-secret",
+      url: "https://mcp.example.test/review?tenant=public-tenant&signature=mcp-url%2Fsecret",
       headers: {
         Authorization: "Bearer mcp-header-secret",
         "Proxy-Authorization": "Basic proxy-credentials",
@@ -38,6 +38,12 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
   assert.ok(secrets.includes(config.aiBaseUrl));
   assert.ok(secrets.includes(config.mcpServers.security?.url ?? ""));
+  assert.ok(secrets.includes("ai-url%2Fsecret"));
+  assert.ok(secrets.includes("ai-url/secret"));
+  assert.ok(secrets.includes("mcp-url%2Fsecret"));
+  assert.ok(secrets.includes("mcp-url/secret"));
+  assert.equal(secrets.includes("2023-06-01"), false);
+  assert.equal(secrets.includes("public-tenant"), false);
   assert.ok(secrets.includes("Bearer mcp-header-secret"));
   assert.ok(secrets.includes("mcp-header-secret"));
   assert.ok(secrets.includes("proxy-credentials"));
@@ -59,6 +65,10 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   assert.equal(
     indexInternals.redact("MCP returned mcp-header-secret.", secrets),
     "MCP returned [REDACTED].",
+  );
+  assert.equal(
+    indexInternals.redact("Provider returned mcp-url/secret.", secrets),
+    "Provider returned [REDACTED].",
   );
   assert.equal(
     indexInternals.redact("a data a prod production prod-prod", ["a", "prod"]),

@@ -309,6 +309,29 @@ test("serializes bounded agent log values without throwing on circular input", (
   assert.match(value, /\[\d+ chars\]/u);
 });
 
+test("redacts JSON-escaped secrets before formatting structured values", () => {
+  const secret = 'token"with\\escapes\nand-newline';
+  const value = agentInternals.boundedAgentLogValue({ token: secret }, [secret]);
+  assert.equal(value.includes('token\\"with\\\\escapes\\nand-newline'), false);
+  assert.match(value, /\[REDACTED\]/u);
+  assert.match(value, new RegExp(`\\[${JSON.stringify({ token: secret }).length} chars\\]$`, "u"));
+});
+
+test("bounds traversal of oversized structured agent log values", () => {
+  const value: Record<string, unknown> = { content: "x".repeat(1_000_000) };
+  Object.defineProperty(value, "unvisited", {
+    enumerable: true,
+    get: () => {
+      throw new Error("the projection read beyond its bound");
+    },
+  });
+
+  const result = agentInternals.boundedAgentLogValue(value, []);
+  assert.match(result, /^\{"content":"x+/u);
+  assert.match(result, /… \[payload truncated\]$/u);
+  assert.equal(result.includes("unserializable"), false);
+});
+
 test("logs plain MCP tool-use blocks and parent-linked fallback results", () => {
   const toolUses = new Map<string, { readonly kind: "agent" | "mcp"; readonly label: string }>();
   const lines: string[] = [];

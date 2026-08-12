@@ -116,27 +116,58 @@ export function inputSecretCandidates(reader: InputReader): readonly string[] {
 }
 
 function authorizationCredential(name: string, value: string): string | undefined {
-  if (name.toLowerCase() !== "authorization" && name.toLowerCase() !== "proxy-authorization") {
+  const normalizedName = name.toLowerCase();
+  if (normalizedName !== "authorization" && normalizedName !== "proxy-authorization") {
     return undefined;
   }
   return /^[A-Za-z][A-Za-z0-9+.-]*\s+(.+)$/u.exec(value)?.[1]?.trim();
 }
 
+function endpointQuerySecretCandidates(value: string): readonly string[] {
+  const url = new URL(value);
+  return url.search
+    .slice(1)
+    .split("&")
+    .flatMap((entry) => {
+      const separator = entry.indexOf("=");
+      if (separator === -1) return [];
+      const rawValue = entry.slice(separator + 1);
+      const parameter = new URLSearchParams(entry).entries().next().value;
+      if (parameter === undefined) return [];
+      const [name, decodedValue] = parameter;
+      if (
+        !/(?:^|[-_.])(?:access[-_.]?key|api[-_.]?key|auth(?:orization)?|credential|passw(?:or)?d|secret|signature|sig|token)(?:$|[-_.])/iu.test(
+          name,
+        )
+      ) {
+        return [];
+      }
+      return [rawValue, decodedValue].filter((candidate) => candidate.length > 0);
+    });
+}
+
+function jsonSecretCandidate(value: string): string {
+  return JSON.stringify(value).slice(1, -1);
+}
+
 export function reviewSecretCandidates(config: ReviewConfig): readonly string[] {
-  return Array.from(
-    new Set([
-      config.githubToken,
-      config.aiSecret,
-      config.aiBaseUrl,
-      ...Object.values(config.mcpServers).flatMap((server) => [
-        server.url,
-        ...Object.entries(server.headers ?? {}).flatMap(([name, value]) => [
-          value,
-          authorizationCredential(name, value) ?? "",
-        ]),
+  const servers = Object.values(config.mcpServers);
+  const endpoints = [config.aiBaseUrl, ...servers.map((server) => server.url)];
+  const candidates = [
+    config.githubToken,
+    config.aiSecret,
+    ...endpoints,
+    ...endpoints.flatMap(endpointQuerySecretCandidates),
+    ...servers.flatMap((server) =>
+      Object.entries(server.headers ?? {}).flatMap(([name, value]) => [
+        value,
+        authorizationCredential(name, value) ?? "",
       ]),
-    ]),
-  ).filter((value) => value.length > 0);
+    ),
+  ].filter((value) => value.length > 0);
+  return Array.from(
+    new Set(candidates.flatMap((candidate) => [candidate, jsonSecretCandidate(candidate)])),
+  );
 }
 
 function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy[] | undefined {

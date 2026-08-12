@@ -42,6 +42,9 @@ const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const DIFF_PAGE_BYTES = 48 * 1024;
 const MAX_GIT_STDERR_BYTES = 64 * 1024;
 const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
+const MAX_AGENT_LOG_PROJECTION_CHARACTERS = 1_024;
+const MAX_AGENT_LOG_PROJECTION_NODES = 100;
+const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 const execFileAsync = promisify(execFile);
@@ -136,25 +139,162 @@ function redactAgentLog(value: string, secrets: readonly string[]): string {
     .reduce((result, secret) => redactAgentLogSecret(result, secret), value);
 }
 
-function serializeAgentLogValue(value: unknown): string {
-  if (typeof value === "string") return value;
+function redactBoundedAgentLogString(
+  value: string,
+  secrets: readonly string[],
+  maxLength: number,
+): string {
+  const prefix = value.slice(0, maxLength);
+  let crossingSecretStart = prefix.length;
+  if (value.length > prefix.length) {
+    for (const secret of secrets) {
+      if (secret.length < 2) continue;
+      const firstCharacter = secret[0];
+      if (firstCharacter === undefined) continue;
+      const minimumStart = Math.max(0, prefix.length - secret.length + 1);
+      let start = prefix.lastIndexOf(firstCharacter);
+      while (start >= minimumStart) {
+        if (start + secret.length > prefix.length && value.startsWith(secret, start)) {
+          crossingSecretStart = Math.min(crossingSecretStart, start);
+          break;
+        }
+        start = prefix.lastIndexOf(firstCharacter, start - 1);
+      }
+    }
+  }
+  const bounded =
+    crossingSecretStart < prefix.length
+      ? `${prefix.slice(0, crossingSecretStart)}[REDACTED]`
+      : prefix;
+  return redactAgentLog(bounded, secrets);
+}
+
+interface AgentLogProjectionState {
+  remainingCharacters: number;
+  remainingNodes: number;
+  truncated: boolean;
+  readonly stack: Set<object>;
+}
+
+interface AgentLogProjection {
+  readonly raw: unknown;
+  readonly redacted: unknown;
+}
+
+function projectAgentLogString(
+  value: string,
+  secrets: readonly string[],
+  state: AgentLogProjectionState,
+): AgentLogProjection {
+  const length = Math.min(value.length, state.remainingCharacters);
+  const raw = value.slice(0, length);
+  const redacted = redactBoundedAgentLogString(value, secrets, length);
+  state.remainingCharacters -= length;
+  if (length < value.length) state.truncated = true;
+  return { raw, redacted };
+}
+
+function projectAgentLogValue(
+  value: unknown,
+  secrets: readonly string[],
+  state: AgentLogProjectionState,
+  depth = 0,
+): AgentLogProjection {
+  if (state.remainingNodes === 0 || depth > MAX_AGENT_LOG_PROJECTION_DEPTH) {
+    state.truncated = true;
+    return { raw: "[truncated]", redacted: "[truncated]" };
+  }
+  state.remainingNodes -= 1;
+  if (typeof value === "string") return projectAgentLogString(value, secrets, state);
+  if (typeof value === "bigint") throw new TypeError("BigInt is not JSON serializable.");
+  if (typeof value !== "object" || value === null) return { raw: value, redacted: value };
+  if (state.stack.has(value)) throw new TypeError("Circular agent log value.");
+
+  state.stack.add(value);
   try {
-    const serialized = JSON.stringify(value) as string | undefined;
-    return serialized ?? String(value);
+    if (Array.isArray(value)) {
+      const raw: unknown[] = [];
+      const redacted: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (state.remainingNodes === 0 || state.remainingCharacters === 0) {
+          state.truncated = true;
+          break;
+        }
+        const item = projectAgentLogValue(value[index], secrets, state, depth + 1);
+        raw.push(item.raw);
+        redacted.push(item.redacted);
+      }
+      return { raw, redacted };
+    }
+
+    const raw: Record<string, unknown> = {};
+    const redacted: Record<string, unknown> = {};
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      if (state.remainingNodes === 0 || state.remainingCharacters === 0) {
+        state.truncated = true;
+        break;
+      }
+      const projectedKey = projectAgentLogString(key, secrets, state);
+      const projectedValue = projectAgentLogValue(
+        (value as Record<string, unknown>)[key],
+        secrets,
+        state,
+        depth + 1,
+      );
+      raw[String(projectedKey.raw)] = projectedValue.raw;
+      redacted[String(projectedKey.redacted)] = projectedValue.redacted;
+    }
+    return { raw, redacted };
+  } finally {
+    state.stack.delete(value);
+  }
+}
+
+interface SerializedAgentLogValue {
+  readonly serialized: string;
+  readonly originalLength?: number;
+}
+
+function serializeAgentLogValue(
+  value: unknown,
+  secrets: readonly string[],
+): SerializedAgentLogValue {
+  if (typeof value === "string") {
+    return {
+      serialized: redactBoundedAgentLogString(value, secrets, MAX_AGENT_LOG_PROJECTION_CHARACTERS),
+      originalLength: value.length,
+    };
+  }
+  try {
+    const state: AgentLogProjectionState = {
+      remainingCharacters: MAX_AGENT_LOG_PROJECTION_CHARACTERS,
+      remainingNodes: MAX_AGENT_LOG_PROJECTION_NODES,
+      truncated: false,
+      stack: new Set(),
+    };
+    const projection = projectAgentLogValue(value, secrets, state);
+    const serialized = JSON.stringify(projection.redacted) as string | undefined;
+    const redacted = redactAgentLog(serialized ?? String(projection.redacted), secrets);
+    if (state.truncated) return { serialized: redacted };
+    const raw = JSON.stringify(projection.raw) as string | undefined;
+    return { serialized: redacted, originalLength: (raw ?? String(projection.raw)).length };
   } catch {
-    return "[unserializable value]";
+    return { serialized: "[unserializable value]", originalLength: 22 };
   }
 }
 
 function boundedAgentLogValue(value: unknown, secrets: readonly string[]): string {
-  const serialized = serializeAgentLogValue(value);
-  const redacted = redactAgentLog(serialized, secrets);
+  const result = serializeAgentLogValue(value, secrets);
+  const redacted = result.serialized;
   const preview =
     redacted.length > MAX_AGENT_LOG_PREVIEW_LENGTH
       ? `${redacted.slice(0, MAX_AGENT_LOG_PREVIEW_LENGTH - 1)}…`
       : redacted;
   const display = typeof value === "string" ? JSON.stringify(preview) : preview;
-  return `${display} [${serialized.length} chars]`;
+  const length =
+    result.originalLength === undefined ? "payload truncated" : `${result.originalLength} chars`;
+  return `${display} [${length}]`;
 }
 
 type AgentToolKind = "agent" | "mcp";
