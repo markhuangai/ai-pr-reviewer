@@ -136,7 +136,7 @@ function endpointQuerySecretCandidates(value: string): readonly string[] {
       if (parameter === undefined) return [];
       const [name, decodedValue] = parameter;
       if (
-        !/(?:^|[-_.])(?:access[-_.]?key|api[-_.]?key|auth(?:orization)?|credential|passw(?:or)?d|secret|signature|sig|token)(?:$|[-_.])/iu.test(
+        !/(?:^|[-_.])(?:access[-_.]?key|api[-_.]?key|auth(?:orization)?|credential|key|passw(?:or)?d|secret|signature|sig|token)(?:$|[-_.])/iu.test(
           name,
         )
       ) {
