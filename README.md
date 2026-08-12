@@ -31,7 +31,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      - uses: markhuangai/ai-pr-reviewer@v1
+      - uses: markhuangai/ai-pr-reviewer@v1.0.0
         with:
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
           ai-base-url: ${{ secrets.AI_BASE_URL }}
@@ -97,14 +97,27 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Security and release model
 
-The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies its SHA-256 digest, validates the bundle manifest, and starts the bundled Node runtime. After publishing the runtime assets, the release workflow advances the consumer-facing `v1` branch. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. Reference the action with an exact stable or release-candidate tag such as `v1.0.0` or `v1.0.1-rc.0`; branches, commit SHAs, and moving major tags are not supported. The bootstrap downloads the platform runtime from the GitHub Release with that exact tag, verifies its SHA-256 digest and versioned manifest, and starts the bundled Node runtime. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+
+Releases are started manually through the `Release runtime bundles` workflow with a version that omits the `v` prefix. A run selected on `dev` accepts only `X.Y.Z-rc.N` and creates a GitHub prerelease. A run selected on `main` accepts only `X.Y.Z`, requires the latest matching RC tag to be an ancestor with an identical Git tree, and promotes the exact verified RC assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
+
+The workflow creates and verifies the exact Git tag before publishing its release, so it cannot attach built assets to a racing tag at another commit. If publication fails after tag creation, the orphan tag deliberately blocks retries until an administrator inspects and removes it.
+
+The first release must be dispatched from `dev` as `1.0.0-rc.0`. Until the updated manual form is present on the default branch, use:
+
+```bash
+gh workflow run release.yml \
+  --repo markhuangai/ai-pr-reviewer \
+  --ref dev \
+  -f version=1.0.0-rc.0
+```
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 
 - every locked npm dependency must be at least 168 hours old before installation;
 - exact lockfile versions, integrity hashes, npm signature checks, lifecycle-script disabling, and no runtime package installation;
 - `npm audit --audit-level=high` blocks vulnerable releases;
-- workflows use readable major action versions whose current releases run on Node 24;
+- consumers use exact immutable action release tags;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
 CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` or `dev` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
@@ -123,7 +136,7 @@ npm run build
 npm run bundle:bootstrap
 ```
 
-Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. The release workflow uses npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, records the SDK and native CLI versions in each manifest, verifies archive checksums, and publishes the assets to the selected release. No container build is required.
+Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
 
 ## License
 

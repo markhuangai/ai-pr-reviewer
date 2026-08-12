@@ -17,12 +17,20 @@ function readPackage(raw: string): Record<string, unknown> {
 const [
   destination = "release",
   asset = "runtime-unknown.tar.gz",
-  releaseTag = "runtime-v1",
+  artifactTag = "v0.0.0-rc.0",
+  stableTag = "v0.0.0",
   sourceCommit = "unknown",
   rawTargetOs = process.platform,
   rawTargetCpu = process.arch,
   targetLibc = process.platform === "linux" ? "glibc" : "",
 ] = process.argv.slice(2);
+const artifactMatch =
+  /^(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-rc\.(?:0|[1-9][0-9]*)$/.exec(
+    artifactTag,
+  );
+if (!artifactMatch?.[1] || artifactMatch[1] !== stableTag) {
+  throw new Error("Runtime artifact and stable tags must be a matching RC/stable version pair.");
+}
 const target = `${rawTargetOs}/${rawTargetCpu}/${targetLibc}`;
 const supportedTargets = new Set([
   "darwin/arm64/",
@@ -77,7 +85,8 @@ await writeFile(
   `${bundle}/runtime/manifest.json`,
   `${JSON.stringify(
     {
-      releaseTag,
+      artifactTag,
+      stableTag,
       asset,
       nodeMajor: 24,
       sdkVersion: sdkPackage.version,

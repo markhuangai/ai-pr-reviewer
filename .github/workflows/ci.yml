@@ -40,7 +40,9 @@ jobs:
       - name: Verify reproducible compiled runtime
         run: npm run security:repro
       - name: Ensure generated bootstrap is present and stable
-        run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
+        run: >-
+          git diff --exit-code -- dist/bootstrap.js
+          dist/lib/bootstrap/archive.js dist/lib/bootstrap/version.js
 
   codeql:
     name: CodeQL
