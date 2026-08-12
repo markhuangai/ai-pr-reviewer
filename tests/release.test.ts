@@ -141,6 +141,24 @@ test("blocks exact draft releases and orphan tags", () => {
   );
 });
 
+test("blocks release progress while any exact-version tag is orphaned", () => {
+  const releases = history("v1.0.0-rc.0", "v1.0.0");
+  const tags = tagRecords("v1.0.0-rc.0", "v1.0.0", "v1.0.1-rc.0", "runtime-v1");
+  assert.throws(
+    () => validateReleaseRequest("1.1.0-rc.0", "dev", releases, tags),
+    /v1\.0\.1-rc\.0 exists as a Git tag without a published release/i,
+  );
+  assert.equal(
+    validateReleaseRequest(
+      "1.0.1-rc.0",
+      "dev",
+      releases,
+      tagRecords("v1.0.0-rc.0", "v1.0.0", "runtime-v1"),
+    ).release_tag,
+    "v1.0.1-rc.0",
+  );
+});
+
 test("fails closed on a corrupted exact-version release history", () => {
   assert.throws(
     () =>

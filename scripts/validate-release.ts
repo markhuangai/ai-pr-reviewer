@@ -202,7 +202,19 @@ export function validateReleaseRequest(
     fail(`${releaseTag} already exists as a Git tag.`);
   }
 
-  const state = replayHistory(readReleaseHistory(releaseValue));
+  const releaseHistory = readReleaseHistory(releaseValue);
+  const publishedTags = new Set(releaseHistory.map((release) => release.tag_name));
+  for (const record of tagRefs) {
+    const existingTag =
+      typeof record.ref === "string" && record.ref.startsWith("refs/tags/")
+        ? record.ref.slice("refs/tags/".length)
+        : undefined;
+    if (existingTag && parseVersionTag(existingTag) && !publishedTags.has(existingTag)) {
+      fail(`${existingTag} exists as a Git tag without a published release.`);
+    }
+  }
+
+  const state = replayHistory(releaseHistory);
   if (requested.rc !== undefined) {
     if (state.active) {
       if (!sameBase(state.active, requested) || requested.rc !== (state.active.rc ?? -1) + 1) {
