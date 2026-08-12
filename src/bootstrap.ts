@@ -5,9 +5,9 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
+import { isCompatibleRuntimeManifest, parseActionReleaseTag } from "./lib/bootstrap/version.js";
 
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
-const RELEASE_TAG = "runtime-v1";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10_000;
@@ -213,17 +213,24 @@ async function runRuntime(
 }
 
 async function main(): Promise<void> {
+  const releaseRef = process.env.GITHUB_ACTION_REF;
+  const requestedRelease = parseActionReleaseTag(releaseRef);
+  if (!requestedRelease) {
+    throw new Error(
+      "This action must be referenced by an exact release tag such as v1.0.0 or v1.0.0-rc.0.",
+    );
+  }
   const assetName = platformAssetName();
   const release = await fetchJson<ReleasePayload>(
-    `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}`,
+    `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
   );
   if (
-    release.tag_name !== RELEASE_TAG ||
-    release.draft === true ||
-    release.prerelease === true ||
+    release.tag_name !== requestedRelease.tag ||
+    release.draft !== false ||
+    release.prerelease !== requestedRelease.prerelease ||
     !Array.isArray(release.assets)
   ) {
-    throw new Error("The runtime release is not a stable, usable release.");
+    throw new Error("The runtime release does not match the requested action version.");
   }
   const assets = release.assets.map(readAsset);
   const asset = assets.find((candidate) => candidate.name === assetName);
@@ -235,7 +242,7 @@ async function main(): Promise<void> {
   const cacheRoot = join(
     process.env.RUNNER_TEMP ?? tmpdir(),
     "ai-pr-reviewer-runtime",
-    RELEASE_TAG,
+    requestedRelease.tag,
     assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
   );
   const archive = join(cacheRoot, assetName);
@@ -250,7 +257,7 @@ async function main(): Promise<void> {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
     if (
       !isRecord(manifest) ||
-      manifest.releaseTag !== RELEASE_TAG ||
+      !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
       manifest.asset !== assetName ||
       manifest.nodeMajor !== 24 ||
       typeof manifest.sdkVersion !== "string" ||
