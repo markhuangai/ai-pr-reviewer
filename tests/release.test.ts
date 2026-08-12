@@ -157,4 +157,12 @@ test("fails closed on a corrupted exact-version release history", () => {
     () => validateReleaseRequest("1.0.0-rc.1", "dev", [wrongFlag], []),
     /prerelease flag/i,
   );
+
+  const missingDraft = history("v1.0.0-rc.0", "v1.0.0", "v1.1.0-rc.0", "v1.1.0").map(
+    (item, index) => (index < 2 ? item : { ...item, draft: undefined }),
+  );
+  assert.throws(
+    () => validateReleaseRequest("1.0.1-rc.0", "dev", missingDraft, []),
+    /boolean draft flag/i,
+  );
 });

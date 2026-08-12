@@ -99,17 +99,16 @@ function readRecords<T>(value: unknown, name: string): T[] {
 function readReleaseHistory(value: unknown): PublishedRelease[] {
   const releases: PublishedRelease[] = [];
   for (const release of readRecords<ReleaseRecord>(value, "Release history")) {
-    if (
-      release.draft !== false ||
-      typeof release.tag_name !== "string" ||
-      parseVersionTag(release.tag_name) === undefined
-    ) {
-      continue;
+    const releaseTag = release.tag_name;
+    if (typeof releaseTag !== "string" || parseVersionTag(releaseTag) === undefined) continue;
+    if (typeof release.draft !== "boolean") {
+      fail(`${releaseTag} has no boolean draft flag.`);
     }
+    if (release.draft) continue;
     if (typeof release.published_at !== "string") {
-      fail(`${release.tag_name} has no publication timestamp.`);
+      fail(`${releaseTag} has no publication timestamp.`);
     }
-    releases.push({ ...release, tag_name: release.tag_name, published_at: release.published_at });
+    releases.push({ ...release, tag_name: releaseTag, published_at: release.published_at });
   }
   return releases.sort((left, right) => {
     const timeOrder = left.published_at.localeCompare(right.published_at);
