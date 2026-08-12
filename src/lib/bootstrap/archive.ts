@@ -9,7 +9,7 @@ export function isSafeArchiveEntryPath(value: string): boolean {
   return (
     path.length > 0 &&
     !path.startsWith("/") &&
-    !/^[A-Za-z]:\//.test(path) &&
+    !/^[A-Za-z]:/.test(path) &&
     !path.split("/").includes("..")
   );
 }
@@ -17,7 +17,7 @@ export function isSafeArchiveEntryPath(value: string): boolean {
 export function isSafeArchiveSymlink(entryPath: string, target: string): boolean {
   const path = normalized(entryPath);
   const link = normalized(target);
-  if (!isSafeArchiveEntryPath(path) || link.startsWith("/") || /^[A-Za-z]:\//.test(link)) {
+  if (!isSafeArchiveEntryPath(path) || link.startsWith("/") || /^[A-Za-z]:/.test(link)) {
     return false;
   }
   return isSafeArchiveEntryPath(posix.normalize(posix.join(posix.dirname(path), link)));

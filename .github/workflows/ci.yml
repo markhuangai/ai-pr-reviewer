@@ -12,12 +12,8 @@ permissions:
 
 jobs:
   quality:
-    name: Node ${{ matrix.node }} quality
+    name: Node 24 quality
     runs-on: docker-runner
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [24, 25]
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -27,7 +23,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
           cache: npm
       - name: Enforce dependency age quarantine before install
         run: node scripts/check-package-age.ts
@@ -45,3 +41,22 @@ jobs:
         run: npm run security:repro
       - name: Ensure generated bootstrap is present and stable
         run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
+
+  codeql:
+    name: CodeQL
+    runs-on: docker-runner
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4

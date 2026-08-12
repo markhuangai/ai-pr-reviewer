@@ -106,8 +106,10 @@ async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): P
   }
 }
 
-async function assertWorkspace(context: PullRequestContext): Promise<void> {
-  const cwd = process.env.GITHUB_WORKSPACE ?? process.cwd();
+async function assertWorkspace(
+  context: PullRequestContext,
+  cwd: string = process.env.GITHUB_WORKSPACE ?? process.cwd(),
+): Promise<void> {
   const { stdout: head } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
     cwd,
     encoding: "utf8",
@@ -118,14 +120,14 @@ async function assertWorkspace(context: PullRequestContext): Promise<void> {
       `Workspace HEAD ${head.trim()} does not match pull request head ${context.headSha}; refusing to review a mismatched checkout.`,
     );
   }
-  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain"], {
+  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain", "--ignored"], {
     cwd,
     encoding: "utf8",
     maxBuffer: 64 * 1024,
   });
   if (status.trim().length > 0) {
     throw new Error(
-      "The checked-out workspace has tracked or untracked changes; refusing to review it.",
+      "The checked-out workspace has tracked, untracked, or ignored content; refusing to review it.",
     );
   }
 }
@@ -212,4 +214,4 @@ export async function main(): Promise<void> {
   }
 }
 
-export const indexInternals = { inputSecretCandidates, redact, reviewSecrets };
+export const indexInternals = { assertWorkspace, inputSecretCandidates, redact, reviewSecrets };

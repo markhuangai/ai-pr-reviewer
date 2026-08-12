@@ -1,8 +1,15 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { indexInternals } from "../src/index.js";
-import type { ReviewConfig } from "../src/lib/types.js";
+import type { PullRequestContext, ReviewConfig } from "../src/lib/types.js";
+
+const execFileAsync = promisify(execFile);
 
 const config: ReviewConfig = {
   githubToken: "github-secret",
@@ -44,5 +51,46 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   assert.equal(
     indexInternals.redact("a data a prod production prod-prod", ["a", "prod"]),
     "[REDACTED] data [REDACTED] [REDACTED] production [REDACTED]-[REDACTED]",
+  );
+});
+
+test("workspace validation rejects ignored content", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-workspace-"));
+  t.after(() => rm(workspace, { force: true, recursive: true }));
+  await execFileAsync("git", ["init", "--quiet"], { cwd: workspace });
+  await writeFile(join(workspace, ".gitignore"), ".env\n");
+  await writeFile(join(workspace, "tracked.txt"), "tracked\n");
+  await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], { cwd: workspace });
+  await execFileAsync(
+    "git",
+    [
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.test",
+      "commit",
+      "--quiet",
+      "--message=initial",
+    ],
+    { cwd: workspace },
+  );
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace });
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: stdout.trim(),
+    baseSha: "base",
+    title: "Change",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+
+  await indexInternals.assertWorkspace(context, workspace);
+  await writeFile(join(workspace, ".env"), "SECRET=ignored\n");
+
+  await assert.rejects(
+    indexInternals.assertWorkspace(context, workspace),
+    /tracked, untracked, or ignored content/,
   );
 });

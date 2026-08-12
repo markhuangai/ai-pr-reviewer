@@ -13,6 +13,10 @@ test("allows npm bin symlinks that resolve inside the archive", () => {
 
 test("rejects archive paths and symlinks that escape the bundle", () => {
   assert.equal(isSafeArchiveEntryPath("../../etc/passwd"), false);
+  assert.equal(isSafeArchiveEntryPath("C:payload"), false);
+  assert.equal(isSafeArchiveEntryPath("C:..\\outside"), false);
   assert.equal(isSafeArchiveSymlink("runtime/link", "../../../../etc/passwd"), false);
   assert.equal(isSafeArchiveSymlink("runtime/link", "/etc/passwd"), false);
+  assert.equal(isSafeArchiveSymlink("runtime/link", "C:payload"), false);
+  assert.equal(isSafeArchiveSymlink("runtime/link", "C:..\\outside"), false);
 });

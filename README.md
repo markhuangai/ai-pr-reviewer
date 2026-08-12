@@ -102,6 +102,8 @@ The lockfile and release workflow enforce the project's supply-chain policy:
 - workflows use readable major action versions whose current releases run on Node 24;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
+CI also runs CodeQL JavaScript/TypeScript analysis for every pull request and push to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
+
 Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
 
 ## Development
