@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
+import * as core from "@actions/core";
 import {
   createSdkMcpServer,
   query as sdkQuery,
@@ -39,6 +40,7 @@ const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const DIFF_PAGE_BYTES = 48 * 1024;
 const MAX_GIT_STDERR_BYTES = 64 * 1024;
+const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 const execFileAsync = promisify(execFile);
@@ -112,6 +114,181 @@ function deferred<T>(): Deferred<T> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function redactAgentLogSecret(value: string, secret: string): string {
+  if (secret.length < 8 && /^[A-Za-z0-9]+$/u.test(secret)) {
+    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "gu");
+    return value.replace(pattern, "[REDACTED]");
+  }
+  return value.split(secret).join("[REDACTED]");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function redactAgentLog(value: string, secrets: readonly string[]): string {
+  return secrets
+    .filter((secret) => secret.length > 0)
+    .sort((left, right) => right.length - left.length)
+    .reduce((result, secret) => redactAgentLogSecret(result, secret), value);
+}
+
+function serializeAgentLogValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    const serialized = JSON.stringify(value) as string | undefined;
+    return serialized ?? String(value);
+  } catch {
+    return "[unserializable value]";
+  }
+}
+
+function boundedAgentLogValue(value: unknown, secrets: readonly string[]): string {
+  const serialized = serializeAgentLogValue(value);
+  const redacted = redactAgentLog(serialized, secrets);
+  const preview =
+    redacted.length > MAX_AGENT_LOG_PREVIEW_LENGTH
+      ? `${redacted.slice(0, MAX_AGENT_LOG_PREVIEW_LENGTH - 1)}…`
+      : redacted;
+  const display = typeof value === "string" ? JSON.stringify(preview) : preview;
+  return `${display} [${serialized.length} chars]`;
+}
+
+type AgentToolKind = "agent" | "mcp";
+
+interface AgentToolUse {
+  readonly kind: AgentToolKind;
+  readonly label: string;
+}
+
+type AgentLogWriter = (line: string) => void;
+
+function isMcpToolName(name: string): boolean {
+  return name.startsWith("mcp__");
+}
+
+function agentLogLine(
+  goalIndex: number,
+  kind: string,
+  label: string,
+  field: string,
+  value: unknown,
+  secrets: readonly string[],
+): string {
+  return `[ai-pr-reviewer][goal ${goalIndex + 1}] ${kind}${label.length === 0 ? "" : ` ${label}`} ${field}: ${boundedAgentLogValue(value, secrets)}`;
+}
+
+function logAgentMessage(
+  message: SDKMessage,
+  goalIndex: number,
+  secrets: readonly string[],
+  toolUses: Map<string, AgentToolUse>,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  if (message.type === "assistant") {
+    const content = isRecord(message.message) ? message.message.content : undefined;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!isRecord(block) || typeof block.type !== "string") continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        write(agentLogLine(goalIndex, "assistant message", "", "text", block.text, secrets));
+        continue;
+      }
+      if (
+        (block.type !== "tool_use" && block.type !== "mcp_tool_use") ||
+        typeof block.id !== "string" ||
+        typeof block.name !== "string"
+      ) {
+        continue;
+      }
+      const kind: AgentToolKind =
+        block.type === "mcp_tool_use" || isMcpToolName(block.name) ? "mcp" : "agent";
+      const label =
+        block.type === "mcp_tool_use" && typeof block.server_name === "string"
+          ? `${block.server_name}.${block.name}`
+          : block.name;
+      toolUses.set(block.id, { kind, label });
+      write(
+        agentLogLine(
+          goalIndex,
+          kind === "mcp" ? "MCP tool use" : "agent tool use",
+          label,
+          "input",
+          block.input,
+          secrets,
+        ),
+      );
+    }
+    return;
+  }
+
+  if (message.type !== "user") return;
+  const content = isRecord(message.message) ? message.message.content : undefined;
+  let loggedResult = false;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const blockType: string | undefined =
+        isRecord(block) && typeof block.type === "string" ? block.type : undefined;
+      if (
+        !isRecord(block) ||
+        (blockType !== "tool_result" && blockType !== "mcp_tool_result") ||
+        typeof block.tool_use_id !== "string"
+      ) {
+        continue;
+      }
+      const toolUse = toolUses.get(block.tool_use_id);
+      const kind: AgentToolKind =
+        blockType === "mcp_tool_result" || toolUse?.kind === "mcp" ? "mcp" : "agent";
+      const label = toolUse?.label ?? block.tool_use_id;
+      const output = {
+        ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
+        content: block.content,
+      };
+      write(
+        agentLogLine(
+          goalIndex,
+          kind === "mcp" ? "MCP tool result" : "agent tool result",
+          label,
+          "output",
+          output,
+          secrets,
+        ),
+      );
+      loggedResult = true;
+    }
+  }
+  if (!loggedResult && message.tool_use_result !== undefined) {
+    const toolUse =
+      typeof message.parent_tool_use_id === "string"
+        ? toolUses.get(message.parent_tool_use_id)
+        : undefined;
+    write(
+      agentLogLine(
+        goalIndex,
+        toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
+        toolUse?.label ?? message.parent_tool_use_id ?? "unknown",
+        "output",
+        message.tool_use_result,
+        secrets,
+      ),
+    );
+  }
+}
+
+function agentLogSecrets(config: ReviewConfig): readonly string[] {
+  return [
+    config.githubToken,
+    config.aiBaseUrl,
+    config.aiSecret,
+    ...Object.values(config.mcpServers).flatMap((server) => [
+      server.url,
+      ...Object.values(server.headers ?? {}),
+    ]),
+  ];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -633,6 +810,8 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   let toolCallCount = 0;
+  const logSecrets = agentLogSecrets(config);
+  const toolUses = new Map<string, AgentToolUse>();
   const diffReader = diff.createReader();
   const diffTool = tool(
     "read_pr_diff",
@@ -693,6 +872,7 @@ export async function runReviewGoal(
     reader = (async () => {
       try {
         for await (const message of session as AsyncIterable<SDKMessage>) {
+          logAgentMessage(message, goalIndex, logSecrets, toolUses);
           if (message.type === "result") {
             const completedTurn = turn;
             turn = deferred<SDKResultMessage>();
@@ -819,10 +999,13 @@ export async function runReviewGoals(
 }
 
 export const agentInternals = {
+  boundedAgentLogValue,
   changedFilePrompt,
   createPullRequestDiff,
   goalCommand,
+  logAgentMessage,
   PullRequestDiffReader,
+  redactAgentLog,
   reviewSubmissionRejection,
   resolveCommit,
   resolveMergeBase,

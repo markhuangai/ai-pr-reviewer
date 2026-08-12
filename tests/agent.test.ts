@@ -7,6 +7,8 @@ import test from "node:test";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
 import { agentInternals } from "../src/runtime/agent.js";
 import type { ChangedFile, PullRequestContext } from "../src/lib/types.js";
 
@@ -235,6 +237,76 @@ test("changed-file prompt contains metadata without REST patches", () => {
   assert.match(prompt, /path="src\/new\.ts"/u);
   assert.match(prompt, /previousPath="src\/old\.ts"/u);
   assert.equal(prompt.includes("secret patch text"), false);
+});
+
+test("logs assistant, agent-tool, and MCP events with bounded redacted payloads", () => {
+  const secret = "mcp-header-secret";
+  const longInput = `${secret}-${"x".repeat(260)}`;
+  const messages: SDKMessage[] = [
+    {
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "I will inspect the changed files." },
+          { type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "src/index.ts" } },
+          {
+            type: "mcp_tool_use",
+            id: "tool-2",
+            name: "lookup",
+            server_name: "security",
+            input: { query: longInput },
+          },
+        ],
+      },
+    } as unknown as SDKMessage,
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-1",
+            content: "Read output",
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "tool-2",
+            content: [{ type: "text", text: longInput }],
+            is_error: true,
+          },
+        ],
+      },
+    } as unknown as SDKMessage,
+  ];
+  const lines: string[] = [];
+  const toolUses = new Map<string, { readonly kind: "agent" | "mcp"; readonly label: string }>();
+  for (const message of messages)
+    agentInternals.logAgentMessage(message, 1, [secret], toolUses, (line) => lines.push(line));
+
+  assert.equal(lines.length, 5);
+  assert.match(lines[0] ?? "", /assistant message text: "I will inspect/u);
+  assert.match(lines[1] ?? "", /agent tool use Read input: \{"file_path":"src\/index\.ts"\}/u);
+  assert.match(lines[2] ?? "", /MCP tool use security\.lookup input:/u);
+  assert.match(lines[3] ?? "", /agent tool result Read output:/u);
+  assert.match(lines[4] ?? "", /MCP tool result security\.lookup output:/u);
+  assert.equal(
+    lines.every((line) => !line.includes(secret)),
+    true,
+  );
+  assert.match(lines[2] ?? "", /\[\d+ chars\]/u);
+  const preview = lines[2]?.match(/input: (.+) \[\d+ chars\]$/u)?.[1];
+  assert.ok(preview);
+  assert.ok(preview.length <= 202);
+  assert.match(lines[4] ?? "", /is_error/u);
+});
+
+test("serializes bounded agent log values without throwing on circular input", () => {
+  const circular: { self?: unknown } = {};
+  circular.self = circular;
+  const value = agentInternals.boundedAgentLogValue(circular, []);
+  assert.match(value, /unserializable value/u);
+  assert.match(value, /\[\d+ chars\]/u);
 });
 
 test("rejects review submission until the prompt is active and the diff reaches EOF", () => {
