@@ -468,3 +468,29 @@ test("partial goals force a comment and remain actionable", () => {
   );
   assert.equal(review.allGoalsFailed, false);
 });
+
+test("binary changed-file metadata does not block an otherwise qualified approval", () => {
+  const review = aggregateReview(
+    context,
+    config,
+    [
+      {
+        path: "assets/image.png",
+        status: "modified",
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+        addedLines: new Set(),
+      },
+    ],
+    [
+      {
+        prompt: "correctness",
+        status: "completed",
+        submission: { summary: "No text findings.", findings: [] },
+      },
+    ],
+  );
+  assert.equal(review.partial, false);
+  assert.equal(review.event, "APPROVE");
+});
