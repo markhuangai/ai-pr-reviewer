@@ -1,129 +1,249 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import type { TestContext } from "node:test";
+import { promisify } from "node:util";
 
 import { agentInternals } from "../src/runtime/agent.js";
-import type { ChangedFile } from "../src/lib/types.js";
+import type { ChangedFile, PullRequestContext } from "../src/lib/types.js";
 
-function patchWithContextLines(count: number): string {
-  return `@@ -1,${count + 1} +1,${count + 1} @@\n-old\n+new\n${" context\n".repeat(count)}`;
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
+  return stdout.trim();
 }
 
-test("keeps every changed-file header when patch excerpts exceed the budget", () => {
-  const files: readonly ChangedFile[] = [
-    {
-      path: "src/large.ts",
-      status: "modified",
-      additions: 1,
-      deletions: 1,
-      changes: 2,
-      patch: patchWithContextLines(4_000),
-      addedLines: new Set([1]),
-    },
-    {
-      path: "src/later.ts",
-      status: "added",
-      additions: 1,
-      deletions: 1,
-      changes: 2,
-      patch: "+later",
-      addedLines: new Set([1]),
-    },
-  ];
-  const prompt = agentInternals.changedFilePrompt(files);
-  assert.match(prompt, /### src\/large\.ts \[modified\]/);
-  assert.match(prompt, /### src\/later\.ts \[added\]/);
-  assert.match(prompt, /patch excerpt truncated/);
-});
-
-test("preserves deleted-file patches ahead of the ordinary patch budget", () => {
-  const prompt = agentInternals.changedFilePrompt([
-    {
-      path: "src/large.ts",
-      status: "modified",
-      additions: 1,
-      deletions: 1,
-      changes: 2,
-      patch: patchWithContextLines(4_000),
-      addedLines: new Set([1]),
-    },
-    {
-      path: "src/removed.ts",
-      status: "removed",
-      additions: 0,
-      deletions: 1,
-      changes: 1,
-      patch: "@@ -1 +0,0 @@\n-removed",
-      addedLines: new Set(),
-    },
+async function commit(cwd: string, message: string): Promise<string> {
+  await git(cwd, ["add", "."]);
+  await git(cwd, [
+    "-c",
+    "user.name=Test User",
+    "-c",
+    "user.email=test@example.test",
+    "commit",
+    "--quiet",
+    `--message=${message}`,
   ]);
-  assert.match(prompt, /### src\/removed\.ts \[removed\][\s\S]*-removed/);
-  assert.match(prompt, /### src\/large\.ts \[modified\][\s\S]*patch excerpt truncated/);
+  return git(cwd, ["rev-parse", "HEAD"]);
+}
+
+interface TestRepository {
+  readonly root: string;
+  readonly temporaryRoot: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly context: PullRequestContext;
+}
+
+async function makeRepository(
+  t: TestContext,
+  change: (root: string) => Promise<void>,
+  prepareBase?: (root: string) => Promise<void>,
+): Promise<TestRepository> {
+  const parent = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-agent-test-"));
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  const root = join(parent, "repository");
+  const temporaryRoot = join(parent, "temporary");
+  await mkdir(root);
+  await mkdir(temporaryRoot);
+  await git(root, ["init", "--quiet"]);
+  await writeFile(join(root, "review.txt"), "base\n");
+  await prepareBase?.(root);
+  const baseSha = await commit(root, "base");
+  await change(root);
+  const headSha = await commit(root, "head");
+  return {
+    root,
+    temporaryRoot,
+    baseSha,
+    headSha,
+    context: {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      baseSha,
+      headSha,
+      title: "Large change",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+  };
+}
+
+async function readCompleteDiff(
+  reader: InstanceType<typeof agentInternals.PullRequestDiffReader>,
+): Promise<{ readonly pages: number; readonly content: string }> {
+  let content = "";
+  let pages = 0;
+  try {
+    while (!reader.complete) {
+      const page = await reader.readNext();
+      pages += 1;
+      content += page.content;
+      assert.equal(page.page, pages);
+    }
+  } finally {
+    await reader.close();
+  }
+  return { pages, content };
+}
+
+test("streams a complete diff larger than the former character budget", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    const lines = Array.from({ length: 8_000 }, (_, index) => `changed-${String(index)}-🙂`);
+    await writeFile(join(root, "review.txt"), `${lines.join("\n")}\n`);
+    await writeFile(join(root, "later.txt"), "final-file-content\n");
+  });
+  const artifact = await agentInternals.createPullRequestDiff(
+    repository.context,
+    repository.root,
+    repository.temporaryRoot,
+  );
+  try {
+    assert.ok(artifact.size > 30_000);
+    const first = artifact.createReader();
+    const second = artifact.createReader();
+    const [firstResult, secondResult] = await Promise.all([
+      readCompleteDiff(first),
+      readCompleteDiff(second),
+    ]);
+    assert.ok(firstResult.pages > 1);
+    assert.equal(firstResult.content, secondResult.content);
+    assert.match(firstResult.content, /changed-7999-🙂/u);
+    assert.match(firstResult.content, /final-file-content/u);
+    assert.equal(firstResult.content.includes("�"), false);
+  } finally {
+    const artifactPath = artifact.path;
+    await artifact.cleanup();
+    await assert.rejects(access(artifactPath));
+  }
 });
 
-test("preserves the source path for renamed files", () => {
-  const prompt = agentInternals.changedFilePrompt([
+test("ignores pull-request diff attributes while omitting binary contents", async (t) => {
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await writeFile(join(root, ".gitattributes"), "* -diff\n");
+      await writeFile(join(root, "review.txt"), "visible source change\n");
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2, 4]));
+    },
+    async (root) => {
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2, 3]));
+    },
+  );
+  const artifact = await agentInternals.createPullRequestDiff(
+    repository.context,
+    repository.root,
+    repository.temporaryRoot,
+  );
+  try {
+    const result = await readCompleteDiff(artifact.createReader());
+    assert.match(result.content, /^\+\* -diff$/mu);
+    assert.match(result.content, /^\+visible source change$/mu);
+    assert.match(result.content, /Binary files/u);
+    assert.equal(result.content.includes("\u0000"), false);
+  } finally {
+    await artifact.cleanup();
+  }
+});
+
+test("returns one completed page for an empty diff", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "review.txt"), "head\n");
+  });
+  const artifact = await agentInternals.createPullRequestDiff(
+    { ...repository.context, baseSha: repository.headSha },
+    repository.root,
+    repository.temporaryRoot,
+  );
+  try {
+    const result = await readCompleteDiff(artifact.createReader());
+    assert.equal(result.pages, 1);
+    assert.equal(result.content, "");
+  } finally {
+    await artifact.cleanup();
+  }
+});
+
+test("includes deletions and renames in the fenced Git diff", async (t) => {
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await rm(join(root, "removed.txt"));
+      await git(root, ["mv", "old-name.txt", "new-name.txt"]);
+    },
+    async (root) => {
+      await writeFile(join(root, "removed.txt"), "removed content\n");
+      await writeFile(join(root, "old-name.txt"), "renamed content\n");
+    },
+  );
+  const artifact = await agentInternals.createPullRequestDiff(
+    repository.context,
+    repository.root,
+    repository.temporaryRoot,
+  );
+  try {
+    const result = await readCompleteDiff(artifact.createReader());
+    assert.match(result.content, /deleted file mode/u);
+    assert.match(result.content, /rename from old-name\.txt/u);
+    assert.match(result.content, /rename to new-name\.txt/u);
+  } finally {
+    await artifact.cleanup();
+  }
+});
+
+test("rejects non-full and unavailable commit SHAs", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "review.txt"), "head\n");
+  });
+  await assert.rejects(
+    agentInternals.createPullRequestDiff(
+      { ...repository.context, baseSha: repository.baseSha.slice(0, 12) },
+      repository.root,
+      repository.temporaryRoot,
+    ),
+    /not a full Git commit SHA/u,
+  );
+  await assert.rejects(
+    agentInternals.createPullRequestDiff(
+      { ...repository.context, headSha: "f".repeat(40) },
+      repository.root,
+      repository.temporaryRoot,
+    ),
+    /not available as a commit/u,
+  );
+});
+
+test("changed-file prompt contains metadata without REST patches", () => {
+  const files: readonly ChangedFile[] = [
     {
       path: "src/new.ts",
       previousPath: "src/old.ts",
       status: "renamed",
-      additions: 0,
-      deletions: 0,
-      changes: 0,
-      addedLines: new Set(),
+      additions: 1,
+      deletions: 1,
+      changes: 2,
+      patch: "secret patch text",
+      addedLines: new Set([1]),
     },
-  ]);
-  assert.match(prompt, /src\/new\.ts \(renamed from src\/old\.ts\) \[renamed\]/);
+  ];
+  const prompt = agentInternals.changedFilePrompt(files);
+  assert.match(prompt, /path="src\/new\.ts"/u);
+  assert.match(prompt, /previousPath="src\/old\.ts"/u);
+  assert.equal(prompt.includes("secret patch text"), false);
 });
 
-test("reports deleted diffs that cannot be supplied to a read-only reviewer", () => {
-  assert.deepEqual(
-    agentInternals.unavailableDiffs([
-      {
-        path: "src/binary.bin",
-        status: "removed",
-        additions: 0,
-        deletions: 1,
-        changes: 1,
-        addedLines: new Set(),
-      },
-      {
-        path: "src/large.bin",
-        status: "deleted",
-        additions: 0,
-        deletions: 1,
-        changes: 1,
-        patch: "x".repeat(30_001),
-        addedLines: new Set(),
-      },
-    ]),
-    ["src/binary.bin", "src/large.bin"],
+test("rejects review submission until the prompt is active and the diff reaches EOF", () => {
+  assert.equal(
+    agentInternals.reviewSubmissionRejection(false, false),
+    "Wait for the full review prompt before submitting.",
   );
-});
-
-test("fails closed when an ordinary changed-file patch is omitted", () => {
-  assert.deepEqual(
-    agentInternals.unavailableDiffs([
-      {
-        path: "src/changed.ts",
-        status: "modified",
-        additions: 1,
-        deletions: 1,
-        changes: 2,
-        patch: patchWithContextLines(3_000),
-        addedLines: new Set([1]),
-      },
-      {
-        path: "src/later.ts",
-        status: "modified",
-        additions: 1,
-        deletions: 1,
-        changes: 2,
-        patch: "+later",
-        addedLines: new Set([1]),
-      },
-    ]),
-    ["src/later.ts"],
-  );
+  assert.match(agentInternals.reviewSubmissionRejection(true, false) ?? "", /done=true/u);
+  assert.equal(agentInternals.reviewSubmissionRejection(true, true), undefined);
 });
 
 test("starts each review with a bounded Claude goal command", () => {

@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, open, realpath, rm, stat, type FileHandle } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative, resolve, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { StringDecoder } from "node:string_decoder";
+import { promisify } from "node:util";
 
 import {
   createSdkMcpServer,
@@ -17,7 +23,6 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { isPatchComplete } from "../lib/github-api.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -29,10 +34,14 @@ import type {
 } from "../lib/types.js";
 
 const MAX_REPAIR_ATTEMPTS = 5;
-const MAX_PROMPT_DIFF_LENGTH = 30_000;
 const MAX_GOAL_CONDITION_LENGTH = 4_000;
 const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
+const DIFF_PAGE_BYTES = 48 * 1024;
+const MAX_GIT_STDERR_BYTES = 64 * 1024;
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+
+const execFileAsync = promisify(execFile);
 
 const findingSchema = z
   .object({
@@ -281,60 +290,227 @@ function toSdkMcpServer(server: HttpMcpServer): McpServerConfig {
   };
 }
 
-function isDeletedFile(file: ChangedFile): boolean {
-  return file.status === "removed" || file.status === "deleted";
+interface PullRequestDiffPage {
+  readonly page: number;
+  readonly content: string;
+  readonly done: boolean;
 }
 
-function orderedChangedFiles(files: readonly ChangedFile[]): readonly ChangedFile[] {
-  return [...files.filter(isDeletedFile), ...files.filter((file) => !isDeletedFile(file))];
-}
+class PullRequestDiffReader {
+  private file: FileHandle | undefined;
+  private offset = 0;
+  private page = 0;
+  private reachedEnd = false;
+  private closed = false;
+  private operation: Promise<void> = Promise.resolve();
+  private readonly decoder = new StringDecoder("utf8");
 
-function unavailableDiffs(files: readonly ChangedFile[]): readonly string[] {
-  let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
-  const unavailable: string[] = [];
-  for (const file of orderedChangedFiles(files)) {
-    if (
-      file.patch === undefined ||
-      !isPatchComplete(file) ||
-      file.patch.length > remainingPatchLength
-    ) {
-      unavailable.push(file.path);
-      continue;
-    }
-    remainingPatchLength -= file.patch.length;
+  constructor(
+    private readonly path: string,
+    private readonly size: number,
+  ) {}
+
+  get complete(): boolean {
+    return this.reachedEnd;
   }
-  return unavailable;
+
+  readNext(): Promise<PullRequestDiffPage> {
+    const result = this.operation.then(() => this.readNextPage());
+    this.operation = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async close(): Promise<void> {
+    await this.operation;
+    if (this.closed) return;
+    this.closed = true;
+    await this.file?.close();
+    this.file = undefined;
+  }
+
+  private async readNextPage(): Promise<PullRequestDiffPage> {
+    if (this.closed) throw new Error("Cannot read a closed pull request diff.");
+    if (this.reachedEnd) return { page: this.page, content: "", done: true };
+    this.file ??= await open(this.path, "r");
+    this.page += 1;
+    if (this.size === 0) {
+      this.reachedEnd = true;
+      return { page: this.page, content: this.decoder.end(), done: true };
+    }
+    const buffer = Buffer.allocUnsafe(Math.min(DIFF_PAGE_BYTES, this.size - this.offset));
+    const { bytesRead } = await this.file.read(buffer, 0, buffer.length, this.offset);
+    if (bytesRead === 0) {
+      throw new Error("The pull request diff ended before its recorded size.");
+    }
+    this.offset += bytesRead;
+    const done = this.offset === this.size;
+    const content =
+      this.decoder.write(buffer.subarray(0, bytesRead)) + (done ? this.decoder.end() : "");
+    this.reachedEnd = done;
+    return { page: this.page, content, done };
+  }
+}
+
+class PullRequestDiffArtifact {
+  constructor(
+    readonly mergeBaseSha: string,
+    readonly path: string,
+    readonly size: number,
+    private readonly directory: string,
+  ) {}
+
+  createReader(): PullRequestDiffReader {
+    return new PullRequestDiffReader(this.path, this.size);
+  }
+
+  async cleanup(): Promise<void> {
+    await rm(this.directory, { force: true, recursive: true });
+  }
+}
+
+async function resolveCommit(cwd: string, sha: string, label: string): Promise<string> {
+  if (!COMMIT_SHA_PATTERN.test(sha)) throw new Error(`${label} is not a full Git commit SHA.`);
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync("git", ["rev-parse", "--verify", `${sha}^{commit}`], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: MAX_GIT_STDERR_BYTES,
+    }));
+  } catch (error) {
+    throw new Error(
+      `${label} is not available as a commit in the checkout: ${errorMessage(error)}`,
+    );
+  }
+  const resolved = stdout.trim();
+  if (!COMMIT_SHA_PATTERN.test(resolved) || resolved.toLowerCase() !== sha.toLowerCase()) {
+    throw new Error(`${label} did not resolve to the exact requested commit.`);
+  }
+  return resolved;
+}
+
+async function resolveMergeBase(cwd: string, baseSha: string, headSha: string): Promise<string> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync("git", ["merge-base", baseSha, headSha], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: MAX_GIT_STDERR_BYTES,
+    }));
+  } catch (error) {
+    throw new Error(`Could not resolve the pull request merge base: ${errorMessage(error)}`);
+  }
+  const mergeBase = stdout.trim();
+  if (!COMMIT_SHA_PATTERN.test(mergeBase)) {
+    throw new Error("Git returned an invalid pull request merge base.");
+  }
+  return mergeBase;
+}
+
+async function streamGitDiff(
+  cwd: string,
+  mergeBaseSha: string,
+  headSha: string,
+  path: string,
+): Promise<void> {
+  const child = spawn(
+    "git",
+    [
+      `--attr-source=${mergeBaseSha}`,
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--full-index",
+      mergeBaseSha,
+      headSha,
+      "--",
+    ],
+    {
+      cwd,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const stderr: Buffer[] = [];
+  let stderrBytes = 0;
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (stderrBytes >= MAX_GIT_STDERR_BYTES) return;
+    const available = MAX_GIT_STDERR_BYTES - stderrBytes;
+    const bounded = chunk.subarray(0, available);
+    stderr.push(bounded);
+    stderrBytes += bounded.length;
+  });
+  const exited = new Promise<{
+    readonly code: number | null;
+    readonly signal: NodeJS.Signals | null;
+  }>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("close", (code, signal) => {
+      resolveExit({ code, signal });
+    });
+  });
+  const streamed = pipeline(
+    child.stdout,
+    createWriteStream(path, { flags: "wx", mode: 0o600 }),
+  ).catch((error: unknown) => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    throw error;
+  });
+  const [streamOutcome, exitOutcome] = await Promise.allSettled([streamed, exited]);
+  const failures: string[] = [];
+  if (streamOutcome.status === "rejected") failures.push(errorMessage(streamOutcome.reason));
+  if (exitOutcome.status === "rejected") failures.push(errorMessage(exitOutcome.reason));
+  else if (exitOutcome.value.code !== 0) {
+    const details = Buffer.concat(stderr).toString("utf8").trim();
+    const status =
+      exitOutcome.value.signal === null
+        ? `exit code ${String(exitOutcome.value.code)}`
+        : `signal ${exitOutcome.value.signal}`;
+    failures.push(`Git diff failed with ${status}${details.length === 0 ? "." : `: ${details}`}`);
+  }
+  if (failures.length > 0) throw new Error([...new Set(failures)].join("; "));
+}
+
+async function createPullRequestDiff(
+  context: PullRequestContext,
+  cwd: string,
+  requestedTemporaryRoot = process.env.RUNNER_TEMP?.trim() || tmpdir(),
+): Promise<PullRequestDiffArtifact> {
+  const repositoryRoot = await realpath(cwd);
+  const temporaryRoot = await realpath(resolve(requestedTemporaryRoot));
+  if (isWithinRepository(repositoryRoot, temporaryRoot)) {
+    throw new Error("The pull request diff temporary directory must be outside the checkout.");
+  }
+  const baseSha = await resolveCommit(repositoryRoot, context.baseSha, "Pull request base SHA");
+  const headSha = await resolveCommit(repositoryRoot, context.headSha, "Pull request head SHA");
+  const mergeBaseSha = await resolveMergeBase(repositoryRoot, baseSha, headSha);
+  const directory = await mkdtemp(join(temporaryRoot, "ai-pr-reviewer-diff-"));
+  const path = join(directory, "pull-request.diff");
+  try {
+    await streamGitDiff(repositoryRoot, mergeBaseSha, headSha, path);
+    const { size } = await stat(path);
+    return new PullRequestDiffArtifact(mergeBaseSha, path, size, directory);
+  } catch (error) {
+    await rm(directory, { force: true, recursive: true });
+    throw error;
+  }
 }
 
 function changedFilePrompt(files: readonly ChangedFile[]): string {
-  let remainingPatchLength = MAX_PROMPT_DIFF_LENGTH;
-  const entries = orderedChangedFiles(files).map((file) => {
-    const patch = !isPatchComplete(file)
-      ? "(patch unavailable or truncated; the review will fail closed)"
-      : (file.patch ?? "");
-    let patchExcerpt = patch;
-    if (!isPatchComplete(file)) {
-      patchExcerpt = isDeletedFile(file)
-        ? "(deleted-file patch unavailable or truncated; the review will fail closed)"
-        : "(patch unavailable or truncated; the review will fail closed)";
-    } else if (remainingPatchLength <= 0) {
-      patchExcerpt = isDeletedFile(file)
-        ? "(deleted-file patch omitted; the review will fail closed)"
-        : "(patch excerpt omitted; the review will fail closed)";
-    } else if (patch.length > remainingPatchLength) {
-      patchExcerpt = `${patch.slice(0, remainingPatchLength)}\n${
-        isDeletedFile(file)
-          ? "(deleted-file patch truncated; the review will fail closed)"
-          : "(patch excerpt truncated; the review will fail closed)"
-      }`;
-      remainingPatchLength = 0;
-    } else {
-      remainingPatchLength -= patch.length;
-    }
-    const rename = file.previousPath === undefined ? "" : ` (renamed from ${file.previousPath})`;
-    return `### ${file.path}${rename} [${file.status}]\n${patchExcerpt}`;
-  });
-  return entries.join("\n\n");
+  if (files.length === 0) return "(GitHub reported no changed files.)";
+  return files
+    .map((file) => {
+      const previousPath =
+        file.previousPath === undefined
+          ? ""
+          : `; previousPath=${JSON.stringify(file.previousPath)}`;
+      return `- path=${JSON.stringify(file.path)}; status=${JSON.stringify(file.status)}; additions=${file.additions}; deletions=${file.deletions}${previousPath}`;
+    })
+    .join("\n");
 }
 
 function goalCommand(goal: string): string {
@@ -353,22 +529,38 @@ function buildGoalPrompt(
   goal: string,
   context: PullRequestContext,
   files: readonly ChangedFile[],
+  mergeBaseSha: string,
 ): string {
   return `You are an isolated pull-request reviewer. Treat the following instruction as your one review goal:
 
 ${goal}
 
-Review pull request #${context.number} (${context.title}) at head ${context.headSha}. The checkout is the repository under the current working directory. The changed-file list and diff excerpts are below:
+Review pull request #${context.number} (${context.title}) at head ${context.headSha}. The checkout is the repository under the current working directory. The pull request text diff is fenced from merge base ${mergeBaseSha} to head ${context.headSha}.
 
 ${changedFilePrompt(files)}
 
-Read the relevant changed files and nearby definitions before deciding. This session is read-only: use only Read, Glob, Grep, the explicitly configured HTTP MCP tools, and the internal review output tool. Never use Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Task, Agent, or project settings. Do not make assumptions about code that you did not inspect.
+You MUST call mcp__review_output__read_pr_diff repeatedly until it returns done=true. Each call returns the next bounded page for this session; pages cannot be skipped and every goal receives the complete text diff. Binary file contents are intentionally excluded from review and must not produce a finding merely because their contents are unavailable.
 
-When finished, you MUST call mcp__review_output__submit_review exactly once. Submit only actionable, evidence-based findings. Use a changed-file path and an added-line number only when the line is present in the supplied pull-request diff; otherwise omit the location and explain the evidence in the body. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
+Read the relevant changed files and nearby definitions before deciding. This session is read-only: use only Read, Glob, Grep, the explicitly configured HTTP MCP tools, and the internal review tools. Never use Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Task, Agent, or project settings. Do not make assumptions about code that you did not inspect.
+
+After reading the complete diff, call mcp__review_output__submit_review exactly once. Submit only actionable, evidence-based findings. Use a changed-file path and an added-line number only when the line is present in the supplied pull-request diff; otherwise omit the location and explain the evidence in the body. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
 }
 
-function repairPrompt(attempt: number): string {
-  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. Do not continue investigating. Call mcp__review_output__submit_review now with a schema-valid JSON object containing summary and findings. Use an empty findings array if no issue is supported by the evidence.`;
+function reviewSubmissionRejection(
+  reviewPromptActive: boolean,
+  diffComplete: boolean,
+): string | undefined {
+  if (!reviewPromptActive) return "Wait for the full review prompt before submitting.";
+  if (!diffComplete)
+    return "Review submission rejected. Read the pull request diff until done=true first.";
+  return undefined;
+}
+
+function repairPrompt(attempt: number, diffComplete: boolean): string {
+  const nextAction = diffComplete
+    ? "Do not continue investigating. Call mcp__review_output__submit_review now"
+    : "Continue calling mcp__review_output__read_pr_diff until it returns done=true, then call mcp__review_output__submit_review";
+  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Use an empty findings array if no issue is supported by the evidence.`;
 }
 
 function makeUserMessage(text: string): SDKUserMessage {
@@ -398,6 +590,7 @@ function makeOptions(
       "Read",
       "Glob",
       "Grep",
+      `mcp__${outputServerName}__read_pr_diff`,
       `mcp__${outputServerName}__submit_review`,
       ...externalNames,
     ],
@@ -424,7 +617,7 @@ function makeOptions(
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
     systemPrompt:
-      "You are a security-conscious, read-only code reviewer. Every claim must be grounded in inspected repository content or an explicitly available MCP response. Never modify files, execute commands, access the web, or reveal credentials.",
+      "You are a security-conscious, read-only code reviewer. Read the internal pull request diff to completion before submitting. Every claim must be grounded in inspected repository content or an explicitly available MCP response. Never modify files, execute commands, access the web, or reveal credentials.",
   };
 }
 
@@ -434,27 +627,37 @@ export async function runReviewGoal(
   context: PullRequestContext,
   files: readonly ChangedFile[],
   config: ReviewConfig,
+  diff: PullRequestDiffArtifact,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
 ): Promise<GoalResult> {
-  const unavailableFiles = unavailableDiffs(files);
-  if (unavailableFiles.length > 0) {
-    return {
-      prompt: goal,
-      status: "failed",
-      error: `Changed-file diffs are unavailable for: ${unavailableFiles.join(", ")}. Refusing to complete a review without their evidence.`,
-    };
-  }
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   let toolCallCount = 0;
+  const diffReader = diff.createReader();
+  const diffTool = tool(
+    "read_pr_diff",
+    "Read the next page of the immutable pull request text diff. Call repeatedly until done is true.",
+    {},
+    async (): Promise<CallToolResult> => {
+      if (!reviewPromptActive) {
+        return {
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        };
+      }
+      const page = await diffReader.readNext();
+      return { content: [{ type: "text", text: JSON.stringify(page) }] };
+    },
+    { alwaysLoad: true },
+  );
   const outputTool = tool(
     "submit_review",
     "Submit the validated findings for this isolated review goal.",
     submissionSchema.shape,
     (input): Promise<CallToolResult> => {
-      if (!reviewPromptActive) {
+      const rejection = reviewSubmissionRejection(reviewPromptActive, diffReader.complete);
+      if (rejection !== undefined) {
         return Promise.resolve({
-          content: [{ type: "text", text: "Wait for the full review prompt before submitting." }],
+          content: [{ type: "text", text: rejection }],
         });
       }
       toolCallCount += 1;
@@ -468,8 +671,9 @@ export async function runReviewGoal(
     [outputServerName]: createSdkMcpServer({
       name: outputServerName,
       version: "1.0.0",
-      instructions: "Call submit_review exactly once when the review goal is complete.",
-      tools: [outputTool],
+      instructions:
+        "Call read_pr_diff until done=true, then call submit_review exactly once when the review goal is complete.",
+      tools: [diffTool, outputTool],
       alwaysLoad: true,
     }),
   };
@@ -501,7 +705,7 @@ export async function runReviewGoal(
       }
     })();
     input.push(makeUserMessage(goalCommand(goal)));
-    input.push(makeUserMessage(buildGoalPrompt(goal, context, files)));
+    input.push(makeUserMessage(buildGoalPrompt(goal, context, files, diff.mergeBaseSha)));
     let repairAttempts = 0;
     for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS + 1; turnIndex += 1) {
       const result = await turn.promise;
@@ -559,7 +763,7 @@ export async function runReviewGoal(
         };
       }
       repairAttempts += 1;
-      input.push(makeUserMessage(repairPrompt(repairAttempts)));
+      input.push(makeUserMessage(repairPrompt(repairAttempts, diffReader.complete)));
     }
     input.finish();
     await reader;
@@ -572,6 +776,8 @@ export async function runReviewGoal(
     input.finish();
     if (reader) await reader.catch(() => undefined);
     return { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) };
+  } finally {
+    await diffReader.close();
   }
 }
 
@@ -579,7 +785,9 @@ export async function runReviewGoals(
   context: PullRequestContext,
   files: readonly ChangedFile[],
   config: ReviewConfig,
+  cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
 ): Promise<readonly GoalResult[]> {
+  const diff = await createPullRequestDiff(context, cwd);
   const results: Array<GoalResult | undefined> = Array.from(
     { length: config.reviewPrompts.length },
     () => undefined,
@@ -591,27 +799,33 @@ export async function runReviewGoals(
       cursor += 1;
       const prompt = config.reviewPrompts[index];
       if (prompt === undefined) return;
-      results[index] = await runReviewGoal(prompt, index, context, files, config);
+      results[index] = await runReviewGoal(prompt, index, context, files, config, diff, cwd);
     }
   };
-  const workerCount = Math.min(config.parallelCount, config.reviewPrompts.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results.map(
-    (result, index) =>
-      result ?? {
-        prompt: config.reviewPrompts[index] ?? "",
-        status: "failed",
-        error: "Worker did not return a result.",
-      },
-  );
+  try {
+    const workerCount = Math.min(config.parallelCount, config.reviewPrompts.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results.map(
+      (result, index) =>
+        result ?? {
+          prompt: config.reviewPrompts[index] ?? "",
+          status: "failed",
+          error: "Worker did not return a result.",
+        },
+    );
+  } finally {
+    await diff.cleanup();
+  }
 }
 
 export const agentInternals = {
   changedFilePrompt,
+  createPullRequestDiff,
   goalCommand,
-  isDeletedFile,
-  orderedChangedFiles,
-  unavailableDiffs,
+  PullRequestDiffReader,
+  reviewSubmissionRejection,
+  resolveCommit,
+  resolveMergeBase,
   isSafeGlobPattern,
   isSafeGrepGlob,
   isGitMetadataPath,
