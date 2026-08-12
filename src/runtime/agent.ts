@@ -419,6 +419,7 @@ async function streamGitDiff(
   const child = spawn(
     "git",
     [
+      `--attr-source=${mergeBaseSha}`,
       "diff",
       "--no-ext-diff",
       "--no-textconv",

@@ -123,10 +123,18 @@ test("streams a complete diff larger than the former character budget", async (t
   }
 });
 
-test("omits binary contents without blocking diff completion", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), Buffer.from([0, 1, 2, 3, 4, 5]));
-  });
+test("ignores pull-request diff attributes while omitting binary contents", async (t) => {
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await writeFile(join(root, ".gitattributes"), "* -diff\n");
+      await writeFile(join(root, "review.txt"), "visible source change\n");
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2, 4]));
+    },
+    async (root) => {
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2, 3]));
+    },
+  );
   const artifact = await agentInternals.createPullRequestDiff(
     repository.context,
     repository.root,
@@ -134,6 +142,8 @@ test("omits binary contents without blocking diff completion", async (t) => {
   );
   try {
     const result = await readCompleteDiff(artifact.createReader());
+    assert.match(result.content, /^\+\* -diff$/mu);
+    assert.match(result.content, /^\+visible source change$/mu);
     assert.match(result.content, /Binary files/u);
     assert.equal(result.content.includes("\u0000"), false);
   } finally {

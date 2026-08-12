@@ -86,7 +86,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
 - Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
-- The action streams one immutable merge-base-to-head Git text diff outside the checkout. Every goal reads the complete diff through its own ordered, bounded internal reader before `submit_review` is accepted; there is no fixed aggregate character limit.
+- The action streams one immutable merge-base-to-head Git text diff outside the checkout. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. Every goal reads the complete diff through its own ordered, bounded internal reader before `submit_review` is accepted; there is no fixed aggregate character limit.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
@@ -113,7 +113,7 @@ Secrets are passed to the AI SDK only through its authentication environment var
 
 ## Development
 
-Node 24+ and npm 12 are required. Dependencies must be installed with lifecycle scripts disabled:
+Node 24+, npm 12, and Git 2.43+ are required. Dependencies must be installed with lifecycle scripts disabled:
 
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund
