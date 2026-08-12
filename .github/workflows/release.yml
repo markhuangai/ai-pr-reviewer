@@ -94,6 +94,12 @@ jobs:
           NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
           NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify target npm signatures
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
+        run: npm audit signatures
       - name: Build and prune development dependencies
         shell: bash
         env:
