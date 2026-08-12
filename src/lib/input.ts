@@ -135,9 +135,10 @@ function endpointQuerySecretCandidates(value: string): readonly string[] {
       const parameter = new URLSearchParams(entry).entries().next().value;
       if (parameter === undefined) return [];
       const [name, decodedValue] = parameter;
+      const normalizedName = name.replace(/([a-z0-9])([A-Z])/gu, "$1-$2");
       if (
         !/(?:^|[-_.])(?:access[-_.]?key|api[-_.]?key|auth(?:orization)?|credential|key|passw(?:or)?d|secret|signature|sig|token)(?:$|[-_.])/iu.test(
-          name,
+          normalizedName,
         )
       ) {
         return [];
