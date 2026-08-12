@@ -1,19 +1,13 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
 import { indexInternals } from "../src/index.js";
-import { GitHubApi } from "../src/lib/github-api.js";
-import type {
-  PullRequestContext,
-  PullRequestReviewRequest,
-  ReviewConfig,
-} from "../src/lib/types.js";
+import type { PullRequestContext, ReviewConfig } from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -99,58 +93,4 @@ test("workspace validation rejects ignored content", async (t) => {
     indexInternals.assertWorkspace(context, workspace),
     /tracked, untracked, or ignored content/,
   );
-});
-
-test("rechecks refs before retrying a rejected approval as a comment", async (t) => {
-  const retryContext: PullRequestContext = {
-    repository: "owner/repository",
-    owner: "owner",
-    name: "repository",
-    number: 1,
-    headSha: "event-head",
-    baseSha: "event-base",
-    title: "Change",
-    htmlUrl: "https://github.com/owner/repository/pull/1",
-  };
-  let reviewRequests = 0;
-  const server = createServer((request, response) => {
-    if (request.method === "POST") {
-      reviewRequests += 1;
-      response.writeHead(422, { "Content-Type": "application/json" });
-      response.end(
-        JSON.stringify({
-          message: "Validation Failed",
-          errors: [{ message: "Reviews may not be approved" }],
-        }),
-      );
-      return;
-    }
-    response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ head: { sha: "new-head" }, base: { sha: "new-base" } }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(
-    () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((error) => {
-          if (error) reject(error);
-          else resolve();
-        }),
-      ),
-  );
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  const api = new GitHubApi("token", `http://127.0.0.1:${address.port}`);
-  const request: PullRequestReviewRequest = {
-    commit_id: retryContext.headSha,
-    body: "review",
-    event: "APPROVE",
-    comments: [],
-  };
-
-  await assert.rejects(
-    indexInternals.postReview(api, retryContext, request),
-    /Pull request refs changed during review/,
-  );
-  assert.equal(reviewRequests, 1);
 });

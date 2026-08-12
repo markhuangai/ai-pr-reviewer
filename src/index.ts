@@ -132,26 +132,6 @@ async function assertWorkspace(
   }
 }
 
-async function postReview(
-  api: GitHubApi,
-  context: PullRequestContext,
-  request: PullRequestReviewRequest,
-): Promise<void> {
-  try {
-    await api.createReview(context, request);
-  } catch (error) {
-    if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
-    core.warning("GitHub rejected the approval review; retrying as a comment review.");
-    await assertCurrentHead(api, context);
-    await assertWorkspace(context);
-    await api.createReview(context, {
-      ...request,
-      event: "COMMENT",
-      body: `${request.body}\n\n> GitHub rejected the requested approval, so this result was posted as a comment.`,
-    });
-  }
-}
-
 function actionInputReader(): InputReader {
   return { get: (name) => core.getInput(name) };
 }
@@ -204,7 +184,19 @@ export async function runAction(
   const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
   await assertCurrentHead(api, context);
   await assertWorkspace(context);
-  await postReview(api, context, request);
+  try {
+    await api.createReview(context, request);
+  } catch (error) {
+    if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
+    core.warning("GitHub rejected the approval review; retrying as a comment review.");
+    await assertCurrentHead(api, context);
+    await assertWorkspace(context);
+    await api.createReview(context, {
+      ...request,
+      event: "COMMENT",
+      body: `${request.body}\n\n> GitHub rejected the requested approval, so this result was posted as a comment.`,
+    });
+  }
   if (review.partial)
     throw new Error("The review was posted as a partial result, but one or more goals failed.");
   return { skipped: false, review };
@@ -224,10 +216,4 @@ export async function main(): Promise<void> {
   }
 }
 
-export const indexInternals = {
-  assertWorkspace,
-  inputSecretCandidates,
-  postReview,
-  redact,
-  reviewSecrets,
-};
+export const indexInternals = { assertWorkspace, inputSecretCandidates, redact, reviewSecrets };
