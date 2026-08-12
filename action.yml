@@ -1,0 +1,44 @@
+name: AI pull request reviewer
+description: Review any GitHub pull request with isolated Claude Agent SDK goal sessions.
+author: MarkHuang.ai
+inputs:
+  github-pat:
+    description: A GitHub PAT that can read the pull request and create pull request reviews.
+    required: true
+  ai-base-url:
+    description: Anthropic Messages API-compatible base URL.
+    required: true
+  ai-secret:
+    description: Secret for the configured AI endpoint.
+    required: true
+  ai-auth-mode:
+    description: Authentication header mode used by the Claude Agent SDK.
+    required: false
+    default: api-key
+  model:
+    description: Model identifier accepted by the configured AI endpoint.
+    required: true
+  review-prompts:
+    description: A JSON string array or newline-separated list of review goals.
+    required: true
+  parallel-count:
+    description: Maximum number of isolated goal sessions running concurrently.
+    required: false
+    default: "5"
+  max-turns:
+    description: Maximum Claude Agent SDK turns per goal session, including the initial /goal setup turn.
+    required: false
+    default: "50"
+  auto-approve:
+    description: Approve only a complete review with no Critical, High, or Medium findings.
+    required: false
+    default: "false"
+  mcp-servers:
+    description: Strict YAML mapping of optional HTTP MCP servers.
+    required: false
+runs:
+  using: node24
+  main: dist/bootstrap.js
+branding:
+  color: purple
+  icon: eye

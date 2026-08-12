@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Node 24 quality
+    runs-on: docker-runner
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Enforce dependency age quarantine before install
+        run: node scripts/check-package-age.ts
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify npm signatures
+        run: npm audit signatures
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Check formatting, lint, types, and unit tests
+        run: npm run check
+      - name: Build compiled runtime and bootstrap
+        run: npm run build && npm run bundle:bootstrap
+      - name: Verify reproducible compiled runtime
+        run: npm run security:repro
+      - name: Ensure generated bootstrap is present and stable
+        run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
+
+  codeql:
+    name: CodeQL
+    runs-on: docker-runner
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          build-mode: none
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4

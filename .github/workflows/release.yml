@@ -1,0 +1,204 @@
+name: Release runtime bundles
+
+on:
+  push:
+    tags:
+      - "v1"
+      - "v1.*"
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Release tag to create or update (runtime-v1 is the stable runtime release).
+        required: true
+        default: runtime-v1
+
+concurrency:
+  group: ai-pr-reviewer-release-${{ github.event.inputs.release-tag || 'runtime-v1' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: Release checks
+    runs-on: docker-runner
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Enforce dependency age quarantine before install
+        run: node scripts/check-package-age.ts
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify npm signatures
+        run: npm audit signatures
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+      - name: Test and build
+        run: npm run check && npm run build && npm run bundle:bootstrap && npm run security:repro
+      - name: Verify generated bootstrap
+        run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
+
+  build-runtime:
+    name: Build ${{ matrix.asset }}
+    needs: security
+    runs-on: docker-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: runtime-linux-x64.tar.gz
+            target_os: linux
+            target_cpu: x64
+            target_libc: glibc
+          - asset: runtime-linux-arm64.tar.gz
+            target_os: linux
+            target_cpu: arm64
+            target_libc: glibc
+          - asset: runtime-win32-x64.tar.gz
+            target_os: win32
+            target_cpu: x64
+            target_libc: ""
+          - asset: runtime-win32-arm64.tar.gz
+            target_os: win32
+            target_cpu: arm64
+            target_libc: ""
+          - asset: runtime-darwin-x64.tar.gz
+            target_os: darwin
+            target_cpu: x64
+            target_libc: ""
+          - asset: runtime-darwin-arm64.tar.gz
+            target_os: darwin
+            target_cpu: arm64
+            target_libc: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install locked dependencies without lifecycle scripts
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify target npm signatures
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
+        run: npm audit signatures
+      - name: Build and prune development dependencies
+        shell: bash
+        env:
+          NPM_CONFIG_OS: ${{ matrix.target_os }}
+          NPM_CONFIG_CPU: ${{ matrix.target_cpu }}
+          NPM_CONFIG_LIBC: ${{ matrix.target_libc }}
+        run: |
+          set -euo pipefail
+          npm run build
+          npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Prepare runtime bundle
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
+        run: >-
+          node scripts/prepare-runtime.ts release "${{ matrix.asset }}" "$RELEASE_TAG"
+          "$GITHUB_SHA" "${{ matrix.target_os }}" "${{ matrix.target_cpu }}"
+          "${{ matrix.target_libc }}"
+      - name: Archive runtime bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=0
+          export TZ=UTC
+          mkdir -p release/assets
+          node scripts/normalize-archive.ts release/bundle
+          if tar --help | grep -q -- '--sort'; then
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf "release/assets/${{ matrix.asset }}" -C release/bundle .
+          else
+            metadata_flags=()
+            if tar --help | grep -q -- '--uid'; then
+              metadata_flags+=(--uid=0 --gid=0 --uname=root --gname=root)
+            elif tar --help | grep -q -- '--owner'; then
+              metadata_flags+=(--owner=0 --group=0 --numeric-owner)
+            fi
+            (
+              cd release/bundle
+              node ../../scripts/list-archive-files.ts . | tar --null --no-recursion \
+                "${metadata_flags[@]}" \
+                -czf "../assets/${{ matrix.asset }}" -T -
+            )
+          fi
+          node scripts/write-checksum.ts "release/assets/${{ matrix.asset }}"
+      - name: Upload runtime bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: release/assets/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [security, build-runtime]
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Download runtime bundles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: runtime-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release-assets/*.tar.gz)
+          test "${#archives[@]}" -eq 6
+          for archive in "${archives[@]}"; do
+            test -f "${archive}.sha256"
+            (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
+          done
+      - name: Publish assets and advance v1
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
+          elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease \
+              --target "$GITHUB_SHA" --repo "$GH_REPO"
+          fi
+          if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
+            git push origin "$GITHUB_SHA:refs/heads/v1"
+          fi
