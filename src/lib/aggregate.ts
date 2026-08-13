@@ -16,15 +16,14 @@ const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
-const MAX_GOAL_STATUS_LENGTH = 8_000;
 const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
 const SEVERITY_ORDER: Record<Severity, number> = {
-  CRITICAL: 5,
-  HIGH: 4,
-  MEDIUM: 3,
-  LOW: 2,
-  INFO: 1,
+  CRITICAL: 4,
+  HIGH: 3,
+  MODERATE: 2,
+  LOW: 1,
 };
+const SEVERITIES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
 
 function stableDigest(value: string): string {
   let hash = 14_695_981_039_346_656_037n;
@@ -258,13 +257,28 @@ function findingSort(left: AggregatedFinding, right: AggregatedFinding): number 
   );
 }
 
-function countBySeverity(findings: readonly AggregatedFinding[]): string {
-  return (["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] as const)
-    .map(
-      (severity) =>
-        `${severity.toLowerCase()}=${findings.filter((finding) => finding.severity === severity).length}`,
-    )
-    .join(", ");
+function severityLabel(severity: Severity): string {
+  return `${severity.slice(0, 1)}${severity.slice(1).toLowerCase()}`;
+}
+
+function joinNaturalLanguage(values: readonly string[]): string {
+  if (values.length <= 1) return values[0] ?? "";
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`;
+}
+
+function severitySummary(findings: readonly AggregatedFinding[]): string {
+  return joinNaturalLanguage(
+    SEVERITIES.flatMap((severity) => {
+      const count = findings.filter((finding) => finding.severity === severity).length;
+      return count === 0 ? [] : [`${count} ${severity.toLowerCase()}`];
+    }),
+  );
+}
+
+function findingSummary(findings: readonly AggregatedFinding[]): string {
+  const count = findings.length;
+  return `Found **${count} actionable issue${count === 1 ? "" : "s"}** — ${severitySummary(findings)}.`;
 }
 
 function formatFinding(finding: AggregatedFinding, index: number): string {
@@ -272,8 +286,7 @@ function formatFinding(finding: AggregatedFinding, index: number): string {
     finding.locationVerified && finding.path && finding.line
       ? ` (${finding.path}:${finding.line})`
       : "";
-  const goals = finding.goals.map((goal) => `goal ${goal + 1}`).join(", ");
-  return `### ${index + 1}. [${finding.severity}] ${finding.title}${location}\n\n${finding.body}\n\n_Found by ${goals}._`;
+  return `### ${index + 1}. ${severityLabel(finding.severity)} · ${finding.title}${location}\n\n${finding.body}`;
 }
 
 export function aggregateReview(
@@ -296,11 +309,10 @@ export function aggregateReview(
   const partial = goals.some((goal) => goal.status === "failed");
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
-    (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MEDIUM,
+    (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,
   );
   const event = config.autoApprove && !partial && !hasBlockingFinding ? "APPROVE" : "COMMENT";
-  const completed = goals.filter((goal) => goal.status === "completed").length;
-  const summary = `Reviewed ${goals.length} goal${goals.length === 1 ? "" : "s"}; ${completed} completed, ${goals.length - completed} failed. ${findings.length} finding${findings.length === 1 ? "" : "s"} (${countBySeverity(findings)}).`;
+  const summary = findings.length === 0 ? "No actionable issues found." : findingSummary(findings);
   return {
     marker,
     summary,
@@ -313,18 +325,6 @@ export function aggregateReview(
   };
 }
 
-function goalStatusMarkdown(goals: readonly GoalResult[]): string {
-  const body = goals
-    .map((goal, index) => {
-      const status =
-        goal.status === "completed" ? "completed" : `failed: ${goal.error ?? "unknown error"}`;
-      return `${index + 1}. ${status} — ${goal.prompt}`;
-    })
-    .join("\n");
-  if (body.length <= MAX_GOAL_STATUS_LENGTH) return body;
-  return `${body.slice(0, MAX_GOAL_STATUS_LENGTH - 80)}\n\n> Goal status truncated; findings are listed above.`;
-}
-
 function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
   return findings
     .map((finding, index) => {
@@ -332,46 +332,53 @@ function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
         finding.path === undefined
           ? ""
           : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
-      return `${index + 1}. [${finding.severity}] ${finding.title}${location}`;
+      return `${index + 1}. ${severityLabel(finding.severity)} · ${finding.title}${location}`;
     })
     .join("\n");
 }
 
+function findingDestination(review: AggregatedReview): string {
+  if (review.inlineFindings.length > 0 && review.bodyFindings.length > 0)
+    return "See the inline comments and findings below for details.";
+  if (review.inlineFindings.length > 0) return "See the inline comments for details.";
+  return "See the findings below for details.";
+}
+
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
-  const sections = [
-    ...(review.partial ? [] : [review.marker]),
-    "## AI pull request review",
-    `\n${review.summary}`,
-    "",
-    "### Findings",
-  ];
+  const completed = goals.filter((goal) => goal.status === "completed").length;
+  if (!review.partial && review.findings.length === 0)
+    return [review.marker, "## ✨ Good job!", "", review.summary].join("\n");
+
+  const sections = review.partial
+    ? [
+        "## ⚠️ Review incomplete",
+        "",
+        `${completed} of ${goals.length} checks completed. Findings may not cover the full change. Rerun the workflow.`,
+      ]
+    : [review.marker, "## 🔎 AI review"];
+
+  if (review.findings.length > 0) {
+    sections.push("", review.summary, "", findingDestination(review));
+  }
   if (review.bodyFindings.length > 0) {
     sections.push(
+      "",
+      "### Findings",
+      "",
       "#### Index",
       findingIndexMarkdown(review.bodyFindings),
       "",
       "#### Details",
       review.bodyFindings.map(formatFinding).join("\n\n"),
     );
-  } else if (review.findings.length === 0) {
-    sections.push("No actionable findings were reported.");
-  } else {
-    sections.push("All findings are attached to changed lines above.");
   }
-  sections.push("", "### Goals", goalStatusMarkdown(goals));
-  if (review.partial)
-    sections.push(
-      "",
-      "> **Partial review:** one or more goals failed. This review is informational and the action will fail.",
-    );
   const body = sections.join("\n");
   if (body.length <= MAX_REVIEW_BODY_LENGTH) return body;
   return `${body.slice(0, MAX_REVIEW_BODY_LENGTH - 120)}\n\n> Review body truncated at 60 KB; see inline comments for the highest-severity findings.`;
 }
 
 function inlineCommentBody(finding: AggregatedFinding): string {
-  const goals = finding.goals.map((goal) => `goal ${goal + 1}`).join(", ");
-  const body = `**[${finding.severity}] ${finding.title}**\n\n${finding.body}\n\n_Found by ${goals}._`;
+  const body = `**${severityLabel(finding.severity)} · ${finding.title}**\n\n${finding.body}`;
   if (body.length <= MAX_INLINE_COMMENT_LENGTH) return body;
   return `${body.slice(0, MAX_INLINE_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
 }

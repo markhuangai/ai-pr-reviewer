@@ -56,18 +56,18 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 ## Inputs
 
-| Input            | Required | Default   | Notes                                                                                                |
-| ---------------- | -------- | --------- | ---------------------------------------------------------------------------------------------------- |
-| `github-pat`     | yes      |           | Fine-grained PAT with pull request review write access in the target repository.                     |
-| `ai-base-url`    | yes      |           | HTTP(S) Anthropic Messages API-compatible endpoint.                                                  |
-| `ai-secret`      | yes      |           | API key or auth token for that endpoint.                                                             |
-| `ai-auth-mode`   | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                        |
-| `model`          | yes      |           | Model name understood by the endpoint.                                                               |
-| `review-prompts` | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                           |
-| `parallel-count` | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                     |
-| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.          |
-| `auto-approve`   | no       | `false`   | An approval is attempted only when every goal completes and no finding is Medium, High, or Critical. |
-| `mcp-servers`    | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                      |
+| Input            | Required | Default   | Notes                                                                                                  |
+| ---------------- | -------- | --------- | ------------------------------------------------------------------------------------------------------ |
+| `github-pat`     | yes      |           | Fine-grained PAT with pull request review write access in the target repository.                       |
+| `ai-base-url`    | yes      |           | HTTP(S) Anthropic Messages API-compatible endpoint.                                                    |
+| `ai-secret`      | yes      |           | API key or auth token for that endpoint.                                                               |
+| `ai-auth-mode`   | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                          |
+| `model`          | yes      |           | Model name understood by the endpoint.                                                                 |
+| `review-prompts` | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                             |
+| `parallel-count` | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                       |
+| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.            |
+| `auto-approve`   | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical. |
+| `mcp-servers`    | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                        |
 
 The action infers the repository, pull request number, base SHA, and head SHA from the pull request event. It skips a duplicate review when the same head and configuration marker already exist.
 
@@ -99,7 +99,9 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - The action writes the full secret-redacted system prompt, `/goal`, review and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, goal iterations, turn results, repairs, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews; hidden model reasoning is not logged.
+- Findings use four severities: Critical for credible immediate compromise, irreversible data loss, or broad outage; High for serious impact on a reachable path; Moderate for bounded impact or a less likely trigger; and Low for a limited-impact but actionable defect. Informational observations, style preferences, and nits are omitted.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
+- Public reviews never include review prompts, model summaries, goal errors, or goal provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count and rerun guidance; full secret-redacted diagnostics remain in the GitHub Actions log.
 - If a goal cannot read the text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
 - A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - If GitHub rejects an approval, the action retries once as a comment review.
@@ -109,18 +111,19 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. Reference the action with an exact stable or release-candidate tag such as `v1.0.0` or `v1.0.1-rc.0` for reproducible behavior, or use a major alias such as `v1` or `v1-prerelease` to receive the latest stable or prerelease release in that major line. Branches and commit SHAs are not supported. Major aliases are annotated, moving Git tags with no GitHub Release of their own; the bootstrap resolves each alias to its exact compatible release before downloading and verifying the platform runtime. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
 
-Releases are started manually through the `Release runtime bundles` workflow with a version that omits the `v` prefix. A run selected on `dev` accepts only `X.Y.Z-rc.N` and creates a GitHub prerelease. A run selected on `main` accepts only `X.Y.Z`, requires the latest matching RC tag to be an ancestor with an identical Git tree, and promotes the exact verified RC assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
+Releases are started manually from `main` through the `Release runtime bundles` workflow. Choose the `prerelease` channel with an `X.Y.Z-rc.N` version to create a GitHub prerelease, or choose the `stable` channel with an `X.Y.Z` version to promote the latest matching RC. Stable promotion requires that RC tag to be an ancestor with an identical Git tree and reuses its exact verified assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
 
 Intermediate GitHub Actions artifacts used to assemble a prerelease are retained for one day. They are separate from the assets attached to a published GitHub Release, which remain available under the release. Self-hosted runners avoid GitHub-hosted runner minutes, but Actions artifact storage is still subject to the repository owner's GitHub plan and billing, so it should not be assumed to have zero cost.
 
 The workflow creates and verifies the exact Git tag before publishing its release, so it cannot attach built assets to a racing tag at another commit. After the exact release is published, a separate idempotent job updates `vN` for stable releases or `vN-prerelease` for prereleases to an annotated tag that records the exact release tag. If alias publication fails, the exact release remains usable and the alias job can be rerun. If exact publication fails after tag creation, the orphan tag deliberately blocks retries until an administrator inspects and removes it.
 
-The first release must be dispatched from `dev` as `1.0.0-rc.0`. Until the updated manual form is present on the default branch, use:
+For example, dispatch a prerelease from `main` with:
 
 ```bash
 gh workflow run release.yml \
   --repo markhuangai/ai-pr-reviewer \
-  --ref dev \
+  --ref main \
+  -f channel=prerelease \
   -f version=1.0.0-rc.0
 ```
 
@@ -132,7 +135,7 @@ The lockfile and release workflow enforce the project's supply-chain policy:
 - consumers may pin exact immutable action release tags for reproducibility or choose a documented major alias for automatic updates;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
-CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` or `dev` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
+CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
 
 Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
 

@@ -17,7 +17,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 async function repository(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-release-source-"));
-  await git(root, "init", "--initial-branch=dev");
+  await git(root, "init", "--initial-branch=main");
   await git(root, "config", "user.name", "Release Test");
   await git(root, "config", "user.email", "release-test@example.com");
   await writeFile(join(root, "action.txt"), "release candidate\n");
@@ -30,7 +30,7 @@ async function repository(): Promise<string> {
 test("accepts an ancestor release candidate with an identical tree", async () => {
   const root = await repository();
   try {
-    await git(root, "commit", "--allow-empty", "-m", "merge dev into main");
+    await git(root, "commit", "--allow-empty", "-m", "promote release candidate");
     const result = await verifyReleaseSource("v1.0.0-rc.0", "HEAD", root);
     assert.equal(result.sourceCommit, await git(root, "rev-parse", "v1.0.0-rc.0"));
     assert.equal(result.tree, await git(root, "rev-parse", "HEAD^{tree}"));

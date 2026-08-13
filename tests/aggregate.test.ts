@@ -50,6 +50,108 @@ const files: readonly ChangedFile[] = [
   },
 ];
 
+test("renders a clean review without exposing goal internals", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "PRIVATE REVIEW GOAL",
+      status: "completed",
+      submission: { summary: "PRIVATE MODEL SUMMARY", findings: [] },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+
+  assert.equal(body, `${review.marker}\n## ✨ Good job!\n\nNo actionable issues found.`);
+  assert.equal(review.event, "APPROVE");
+  assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
+});
+
+test("formats four public severities without exposing goal provenance", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "PRIVATE SECURITY GOAL",
+      status: "completed",
+      submission: {
+        summary: "PRIVATE FINDING SUMMARY",
+        findings: [
+          {
+            title: "Authorization can be bypassed",
+            severity: "CRITICAL",
+            body: "The caller can cross the repository boundary.",
+            path: "src/change.ts",
+            line: 1,
+          },
+          {
+            title: "Failure leaves stale state",
+            severity: "HIGH",
+            body: "The failure path preserves the previous success state.",
+            path: "src/change.ts",
+            line: 2,
+          },
+          {
+            title: "Cancellation is ignored",
+            severity: "MODERATE",
+            body: "The retry continues after cancellation.",
+          },
+          {
+            title: "Error loses its reason",
+            severity: "LOW",
+            body: "The safe diagnostic reason is discarded.",
+          },
+        ],
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const request = buildReviewRequest(context, review, goals);
+
+  assert.deepEqual(
+    review.findings.map((finding) => finding.severity),
+    ["CRITICAL", "HIGH", "MODERATE", "LOW"],
+  );
+  assert.match(request.body, /## 🔎 AI review/u);
+  assert.match(
+    request.body,
+    /Found \*\*4 actionable issues\*\* — 1 critical, 1 high, 1 moderate, and 1 low\./u,
+  );
+  assert.match(request.body, /See the inline comments and findings below for details\./u);
+  assert.match(request.body, /Moderate · Cancellation is ignored/u);
+  assert.match(request.body, /Low · Error loses its reason/u);
+  assert.equal(
+    request.comments[0]?.body,
+    "**Critical · Authorization can be bypassed**\n\nThe caller can cross the repository boundary.",
+  );
+  assert.equal(
+    request.comments[1]?.body,
+    "**High · Failure leaves stale state**\n\nThe failure path preserves the previous success state.",
+  );
+  assert.doesNotMatch(
+    `${request.body}\n${request.comments.map((comment) => comment.body).join("\n")}`,
+    /PRIVATE SECURITY GOAL|PRIVATE FINDING SUMMARY|Found by goal|### Goals|\[(?:CRITICAL|HIGH|MODERATE|LOW)\]/u,
+  );
+});
+
+test("allows only low findings through the automatic approval threshold", () => {
+  for (const [severity, event] of [
+    ["LOW", "APPROVE"],
+    ["MODERATE", "COMMENT"],
+    ["HIGH", "COMMENT"],
+    ["CRITICAL", "COMMENT"],
+  ] as const) {
+    const review = aggregateReview(context, config, files, [
+      {
+        prompt: "threshold",
+        status: "completed",
+        submission: {
+          summary: "threshold",
+          findings: [{ title: `${severity} issue`, severity, body: "Actionable defect." }],
+        },
+      },
+    ]);
+    assert.equal(review.event, event, severity);
+  }
+});
+
 test("deduplicates findings, preserves the strongest severity, and verifies diff locations", () => {
   const goals: readonly GoalResult[] = [
     {
@@ -83,7 +185,7 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
         findings: [
           {
             title: "Unchecked result",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The result is ignored in this path.",
             path: "src/change.ts",
             line: 1,
@@ -156,7 +258,7 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
         findings: [
           {
             title: "Range",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The whole changed block is affected.",
             path: "src/change.ts",
             line: 1,
@@ -175,7 +277,7 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
         findings: [
           {
             title: "Range",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The whole changed block is affected.",
             path: "src/change.ts",
             line: 1,
@@ -205,7 +307,7 @@ test("rejects oversized finding ranges before location verification", () => {
         findings: [
           {
             title: "Oversized range",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The reported range is too large to verify safely.",
             path: "src/change.ts",
             line: 1,
@@ -292,14 +394,14 @@ test("preserves distinct claimed locations for unverified findings", () => {
         findings: [
           {
             title: "Unverified issue",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The same issue was reported at two different paths.",
             path: "src/missing-a.ts",
             line: 10,
           },
           {
             title: "Unverified issue",
-            severity: "MEDIUM",
+            severity: "MODERATE",
             body: "The same issue was reported at two different paths.",
             path: "src/missing-b.ts",
             line: 20,
@@ -389,13 +491,13 @@ test("bounds merged evidence so later body findings remain visible", () => {
   assert.match(buildReviewBody(review, duplicateGoals), /Later body finding/);
 });
 
-test("keeps body findings ahead of oversized goal status", () => {
-  const review = aggregateReview(context, config, files, [
+test("keeps body findings while withholding oversized goal internals", () => {
+  const goals: readonly GoalResult[] = [
     {
-      prompt: "goal".repeat(30_000),
+      prompt: "PRIVATE OVERSIZED GOAL ".repeat(30_000),
       status: "completed",
       submission: {
-        summary: "body finding",
+        summary: "PRIVATE OVERSIZED SUMMARY",
         findings: [
           {
             title: "Unverified finding",
@@ -407,27 +509,12 @@ test("keeps body findings ahead of oversized goal status", () => {
         ],
       },
     },
-  ]);
-  const body = buildReviewBody(review, [
-    {
-      prompt: "goal".repeat(30_000),
-      status: "completed",
-      submission: {
-        summary: "body finding",
-        findings: [
-          {
-            title: "Unverified finding",
-            severity: "LOW",
-            body: "This finding must remain visible in the review body.",
-            path: "src/other.ts",
-            line: 1,
-          },
-        ],
-      },
-    },
-  ]);
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+
   assert.match(body, /Unverified finding/);
-  assert.match(body, /Goal status truncated/);
+  assert.doesNotMatch(body, /PRIVATE OVERSIZED GOAL|PRIVATE OVERSIZED SUMMARY|### Goals/u);
 });
 
 test("indexes every body finding before truncating details", () => {
@@ -453,18 +540,34 @@ test("indexes every body finding before truncating details", () => {
 });
 
 test("partial goals force a comment and remain actionable", () => {
-  const review = aggregateReview(context, config, files, [
-    { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },
-    { prompt: "security", status: "failed", error: "timeout" },
-  ]);
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "PRIVATE COMPLETED GOAL",
+      status: "completed",
+      submission: {
+        summary: "PRIVATE PARTIAL SUMMARY",
+        findings: [
+          {
+            title: "Partial finding",
+            severity: "LOW",
+            body: "This completed check found an actionable defect.",
+          },
+        ],
+      },
+    },
+    { prompt: "PRIVATE FAILED GOAL", status: "failed", error: "PRIVATE FAILURE ERROR" },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+
   assert.equal(review.partial, true);
   assert.equal(review.event, "COMMENT");
+  assert.match(body, /^## ⚠️ Review incomplete\n\n1 of 2 checks completed\./u);
+  assert.match(body, /Partial finding/u);
+  assert.doesNotMatch(body, /✨ Good job|ai-pr-reviewer:v2|PRIVATE COMPLETED GOAL/u);
   assert.doesNotMatch(
-    buildReviewBody(review, [
-      { prompt: "correctness", status: "completed", submission: { summary: "ok", findings: [] } },
-      { prompt: "security", status: "failed", error: "timeout" },
-    ]),
-    /ai-pr-reviewer:v1:/,
+    body,
+    /PRIVATE FAILED GOAL|PRIVATE PARTIAL SUMMARY|PRIVATE FAILURE ERROR|Found by goal|### Goals/u,
   );
   assert.equal(review.allGoalsFailed, false);
 });

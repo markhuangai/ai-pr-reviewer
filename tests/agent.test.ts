@@ -698,6 +698,68 @@ test("rejects review submission until the prompt is active and the diff reaches 
   );
 });
 
+test("accepts exactly the four public finding severities", () => {
+  for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const) {
+    assert.equal(
+      agentInternals.submissionSchema.safeParse({
+        summary: "finding",
+        findings: [{ title: "Actionable defect", severity, body: "Evidence and impact." }],
+      }).success,
+      true,
+      severity,
+    );
+  }
+  for (const severity of ["MEDIUM", "INFO"] as const) {
+    assert.equal(
+      agentInternals.submissionSchema.safeParse({
+        summary: "legacy finding",
+        findings: [{ title: "Legacy severity", severity, body: "Evidence and impact." }],
+      }).success,
+      false,
+      severity,
+    );
+  }
+});
+
+test("teaches the four severity definitions before review submission", () => {
+  const events: string[] = [];
+  const queued: SDKMessage[] = [];
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 8,
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    title: "Severity contract",
+    htmlUrl: "https://github.com/owner/repository/pull/8",
+  };
+
+  agentInternals.startReviewPrompt(
+    {
+      push: (message) => {
+        queued.push(message);
+        events.push(`push-${queued.length}`);
+      },
+    },
+    "Check severity guidance.",
+    context,
+    [],
+    context.baseSha,
+    0,
+    [],
+    () => events.push("activate"),
+    () => undefined,
+  );
+
+  const prompt = (queued[1] as { message: { content: string } }).message.content;
+  for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"])
+    assert.match(prompt, new RegExp(`- ${severity}:`, "u"));
+  assert.match(prompt, /Omit style preferences, nits, and informational observations/u);
+  assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
+  assert.match(agentInternals.repairPrompt(1, true), /MEDIUM and INFO are invalid/u);
+});
+
 test("starts each review with a bounded Claude goal command", () => {
   const command = agentInternals.goalCommand("Check authentication paths and failure handling.");
   assert.equal(
