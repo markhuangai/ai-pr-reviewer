@@ -7,7 +7,7 @@ import test from "node:test";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKActiveGoalMessage, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { agentInternals } from "../src/runtime/agent.js";
 import type { ChangedFile, PullRequestContext } from "../src/lib/types.js";
@@ -298,7 +298,183 @@ test("logs assistant, agent-tool, and MCP events with bounded redacted payloads"
   const preview = lines[2]?.match(/input: (.+) \[\d+ chars\]$/u)?.[1];
   assert.ok(preview);
   assert.ok(preview.length <= 202);
-  assert.match(lines[4] ?? "", /is_error/u);
+  assert.match(lines[4] ?? "", /"is_error":true/u);
+  assert.match(lines[4] ?? "", new RegExp("x{260}", "u"));
+});
+
+test("logs complete redacted user and assistant messages in reconstructable chunks", () => {
+  const secret = "conversation-secret";
+  const text = `before-${secret}-${"🙂".repeat(5_000)}-after`;
+  const lines: string[] = [];
+  const message = {
+    type: "assistant",
+    message: { content: [{ type: "text", text }] },
+  } as unknown as SDKMessage;
+
+  agentInternals.logAgentMessage(message, 0, [secret], new Map(), (line) => lines.push(line));
+
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? "", /part 1\/2/u);
+  assert.match(lines[1] ?? "", /part 2\/2/u);
+  const reconstructed = lines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  assert.equal(reconstructed, JSON.stringify(text.replace(secret, "[REDACTED]")));
+  assert.equal(reconstructed.includes(secret), false);
+  assert.equal(reconstructed.includes("�"), false);
+
+  const userLines: string[] = [];
+  agentInternals.logQueuedUserMessage(
+    agentInternals.makeUserMessage(text),
+    "review",
+    0,
+    [secret],
+    (line) => userLines.push(line),
+  );
+  assert.equal(userLines.length, 2);
+  assert.equal(userLines.map((line) => line.slice(line.indexOf(": ") + 2)).join(""), reconstructed);
+});
+
+test("redacts complete structured error results before chunking", () => {
+  const secret = "validation-secret";
+  const validation = `findings.0.path: ${"x".repeat(9_000)} ${secret}`;
+  const message = {
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "mcp_tool_result",
+          tool_use_id: "submit-1",
+          content: [{ type: "text", text: validation }],
+          is_error: true,
+        },
+      ],
+    },
+  } as unknown as SDKMessage;
+  const lines: string[] = [];
+  const tools = new Map([
+    ["submit-1", { kind: "mcp" as const, label: "review_output.submit_review" }],
+  ]);
+
+  agentInternals.logAgentMessage(message, 0, [secret], tools, (line) => lines.push(line));
+
+  assert.ok(lines.length > 1);
+  const reconstructed = lines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  assert.match(reconstructed, /findings\.0\.path/u);
+  assert.match(reconstructed, new RegExp("x{9000}", "u"));
+  assert.match(reconstructed, /\[REDACTED\]/u);
+  assert.equal(reconstructed.includes(secret), false);
+});
+
+test("queues both initial prompts before activating the review gate", () => {
+  const events: string[] = [];
+  const queued: SDKMessage[] = [];
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 7,
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    title: "Review sequencing",
+    htmlUrl: "https://github.com/owner/repository/pull/7",
+  };
+
+  agentInternals.startReviewPrompt(
+    {
+      push: (message) => {
+        queued.push(message);
+        events.push(`push-${queued.length}`);
+      },
+    },
+    "Check sequencing.",
+    context,
+    [],
+    context.baseSha,
+    0,
+    [],
+    () => events.push("activate"),
+    () => undefined,
+  );
+
+  assert.deepEqual(events, ["push-1", "push-2", "activate"]);
+  assert.match((queued[0] as { message: { content: string } }).message.content, /^\/goal /u);
+  assert.match(
+    (queued[1] as { message: { content: string } }).message.content,
+    /isolated pull-request reviewer/u,
+  );
+});
+
+test("logs goal, result, and compaction lifecycle events with counters", () => {
+  const state = agentInternals.createAgentLifecycleState();
+  const lines: string[] = [];
+  const write = (line: string): void => {
+    lines.push(line);
+  };
+  const base = { uuid: "event", session_id: "session-1" };
+  const events = [
+    {
+      type: "system",
+      subtype: "init",
+      model: "review-model",
+      claude_code_version: "2.0.0",
+      ...base,
+    },
+    {
+      type: "active_goal",
+      value: {
+        condition: "Complete the goal",
+        iterations: 2,
+        set_at: 1,
+        tokens_at_start: 10,
+        last_reason: "Need the diff",
+      },
+      ...base,
+    },
+    { type: "system", subtype: "status", status: "compacting", ...base },
+    {
+      type: "system",
+      subtype: "status",
+      status: null,
+      compact_result: "failed",
+      compact_error: "provider error",
+      ...base,
+    },
+    {
+      type: "system",
+      subtype: "compact_boundary",
+      compact_metadata: { trigger: "auto", pre_tokens: 100, post_tokens: 50 },
+      ...base,
+    },
+    {
+      type: "result",
+      subtype: "error_max_turns",
+      num_turns: 4,
+      duration_ms: 80,
+      duration_api_ms: 60,
+      stop_reason: "max_turns",
+      is_error: true,
+      errors: ["full result error"],
+      ...base,
+    },
+    { type: "active_goal", value: null, ...base },
+  ] as unknown as Array<SDKMessage | SDKActiveGoalMessage>;
+
+  for (const event of events) agentInternals.logAgentLifecycleMessage(event, 0, [], state, write);
+
+  assert.equal(state.sessionId, "session-1");
+  assert.equal(state.goalIterations, 2);
+  assert.equal(state.turnResults, 1);
+  assert.equal(state.latestTurnCount, 4);
+  assert.equal(state.compactionStarts, 1);
+  assert.equal(state.compactionFailures, 1);
+  assert.equal(state.compactionBoundaries, 1);
+  assert.match(lines.join("\n"), /session init/u);
+  assert.match(lines.join("\n"), /session goal-iteration/u);
+  assert.match(lines.join("\n"), /session compaction-start/u);
+  assert.match(lines.join("\n"), /session compaction-result error/u);
+  assert.match(lines.join("\n"), /session compaction-boundary/u);
+  assert.match(lines.join("\n"), /session turn-result errors/u);
+  assert.match(lines.join("\n"), /session goal-cleared/u);
 });
 
 test("serializes bounded agent log values without throwing on circular input", () => {
@@ -374,6 +550,41 @@ test("logs plain MCP tool-use blocks and parent-linked fallback results", () => 
   assert.match(lines[1] ?? "", /Memory result/u);
 });
 
+test("logs fallback error results completely while bounding fallback successes", () => {
+  const tools = new Map([
+    ["mcp-tool-1", { kind: "mcp" as const, label: "mcp__security__validate" }],
+  ]);
+  const errorLines: string[] = [];
+  const error = {
+    type: "user",
+    parent_tool_use_id: "mcp-tool-1",
+    tool_use_result: {
+      isError: true,
+      content: `findings.0.body: ${"e".repeat(9_000)}`,
+    },
+    message: { role: "user", content: [] },
+  } as unknown as SDKMessage;
+
+  agentInternals.logAgentMessage(error, 0, [], tools, (line) => errorLines.push(line));
+
+  assert.ok(errorLines.length > 1);
+  const reconstructed = errorLines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  assert.match(reconstructed, new RegExp("e{9000}", "u"));
+
+  const successLines: string[] = [];
+  const success = {
+    type: "user",
+    parent_tool_use_id: "mcp-tool-1",
+    tool_use_result: { content: "s".repeat(9_000) },
+    message: { role: "user", content: [] },
+  } as unknown as SDKMessage;
+  agentInternals.logAgentMessage(success, 0, [], tools, (line) => successLines.push(line));
+
+  assert.equal(successLines.length, 1);
+  assert.match(successLines[0] ?? "", /payload truncated/u);
+  assert.equal((successLines[0] ?? "").includes("s".repeat(9_000)), false);
+});
+
 test("contains agent logging failures without failing the review turn", () => {
   const secret = "mcp-header-secret";
   const warnings: string[] = [];
@@ -407,6 +618,10 @@ test("rejects review submission until the prompt is active and the diff reaches 
   );
   assert.match(agentInternals.reviewSubmissionRejection(true, false) ?? "", /done=true/u);
   assert.equal(agentInternals.reviewSubmissionRejection(true, true), undefined);
+  assert.match(
+    agentInternals.reviewSubmissionRejection(true, true, true) ?? "",
+    /already been accepted/u,
+  );
 });
 
 test("starts each review with a bounded Claude goal command", () => {
