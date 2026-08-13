@@ -448,7 +448,7 @@ function writeAgentLifecycleLog(
     core.info(line);
   },
 ): void {
-  writeCompleteAgentLog(goalIndex, "session", event, "details", value, secrets, write);
+  write(agentLogLine(goalIndex, "session", event, "details", value, secrets));
 }
 
 function userMessageText(message: SDKUserMessage): string | undefined {

@@ -460,7 +460,7 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
         iterations: 2,
         set_at: 1,
         tokens_at_start: 10,
-        last_reason: "Need the diff",
+        last_reason: `Need the diff ${"g".repeat(9_000)}`,
       },
       ...base,
     },
@@ -504,6 +504,9 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   assert.equal(state.compactionBoundaries, 1);
   assert.match(lines.join("\n"), /session init/u);
   assert.match(lines.join("\n"), /session goal-iteration/u);
+  const goalIteration = lines.find((line) => /session goal-iteration/u.test(line));
+  assert.match(goalIteration ?? "", /payload truncated/u);
+  assert.equal((goalIteration ?? "").includes("g".repeat(9_000)), false);
   assert.match(lines.join("\n"), /session compaction-start/u);
   assert.match(lines.join("\n"), /session compaction-result error/u);
   assert.match(lines.join("\n"), /session compaction-boundary/u);
