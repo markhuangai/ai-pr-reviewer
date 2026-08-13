@@ -3,11 +3,20 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
+import {
+  aliasAcceptsRelease,
+  isCompatibleRuntimeManifest,
+  parseActionReleaseReference,
+  parseActionReleaseTag,
+  type ActionReleaseAlias,
+  type ActionReleaseReference,
+  type ActionReleaseVersion,
+} from "./lib/bootstrap/version.js";
 
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
-const RELEASE_TAG = "runtime-v1";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10_000;
@@ -48,10 +57,75 @@ function requestHeaders(): Headers {
   });
 }
 
+function apiRequestHeaders(): Headers {
+  const headers = requestHeaders();
+  const token = process.env["INPUT_GITHUB-PAT"]?.trim();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return headers;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: requestHeaders() });
+  const response = await fetch(url, { headers: apiRequestHeaders() });
   if (!response.ok) throw new Error(`Runtime release lookup failed (${response.status}).`);
   return (await response.json()) as T;
+}
+
+type JsonFetcher = <T>(url: string) => Promise<T>;
+
+function gitObject(value: unknown, expectedType: "commit" | "tag"): string | undefined {
+  if (!isRecord(value) || !isRecord(value.object)) return undefined;
+  const sha = value.object.sha;
+  return value.object.type === expectedType &&
+    typeof sha === "string" &&
+    /^[a-f0-9]{40}$/iu.test(sha)
+    ? sha
+    : undefined;
+}
+
+async function resolveAlias(
+  alias: ActionReleaseAlias,
+  getJson: JsonFetcher,
+): Promise<ActionReleaseVersion> {
+  const ref = await getJson<unknown>(
+    `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`,
+  );
+  const tagObjectSha = gitObject(ref, "tag");
+  if (!tagObjectSha) throw new Error("The action release alias is not an annotated Git tag.");
+  const tagObject = await getJson<unknown>(
+    `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`,
+  );
+  if (
+    !isRecord(tagObject) ||
+    tagObject.tag !== alias.tag ||
+    typeof tagObject.message !== "string"
+  ) {
+    throw new Error("The action release alias contains invalid metadata.");
+  }
+  const release = parseActionReleaseTag(tagObject.message.trim());
+  const commitSha = gitObject(tagObject, "commit");
+  if (!release || !commitSha || !aliasAcceptsRelease(alias, release)) {
+    throw new Error("The action release alias targets an incompatible exact version.");
+  }
+  const exactRef = await getJson<unknown>(
+    `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`,
+  );
+  if (gitObject(exactRef, "commit") !== commitSha) {
+    throw new Error("The action release alias and exact version resolve to different commits.");
+  }
+  return release;
+}
+
+export async function resolveActionRelease(
+  value: string | undefined,
+  getJson: JsonFetcher = fetchJson,
+): Promise<ActionReleaseVersion> {
+  const reference: ActionReleaseReference | undefined = parseActionReleaseReference(value);
+  if (!reference) {
+    throw new Error(
+      "This action must be referenced by vN, vN-prerelease, or an exact tag such as v1.0.0 or v1.0.0-rc.0.",
+    );
+  }
+  return "stableTag" in reference ? reference : resolveAlias(reference, getJson);
 }
 
 function readAsset(value: unknown): ReleaseAsset {
@@ -213,17 +287,19 @@ async function runRuntime(
 }
 
 async function main(): Promise<void> {
+  const releaseRef = process.env.GITHUB_ACTION_REF;
+  const requestedRelease = await resolveActionRelease(releaseRef);
   const assetName = platformAssetName();
   const release = await fetchJson<ReleasePayload>(
-    `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}`,
+    `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
   );
   if (
-    release.tag_name !== RELEASE_TAG ||
-    release.draft === true ||
-    release.prerelease === true ||
+    release.tag_name !== requestedRelease.tag ||
+    release.draft !== false ||
+    release.prerelease !== requestedRelease.prerelease ||
     !Array.isArray(release.assets)
   ) {
-    throw new Error("The runtime release is not a stable, usable release.");
+    throw new Error("The runtime release does not match the requested action version.");
   }
   const assets = release.assets.map(readAsset);
   const asset = assets.find((candidate) => candidate.name === assetName);
@@ -235,7 +311,7 @@ async function main(): Promise<void> {
   const cacheRoot = join(
     process.env.RUNNER_TEMP ?? tmpdir(),
     "ai-pr-reviewer-runtime",
-    RELEASE_TAG,
+    requestedRelease.tag,
     assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
   );
   const archive = join(cacheRoot, assetName);
@@ -250,7 +326,7 @@ async function main(): Promise<void> {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
     if (
       !isRecord(manifest) ||
-      manifest.releaseTag !== RELEASE_TAG ||
+      !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
       manifest.asset !== assetName ||
       manifest.nodeMajor !== 24 ||
       typeof manifest.sdkVersion !== "string" ||
@@ -268,7 +344,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+const entry = process.argv[1];
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

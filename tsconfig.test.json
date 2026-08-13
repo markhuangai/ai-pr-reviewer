@@ -8,5 +8,11 @@
     "declaration": false,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "scripts/select-release-alias.ts",
+    "scripts/validate-release.ts",
+    "scripts/verify-release-source.ts",
+    "tests/**/*.ts"
+  ]
 }

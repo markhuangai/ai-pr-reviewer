@@ -1,27 +1,76 @@
 name: Release runtime bundles
 
 on:
-  push:
-    tags:
-      - "v1"
-      - "v1.*"
   workflow_dispatch:
     inputs:
-      release-tag:
-        description: Release tag to create or update (runtime-v1 is the stable runtime release).
+      version:
+        description: Exact version without a v prefix (X.Y.Z on main or X.Y.Z-rc.N on dev).
         required: true
-        default: runtime-v1
+        type: string
 
 concurrency:
-  group: ai-pr-reviewer-release-${{ github.event.inputs.release-tag || 'runtime-v1' }}
+  group: ai-pr-reviewer-release
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate release request
+    runs-on: docker-runner
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      source_rc_tag: ${{ steps.version.outputs.source_rc_tag }}
+      stable_tag: ${{ steps.version.outputs.stable_tag }}
+    steps:
+      - name: Check out selected release branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Fetch release and tag history
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v?per_page=100" \
+            > "${RUNNER_TEMP}/tags.json"
+      - name: Validate version sequence and channel
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: >-
+          node scripts/validate-release.ts
+          --version "${REQUESTED_VERSION}"
+          --branch "${GITHUB_REF_NAME}"
+          --releases "${RUNNER_TEMP}/releases.json"
+          --tags "${RUNNER_TEMP}/tags.json"
+      - name: Verify stable source matches the latest release candidate
+        if: steps.version.outputs.prerelease == 'false'
+        shell: bash
+        env:
+          SOURCE_RC_TAG: ${{ steps.version.outputs.source_rc_tag }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-source.ts \
+            --source-rc-tag "${SOURCE_RC_TAG}" \
+            --stable-commit "${GITHUB_SHA}"
+
   security:
     name: Release checks
+    needs: validate
     runs-on: docker-runner
     steps:
       - name: Check out source
@@ -44,11 +93,14 @@ jobs:
       - name: Test and build
         run: npm run check && npm run build && npm run bundle:bootstrap && npm run security:repro
       - name: Verify generated bootstrap
-        run: git diff --exit-code -- dist/bootstrap.js dist/lib/bootstrap/archive.js
+        run: >-
+          git diff --exit-code -- dist/bootstrap.js
+          dist/lib/bootstrap/archive.js dist/lib/bootstrap/version.js
 
   build-runtime:
     name: Build ${{ matrix.asset }}
-    needs: security
+    needs: [validate, security]
+    if: needs.validate.outputs.prerelease == 'true'
     runs-on: docker-runner
     strategy:
       fail-fast: false
@@ -112,10 +164,10 @@ jobs:
           npm prune --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Prepare runtime bundle
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
         run: >-
-          node scripts/prepare-runtime.ts release "${{ matrix.asset }}" "$RELEASE_TAG"
+          node scripts/prepare-runtime.ts release "${{ matrix.asset }}"
+          "${{ needs.validate.outputs.release_tag }}"
+          "${{ needs.validate.outputs.stable_tag }}"
           "$GITHUB_SHA" "${{ matrix.target_os }}" "${{ matrix.target_cpu }}"
           "${{ matrix.target_libc }}"
       - name: Archive runtime bundle
@@ -151,20 +203,23 @@ jobs:
           path: release/assets/${{ matrix.asset }}*
           if-no-files-found: error
 
-  publish:
-    name: Publish release
-    needs: [security, build-runtime]
+  publish-prerelease:
+    name: Publish prerelease
+    needs: [validate, security, build-runtime]
     runs-on: docker-runner
     permissions:
       contents: write
-    env:
-      RELEASE_TAG: ${{ github.event.inputs.release-tag || 'runtime-v1' }}
     steps:
       - name: Check out release commit
         uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Download runtime bundles
         uses: actions/download-artifact@v8
         with:
@@ -178,27 +233,274 @@ jobs:
           shopt -s nullglob
           archives=(release-assets/*.tar.gz)
           test "${#archives[@]}" -eq 6
-          for archive in "${archives[@]}"; do
+          checksums=(release-assets/*.tar.gz.sha256)
+          test "${#checksums[@]}" -eq 6
+          expected=(
+            runtime-linux-x64.tar.gz runtime-linux-arm64.tar.gz
+            runtime-win32-x64.tar.gz runtime-win32-arm64.tar.gz
+            runtime-darwin-x64.tar.gz runtime-darwin-arm64.tar.gz
+          )
+          for name in "${expected[@]}"; do
+            archive="release-assets/${name}"
             test -f "${archive}.sha256"
+            test -f "${archive}"
             (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
           done
-      - name: Publish assets and advance v1
+      - name: Revalidate release sequence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v?per_page=100" \
+            > "${RUNNER_TEMP}/tags.json"
+          node scripts/validate-release.ts \
+            --version "${REQUESTED_VERSION}" \
+            --branch "${GITHUB_REF_NAME}" \
+            --releases "${RUNNER_TEMP}/releases.json" \
+            --tags "${RUNNER_TEMP}/tags.json"
+      - name: Publish exact release candidate
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GH_REPO"
-          elif [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-            gh release create "$RELEASE_TAG" release-assets/* \
-              --title "AI PR reviewer $RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GH_REPO"
+          gh api --method POST "repos/${GH_REPO}/git/refs" \
+            -f ref="refs/tags/${RELEASE_TAG}" -f sha="${GITHUB_SHA}" >/dev/null
+          test "$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')" = \
+            "${GITHUB_SHA}"
+          gh release create "${RELEASE_TAG}" release-assets/* \
+            --title "AI PR Reviewer ${RELEASE_TAG}" --generate-notes --prerelease \
+            --latest=false --verify-tag --repo "${GH_REPO}"
+
+  update-prerelease-alias:
+    name: Update prerelease alias
+    needs: [validate, publish-prerelease]
+    if: needs.validate.outputs.prerelease == 'true'
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Select latest prerelease alias target
+        id: alias
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GH_REPO}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          node scripts/select-release-alias.ts \
+            --release-tag "${RELEASE_TAG}" \
+            --releases "${RUNNER_TEMP}/releases.json"
+      - name: Move prerelease alias tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          ALIAS_TAG: ${{ steps.alias.outputs.alias_tag }}
+          ALIAS_RELEASE_TAG: ${{ steps.alias.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          exact_commit="$(gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_RELEASE_TAG}" --jq '.object.sha')"
+          tag_object="$(gh api --method POST "repos/${GH_REPO}/git/tags" \
+            -f tag="${ALIAS_TAG}" \
+            -f message="${ALIAS_RELEASE_TAG}" \
+            -f object="${exact_commit}" \
+            -f type=commit --jq '.sha')"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" > "${RUNNER_TEMP}/alias-ref.json" 2>/dev/null; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${ALIAS_TAG}" \
+              -f sha="${tag_object}" -F force=true >/dev/null
           else
-            gh release create "$RELEASE_TAG" release-assets/* \
-              --title "AI PR reviewer candidate $RELEASE_TAG" --prerelease \
-              --target "$GITHUB_SHA" --repo "$GH_REPO"
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/${ALIAS_TAG}" -f sha="${tag_object}" >/dev/null
           fi
-          if [[ "$RELEASE_TAG" == "runtime-v1" ]]; then
-            git push origin "$GITHUB_SHA:refs/heads/v1"
+          gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" \
+            | jq -e --arg sha "${tag_object}" '.object.type == "tag" and .object.sha == $sha' >/dev/null
+          gh api "repos/${GH_REPO}/git/tags/${tag_object}" \
+            | jq -e --arg alias "${ALIAS_TAG}" --arg release "${ALIAS_RELEASE_TAG}" --arg commit "${exact_commit}" \
+              '(.tag == $alias) and ((.message | rtrimstr("\n")) == $release) and (.object.type == "commit") and (.object.sha == $commit)' >/dev/null
+
+  publish-stable:
+    name: Promote stable release
+    needs: [validate, security]
+    if: needs.validate.outputs.prerelease == 'false'
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    steps:
+      - name: Check out stable release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Revalidate release candidate source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RC_TAG: ${{ needs.validate.outputs.source_rc_tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_RC_TAG}" \
+            --jq 'select(.draft == false and .prerelease == true) | .tag_name' \
+            | grep -Fx -- "${SOURCE_RC_TAG}"
+          node scripts/verify-release-source.ts \
+            --source-rc-tag "${SOURCE_RC_TAG}" \
+            --stable-commit "${GITHUB_SHA}"
+      - name: Download exact release candidate assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_RC_TAG: ${{ needs.validate.outputs.source_rc_tag }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "${SOURCE_RC_TAG}" --repo "${GH_REPO}" \
+            --dir release-assets \
+            --pattern 'runtime-*.tar.gz' \
+            --pattern 'runtime-*.tar.gz.sha256'
+      - name: Verify promoted release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release-assets/*.tar.gz)
+          test "${#archives[@]}" -eq 6
+          checksums=(release-assets/*.tar.gz.sha256)
+          test "${#checksums[@]}" -eq 6
+          expected=(
+            runtime-linux-x64.tar.gz runtime-linux-arm64.tar.gz
+            runtime-win32-x64.tar.gz runtime-win32-arm64.tar.gz
+            runtime-darwin-x64.tar.gz runtime-darwin-arm64.tar.gz
+          )
+          for name in "${expected[@]}"; do
+            archive="release-assets/${name}"
+            test -f "${archive}.sha256"
+            test -f "${archive}"
+            (cd release-assets && sha256sum --check "$(basename "${archive}").sha256")
+          done
+      - name: Revalidate release sequence and source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          SOURCE_RC_TAG: ${{ needs.validate.outputs.source_rc_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v?per_page=100" \
+            > "${RUNNER_TEMP}/tags.json"
+          node scripts/validate-release.ts \
+            --version "${REQUESTED_VERSION}" \
+            --branch "${GITHUB_REF_NAME}" \
+            --releases "${RUNNER_TEMP}/releases.json" \
+            --tags "${RUNNER_TEMP}/tags.json"
+          node scripts/verify-release-source.ts \
+            --source-rc-tag "${SOURCE_RC_TAG}" \
+            --stable-commit "${GITHUB_SHA}"
+      - name: Publish exact stable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GH_REPO}/git/refs" \
+            -f ref="refs/tags/${RELEASE_TAG}" -f sha="${GITHUB_SHA}" >/dev/null
+          test "$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')" = \
+            "${GITHUB_SHA}"
+          gh release create "${RELEASE_TAG}" release-assets/* \
+            --title "AI PR Reviewer ${RELEASE_TAG}" --generate-notes --latest \
+            --verify-tag --repo "${GH_REPO}"
+
+  update-stable-alias:
+    name: Update stable alias
+    needs: [validate, publish-stable]
+    if: needs.validate.outputs.prerelease == 'false'
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Select latest stable alias target
+        id: alias
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GH_REPO}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          node scripts/select-release-alias.ts \
+            --release-tag "${RELEASE_TAG}" \
+            --releases "${RUNNER_TEMP}/releases.json"
+      - name: Move stable alias tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ALIAS_TAG: ${{ steps.alias.outputs.alias_tag }}
+          ALIAS_RELEASE_TAG: ${{ steps.alias.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          exact_commit="$(gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_RELEASE_TAG}" --jq '.object.sha')"
+          tag_object="$(gh api --method POST "repos/${GH_REPO}/git/tags" \
+            -f tag="${ALIAS_TAG}" \
+            -f message="${ALIAS_RELEASE_TAG}" \
+            -f object="${exact_commit}" \
+            -f type=commit --jq '.sha')"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" > "${RUNNER_TEMP}/alias-ref.json" 2>/dev/null; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${ALIAS_TAG}" \
+              -f sha="${tag_object}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/${ALIAS_TAG}" -f sha="${tag_object}" >/dev/null
           fi
+          gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" \
+            | jq -e --arg sha "${tag_object}" '.object.type == "tag" and .object.sha == $sha' >/dev/null
+          gh api "repos/${GH_REPO}/git/tags/${tag_object}" \
+            | jq -e --arg alias "${ALIAS_TAG}" --arg release "${ALIAS_RELEASE_TAG}" --arg commit "${exact_commit}" \
+              '(.tag == $alias) and ((.message | rtrimstr("\n")) == $release) and (.object.type == "commit") and (.object.sha == $commit)' >/dev/null

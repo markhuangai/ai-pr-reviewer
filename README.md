@@ -1,4 +1,4 @@
-# AI pull request reviewer
+# AI PR Reviewer
 
 This repository contains a Docker-free JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
@@ -31,7 +31,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      - uses: markhuangai/ai-pr-reviewer@v1
+      - uses: markhuangai/ai-pr-reviewer@v1.0.0
         with:
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
           ai-base-url: ${{ secrets.AI_BASE_URL }}
@@ -41,6 +41,15 @@ jobs:
             Check changed code for correctness and regressions.
             Check authentication, authorization, and secret-handling paths.
             Check tests and failure handling for the changed behavior.
+```
+
+Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` for the newest version-1 release candidate. Use an exact tag when the workflow must remain pinned:
+
+```yaml
+- uses: markhuangai/ai-pr-reviewer@v1
+- uses: markhuangai/ai-pr-reviewer@v1-prerelease
+- uses: markhuangai/ai-pr-reviewer@v1.0.0
+- uses: markhuangai/ai-pr-reviewer@v1.0.0-rc.0
 ```
 
 `pull_request_target` runs the checked-in workflow from the base branch and makes secrets available for fork pull requests. Review the security implications for your repository before enabling it. For same-repository pull requests, `pull_request` is usually preferable. Never interpolate untrusted pull request text into shell commands.
@@ -89,6 +98,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - The action streams one immutable merge-base-to-head Git text diff outside the checkout. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. Every goal reads the complete diff through its own ordered, bounded internal reader before `submit_review` is accepted; there is no fixed aggregate character limit.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
+- The action writes assistant text, agent tool calls, and MCP inputs/results to the GitHub Actions log as secret-redacted previews capped at 200 characters. Bounded payloads include their original length; oversized or deeply nested structured payloads are marked `payload truncated` without being fully serialized. Hidden model reasoning is not logged.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
 - If a goal cannot read the text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
 - A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
@@ -97,14 +107,27 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Security and release model
 
-The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. The bootstrap downloads one platform-specific runtime bundle from the `runtime-v1` GitHub Release, verifies its SHA-256 digest, validates the bundle manifest, and starts the bundled Node runtime. After publishing the runtime assets, the release workflow advances the consumer-facing `v1` branch. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. Reference the action with an exact stable or release-candidate tag such as `v1.0.0` or `v1.0.1-rc.0` for reproducible behavior, or use a major alias such as `v1` or `v1-prerelease` to receive the latest stable or prerelease release in that major line. Branches and commit SHAs are not supported. Major aliases are annotated, moving Git tags with no GitHub Release of their own; the bootstrap resolves each alias to its exact compatible release before downloading and verifying the platform runtime. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+
+Releases are started manually through the `Release runtime bundles` workflow with a version that omits the `v` prefix. A run selected on `dev` accepts only `X.Y.Z-rc.N` and creates a GitHub prerelease. A run selected on `main` accepts only `X.Y.Z`, requires the latest matching RC tag to be an ancestor with an identical Git tree, and promotes the exact verified RC assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
+
+The workflow creates and verifies the exact Git tag before publishing its release, so it cannot attach built assets to a racing tag at another commit. After the exact release is published, a separate idempotent job updates `vN` for stable releases or `vN-prerelease` for prereleases to an annotated tag that records the exact release tag. If alias publication fails, the exact release remains usable and the alias job can be rerun. If exact publication fails after tag creation, the orphan tag deliberately blocks retries until an administrator inspects and removes it.
+
+The first release must be dispatched from `dev` as `1.0.0-rc.0`. Until the updated manual form is present on the default branch, use:
+
+```bash
+gh workflow run release.yml \
+  --repo markhuangai/ai-pr-reviewer \
+  --ref dev \
+  -f version=1.0.0-rc.0
+```
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 
 - every locked npm dependency must be at least 168 hours old before installation;
 - exact lockfile versions, integrity hashes, npm signature checks, lifecycle-script disabling, and no runtime package installation;
 - `npm audit --audit-level=high` blocks vulnerable releases;
-- workflows use readable major action versions whose current releases run on Node 24;
+- consumers may pin exact immutable action release tags for reproducibility or choose a documented major alias for automatic updates;
 - a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
 
 CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` or `dev` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
@@ -123,7 +146,7 @@ npm run build
 npm run bundle:bootstrap
 ```
 
-Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. The release workflow uses npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, records the SDK and native CLI versions in each manifest, verifies archive checksums, and publishes the assets to the selected release. No container build is required.
+Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
 
 ## License
 

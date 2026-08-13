@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
+import * as core from "@actions/core";
 import {
   createSdkMcpServer,
   query as sdkQuery,
@@ -23,6 +24,7 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { reviewSecretCandidates } from "../lib/input.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -39,6 +41,10 @@ const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const DIFF_PAGE_BYTES = 48 * 1024;
 const MAX_GIT_STDERR_BYTES = 64 * 1024;
+const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
+const MAX_AGENT_LOG_PROJECTION_CHARACTERS = 1_024;
+const MAX_AGENT_LOG_PROJECTION_NODES = 100;
+const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 const execFileAsync = promisify(execFile);
@@ -112,6 +118,328 @@ function deferred<T>(): Deferred<T> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function redactAgentLogSecret(value: string, secret: string): string {
+  if (secret.length < 8 && /^[A-Za-z0-9]+$/u.test(secret)) {
+    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "gu");
+    return value.replace(pattern, "[REDACTED]");
+  }
+  return value.split(secret).join("[REDACTED]");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function redactAgentLog(value: string, secrets: readonly string[]): string {
+  return secrets
+    .filter((secret) => secret.length > 0)
+    .sort((left, right) => right.length - left.length)
+    .reduce((result, secret) => redactAgentLogSecret(result, secret), value);
+}
+
+function redactBoundedAgentLogString(
+  value: string,
+  secrets: readonly string[],
+  maxLength: number,
+): string {
+  const prefix = value.slice(0, maxLength);
+  let crossingSecretStart = prefix.length;
+  if (value.length > prefix.length) {
+    for (const secret of secrets) {
+      if (secret.length < 2) continue;
+      const firstCharacter = secret[0];
+      if (firstCharacter === undefined) continue;
+      const minimumStart = Math.max(0, prefix.length - secret.length + 1);
+      let start = prefix.lastIndexOf(firstCharacter);
+      while (start >= minimumStart) {
+        if (start + secret.length > prefix.length && value.startsWith(secret, start)) {
+          crossingSecretStart = Math.min(crossingSecretStart, start);
+          break;
+        }
+        start = prefix.lastIndexOf(firstCharacter, start - 1);
+      }
+    }
+  }
+  const bounded =
+    crossingSecretStart < prefix.length
+      ? `${prefix.slice(0, crossingSecretStart)}[REDACTED]`
+      : prefix;
+  return redactAgentLog(bounded, secrets);
+}
+
+interface AgentLogProjectionState {
+  remainingCharacters: number;
+  remainingNodes: number;
+  truncated: boolean;
+  readonly stack: Set<object>;
+}
+
+interface AgentLogProjection {
+  readonly raw: unknown;
+  readonly redacted: unknown;
+}
+
+function projectAgentLogString(
+  value: string,
+  secrets: readonly string[],
+  state: AgentLogProjectionState,
+): AgentLogProjection {
+  const length = Math.min(value.length, state.remainingCharacters);
+  const raw = value.slice(0, length);
+  const redacted = redactBoundedAgentLogString(value, secrets, length);
+  state.remainingCharacters -= length;
+  if (length < value.length) state.truncated = true;
+  return { raw, redacted };
+}
+
+function projectAgentLogValue(
+  value: unknown,
+  secrets: readonly string[],
+  state: AgentLogProjectionState,
+  depth = 0,
+): AgentLogProjection {
+  if (state.remainingNodes === 0 || depth > MAX_AGENT_LOG_PROJECTION_DEPTH) {
+    state.truncated = true;
+    return { raw: "[truncated]", redacted: "[truncated]" };
+  }
+  state.remainingNodes -= 1;
+  if (typeof value === "string") return projectAgentLogString(value, secrets, state);
+  if (typeof value === "bigint") throw new TypeError("BigInt is not JSON serializable.");
+  if (typeof value !== "object" || value === null) return { raw: value, redacted: value };
+  if (state.stack.has(value)) throw new TypeError("Circular agent log value.");
+
+  state.stack.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const raw: unknown[] = [];
+      const redacted: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (state.remainingNodes === 0 || state.remainingCharacters === 0) {
+          state.truncated = true;
+          break;
+        }
+        const item = projectAgentLogValue(value[index], secrets, state, depth + 1);
+        raw.push(item.raw);
+        redacted.push(item.redacted);
+      }
+      return { raw, redacted };
+    }
+
+    const raw: Record<string, unknown> = {};
+    const redacted: Record<string, unknown> = {};
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      if (state.remainingNodes === 0 || state.remainingCharacters === 0) {
+        state.truncated = true;
+        break;
+      }
+      const projectedKey = projectAgentLogString(key, secrets, state);
+      const projectedValue = projectAgentLogValue(
+        (value as Record<string, unknown>)[key],
+        secrets,
+        state,
+        depth + 1,
+      );
+      raw[String(projectedKey.raw)] = projectedValue.raw;
+      redacted[String(projectedKey.redacted)] = projectedValue.redacted;
+    }
+    return { raw, redacted };
+  } finally {
+    state.stack.delete(value);
+  }
+}
+
+interface SerializedAgentLogValue {
+  readonly serialized: string;
+  readonly originalLength?: number;
+}
+
+function serializeAgentLogValue(
+  value: unknown,
+  secrets: readonly string[],
+): SerializedAgentLogValue {
+  if (typeof value === "string") {
+    return {
+      serialized: redactBoundedAgentLogString(value, secrets, MAX_AGENT_LOG_PROJECTION_CHARACTERS),
+      originalLength: value.length,
+    };
+  }
+  try {
+    const state: AgentLogProjectionState = {
+      remainingCharacters: MAX_AGENT_LOG_PROJECTION_CHARACTERS,
+      remainingNodes: MAX_AGENT_LOG_PROJECTION_NODES,
+      truncated: false,
+      stack: new Set(),
+    };
+    const projection = projectAgentLogValue(value, secrets, state);
+    const serialized = JSON.stringify(projection.redacted) as string | undefined;
+    const redacted = redactAgentLog(serialized ?? String(projection.redacted), secrets);
+    if (state.truncated) return { serialized: redacted };
+    const raw = JSON.stringify(projection.raw) as string | undefined;
+    return { serialized: redacted, originalLength: (raw ?? String(projection.raw)).length };
+  } catch {
+    return { serialized: "[unserializable value]", originalLength: 22 };
+  }
+}
+
+function boundedAgentLogValue(value: unknown, secrets: readonly string[]): string {
+  const result = serializeAgentLogValue(value, secrets);
+  const display = typeof value === "string" ? JSON.stringify(result.serialized) : result.serialized;
+  const preview =
+    display.length > MAX_AGENT_LOG_PREVIEW_LENGTH
+      ? `${display.slice(0, MAX_AGENT_LOG_PREVIEW_LENGTH - 1)}…`
+      : display;
+  const length =
+    result.originalLength === undefined ? "payload truncated" : `${result.originalLength} chars`;
+  return `${preview} [${length}]`;
+}
+
+type AgentToolKind = "agent" | "mcp";
+
+interface AgentToolUse {
+  readonly kind: AgentToolKind;
+  readonly label: string;
+}
+
+type AgentLogWriter = (line: string) => void;
+
+function isMcpToolName(name: string): boolean {
+  return name.startsWith("mcp__");
+}
+
+function agentLogLine(
+  goalIndex: number,
+  kind: string,
+  label: string,
+  field: string,
+  value: unknown,
+  secrets: readonly string[],
+): string {
+  return `[ai-pr-reviewer][goal ${goalIndex + 1}] ${kind}${label.length === 0 ? "" : ` ${label}`} ${field}: ${boundedAgentLogValue(value, secrets)}`;
+}
+
+function logAgentMessage(
+  message: SDKMessage,
+  goalIndex: number,
+  secrets: readonly string[],
+  toolUses: Map<string, AgentToolUse>,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  if (message.type === "assistant") {
+    const content = isRecord(message.message) ? message.message.content : undefined;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!isRecord(block) || typeof block.type !== "string") continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        write(agentLogLine(goalIndex, "assistant message", "", "text", block.text, secrets));
+        continue;
+      }
+      if (
+        (block.type !== "tool_use" && block.type !== "mcp_tool_use") ||
+        typeof block.id !== "string" ||
+        typeof block.name !== "string"
+      ) {
+        continue;
+      }
+      const kind: AgentToolKind =
+        block.type === "mcp_tool_use" || isMcpToolName(block.name) ? "mcp" : "agent";
+      const label =
+        block.type === "mcp_tool_use" && typeof block.server_name === "string"
+          ? `${block.server_name}.${block.name}`
+          : block.name;
+      toolUses.set(block.id, { kind, label });
+      write(
+        agentLogLine(
+          goalIndex,
+          kind === "mcp" ? "MCP tool use" : "agent tool use",
+          label,
+          "input",
+          block.input,
+          secrets,
+        ),
+      );
+    }
+    return;
+  }
+
+  if (message.type !== "user") return;
+  const content = isRecord(message.message) ? message.message.content : undefined;
+  let loggedResult = false;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const blockType: string | undefined =
+        isRecord(block) && typeof block.type === "string" ? block.type : undefined;
+      if (
+        !isRecord(block) ||
+        (blockType !== "tool_result" && blockType !== "mcp_tool_result") ||
+        typeof block.tool_use_id !== "string"
+      ) {
+        continue;
+      }
+      const toolUse = toolUses.get(block.tool_use_id);
+      const kind: AgentToolKind =
+        blockType === "mcp_tool_result" || toolUse?.kind === "mcp" ? "mcp" : "agent";
+      const label = toolUse?.label ?? block.tool_use_id;
+      const output = {
+        ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
+        content: block.content,
+      };
+      write(
+        agentLogLine(
+          goalIndex,
+          kind === "mcp" ? "MCP tool result" : "agent tool result",
+          label,
+          "output",
+          output,
+          secrets,
+        ),
+      );
+      loggedResult = true;
+    }
+  }
+  if (!loggedResult && message.tool_use_result !== undefined) {
+    const toolUse =
+      typeof message.parent_tool_use_id === "string"
+        ? toolUses.get(message.parent_tool_use_id)
+        : undefined;
+    write(
+      agentLogLine(
+        goalIndex,
+        toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
+        toolUse?.label ?? message.parent_tool_use_id ?? "unknown",
+        "output",
+        message.tool_use_result,
+        secrets,
+      ),
+    );
+  }
+}
+
+function logAgentMessageSafely(
+  message: SDKMessage,
+  goalIndex: number,
+  secrets: readonly string[],
+  toolUses: Map<string, AgentToolUse>,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+  warn: AgentLogWriter = (line) => {
+    core.warning(line);
+  },
+): void {
+  try {
+    logAgentMessage(message, goalIndex, secrets, toolUses, write);
+  } catch (error) {
+    try {
+      warn(agentLogLine(goalIndex, "agent event log", "", "warning", errorMessage(error), secrets));
+    } catch {
+      // Logging is diagnostic and must not change the review result.
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -633,6 +961,8 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   let toolCallCount = 0;
+  const logSecrets = reviewSecretCandidates(config);
+  const toolUses = new Map<string, AgentToolUse>();
   const diffReader = diff.createReader();
   const diffTool = tool(
     "read_pr_diff",
@@ -693,6 +1023,7 @@ export async function runReviewGoal(
     reader = (async () => {
       try {
         for await (const message of session as AsyncIterable<SDKMessage>) {
+          logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
           if (message.type === "result") {
             const completedTurn = turn;
             turn = deferred<SDKResultMessage>();
@@ -819,10 +1150,14 @@ export async function runReviewGoals(
 }
 
 export const agentInternals = {
+  boundedAgentLogValue,
   changedFilePrompt,
   createPullRequestDiff,
   goalCommand,
+  logAgentMessage,
+  logAgentMessageSafely,
   PullRequestDiffReader,
+  redactAgentLog,
   reviewSubmissionRejection,
   resolveCommit,
   resolveMergeBase,

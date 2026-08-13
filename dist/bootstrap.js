@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
+import { aliasAcceptsRelease, isCompatibleRuntimeManifest, parseActionReleaseReference, parseActionReleaseTag, } from "./lib/bootstrap/version.js";
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
-const RELEASE_TAG = "runtime-v1";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10_000;
@@ -28,11 +29,57 @@ function requestHeaders() {
         "X-GitHub-Api-Version": "2022-11-28",
     });
 }
+function apiRequestHeaders() {
+    const headers = requestHeaders();
+    const token = process.env["INPUT_GITHUB-PAT"]?.trim();
+    if (token)
+        headers.set("Authorization", `Bearer ${token}`);
+    return headers;
+}
 async function fetchJson(url) {
-    const response = await fetch(url, { headers: requestHeaders() });
+    const response = await fetch(url, { headers: apiRequestHeaders() });
     if (!response.ok)
         throw new Error(`Runtime release lookup failed (${response.status}).`);
     return (await response.json());
+}
+function gitObject(value, expectedType) {
+    if (!isRecord(value) || !isRecord(value.object))
+        return undefined;
+    const sha = value.object.sha;
+    return value.object.type === expectedType &&
+        typeof sha === "string" &&
+        /^[a-f0-9]{40}$/iu.test(sha)
+        ? sha
+        : undefined;
+}
+async function resolveAlias(alias, getJson) {
+    const ref = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`);
+    const tagObjectSha = gitObject(ref, "tag");
+    if (!tagObjectSha)
+        throw new Error("The action release alias is not an annotated Git tag.");
+    const tagObject = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`);
+    if (!isRecord(tagObject) ||
+        tagObject.tag !== alias.tag ||
+        typeof tagObject.message !== "string") {
+        throw new Error("The action release alias contains invalid metadata.");
+    }
+    const release = parseActionReleaseTag(tagObject.message.trim());
+    const commitSha = gitObject(tagObject, "commit");
+    if (!release || !commitSha || !aliasAcceptsRelease(alias, release)) {
+        throw new Error("The action release alias targets an incompatible exact version.");
+    }
+    const exactRef = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`);
+    if (gitObject(exactRef, "commit") !== commitSha) {
+        throw new Error("The action release alias and exact version resolve to different commits.");
+    }
+    return release;
+}
+export async function resolveActionRelease(value, getJson = fetchJson) {
+    const reference = parseActionReleaseReference(value);
+    if (!reference) {
+        throw new Error("This action must be referenced by vN, vN-prerelease, or an exact tag such as v1.0.0 or v1.0.0-rc.0.");
+    }
+    return "stableTag" in reference ? reference : resolveAlias(reference, getJson);
 }
 function readAsset(value) {
     if (!isRecord(value) ||
@@ -177,13 +224,15 @@ async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER
     });
 }
 async function main() {
+    const releaseRef = process.env.GITHUB_ACTION_REF;
+    const requestedRelease = await resolveActionRelease(releaseRef);
     const assetName = platformAssetName();
-    const release = await fetchJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}`);
-    if (release.tag_name !== RELEASE_TAG ||
-        release.draft === true ||
-        release.prerelease === true ||
+    const release = await fetchJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`);
+    if (release.tag_name !== requestedRelease.tag ||
+        release.draft !== false ||
+        release.prerelease !== requestedRelease.prerelease ||
         !Array.isArray(release.assets)) {
-        throw new Error("The runtime release is not a stable, usable release.");
+        throw new Error("The runtime release does not match the requested action version.");
     }
     const assets = release.assets.map(readAsset);
     const asset = assets.find((candidate) => candidate.name === assetName);
@@ -192,7 +241,7 @@ async function main() {
     if (typeof asset.size === "number" && asset.size > MAX_ARCHIVE_BYTES)
         throw new Error("Runtime asset is larger than the safety limit.");
     const checksum = await readChecksum(`${asset.browser_download_url}.sha256`);
-    const cacheRoot = join(process.env.RUNNER_TEMP ?? tmpdir(), "ai-pr-reviewer-runtime", RELEASE_TAG, assetName.replace(/[^A-Za-z0-9_.-]/g, "_"));
+    const cacheRoot = join(process.env.RUNNER_TEMP ?? tmpdir(), "ai-pr-reviewer-runtime", requestedRelease.tag, assetName.replace(/[^A-Za-z0-9_.-]/g, "_"));
     const archive = join(cacheRoot, assetName);
     const bytes = await download(asset.browser_download_url, archive);
     const actualDigest = sha256(bytes);
@@ -204,7 +253,7 @@ async function main() {
         const manifestPath = join(extracted, "runtime", "manifest.json");
         const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
         if (!isRecord(manifest) ||
-            manifest.releaseTag !== RELEASE_TAG ||
+            !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
             manifest.asset !== assetName ||
             manifest.nodeMajor !== 24 ||
             typeof manifest.sdkVersion !== "string" ||
@@ -222,7 +271,10 @@ async function main() {
         await rm(extracted, { recursive: true, force: true });
     }
 }
-main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-});
+const entry = process.argv[1];
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+    main().catch((error) => {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+    });
+}
