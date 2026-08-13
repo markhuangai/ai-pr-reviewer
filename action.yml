@@ -1,4 +1,4 @@
-name: AI pull request reviewer
+name: AI PR Reviewer
 description: Review any GitHub pull request with isolated Claude Agent SDK goal sessions.
 author: MarkHuang.ai
 inputs:

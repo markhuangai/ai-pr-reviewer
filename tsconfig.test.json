@@ -10,6 +10,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "scripts/select-release-alias.ts",
     "scripts/validate-release.ts",
     "scripts/verify-release-source.ts",
     "tests/**/*.ts"

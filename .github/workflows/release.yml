@@ -277,8 +277,70 @@ jobs:
           test "$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')" = \
             "${GITHUB_SHA}"
           gh release create "${RELEASE_TAG}" release-assets/* \
-            --title "AI PR reviewer ${RELEASE_TAG}" --generate-notes --prerelease \
+            --title "AI PR Reviewer ${RELEASE_TAG}" --generate-notes --prerelease \
             --latest=false --verify-tag --repo "${GH_REPO}"
+
+  update-prerelease-alias:
+    name: Update prerelease alias
+    needs: [validate, publish-prerelease]
+    if: needs.validate.outputs.prerelease == 'true'
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Select latest prerelease alias target
+        id: alias
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GH_REPO}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          node scripts/select-release-alias.ts \
+            --release-tag "${RELEASE_TAG}" \
+            --releases "${RUNNER_TEMP}/releases.json"
+      - name: Move prerelease alias tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          ALIAS_TAG: ${{ steps.alias.outputs.alias_tag }}
+          ALIAS_RELEASE_TAG: ${{ steps.alias.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          exact_commit="$(gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_RELEASE_TAG}" --jq '.object.sha')"
+          tag_object="$(gh api --method POST "repos/${GH_REPO}/git/tags" \
+            -f tag="${ALIAS_TAG}" \
+            -f message="${ALIAS_RELEASE_TAG}" \
+            -f object="${exact_commit}" \
+            -f type=commit --jq '.sha')"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" > "${RUNNER_TEMP}/alias-ref.json" 2>/dev/null; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${ALIAS_TAG}" \
+              -f sha="${tag_object}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/${ALIAS_TAG}" -f sha="${tag_object}" >/dev/null
+          fi
+          gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" \
+            | jq -e --arg sha "${tag_object}" '.object.type == "tag" and .object.sha == $sha' >/dev/null
+          gh api "repos/${GH_REPO}/git/tags/${tag_object}" \
+            | jq -e --arg alias "${ALIAS_TAG}" --arg release "${ALIAS_RELEASE_TAG}" --arg commit "${exact_commit}" \
+              '(.tag == $alias) and ((.message | rtrimstr("\n")) == $release) and (.object.type == "commit") and (.object.sha == $commit)' >/dev/null
 
   publish-stable:
     name: Promote stable release
@@ -379,5 +441,66 @@ jobs:
           test "$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')" = \
             "${GITHUB_SHA}"
           gh release create "${RELEASE_TAG}" release-assets/* \
-            --title "AI PR reviewer ${RELEASE_TAG}" --generate-notes --latest \
+            --title "AI PR Reviewer ${RELEASE_TAG}" --generate-notes --latest \
             --verify-tag --repo "${GH_REPO}"
+
+  update-stable-alias:
+    name: Update stable alias
+    needs: [validate, publish-stable]
+    if: needs.validate.outputs.prerelease == 'false'
+    runs-on: docker-runner
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Select latest stable alias target
+        id: alias
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GH_REPO}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/releases.json"
+          node scripts/select-release-alias.ts \
+            --release-tag "${RELEASE_TAG}" \
+            --releases "${RUNNER_TEMP}/releases.json"
+      - name: Move stable alias tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ALIAS_TAG: ${{ steps.alias.outputs.alias_tag }}
+          ALIAS_RELEASE_TAG: ${{ steps.alias.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          exact_commit="$(gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_RELEASE_TAG}" --jq '.object.sha')"
+          tag_object="$(gh api --method POST "repos/${GH_REPO}/git/tags" \
+            -f tag="${ALIAS_TAG}" \
+            -f message="${ALIAS_RELEASE_TAG}" \
+            -f object="${exact_commit}" \
+            -f type=commit --jq '.sha')"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" > "${RUNNER_TEMP}/alias-ref.json" 2>/dev/null; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${ALIAS_TAG}" \
+              -f sha="${tag_object}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/${ALIAS_TAG}" -f sha="${tag_object}" >/dev/null
+          fi
+          gh api "repos/${GH_REPO}/git/ref/tags/${ALIAS_TAG}" \
+            | jq -e --arg sha "${tag_object}" '.object.type == "tag" and .object.sha == $sha' >/dev/null
+          gh api "repos/${GH_REPO}/git/tags/${tag_object}" \
+            | jq -e --arg alias "${ALIAS_TAG}" --arg release "${ALIAS_RELEASE_TAG}" --arg commit "${exact_commit}" \
+              '(.tag == $alias) and ((.message | rtrimstr("\n")) == $release) and (.object.type == "commit") and (.object.sha == $commit)' >/dev/null
