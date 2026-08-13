@@ -1,5 +1,8 @@
 import { strict as assert } from "node:assert";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+
+import { parse } from "yaml";
 
 import {
   validateReleaseRequest,
@@ -24,6 +27,18 @@ function history(...tags: string[]): ReleaseRecord[] {
 function tagRecords(...tags: string[]): TagRecord[] {
   return tags.map((tag) => ({ ref: `refs/tags/${tag}` }));
 }
+
+test("keeps every release workflow upload artifact for one day", async () => {
+  const workflow = parse(await readFile(".github/workflows/release.yml", "utf8")) as {
+    jobs?: Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>;
+  };
+  const uploadSteps = Object.values(workflow.jobs ?? {})
+    .flatMap((job) => job.steps ?? [])
+    .filter((step) => step.uses?.startsWith("actions/upload-artifact@"));
+
+  assert.ok(uploadSteps.length > 0);
+  for (const step of uploadSteps) assert.equal(step.with?.["retention-days"], 1);
+});
 
 test("starts the release stream at 1.0.0-rc.0", () => {
   assert.deepEqual(validateReleaseRequest("1.0.0-rc.0", "dev", [[]], [[]]), {

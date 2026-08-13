@@ -205,6 +205,7 @@ jobs:
           name: ${{ matrix.asset }}
           path: release/assets/${{ matrix.asset }}*
           if-no-files-found: error
+          retention-days: 1
 
   publish-prerelease:
     name: Publish prerelease
