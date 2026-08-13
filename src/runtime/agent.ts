@@ -17,6 +17,7 @@ import {
   type Options,
   type HookCallback,
   type HookInput,
+  type SDKActiveGoalMessage,
   type SDKMessage,
   type SDKResultMessage,
   type SDKUserMessage,
@@ -42,10 +43,13 @@ const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const DIFF_PAGE_BYTES = 48 * 1024;
 const MAX_GIT_STDERR_BYTES = 64 * 1024;
 const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
+const MAX_AGENT_LOG_CHUNK_LENGTH = 8_000;
 const MAX_AGENT_LOG_PROJECTION_CHARACTERS = 1_024;
 const MAX_AGENT_LOG_PROJECTION_NODES = 100;
 const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+const REVIEW_SYSTEM_PROMPT =
+  "You are a security-conscious, read-only code reviewer. Read the internal pull request diff to completion before submitting. Every claim must be grounded in inspected repository content or an explicitly available MCP response. Never modify files, execute commands, access the web, or reveal credentials.";
 
 const execFileAsync = promisify(execFile);
 
@@ -137,6 +141,70 @@ function redactAgentLog(value: string, secrets: readonly string[]): string {
     .filter((secret) => secret.length > 0)
     .sort((left, right) => right.length - left.length)
     .reduce((result, secret) => redactAgentLogSecret(result, secret), value);
+}
+
+function projectCompleteAgentLogValue(
+  value: unknown,
+  secrets: readonly string[],
+  stack = new Set<object>(),
+): unknown {
+  if (typeof value === "string") return redactAgentLog(value, secrets);
+  if (typeof value === "bigint") throw new TypeError("BigInt is not JSON serializable.");
+  if (typeof value !== "object" || value === null) return value;
+  if (stack.has(value)) throw new TypeError("Circular agent log value.");
+
+  stack.add(value);
+  try {
+    if (Array.isArray(value))
+      return value.map((item) => projectCompleteAgentLogValue(item, secrets, stack));
+
+    const projected: Record<string, unknown> = {};
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      projected[redactAgentLog(key, secrets)] = projectCompleteAgentLogValue(
+        (value as Record<string, unknown>)[key],
+        secrets,
+        stack,
+      );
+    }
+    return projected;
+  } finally {
+    stack.delete(value);
+  }
+}
+
+function completeAgentLogValue(value: unknown, secrets: readonly string[]): string {
+  try {
+    const projected = projectCompleteAgentLogValue(value, secrets);
+    if (projected === undefined) return "undefined";
+    return JSON.stringify(projected);
+  } catch {
+    return "[unserializable value]";
+  }
+}
+
+function chunkAgentLogValue(
+  value: string,
+  maxLength = MAX_AGENT_LOG_CHUNK_LENGTH,
+): readonly string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 2)
+    throw new RangeError("Agent log chunk length must be an integer of at least 2.");
+  if (value.length === 0) return [""];
+
+  const chunks: string[] = [];
+  for (let offset = 0; offset < value.length; ) {
+    let end = Math.min(offset + maxLength, value.length);
+    if (
+      end < value.length &&
+      /[\uD800-\uDBFF]/u.test(value[end - 1] ?? "") &&
+      /[\uDC00-\uDFFF]/u.test(value[end] ?? "")
+    ) {
+      end -= 1;
+    }
+    chunks.push(value.slice(offset, end));
+    offset = end;
+  }
+  return chunks;
 }
 
 function redactBoundedAgentLogString(
@@ -305,8 +373,40 @@ interface AgentToolUse {
 
 type AgentLogWriter = (line: string) => void;
 
+interface AgentLifecycleState {
+  sessionId?: string;
+  turnResults: number;
+  latestTurnCount: number;
+  goalIterations: number;
+  compactionStarts: number;
+  compactionSuccesses: number;
+  compactionFailures: number;
+  compactionBoundaries: number;
+}
+
+function createAgentLifecycleState(): AgentLifecycleState {
+  return {
+    turnResults: 0,
+    latestTurnCount: 0,
+    goalIterations: 0,
+    compactionStarts: 0,
+    compactionSuccesses: 0,
+    compactionFailures: 0,
+    compactionBoundaries: 0,
+  };
+}
+
 function isMcpToolName(name: string): boolean {
   return name.startsWith("mcp__");
+}
+
+function isInternalReviewTool(label: string): boolean {
+  return (
+    label === "review_output.read_pr_diff" ||
+    label === "review_output.submit_review" ||
+    label === "mcp__review_output__read_pr_diff" ||
+    label === "mcp__review_output__submit_review"
+  );
 }
 
 function agentLogLine(
@@ -318,6 +418,205 @@ function agentLogLine(
   secrets: readonly string[],
 ): string {
   return `[ai-pr-reviewer][goal ${goalIndex + 1}] ${kind}${label.length === 0 ? "" : ` ${label}`} ${field}: ${boundedAgentLogValue(value, secrets)}`;
+}
+
+function writeCompleteAgentLog(
+  goalIndex: number,
+  kind: string,
+  label: string,
+  field: string,
+  value: unknown,
+  secrets: readonly string[],
+  write: AgentLogWriter,
+): void {
+  const serialized = completeAgentLogValue(value, secrets);
+  const chunks = chunkAgentLogValue(serialized);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const part = chunks.length === 1 ? "" : ` part ${index + 1}/${chunks.length}`;
+    write(
+      `[ai-pr-reviewer][goal ${goalIndex + 1}] ${kind}${label.length === 0 ? "" : ` ${label}`} ${field}${part}: ${chunks[index]}`,
+    );
+  }
+}
+
+function writeAgentLifecycleLog(
+  goalIndex: number,
+  event: string,
+  value: unknown,
+  secrets: readonly string[],
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  write(agentLogLine(goalIndex, "session", event, "details", value, secrets));
+}
+
+function userMessageText(message: SDKUserMessage): string | undefined {
+  const content = message.message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+
+  const parts: string[] = [];
+  for (const block of content) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string")
+      parts.push(block.text);
+  }
+  const text = parts.join("\n");
+  return text.length > 0 ? text : undefined;
+}
+
+function logQueuedUserMessage(
+  message: SDKUserMessage,
+  label: string,
+  goalIndex: number,
+  secrets: readonly string[],
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  const text = userMessageText(message);
+  if (text !== undefined)
+    writeCompleteAgentLog(goalIndex, "user message", label, "text", text, secrets, write);
+}
+
+function logAgentEventSafely(
+  goalIndex: number,
+  secrets: readonly string[],
+  log: (write: AgentLogWriter) => void,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+  warn: AgentLogWriter = (line) => {
+    core.warning(line);
+  },
+): void {
+  try {
+    log(write);
+  } catch (error) {
+    try {
+      warn(agentLogLine(goalIndex, "agent event log", "", "warning", errorMessage(error), secrets));
+    } catch {
+      // Logging is diagnostic and must not change the review result.
+    }
+  }
+}
+
+function logAgentLifecycleMessage(
+  message: SDKMessage | SDKActiveGoalMessage,
+  goalIndex: number,
+  secrets: readonly string[],
+  state: AgentLifecycleState,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  if (message.type === "active_goal") {
+    if (message.value === null) {
+      writeAgentLifecycleLog(
+        goalIndex,
+        "goal-cleared",
+        { iterations: state.goalIterations },
+        secrets,
+        write,
+      );
+      return;
+    }
+    state.goalIterations = message.value.iterations;
+    writeAgentLifecycleLog(goalIndex, "goal-iteration", message.value, secrets, write);
+    return;
+  }
+
+  if (message.type === "result") {
+    state.turnResults += 1;
+    state.latestTurnCount = message.num_turns;
+    writeAgentLifecycleLog(
+      goalIndex,
+      "turn-result",
+      {
+        result: state.turnResults,
+        subtype: message.subtype,
+        turns: message.num_turns,
+        duration_ms: message.duration_ms,
+        duration_api_ms: message.duration_api_ms,
+        stop_reason: message.stop_reason,
+        is_error: message.is_error,
+      },
+      secrets,
+      write,
+    );
+    if (message.subtype !== "success" && message.errors.length > 0)
+      write(agentLogLine(goalIndex, "session", "turn-result", "errors", message.errors, secrets));
+    return;
+  }
+
+  if (message.type !== "system") return;
+  if (message.subtype === "init") {
+    state.sessionId = message.session_id;
+    writeAgentLifecycleLog(
+      goalIndex,
+      "init",
+      {
+        session_id: message.session_id,
+        model: message.model,
+        claude_code_version: message.claude_code_version,
+      },
+      secrets,
+      write,
+    );
+    return;
+  }
+  if (message.subtype === "status") {
+    if (message.status === "compacting") {
+      state.compactionStarts += 1;
+      writeAgentLifecycleLog(
+        goalIndex,
+        "compaction-start",
+        { attempt: state.compactionStarts },
+        secrets,
+        write,
+      );
+    }
+    if (message.compact_result !== undefined) {
+      if (message.compact_result === "success") state.compactionSuccesses += 1;
+      else state.compactionFailures += 1;
+      writeAgentLifecycleLog(
+        goalIndex,
+        "compaction-result",
+        {
+          result: message.compact_result,
+          successes: state.compactionSuccesses,
+          failures: state.compactionFailures,
+        },
+        secrets,
+        write,
+      );
+      if (message.compact_error !== undefined)
+        write(
+          agentLogLine(
+            goalIndex,
+            "session",
+            "compaction-result",
+            "error",
+            message.compact_error,
+            secrets,
+          ),
+        );
+    }
+    return;
+  }
+  if (message.subtype === "compact_boundary") {
+    state.compactionBoundaries += 1;
+    writeAgentLifecycleLog(
+      goalIndex,
+      "compaction-boundary",
+      {
+        boundary: state.compactionBoundaries,
+        ...message.compact_metadata,
+      },
+      secrets,
+      write,
+    );
+  }
 }
 
 function logAgentMessage(
@@ -335,7 +634,15 @@ function logAgentMessage(
     for (const block of content) {
       if (!isRecord(block) || typeof block.type !== "string") continue;
       if (block.type === "text" && typeof block.text === "string") {
-        write(agentLogLine(goalIndex, "assistant message", "", "text", block.text, secrets));
+        writeCompleteAgentLog(
+          goalIndex,
+          "assistant message",
+          "",
+          "text",
+          block.text,
+          secrets,
+          write,
+        );
         continue;
       }
       if (
@@ -384,20 +691,35 @@ function logAgentMessage(
       const kind: AgentToolKind =
         blockType === "mcp_tool_result" || toolUse?.kind === "mcp" ? "mcp" : "agent";
       const label = toolUse?.label ?? block.tool_use_id;
+      const isError = block.is_error === true || block.isError === true;
       const output = {
-        ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
+        ...(typeof block.is_error === "boolean" || typeof block.isError === "boolean"
+          ? { is_error: isError }
+          : {}),
         content: block.content,
       };
-      write(
-        agentLogLine(
+      if (isError && isInternalReviewTool(label)) {
+        writeCompleteAgentLog(
           goalIndex,
           kind === "mcp" ? "MCP tool result" : "agent tool result",
           label,
           "output",
           output,
           secrets,
-        ),
-      );
+          write,
+        );
+      } else {
+        write(
+          agentLogLine(
+            goalIndex,
+            kind === "mcp" ? "MCP tool result" : "agent tool result",
+            label,
+            "output",
+            output,
+            secrets,
+          ),
+        );
+      }
       loggedResult = true;
     }
   }
@@ -406,16 +728,32 @@ function logAgentMessage(
       typeof message.parent_tool_use_id === "string"
         ? toolUses.get(message.parent_tool_use_id)
         : undefined;
-    write(
-      agentLogLine(
+    const isError =
+      isRecord(message.tool_use_result) &&
+      (message.tool_use_result.isError === true || message.tool_use_result.is_error === true);
+    const label = toolUse?.label ?? message.parent_tool_use_id ?? "unknown";
+    if (isError && isInternalReviewTool(label)) {
+      writeCompleteAgentLog(
         goalIndex,
         toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
-        toolUse?.label ?? message.parent_tool_use_id ?? "unknown",
+        label,
         "output",
         message.tool_use_result,
         secrets,
-      ),
-    );
+        write,
+      );
+    } else {
+      write(
+        agentLogLine(
+          goalIndex,
+          toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
+          label,
+          "output",
+          message.tool_use_result,
+          secrets,
+        ),
+      );
+    }
   }
 }
 
@@ -877,10 +1215,13 @@ After reading the complete diff, call mcp__review_output__submit_review exactly 
 function reviewSubmissionRejection(
   reviewPromptActive: boolean,
   diffComplete: boolean,
+  submissionAccepted = false,
 ): string | undefined {
   if (!reviewPromptActive) return "Wait for the full review prompt before submitting.";
   if (!diffComplete)
     return "Review submission rejected. Read the pull request diff until done=true first.";
+  if (submissionAccepted)
+    return "Review submission rejected. A review has already been accepted for this goal.";
   return undefined;
 }
 
@@ -944,9 +1285,44 @@ function makeOptions(
     },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
-    systemPrompt:
-      "You are a security-conscious, read-only code reviewer. Read the internal pull request diff to completion before submitting. Every claim must be grounded in inspected repository content or an explicitly available MCP response. Never modify files, execute commands, access the web, or reveal credentials.",
+    systemPrompt: REVIEW_SYSTEM_PROMPT,
   };
+}
+
+function startReviewPrompt(
+  input: Pick<PromptStream, "push">,
+  goal: string,
+  context: PullRequestContext,
+  files: readonly ChangedFile[],
+  mergeBaseSha: string,
+  goalIndex: number,
+  secrets: readonly string[],
+  activate: () => void,
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  const goalMessage = makeUserMessage(goalCommand(goal));
+  const reviewMessage = makeUserMessage(buildGoalPrompt(goal, context, files, mergeBaseSha));
+  input.push(goalMessage);
+  input.push(reviewMessage);
+  activate();
+  logAgentEventSafely(
+    goalIndex,
+    secrets,
+    (safeWrite) => {
+      logQueuedUserMessage(goalMessage, "goal", goalIndex, secrets, safeWrite);
+    },
+    write,
+  );
+  logAgentEventSafely(
+    goalIndex,
+    secrets,
+    (safeWrite) => {
+      logQueuedUserMessage(reviewMessage, "review", goalIndex, secrets, safeWrite);
+    },
+    write,
+  );
 }
 
 export async function runReviewGoal(
@@ -960,9 +1336,9 @@ export async function runReviewGoal(
 ): Promise<GoalResult> {
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
-  let toolCallCount = 0;
   const logSecrets = reviewSecretCandidates(config);
   const toolUses = new Map<string, AgentToolUse>();
+  const lifecycle = createAgentLifecycleState();
   const diffReader = diff.createReader();
   const diffTool = tool(
     "read_pr_diff",
@@ -984,14 +1360,17 @@ export async function runReviewGoal(
     "Submit the validated findings for this isolated review goal.",
     submissionSchema.shape,
     (input): Promise<CallToolResult> => {
-      const rejection = reviewSubmissionRejection(reviewPromptActive, diffReader.complete);
+      const rejection = reviewSubmissionRejection(
+        reviewPromptActive,
+        diffReader.complete,
+        submission !== undefined,
+      );
       if (rejection !== undefined) {
         return Promise.resolve({
           content: [{ type: "text", text: rejection }],
         });
       }
-      toolCallCount += 1;
-      if (toolCallCount === 1) submission = toSubmission(input);
+      submission = toSubmission(input);
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
     { alwaysLoad: true },
@@ -1014,7 +1393,20 @@ export async function runReviewGoal(
   let turn = deferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
+  let repairAttempts = 0;
   try {
+    logAgentEventSafely(goalIndex, logSecrets, (write) => {
+      writeAgentLifecycleLog(goalIndex, "start", { prompt_gate: "closed" }, logSecrets, write);
+      writeCompleteAgentLog(
+        goalIndex,
+        "system message",
+        "review",
+        "text",
+        REVIEW_SYSTEM_PROMPT,
+        logSecrets,
+        write,
+      );
+    });
     const session = sdkQuery({
       prompt: input,
       options: makeOptions(config, cwd, mcpServers, outputServerName),
@@ -1022,8 +1414,12 @@ export async function runReviewGoal(
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
     reader = (async () => {
       try {
-        for await (const message of session as AsyncIterable<SDKMessage>) {
-          logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
+        for await (const message of session as AsyncIterable<SDKMessage | SDKActiveGoalMessage>) {
+          if (message.type !== "active_goal")
+            logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
+          logAgentEventSafely(goalIndex, logSecrets, (write) => {
+            logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
+          });
           if (message.type === "result") {
             const completedTurn = turn;
             turn = deferred<SDKResultMessage>();
@@ -1035,24 +1431,20 @@ export async function runReviewGoal(
         turn.reject(readerFailure);
       }
     })();
-    input.push(makeUserMessage(goalCommand(goal)));
-    input.push(makeUserMessage(buildGoalPrompt(goal, context, files, diff.mergeBaseSha)));
-    let repairAttempts = 0;
-    for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS + 1; turnIndex += 1) {
+    startReviewPrompt(input, goal, context, files, diff.mergeBaseSha, goalIndex, logSecrets, () => {
+      reviewPromptActive = true;
+    });
+    logAgentEventSafely(goalIndex, logSecrets, (write) => {
+      writeAgentLifecycleLog(
+        goalIndex,
+        "prompt-gate-open",
+        { queued_messages: 2 },
+        logSecrets,
+        write,
+      );
+    });
+    for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS; turnIndex += 1) {
       const result = await turn.promise;
-      if (!reviewPromptActive) {
-        if (result.subtype !== "success") {
-          input.finish();
-          await reader;
-          return {
-            prompt: goal,
-            status: "failed",
-            error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
-          };
-        }
-        reviewPromptActive = true;
-        continue;
-      }
       if (submission !== undefined) {
         const mcpFailures = (await session.mcpServerStatus()).filter(
           (status) =>
@@ -1094,7 +1486,17 @@ export async function runReviewGoal(
         };
       }
       repairAttempts += 1;
-      input.push(makeUserMessage(repairPrompt(repairAttempts, diffReader.complete)));
+      const repairMessage = makeUserMessage(repairPrompt(repairAttempts, diffReader.complete));
+      input.push(repairMessage);
+      logAgentEventSafely(goalIndex, logSecrets, (write) => {
+        logQueuedUserMessage(
+          repairMessage,
+          `repair-${repairAttempts}`,
+          goalIndex,
+          logSecrets,
+          write,
+        );
+      });
     }
     input.finish();
     await reader;
@@ -1104,10 +1506,43 @@ export async function runReviewGoal(
       error: "Claude did not submit a valid review after five repair attempts.",
     };
   } catch (error) {
+    logAgentEventSafely(goalIndex, logSecrets, (write) => {
+      write(
+        agentLogLine(
+          goalIndex,
+          "session",
+          "failure",
+          "error",
+          readerFailure?.message ?? errorMessage(error),
+          logSecrets,
+        ),
+      );
+    });
     input.finish();
     if (reader) await reader.catch(() => undefined);
     return { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) };
   } finally {
+    logAgentEventSafely(goalIndex, logSecrets, (write) => {
+      writeAgentLifecycleLog(
+        goalIndex,
+        "end",
+        {
+          session_id: lifecycle.sessionId,
+          prompt_gate: reviewPromptActive ? "open" : "closed",
+          turn_results: lifecycle.turnResults,
+          latest_turn_count: lifecycle.latestTurnCount,
+          repair_attempts: repairAttempts,
+          goal_iterations: lifecycle.goalIterations,
+          compaction_starts: lifecycle.compactionStarts,
+          compaction_successes: lifecycle.compactionSuccesses,
+          compaction_failures: lifecycle.compactionFailures,
+          compaction_boundaries: lifecycle.compactionBoundaries,
+          submission_accepted: submission !== undefined,
+        },
+        logSecrets,
+        write,
+      );
+    });
     await diffReader.close();
   }
 }
@@ -1152,12 +1587,19 @@ export async function runReviewGoals(
 export const agentInternals = {
   boundedAgentLogValue,
   changedFilePrompt,
+  chunkAgentLogValue,
+  completeAgentLogValue,
   createPullRequestDiff,
+  createAgentLifecycleState,
   goalCommand,
+  logAgentLifecycleMessage,
   logAgentMessage,
   logAgentMessageSafely,
+  logQueuedUserMessage,
   PullRequestDiffReader,
+  startReviewPrompt,
   redactAgentLog,
+  REVIEW_SYSTEM_PROMPT,
   reviewSubmissionRejection,
   resolveCommit,
   resolveMergeBase,
