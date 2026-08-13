@@ -34,6 +34,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Fetch release and tag history
         shell: bash
         env:
@@ -82,6 +83,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Enforce dependency age quarantine before install
         run: node scripts/check-package-age.ts
       - name: Install locked dependencies without lifecycle scripts
@@ -140,6 +142,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Install locked dependencies without lifecycle scripts
         env:
           NPM_CONFIG_OS: ${{ matrix.target_os }}
@@ -220,6 +223,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Download runtime bundles
         uses: actions/download-artifact@v8
         with:
@@ -298,6 +302,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Select latest prerelease alias target
         id: alias
         shell: bash
@@ -360,6 +365,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Revalidate release candidate source
         shell: bash
         env:
@@ -462,6 +468,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Select latest stable alias target
         id: alias
         shell: bash

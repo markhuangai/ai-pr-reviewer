@@ -24,7 +24,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: npm
+          package-manager-cache: false
       - name: Enforce dependency age quarantine before install
         run: node scripts/check-package-age.ts
       - name: Install locked dependencies without lifecycle scripts
@@ -59,6 +59,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
