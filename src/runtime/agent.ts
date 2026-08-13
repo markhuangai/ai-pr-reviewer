@@ -545,15 +545,7 @@ function logAgentLifecycleMessage(
       write,
     );
     if (message.subtype !== "success" && message.errors.length > 0)
-      writeCompleteAgentLog(
-        goalIndex,
-        "session",
-        "turn-result",
-        "errors",
-        message.errors,
-        secrets,
-        write,
-      );
+      write(agentLogLine(goalIndex, "session", "turn-result", "errors", message.errors, secrets));
     return;
   }
 
@@ -599,14 +591,15 @@ function logAgentLifecycleMessage(
         write,
       );
       if (message.compact_error !== undefined)
-        writeCompleteAgentLog(
-          goalIndex,
-          "session",
-          "compaction-result",
-          "error",
-          message.compact_error,
-          secrets,
-          write,
+        write(
+          agentLogLine(
+            goalIndex,
+            "session",
+            "compaction-result",
+            "error",
+            message.compact_error,
+            secrets,
+          ),
         );
     }
     return;
@@ -1514,14 +1507,15 @@ export async function runReviewGoal(
     };
   } catch (error) {
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      writeCompleteAgentLog(
-        goalIndex,
-        "session",
-        "failure",
-        "error",
-        readerFailure?.message ?? errorMessage(error),
-        logSecrets,
-        write,
+      write(
+        agentLogLine(
+          goalIndex,
+          "session",
+          "failure",
+          "error",
+          readerFailure?.message ?? errorMessage(error),
+          logSecrets,
+        ),
       );
     });
     input.finish();

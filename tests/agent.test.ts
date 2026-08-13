@@ -487,7 +487,7 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
       duration_api_ms: 60,
       stop_reason: "max_turns",
       is_error: true,
-      errors: ["full result error"],
+      errors: [`provider error ${"r".repeat(9_000)}`],
       ...base,
     },
     { type: "active_goal", value: null, ...base },
@@ -508,6 +508,9 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   assert.match(lines.join("\n"), /session compaction-result error/u);
   assert.match(lines.join("\n"), /session compaction-boundary/u);
   assert.match(lines.join("\n"), /session turn-result errors/u);
+  const resultError = lines.find((line) => /session turn-result errors/u.test(line));
+  assert.match(resultError ?? "", /payload truncated/u);
+  assert.equal((resultError ?? "").includes("r".repeat(9_000)), false);
   assert.match(lines.join("\n"), /session goal-cleared/u);
 });
 
