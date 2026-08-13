@@ -626,6 +626,33 @@ test("bounds external MCP errors while preserving complete internal fallback err
   assert.match(reconstructed, new RegExp("i{9000}", "u"));
 });
 
+test("does not treat an external dotted server name as the internal review server", () => {
+  const message = {
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "mcp_tool_result",
+          tool_use_id: "collision-tool",
+          content: "c".repeat(9_000),
+          is_error: true,
+        },
+      ],
+    },
+  } as unknown as SDKMessage;
+  const lines: string[] = [];
+  const tools = new Map([
+    ["collision-tool", { kind: "mcp" as const, label: "review_output.foo.validate" }],
+  ]);
+
+  agentInternals.logAgentMessage(message, 0, [], tools, (line) => lines.push(line));
+
+  assert.equal(lines.length, 1);
+  assert.match(lines[0] ?? "", /payload truncated/u);
+  assert.equal((lines[0] ?? "").includes("c".repeat(9_000)), false);
+});
+
 test("contains agent logging failures without failing the review turn", () => {
   const secret = "mcp-header-secret";
   const warnings: string[] = [];

@@ -401,7 +401,12 @@ function isMcpToolName(name: string): boolean {
 }
 
 function isInternalReviewTool(label: string): boolean {
-  return label.startsWith("review_output.") || label.startsWith("mcp__review_output__");
+  return (
+    label === "review_output.read_pr_diff" ||
+    label === "review_output.submit_review" ||
+    label === "mcp__review_output__read_pr_diff" ||
+    label === "mcp__review_output__submit_review"
+  );
 }
 
 function agentLogLine(
