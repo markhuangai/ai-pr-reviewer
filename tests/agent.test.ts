@@ -299,7 +299,8 @@ test("logs assistant, agent-tool, and MCP events with bounded redacted payloads"
   assert.ok(preview);
   assert.ok(preview.length <= 202);
   assert.match(lines[4] ?? "", /"is_error":true/u);
-  assert.match(lines[4] ?? "", new RegExp("x{260}", "u"));
+  assert.match(lines[4] ?? "", /\[333 chars\]$/u);
+  assert.equal((lines[4] ?? "").includes("x".repeat(260)), false);
 });
 
 test("logs complete redacted user and assistant messages in reconstructable chunks", () => {
@@ -316,7 +317,12 @@ test("logs complete redacted user and assistant messages in reconstructable chun
   assert.equal(lines.length, 2);
   assert.match(lines[0] ?? "", /part 1\/2/u);
   assert.match(lines[1] ?? "", /part 2\/2/u);
-  const reconstructed = lines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  const chunks = lines.map((line) => line.slice(line.indexOf(": ") + 2));
+  for (const chunk of chunks) {
+    assert.doesNotMatch(chunk, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/u);
+    assert.doesNotMatch(chunk, /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+  }
+  const reconstructed = chunks.join("");
   assert.equal(reconstructed, JSON.stringify(text.replace(secret, "[REDACTED]")));
   assert.equal(reconstructed.includes(secret), false);
   assert.equal(reconstructed.includes("�"), false);
@@ -363,6 +369,34 @@ test("redacts complete structured error results before chunking", () => {
   assert.match(reconstructed, new RegExp("x{9000}", "u"));
   assert.match(reconstructed, /\[REDACTED\]/u);
   assert.equal(reconstructed.includes(secret), false);
+});
+
+test("treats camelCase internal validation flags as complete errors", () => {
+  const message = {
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "mcp_tool_result",
+          tool_use_id: "submit-1",
+          content: `findings.0.body: ${"v".repeat(9_000)}`,
+          isError: true,
+        },
+      ],
+    },
+  } as unknown as SDKMessage;
+  const lines: string[] = [];
+  const tools = new Map([
+    ["submit-1", { kind: "mcp" as const, label: "mcp__review_output__submit_review" }],
+  ]);
+
+  agentInternals.logAgentMessage(message, 0, [], tools, (line) => lines.push(line));
+
+  assert.ok(lines.length > 1);
+  const reconstructed = lines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  assert.match(reconstructed, /"is_error":true/u);
+  assert.match(reconstructed, new RegExp("v{9000}", "u"));
 });
 
 test("queues both initial prompts before activating the review gate", () => {
@@ -550,39 +584,46 @@ test("logs plain MCP tool-use blocks and parent-linked fallback results", () => 
   assert.match(lines[1] ?? "", /Memory result/u);
 });
 
-test("logs fallback error results completely while bounding fallback successes", () => {
-  const tools = new Map([
-    ["mcp-tool-1", { kind: "mcp" as const, label: "mcp__security__validate" }],
+test("bounds external MCP errors while preserving complete internal fallback errors", () => {
+  const externalTools = new Map([
+    ["external-tool", { kind: "mcp" as const, label: "mcp__security__validate" }],
   ]);
-  const errorLines: string[] = [];
-  const error = {
+  const externalLines: string[] = [];
+  const externalError = {
     type: "user",
-    parent_tool_use_id: "mcp-tool-1",
+    parent_tool_use_id: "external-tool",
     tool_use_result: {
       isError: true,
-      content: `findings.0.body: ${"e".repeat(9_000)}`,
+      content: "e".repeat(9_000),
     },
     message: { role: "user", content: [] },
   } as unknown as SDKMessage;
 
-  agentInternals.logAgentMessage(error, 0, [], tools, (line) => errorLines.push(line));
+  agentInternals.logAgentMessage(externalError, 0, [], externalTools, (line) =>
+    externalLines.push(line),
+  );
 
-  assert.ok(errorLines.length > 1);
-  const reconstructed = errorLines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
-  assert.match(reconstructed, new RegExp("e{9000}", "u"));
+  assert.equal(externalLines.length, 1);
+  assert.match(externalLines[0] ?? "", /payload truncated/u);
+  assert.equal((externalLines[0] ?? "").includes("e".repeat(9_000)), false);
 
-  const successLines: string[] = [];
-  const success = {
+  const internalTools = new Map([
+    ["internal-tool", { kind: "mcp" as const, label: "review_output.submit_review" }],
+  ]);
+  const internalLines: string[] = [];
+  const internalError = {
     type: "user",
-    parent_tool_use_id: "mcp-tool-1",
-    tool_use_result: { content: "s".repeat(9_000) },
+    parent_tool_use_id: "internal-tool",
+    tool_use_result: { is_error: true, content: "i".repeat(9_000) },
     message: { role: "user", content: [] },
   } as unknown as SDKMessage;
-  agentInternals.logAgentMessage(success, 0, [], tools, (line) => successLines.push(line));
+  agentInternals.logAgentMessage(internalError, 0, [], internalTools, (line) =>
+    internalLines.push(line),
+  );
 
-  assert.equal(successLines.length, 1);
-  assert.match(successLines[0] ?? "", /payload truncated/u);
-  assert.equal((successLines[0] ?? "").includes("s".repeat(9_000)), false);
+  assert.ok(internalLines.length > 1);
+  const reconstructed = internalLines.map((line) => line.slice(line.indexOf(": ") + 2)).join("");
+  assert.match(reconstructed, new RegExp("i{9000}", "u"));
 });
 
 test("contains agent logging failures without failing the review turn", () => {

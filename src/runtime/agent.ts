@@ -400,6 +400,10 @@ function isMcpToolName(name: string): boolean {
   return name.startsWith("mcp__");
 }
 
+function isInternalReviewTool(label: string): boolean {
+  return label.startsWith("review_output.") || label.startsWith("mcp__review_output__");
+}
+
 function agentLogLine(
   goalIndex: number,
   kind: string,
@@ -689,11 +693,14 @@ function logAgentMessage(
       const kind: AgentToolKind =
         blockType === "mcp_tool_result" || toolUse?.kind === "mcp" ? "mcp" : "agent";
       const label = toolUse?.label ?? block.tool_use_id;
+      const isError = block.is_error === true || block.isError === true;
       const output = {
-        ...(typeof block.is_error === "boolean" ? { is_error: block.is_error } : {}),
+        ...(typeof block.is_error === "boolean" || typeof block.isError === "boolean"
+          ? { is_error: isError }
+          : {}),
         content: block.content,
       };
-      if (block.is_error === true) {
+      if (isError && isInternalReviewTool(label)) {
         writeCompleteAgentLog(
           goalIndex,
           kind === "mcp" ? "MCP tool result" : "agent tool result",
@@ -726,11 +733,12 @@ function logAgentMessage(
     const isError =
       isRecord(message.tool_use_result) &&
       (message.tool_use_result.isError === true || message.tool_use_result.is_error === true);
-    if (isError) {
+    const label = toolUse?.label ?? message.parent_tool_use_id ?? "unknown";
+    if (isError && isInternalReviewTool(label)) {
       writeCompleteAgentLog(
         goalIndex,
         toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
-        toolUse?.label ?? message.parent_tool_use_id ?? "unknown",
+        label,
         "output",
         message.tool_use_result,
         secrets,
@@ -741,7 +749,7 @@ function logAgentMessage(
         agentLogLine(
           goalIndex,
           toolUse?.kind === "mcp" ? "MCP tool result" : "agent tool result",
-          toolUse?.label ?? message.parent_tool_use_id ?? "unknown",
+          label,
           "output",
           message.tool_use_result,
           secrets,
