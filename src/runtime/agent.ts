@@ -48,6 +48,11 @@ const MAX_AGENT_LOG_PROJECTION_CHARACTERS = 1_024;
 const MAX_AGENT_LOG_PROJECTION_NODES = 100;
 const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
+const SEVERITY_VALUES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
+const SEVERITY_GUIDANCE = `- CRITICAL: a credible immediate risk of compromise, irreversible data loss, or broad outage.
+- HIGH: serious user, security, data, or reliability impact on a reachable path.
+- MODERATE: an actionable defect with bounded impact or a less likely trigger.
+- LOW: a limited-impact but actionable defect. Omit style preferences, nits, and informational observations instead of reporting them as LOW.`;
 const REVIEW_SYSTEM_PROMPT =
   "You are a security-conscious, read-only code reviewer. Read the internal pull request diff to completion before submitting. Every claim must be grounded in inspected repository content or an explicitly available MCP response. Never modify files, execute commands, access the web, or reveal credentials.";
 
@@ -56,7 +61,11 @@ const execFileAsync = promisify(execFile);
 const findingSchema = z
   .object({
     title: z.string().min(1).max(200),
-    severity: z.enum(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]),
+    severity: z
+      .enum(SEVERITY_VALUES)
+      .describe(
+        "Finding severity. Informational observations and style-only suggestions are omitted.",
+      ),
     body: z.string().min(1).max(8_000),
     path: z.string().min(1).max(500).optional(),
     line: z.number().int().min(1).max(1_000_000).optional(),
@@ -1209,6 +1218,9 @@ You MUST call mcp__review_output__read_pr_diff repeatedly until it returns done=
 
 Read the relevant changed files and nearby definitions before deciding. This session is read-only: use only Read, Glob, Grep, the explicitly configured HTTP MCP tools, and the internal review tools. Never use Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Task, Agent, or project settings. Do not make assumptions about code that you did not inspect.
 
+Classify each finding with exactly one of these severities:
+${SEVERITY_GUIDANCE}
+
 After reading the complete diff, call mcp__review_output__submit_review exactly once. Submit only actionable, evidence-based findings. Use a changed-file path and an added-line number only when the line is present in the supplied pull-request diff; otherwise omit the location and explain the evidence in the body. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
 }
 
@@ -1229,7 +1241,7 @@ function repairPrompt(attempt: number, diffComplete: boolean): string {
   const nextAction = diffComplete
     ? "Do not continue investigating. Call mcp__review_output__submit_review now"
     : "Continue calling mcp__review_output__read_pr_diff until it returns done=true, then call mcp__review_output__submit_review";
-  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Use an empty findings array if no issue is supported by the evidence.`;
+  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Severity must be ${SEVERITY_VALUES.join(", ")}; MEDIUM and INFO are invalid. Use an empty findings array if no issue is supported by the evidence.`;
 }
 
 function makeUserMessage(text: string): SDKUserMessage {
@@ -1603,6 +1615,7 @@ export const agentInternals = {
   reviewSubmissionRejection,
   resolveCommit,
   resolveMergeBase,
+  submissionSchema,
   isSafeGlobPattern,
   isSafeGrepGlob,
   isGitMetadataPath,

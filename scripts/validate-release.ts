@@ -174,6 +174,7 @@ function replayHistory(releases: readonly ReleaseRecord[]): ReleaseState {
 export function validateReleaseRequest(
   rawVersion: string,
   branch: string,
+  channel: string,
   releaseValue: unknown,
   tagValue: unknown,
 ): ValidationResult {
@@ -181,14 +182,17 @@ export function validateReleaseRequest(
   if (!requested) {
     fail("Version must be strict SemVer without a v prefix: X.Y.Z or X.Y.Z-rc.N.");
   }
-  if (branch !== "dev" && branch !== "main") {
-    fail("Releases may only be dispatched from the dev or main branch.");
+  if (branch !== "main") {
+    fail("Releases may only be dispatched from the main branch.");
   }
-  if ((branch === "dev") !== (requested.rc !== undefined)) {
+  if (channel !== "prerelease" && channel !== "stable") {
+    fail("Release channel must be prerelease or stable.");
+  }
+  if ((channel === "prerelease") !== (requested.rc !== undefined)) {
     fail(
-      branch === "dev"
-        ? "The dev branch only publishes X.Y.Z-rc.N prereleases."
-        : "The main branch only publishes stable X.Y.Z releases.",
+      channel === "prerelease"
+        ? "The prerelease channel only publishes X.Y.Z-rc.N versions."
+        : "The stable channel only publishes X.Y.Z versions.",
     );
   }
 
@@ -251,9 +255,10 @@ function argument(name: string): string {
 async function main(): Promise<void> {
   const version = argument("--version");
   const branch = argument("--branch");
+  const channel = argument("--channel");
   const releases = JSON.parse(await readFile(argument("--releases"), "utf8")) as unknown;
   const tags = JSON.parse(await readFile(argument("--tags"), "utf8")) as unknown;
-  const result = validateReleaseRequest(version, branch, releases, tags);
+  const result = validateReleaseRequest(version, branch, channel, releases, tags);
   const output = `${Object.entries(result)
     .map(([key, value]) => `${key}=${String(value)}`)
     .join("\n")}\n`;

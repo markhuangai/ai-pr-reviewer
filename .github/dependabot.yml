@@ -11,14 +11,14 @@ multi-ecosystem-groups:
 updates:
   - package-ecosystem: npm
     directory: /
-    target-branch: dev
+    target-branch: main
     patterns:
       - "*"
     multi-ecosystem-group: dependencies
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: dev
+    target-branch: main
     patterns:
       - "*"
     multi-ecosystem-group: dependencies

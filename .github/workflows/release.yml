@@ -3,8 +3,16 @@ name: Release runtime bundles
 on:
   workflow_dispatch:
     inputs:
+      channel:
+        description: Release channel to publish from main.
+        required: true
+        default: prerelease
+        type: choice
+        options:
+          - prerelease
+          - stable
       version:
-        description: Exact version without a v prefix (X.Y.Z on main or X.Y.Z-rc.N on dev).
+        description: Exact version without a v prefix (X.Y.Z or X.Y.Z-rc.N).
         required: true
         type: string
 
@@ -51,11 +59,13 @@ jobs:
         id: version
         shell: bash
         env:
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: >-
           node scripts/validate-release.ts
           --version "${REQUESTED_VERSION}"
           --branch "${GITHUB_REF_NAME}"
+          --channel "${REQUESTED_CHANNEL}"
           --releases "${RUNNER_TEMP}/releases.json"
           --tags "${RUNNER_TEMP}/tags.json"
       - name: Verify stable source matches the latest release candidate
@@ -255,6 +265,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -267,6 +278,7 @@ jobs:
           node scripts/validate-release.ts \
             --version "${REQUESTED_VERSION}" \
             --branch "${GITHUB_REF_NAME}" \
+            --channel "${REQUESTED_CHANNEL}" \
             --releases "${RUNNER_TEMP}/releases.json" \
             --tags "${RUNNER_TEMP}/tags.json"
       - name: Publish exact release candidate
@@ -417,6 +429,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_CHANNEL: ${{ inputs.channel }}
           REQUESTED_VERSION: ${{ inputs.version }}
           SOURCE_RC_TAG: ${{ needs.validate.outputs.source_rc_tag }}
         run: |
@@ -430,6 +443,7 @@ jobs:
           node scripts/validate-release.ts \
             --version "${REQUESTED_VERSION}" \
             --branch "${GITHUB_REF_NAME}" \
+            --channel "${REQUESTED_CHANNEL}" \
             --releases "${RUNNER_TEMP}/releases.json" \
             --tags "${RUNNER_TEMP}/tags.json"
           node scripts/verify-release-source.ts \

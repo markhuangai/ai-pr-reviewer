@@ -1,4 +1,4 @@
-export type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
+export type Severity = "CRITICAL" | "HIGH" | "MODERATE" | "LOW";
 
 export type AuthMode = "api-key" | "auth-token";
 
