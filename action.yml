@@ -1,5 +1,5 @@
-name: AI PR Reviewer
-description: Review any GitHub pull request with isolated Claude Agent SDK goal sessions.
+name: Goal-Driven AI PR Reviewer
+description: Goal-driven pull request reviews with isolated AI sessions and MCP-enabled tools.
 author: MarkHuang.ai
 inputs:
   github-pat:

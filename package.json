@@ -1,7 +1,7 @@
 {
   "name": "ai-pr-reviewer",
   "version": "0.1.0",
-  "description": "A portable GitHub Action that reviews pull requests with isolated Claude Agent SDK sessions.",
+  "description": "A goal-driven GitHub Action for pull request reviews with isolated AI sessions and MCP-enabled tools.",
   "type": "module",
   "engines": {
     "node": ">=24"
