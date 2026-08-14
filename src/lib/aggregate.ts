@@ -385,6 +385,12 @@ function runSummaryHeading(review: AggregatedReview): string {
   return "## 🔎 AI review";
 }
 
+function runSummaryOmissionNotice(omitted: number): string {
+  return omitted === 0
+    ? ""
+    : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
+}
+
 export function buildRunSummary(
   context: PullRequestContext,
   review: AggregatedReview,
@@ -409,26 +415,32 @@ export function buildRunSummary(
 
   lines.push("", "### Findings", "");
   const fixed = `${lines.join("\n")}\n`;
+  const fixedBytes = Buffer.byteLength(fixed, "utf8");
+  const reservedNoticeBytes = Buffer.byteLength(
+    runSummaryOmissionNotice(review.findings.length),
+    "utf8",
+  );
   const findings: string[] = [];
+  let findingBytes = 0;
   for (let index = 0; index < review.findings.length; index += 1) {
     const finding = review.findings[index];
     if (finding === undefined) break;
     const block = formatFinding(finding, index);
-    const candidateFindings = [...findings, block];
-    const omitted = review.findings.length - candidateFindings.length;
-    const notice =
-      omitted === 0
-        ? ""
-        : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
-    const candidate = `${fixed}${candidateFindings.join("\n\n")}${notice}`;
-    if (Buffer.byteLength(candidate, "utf8") > MAX_RUN_SUMMARY_BYTES) break;
+    const separatorBytes = findings.length === 0 ? 0 : 2;
+    const blockBytes = Buffer.byteLength(block, "utf8");
+    const omittedAfterBlock = review.findings.length - findings.length - 1;
+    const noticeBytes = omittedAfterBlock === 0 ? 0 : reservedNoticeBytes;
+    if (
+      fixedBytes + findingBytes + separatorBytes + blockBytes + noticeBytes >
+      MAX_RUN_SUMMARY_BYTES
+    ) {
+      break;
+    }
     findings.push(block);
+    findingBytes += separatorBytes + blockBytes;
   }
   const omitted = review.findings.length - findings.length;
-  const notice =
-    omitted === 0
-      ? ""
-      : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
+  const notice = runSummaryOmissionNotice(omitted);
   return `${fixed}${findings.join("\n\n")}${notice}`;
 }
 

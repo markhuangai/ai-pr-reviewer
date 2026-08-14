@@ -619,6 +619,31 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
   assert.ok(included > 0 && included < goals.length);
 });
 
+test("renders the maximum supported finding count with linear byte accounting", () => {
+  const goals: readonly GoalResult[] = Array.from({ length: 50 }, (_, goalIndex) => ({
+    prompt: `goal-${goalIndex}`,
+    status: "completed",
+    submission: {
+      summary: "many findings",
+      findings: Array.from({ length: 100 }, (_, findingIndex) => {
+        const identifier = String(goalIndex * 100 + findingIndex).padStart(4, "0");
+        return {
+          title: `Finding ${identifier}`,
+          severity: "LOW" as const,
+          body: `Issue ${identifier}.`,
+        };
+      }),
+    },
+  }));
+  const review = aggregateReview(context, config, files, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.equal(review.findings.length, 5_000);
+  assert.match(summary, /Finding 4999/u);
+  assert.doesNotMatch(summary, /additional findings? (?:was|were) omitted/u);
+  assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
+});
+
 test("indexes every body finding before truncating details", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 9 }, (_, index) => ({
     prompt: `goal-${index}`,
