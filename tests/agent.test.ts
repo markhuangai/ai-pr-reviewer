@@ -705,7 +705,14 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "finding",
-        findings: [{ title: "Actionable defect", severity, body: "Evidence and impact." }],
+        findings: [
+          {
+            title: "Actionable defect",
+            severity,
+            why: "The defect breaks a supported path.",
+            fix: "Use the validated value.",
+          },
+        ],
       }).success,
       true,
       severity,
@@ -715,12 +722,114 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "legacy finding",
-        findings: [{ title: "Legacy severity", severity, body: "Evidence and impact." }],
+        findings: [
+          {
+            title: "Legacy severity",
+            severity,
+            why: "The defect breaks a supported path.",
+            fix: "Use the validated value.",
+          },
+        ],
       }).success,
       false,
       severity,
     );
   }
+});
+
+test("accepts an apply suggestion for any sized contiguous replacement region", () => {
+  const suggestion = Array.from({ length: 100 }, (_, index) => `replacement line ${index}`).join(
+    "\n",
+  );
+  const finding = {
+    title: "Replace the affected region",
+    severity: "HIGH",
+    why: "The current region returns the wrong value.",
+    fix: "Replace the full contiguous region.",
+    suggestion,
+    path: "src/change.ts",
+    line: 10,
+    endLine: 40,
+  };
+
+  assert.equal(
+    agentInternals.submissionSchema.safeParse({ summary: "finding", findings: [finding] }).success,
+    true,
+  );
+  assert.equal(
+    agentInternals.submissionSchema.safeParse({
+      summary: "finding",
+      findings: [{ ...finding, path: undefined, line: undefined }],
+    }).success,
+    false,
+  );
+});
+
+test("rejects required finding prose that normalizes to empty", () => {
+  const finding = {
+    title: "Actionable defect",
+    severity: "HIGH",
+    why: "The defect breaks a supported path.",
+    fix: "Use the validated value.",
+  };
+
+  for (const field of ["title", "why", "fix"] as const) {
+    assert.equal(
+      agentInternals.submissionSchema.safeParse({
+        summary: "finding",
+        findings: [{ ...finding, [field]: " \t\n " }],
+      }).success,
+      false,
+      field,
+    );
+  }
+});
+
+test("accounts for dynamic suggestion fences in the comment capacity", () => {
+  assert.equal(
+    agentInternals.submissionSchema.safeParse({
+      summary: "finding",
+      findings: [
+        {
+          title: "Replace the affected region",
+          severity: "HIGH",
+          why: "The current region returns the wrong value.",
+          fix: "Replace the full contiguous region.",
+          suggestion: "`".repeat(29_000),
+          path: "src/change.ts",
+          line: 10,
+        },
+      ],
+    }).success,
+    false,
+  );
+});
+
+test("renders structured finding prose and preserves raw suggestion text", () => {
+  const suggestion = "if ready {\n\treturn result\n}\n";
+  const submission = agentInternals.toSubmission({
+    summary: "finding",
+    findings: [
+      {
+        title: "  Return   the result ",
+        severity: "HIGH",
+        why: " The current path   drops the result. ",
+        fix: " Return it from the   verified branch. ",
+        suggestion,
+        path: "src/change.ts",
+        line: 10,
+      },
+    ],
+  });
+
+  assert.deepEqual(submission.findings[0], {
+    title: "Return the result",
+    severity: "HIGH",
+    body: "**Why it matters:** The current path drops the result.\n\n**Fix:** Return it from the verified branch.",
+    suggestion,
+    path: "src/change.ts",
+    line: 10,
+  });
 });
 
 test("teaches the four severity definitions before review submission", () => {
@@ -760,7 +869,10 @@ test("teaches the four severity definitions before review submission", () => {
     assert.match(prompt, new RegExp(`- ${severity}:`, "u"));
   assert.match(prompt, /Omit style preferences, nits, and informational observations/u);
   assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
+  assert.match(prompt, /raw replacement text/u);
+  assert.match(prompt, /multi-file, noncontiguous, or uncertain fixes/u);
   assert.match(agentInternals.repairPrompt(1, true), /MEDIUM and INFO are invalid/u);
+  assert.match(agentInternals.repairPrompt(1, true), /suggestion is optional raw replacement/u);
 });
 
 test("starts each review with a bounded Claude goal command", () => {

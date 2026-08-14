@@ -68,11 +68,18 @@ function redactGoals(
       : {
           submission: {
             summary: redact(goal.submission.summary, secrets),
-            findings: goal.submission.findings.map((finding) => ({
-              ...finding,
-              title: redact(finding.title, secrets),
-              body: redact(finding.body, secrets),
-            })),
+            findings: goal.submission.findings.map(({ suggestion, ...finding }) => {
+              const redactedSuggestion =
+                suggestion === undefined ? undefined : redact(suggestion, secrets);
+              return {
+                ...finding,
+                title: redact(finding.title, secrets),
+                body: redact(finding.body, secrets),
+                ...(suggestion !== undefined && redactedSuggestion === suggestion
+                  ? { suggestion }
+                  : {}),
+              };
+            }),
           },
         }),
   }));
@@ -289,5 +296,6 @@ export const indexInternals = {
   writeRunSummary,
   inputSecretCandidates,
   redact,
+  redactGoals,
   reviewSecrets: reviewSecretCandidates,
 };

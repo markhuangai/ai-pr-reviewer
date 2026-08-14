@@ -87,6 +87,42 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   );
 });
 
+test("omits apply suggestions changed by secret redaction", () => {
+  const [goal] = indexInternals.redactGoals(
+    [
+      {
+        prompt: "security",
+        status: "completed",
+        submission: {
+          summary: "finding",
+          findings: [
+            {
+              title: "Replace secret",
+              severity: "HIGH",
+              body: "The value is exposed.",
+              suggestion: 'token := "private-token"',
+              path: "src/change.ts",
+              line: 1,
+            },
+            {
+              title: "Keep safe replacement",
+              severity: "LOW",
+              body: "The value is stale.",
+              suggestion: "return currentValue;",
+              path: "src/change.ts",
+              line: 2,
+            },
+          ],
+        },
+      },
+    ],
+    ["private-token"],
+  );
+
+  assert.equal(goal?.submission?.findings[0]?.suggestion, undefined);
+  assert.equal(goal?.submission?.findings[1]?.suggestion, "return currentValue;");
+});
+
 test("workspace validation rejects ignored content", async (t) => {
   const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-workspace-"));
   t.after(() => rm(workspace, { force: true, recursive: true }));
