@@ -209,6 +209,54 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
   assert.match(request.body, /Location could not be verified/);
 });
 
+test("keeps an adopted duplicate suggestion paired with its verified range", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "correctness",
+      status: "completed",
+      submission: {
+        summary: "found issue",
+        findings: [
+          {
+            title: "Unchecked result",
+            severity: "HIGH",
+            body: "The result is ignored.",
+            path: "src/change.ts",
+            line: 1,
+          },
+        ],
+      },
+    },
+    {
+      prompt: "security",
+      status: "completed",
+      submission: {
+        summary: "same issue",
+        findings: [
+          {
+            title: "Unchecked result",
+            severity: "MODERATE",
+            body: "The result is ignored in this path.",
+            suggestion: "replacement one\nreplacement two",
+            path: "src/change.ts",
+            line: 1,
+            endLine: 2,
+          },
+        ],
+      },
+    },
+  ];
+
+  const review = aggregateReview(context, config, files, goals);
+  assert.equal(review.findings.length, 1);
+  assert.equal(review.findings[0]?.suggestion, "replacement one\nreplacement two");
+  assert.equal(review.findings[0]?.line, 1);
+  assert.equal(review.findings[0]?.endLine, 2);
+  const request = buildReviewRequest(context, review, goals);
+  assert.equal(request.comments[0]?.start_line, 1);
+  assert.equal(request.comments[0]?.line, 2);
+});
+
 test("does not include secrets in duplicate markers", () => {
   const marker = reviewMarker(context, config);
   assert.doesNotMatch(marker, /github-secret|ai-secret/);

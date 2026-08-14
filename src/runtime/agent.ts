@@ -26,7 +26,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { reviewSecretCandidates } from "../lib/input.js";
-import { MAX_INLINE_REVIEW_COMMENT_LENGTH } from "../lib/types.js";
+import { MAX_INLINE_REVIEW_COMMENT_LENGTH, suggestionFenceLength } from "../lib/types.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -64,7 +64,7 @@ const execFileAsync = promisify(execFile);
 
 const findingSchema = z
   .object({
-    title: z.string().min(1).max(MAX_FINDING_TITLE_LENGTH),
+    title: z.string().trim().min(1).max(MAX_FINDING_TITLE_LENGTH),
     severity: z
       .enum(SEVERITY_VALUES)
       .describe(
@@ -72,11 +72,13 @@ const findingSchema = z
       ),
     why: z
       .string()
+      .trim()
       .min(1)
       .max(MAX_FINDING_PROSE_LENGTH)
       .describe("One or two direct sentences explaining the concrete impact."),
     fix: z
       .string()
+      .trim()
       .min(1)
       .max(MAX_FINDING_PROSE_LENGTH)
       .describe("One or two direct sentences explaining how to fix the defect."),
@@ -109,6 +111,7 @@ const findingSchema = z
         finding.why.length +
         finding.fix.length +
         finding.suggestion.length +
+        suggestionFenceLength(finding.suggestion) * 2 +
         FINDING_COMMENT_FORMAT_OVERHEAD <=
         MAX_INLINE_REVIEW_COMMENT_LENGTH,
     {

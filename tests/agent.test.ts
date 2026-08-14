@@ -765,6 +765,46 @@ test("accepts an apply suggestion for any sized contiguous replacement region", 
   );
 });
 
+test("rejects required finding prose that normalizes to empty", () => {
+  const finding = {
+    title: "Actionable defect",
+    severity: "HIGH",
+    why: "The defect breaks a supported path.",
+    fix: "Use the validated value.",
+  };
+
+  for (const field of ["title", "why", "fix"] as const) {
+    assert.equal(
+      agentInternals.submissionSchema.safeParse({
+        summary: "finding",
+        findings: [{ ...finding, [field]: " \t\n " }],
+      }).success,
+      false,
+      field,
+    );
+  }
+});
+
+test("accounts for dynamic suggestion fences in the comment capacity", () => {
+  assert.equal(
+    agentInternals.submissionSchema.safeParse({
+      summary: "finding",
+      findings: [
+        {
+          title: "Replace the affected region",
+          severity: "HIGH",
+          why: "The current region returns the wrong value.",
+          fix: "Replace the full contiguous region.",
+          suggestion: "`".repeat(29_000),
+          path: "src/change.ts",
+          line: 10,
+        },
+      ],
+    }).success,
+    false,
+  );
+});
+
 test("renders structured finding prose and preserves raw suggestion text", () => {
   const suggestion = "if ready {\n\treturn result\n}\n";
   const submission = agentInternals.toSubmission({

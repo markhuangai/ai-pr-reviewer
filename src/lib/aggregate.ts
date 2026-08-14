@@ -10,7 +10,7 @@ import type {
   ReviewFinding,
   Severity,
 } from "./types.js";
-import { MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
+import { MAX_INLINE_REVIEW_COMMENT_LENGTH, suggestionFenceLength } from "./types.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
@@ -244,12 +244,19 @@ function mergeFindings(findings: readonly AggregatedFinding[]): readonly Aggrega
         ? finding.severity
         : existing.severity;
     const body = mergeFindingBodies(existing.body, finding.body);
-    merged[duplicate] = {
+    const adoptSuggestion = existing.suggestion === undefined && finding.suggestion !== undefined;
+    const mergedFinding: AggregatedFinding = {
       ...existing,
       severity,
       body,
-      ...(existing.suggestion === undefined && finding.suggestion !== undefined
-        ? { suggestion: finding.suggestion }
+      ...(adoptSuggestion
+        ? {
+            suggestion: finding.suggestion,
+            path: finding.path,
+            line: finding.line,
+            endLine: finding.endLine,
+            locationVerified: finding.locationVerified,
+          }
         : {}),
       goals: [...new Set([...existing.goals, ...finding.goals])].sort(
         (left, right) => left - right,
@@ -259,6 +266,12 @@ function mergeFindings(findings: readonly AggregatedFinding[]): readonly Aggrega
         ? { path: finding.path, line: finding.line, endLine: finding.endLine }
         : {}),
     };
+    merged[duplicate] = mergedFinding;
+    for (const key of findingKeys(mergedFinding)) {
+      const indexes = candidatesByKey.get(key) ?? [];
+      if (!indexes.includes(duplicate)) indexes.push(duplicate);
+      candidatesByKey.set(key, indexes);
+    }
   }
   return merged;
 }
@@ -470,11 +483,7 @@ function inlineCommentBody(finding: AggregatedFinding): string {
     return `${body.slice(0, MAX_INLINE_REVIEW_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
   }
 
-  let longestBacktickRun = 0;
-  for (const match of finding.suggestion.matchAll(/`+/gu)) {
-    longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
-  }
-  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  const fence = "`".repeat(suggestionFenceLength(finding.suggestion));
   const trailingNewline = finding.suggestion.endsWith("\n") ? "" : "\n";
   const suggestion = `\n\n**Suggested change:**\n\n${fence}suggestion\n${finding.suggestion}${trailingNewline}${fence}`;
   if (body.length + suggestion.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) {

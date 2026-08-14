@@ -2,6 +2,14 @@ export type Severity = "CRITICAL" | "HIGH" | "MODERATE" | "LOW";
 
 export const MAX_INLINE_REVIEW_COMMENT_LENGTH = 60_000;
 
+export function suggestionFenceLength(value: string): number {
+  let longestBacktickRun = 0;
+  for (const match of value.matchAll(/`+/gu)) {
+    longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
+  }
+  return Math.max(3, longestBacktickRun + 1);
+}
+
 export type AuthMode = "api-key" | "auth-token";
 
 export type ReviewEvent = "APPROVE" | "COMMENT";
