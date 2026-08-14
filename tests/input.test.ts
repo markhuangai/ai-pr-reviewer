@@ -29,6 +29,8 @@ security:
   assert.equal(config.aiBaseUrl, "https://ai.example.test/v1");
   assert.equal(config.mcpServers.security?.type, "http");
   assert.equal(config.mcpServers.security?.headers?.Authorization, "Bearer token");
+  assert.equal(config.interactWithPullRequest, true);
+  assert.equal(config.pullRequestUrl, undefined);
   assert.equal(
     inputInternals.parseMcpServers(
       "server:\n  type: http\n  url: https://mcp.example.test/review?tenant=foo/",
@@ -100,4 +102,27 @@ test("rejects invalid numeric and boolean inputs", () => {
     () => readReviewConfig(reader({ ...values, "parallel-count": "1", "max-turns": "1" })),
     /max-turns.*between 2 and 100/,
   );
+  assert.throws(
+    () =>
+      readReviewConfig(
+        reader({ ...values, "parallel-count": "1", "interact-with-pr": "sometimes" }),
+      ),
+    /interact-with-pr.*true.*false/,
+  );
+});
+
+test("reads summary-only and pull request URL inputs", () => {
+  const config = readReviewConfig(
+    reader({
+      "github-pat": "ghp_test",
+      "ai-base-url": "https://ai.example.test",
+      "ai-secret": "secret",
+      model: "model",
+      "review-prompts": "goal",
+      "interact-with-pr": "false",
+      "pull-request-url": "https://github.com/owner/repository/pull/42/",
+    }),
+  );
+  assert.equal(config.interactWithPullRequest, false);
+  assert.equal(config.pullRequestUrl, "https://github.com/owner/repository/pull/42");
 });

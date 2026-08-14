@@ -5,6 +5,7 @@ import {
   aggregateReview,
   buildReviewBody,
   buildReviewRequest,
+  buildRunSummary,
   reviewMarker,
 } from "../src/lib/aggregate.js";
 import type {
@@ -21,6 +22,7 @@ const context: PullRequestContext = {
   number: 42,
   headSha: "0123456789abcdef0123456789abcdef01234567",
   baseSha: "fedcba9876543210fedcba9876543210fedcba98",
+  baseRef: "main",
   title: "Change",
   htmlUrl: "https://github.com/owner/repository/pull/42",
 };
@@ -35,6 +37,7 @@ const config: ReviewConfig = {
   parallelCount: 2,
   maxTurns: 50,
   autoApprove: true,
+  interactWithPullRequest: true,
   mcpServers: {},
 };
 
@@ -515,6 +518,130 @@ test("keeps body findings while withholding oversized goal internals", () => {
 
   assert.match(body, /Unverified finding/);
   assert.doesNotMatch(body, /PRIVATE OVERSIZED GOAL|PRIVATE OVERSIZED SUMMARY|### Goals/u);
+});
+
+test("writes every inline and body finding to a complete run summary", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "PRIVATE REVIEW GOAL",
+      status: "completed",
+      submission: {
+        summary: "PRIVATE MODEL SUMMARY",
+        findings: [
+          {
+            title: "Verified issue",
+            severity: "HIGH",
+            body: "This issue is on an added line.",
+            path: "src/change.ts",
+            line: 1,
+          },
+          {
+            title: "Repository-wide issue",
+            severity: "LOW",
+            body: "This issue has no safe inline location.",
+          },
+        ],
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.match(summary, /^## 🔎 AI review/mu);
+  assert.match(summary, /- Result: complete/u);
+  assert.match(summary, /Verified issue \(src\/change\.ts:1\)/u);
+  assert.match(summary, /This issue is on an added line\./u);
+  assert.match(summary, /Repository-wide issue/u);
+  assert.match(summary, /This issue has no safe inline location\./u);
+  assert.doesNotMatch(summary, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY/u);
+});
+
+test("labels partial and all-failed run summaries", () => {
+  const partialGoals: readonly GoalResult[] = [
+    {
+      prompt: "completed",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+    },
+    { prompt: "failed", status: "failed", error: "PRIVATE FAILURE" },
+  ];
+  const partialReview = aggregateReview(context, config, files, partialGoals);
+  const partialSummary = buildRunSummary(context, partialReview, partialGoals);
+  assert.match(partialSummary, /^## ⚠️ AI review incomplete/mu);
+  assert.match(partialSummary, /- Checks completed: 1 of 2/u);
+  assert.match(partialSummary, /- Result: incomplete/u);
+  assert.doesNotMatch(partialSummary, /PRIVATE FAILURE/u);
+
+  const failedGoals: readonly GoalResult[] = [
+    { prompt: "failed-one", status: "failed", error: "PRIVATE FAILURE ONE" },
+    { prompt: "failed-two", status: "failed", error: "PRIVATE FAILURE TWO" },
+  ];
+  const failedReview = aggregateReview(context, config, files, failedGoals);
+  const failedSummary = buildRunSummary(context, failedReview, failedGoals);
+  assert.match(failedSummary, /^## ⚠️ AI review failed/mu);
+  assert.match(failedSummary, /- Checks completed: 0 of 2/u);
+  assert.match(failedSummary, /- Result: failed/u);
+  assert.match(failedSummary, /see the step logs for redacted diagnostics/u);
+  assert.doesNotMatch(failedSummary, /PRIVATE FAILURE/u);
+});
+
+test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
+  const goals: readonly GoalResult[] = Array.from({ length: 100 }, (_, index) => {
+    const identifier = String(index).padStart(3, "0");
+    return {
+      prompt: `goal-${identifier}`,
+      status: "completed",
+      submission: {
+        summary: "large",
+        findings: [
+          {
+            title: `Finding ${identifier}`,
+            severity: "LOW",
+            body: `BEGIN-${identifier}:${"界".repeat(8_000)}:END-${identifier}`,
+          },
+        ],
+      },
+    };
+  });
+  const review = aggregateReview(context, config, files, goals);
+  const summary = buildRunSummary(context, review, goals);
+  let included = 0;
+
+  assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
+  assert.match(summary, /additional findings? (?:was|were) omitted/u);
+  for (let index = 0; index < goals.length; index += 1) {
+    const identifier = String(index).padStart(3, "0");
+    const hasHeading = summary.includes(`Low · Finding ${identifier}`);
+    assert.equal(summary.includes(`BEGIN-${identifier}:`), hasHeading);
+    assert.equal(summary.includes(`:END-${identifier}`), hasHeading);
+    if (hasHeading) included += 1;
+  }
+  assert.ok(included > 0 && included < goals.length);
+});
+
+test("renders the maximum supported finding count with linear byte accounting", () => {
+  const goals: readonly GoalResult[] = Array.from({ length: 50 }, (_, goalIndex) => ({
+    prompt: `goal-${goalIndex}`,
+    status: "completed",
+    submission: {
+      summary: "many findings",
+      findings: Array.from({ length: 100 }, (_, findingIndex) => {
+        const identifier = String(goalIndex * 100 + findingIndex).padStart(4, "0");
+        return {
+          title: `Finding ${identifier}`,
+          severity: "LOW" as const,
+          body: `Issue ${identifier}.`,
+        };
+      }),
+    },
+  }));
+  const review = aggregateReview(context, config, files, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.equal(review.findings.length, 5_000);
+  assert.match(summary, /Finding 4999/u);
+  assert.doesNotMatch(summary, /additional findings? (?:was|were) omitted/u);
+  assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
 });
 
 test("indexes every body finding before truncating details", () => {

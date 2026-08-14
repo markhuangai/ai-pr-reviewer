@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { SDKActiveGoalMessage, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { agentInternals } from "../src/runtime/agent.js";
-import type { ChangedFile, PullRequestContext } from "../src/lib/types.js";
+import type { ChangedFile, PullRequestContext, ReviewConfig } from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -70,6 +70,7 @@ async function makeRepository(
       number: 1,
       baseSha,
       headSha,
+      baseRef: "main",
       title: "Large change",
       htmlUrl: "https://github.com/owner/repository/pull/1",
     },
@@ -409,6 +410,7 @@ test("queues both initial prompts before activating the review gate", () => {
     number: 7,
     baseSha: "a".repeat(40),
     headSha: "b".repeat(40),
+    baseRef: "main",
     title: "Review sequencing",
     htmlUrl: "https://github.com/owner/repository/pull/7",
   };
@@ -731,6 +733,7 @@ test("teaches the four severity definitions before review submission", () => {
     number: 8,
     baseSha: "a".repeat(40),
     headSha: "b".repeat(40),
+    baseRef: "main",
     title: "Severity contract",
     htmlUrl: "https://github.com/owner/repository/pull/8",
   };
@@ -803,4 +806,24 @@ test("blocks Git metadata paths from the reviewer", () => {
     false,
   );
   assert.equal(agentInternals.isSafeResolvedPath("/workspace/repo", "/workspace/repo/src"), true);
+});
+
+test("reports the reviewed checkout as the subprocess workspace", () => {
+  const config: ReviewConfig = {
+    githubToken: "github-secret",
+    aiBaseUrl: "https://ai.example.test",
+    aiSecret: "ai-secret",
+    aiAuthMode: "api-key",
+    model: "review-model",
+    reviewPrompts: ["correctness"],
+    parallelCount: 1,
+    maxTurns: 2,
+    autoApprove: false,
+    interactWithPullRequest: false,
+    mcpServers: {},
+  };
+
+  const environment = agentInternals.safeAgentEnvironment(config, "/tmp/reviewed-repository");
+  assert.equal(environment.GITHUB_WORKSPACE, "/tmp/reviewed-repository");
+  assert.equal(environment.ANTHROPIC_API_KEY, "ai-secret");
 });

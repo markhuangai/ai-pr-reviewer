@@ -1,4 +1,9 @@
-import type { ChangedFile, PullRequestContext, PullRequestReviewRequest } from "./types.js";
+import type {
+  ChangedFile,
+  PullRequestContext,
+  PullRequestLocator,
+  PullRequestReviewRequest,
+} from "./types.js";
 
 interface PullRequestFilePayload {
   readonly filename?: unknown;
@@ -67,6 +72,40 @@ function readBaseSha(value: unknown): string | undefined {
     return undefined;
   }
   return value.base.sha.length > 0 ? value.base.sha : undefined;
+}
+
+function readBaseRef(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.base) || typeof value.base.ref !== "string") {
+    return undefined;
+  }
+  return value.base.ref.length > 0 ? value.base.ref : undefined;
+}
+
+function readPullRequestContext(value: unknown, locator: PullRequestLocator): PullRequestContext {
+  if (!isRecord(value)) throw new Error("GitHub returned invalid pull request metadata.");
+  const headSha = readHeadSha(value);
+  const baseSha = readBaseSha(value);
+  const baseRef = readBaseRef(value);
+  if (headSha === undefined || baseSha === undefined || baseRef === undefined) {
+    throw new Error("GitHub returned incomplete pull request ref metadata.");
+  }
+  if (typeof value.title !== "string" || value.title.length === 0) {
+    throw new Error("GitHub returned a pull request without a title.");
+  }
+  const changedFiles =
+    typeof value.changed_files === "number" &&
+    Number.isInteger(value.changed_files) &&
+    value.changed_files >= 0
+      ? value.changed_files
+      : undefined;
+  return {
+    ...locator,
+    headSha,
+    baseSha,
+    baseRef,
+    ...(changedFiles === undefined ? {} : { changedFiles }),
+    title: value.title,
+  };
 }
 
 function parseAddedLines(patch: string | undefined): ReadonlySet<number> {
@@ -213,6 +252,13 @@ export class GitHubApi {
     return login;
   }
 
+  async getPullRequestContext(locator: PullRequestLocator): Promise<PullRequestContext> {
+    const payload = await this.request<unknown>(
+      `/repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}/pulls/${locator.number}`,
+    );
+    return readPullRequestContext(payload, locator);
+  }
+
   async getPullRequestRefs(
     context: PullRequestContext,
   ): Promise<{ readonly headSha: string; readonly baseSha: string }> {
@@ -352,6 +398,8 @@ export const githubApiInternals = {
   isPatchComplete,
   nextPagePath,
   readBaseSha,
+  readBaseRef,
+  readPullRequestContext,
   errorDetails,
   readHeadSha,
   readLogin,

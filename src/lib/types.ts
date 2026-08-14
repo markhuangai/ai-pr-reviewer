@@ -29,7 +29,17 @@ export interface ReviewConfig {
   readonly parallelCount: number;
   readonly maxTurns: number;
   readonly autoApprove: boolean;
+  readonly interactWithPullRequest: boolean;
+  readonly pullRequestUrl?: string;
   readonly mcpServers: Readonly<Record<string, HttpMcpServer>>;
+}
+
+export interface PullRequestLocator {
+  readonly repository: string;
+  readonly owner: string;
+  readonly name: string;
+  readonly number: number;
+  readonly htmlUrl: string;
 }
 
 export interface PullRequestContext {
@@ -39,6 +49,7 @@ export interface PullRequestContext {
   readonly number: number;
   readonly headSha: string;
   readonly baseSha: string;
+  readonly baseRef: string;
   readonly changedFiles?: number;
   readonly title: string;
   readonly htmlUrl: string;

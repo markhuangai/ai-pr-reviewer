@@ -2,11 +2,11 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged, deduplicated, and posted as one GitHub pull request review.
+Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary.
 
 ## Consumer workflow
 
-The action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required because the action creates the review through the GitHub API.
+For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access; it needs write access only when the action may post a review.
 
 Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review.
 
@@ -56,20 +56,72 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 ## Inputs
 
-| Input            | Required | Default   | Notes                                                                                                  |
-| ---------------- | -------- | --------- | ------------------------------------------------------------------------------------------------------ |
-| `github-pat`     | yes      |           | Fine-grained PAT with pull request review write access in the target repository.                       |
-| `ai-base-url`    | yes      |           | HTTP(S) Anthropic Messages API-compatible endpoint.                                                    |
-| `ai-secret`      | yes      |           | API key or auth token for that endpoint.                                                               |
-| `ai-auth-mode`   | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                          |
-| `model`          | yes      |           | Model name understood by the endpoint.                                                                 |
-| `review-prompts` | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                             |
-| `parallel-count` | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                       |
-| `max-turns`      | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.            |
-| `auto-approve`   | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical. |
-| `mcp-servers`    | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                        |
+| Input              | Required | Default   | Notes                                                                                                     |
+| ------------------ | -------- | --------- | --------------------------------------------------------------------------------------------------------- |
+| `github-pat`       | yes      |           | Fine-grained PAT with read access to the target; pull request review write access is needed when posting. |
+| `ai-base-url`      | yes      |           | HTTP(S) Anthropic Messages API-compatible endpoint.                                                       |
+| `ai-secret`        | yes      |           | API key or auth token for that endpoint.                                                                  |
+| `ai-auth-mode`     | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                             |
+| `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
+| `review-prompts`   | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                                |
+| `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
+| `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.               |
+| `auto-approve`     | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.    |
+| `interact-with-pr` | no       | `true`    | When `false`, do not list or create reviews; write all findings only to the workflow run summary.         |
+| `pull-request-url` | no       |           | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.       |
+| `mcp-servers`      | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                           |
 
-The action infers the repository, pull request number, base SHA, and head SHA from the pull request event. It skips a duplicate review when the same head and configuration marker already exist.
+Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review if the same head and configuration marker already exist. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
+
+### Summary-only event review
+
+Set `interact-with-pr: false` to keep the result out of the pull request. The action still reads PR metadata and changed files, but it does not look up the authenticated user, list existing reviews, post a review, add inline comments, or approve the PR. Complete, partial, and failed results are written to the workflow run summary; partial and failed reviews still fail the action after the summary is written.
+
+```yaml
+- uses: markhuangai/ai-pr-reviewer@v1-prerelease
+  with:
+    github-pat: ${{ secrets.READ_ONLY_REVIEW_PAT }}
+    ai-base-url: ${{ secrets.AI_BASE_URL }}
+    ai-secret: ${{ secrets.AI_SECRET }}
+    model: claude-sonnet-4-5
+    review-prompts: Check changed code for correctness and regressions.
+    interact-with-pr: false
+```
+
+### Cross-repository review
+
+`pull-request-url` supports dispatch, schedule, or other non-PR workflows. The target must use the same origin as `GITHUB_SERVER_URL`. The action fetches the target base branch and `refs/pull/<number>/head` into an isolated temporary checkout, verifies both fetched SHAs against live API metadata, reviews that checkout, and removes it afterward. Do not add an `actions/checkout` step for this mode.
+
+```yaml
+name: External PR review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull-request-url:
+        description: GitHub pull request URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: markhuangai/ai-pr-reviewer@v1-prerelease
+        with:
+          github-pat: ${{ secrets.CROSS_REPOSITORY_REVIEW_PAT }}
+          ai-base-url: ${{ secrets.AI_BASE_URL }}
+          ai-secret: ${{ secrets.AI_SECRET }}
+          model: claude-sonnet-4-5
+          review-prompts: Check changed code for correctness and regressions.
+          pull-request-url: ${{ inputs.pull-request-url }}
+          interact-with-pr: false
+```
+
+The PAT must cover the target repository. For summary-only review, grant target contents and pull request metadata read access. If `interact-with-pr` is `true`, also grant pull request review write access.
 
 ## HTTP MCP configuration
 
@@ -91,6 +143,8 @@ mcp-servers: |
 
 The MCP service can provide context, but it cannot grant the reviewer write access to the checkout. The action passes only explicitly configured HTTP servers and enables `strictMcpConfig`, so project `.mcp.json`, user settings, plugins, stdio servers, and SSE servers are ignored.
 
+`interact-with-pr: false` controls only this action's built-in GitHub pull request writes. An explicitly configured external MCP tool can have side effects in its own service. Do not enable write-capable MCP tools when the workflow must be end-to-end side-effect-free.
+
 ## Review behavior
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
@@ -103,7 +157,8 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. A location that is not an added line in the pull request diff is moved into the review body.
 - Public reviews never include review prompts, model summaries, goal errors, or goal provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count and rerun guidance; full secret-redacted diagnostics remain in the GitHub Actions log.
 - If a goal cannot read the text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
-- A partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
+- When interaction is enabled, a partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
+- In summary-only mode, every finding is included in the run summary rather than split between body and inline destinations. The summary is capped below GitHub's 1 MiB per-step limit and omits only whole findings when needed.
 - If GitHub rejects an approval, the action retries once as a comment review.
 - Review bodies are capped at approximately 60 KB. No report artifact is uploaded.
 
@@ -137,7 +192,7 @@ The lockfile and release workflow enforce the project's supply-chain policy:
 
 CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
 
-Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT only for the GitHub API call.
+Secrets are passed to the AI SDK only through its authentication environment variables. The Claude reviewer subprocess receives no GitHub PAT, GitHub token, or action runtime token, and its built-in tools are read-only; the parent action process retains the PAT for GitHub API calls and the isolated cross-repository fetch.
 
 ## Development
 
