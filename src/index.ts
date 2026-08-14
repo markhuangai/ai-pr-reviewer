@@ -68,14 +68,18 @@ function redactGoals(
       : {
           submission: {
             summary: redact(goal.submission.summary, secrets),
-            findings: goal.submission.findings.map((finding) => ({
-              ...finding,
-              title: redact(finding.title, secrets),
-              body: redact(finding.body, secrets),
-              ...(finding.suggestion === undefined
-                ? {}
-                : { suggestion: redact(finding.suggestion, secrets) }),
-            })),
+            findings: goal.submission.findings.map(({ suggestion, ...finding }) => {
+              const redactedSuggestion =
+                suggestion === undefined ? undefined : redact(suggestion, secrets);
+              return {
+                ...finding,
+                title: redact(finding.title, secrets),
+                body: redact(finding.body, secrets),
+                ...(suggestion !== undefined && redactedSuggestion === suggestion
+                  ? { suggestion }
+                  : {}),
+              };
+            }),
           },
         }),
   }));
