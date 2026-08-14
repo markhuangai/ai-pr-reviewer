@@ -1,5 +1,7 @@
 export type Severity = "CRITICAL" | "HIGH" | "MODERATE" | "LOW";
 
+export const MAX_INLINE_REVIEW_COMMENT_LENGTH = 60_000;
+
 export type AuthMode = "api-key" | "auth-token";
 
 export type ReviewEvent = "APPROVE" | "COMMENT";
@@ -70,6 +72,7 @@ export interface ReviewFinding {
   readonly title: string;
   readonly severity: Severity;
   readonly body: string;
+  readonly suggestion?: string;
   readonly path?: string;
   readonly line?: number;
   readonly endLine?: number;

@@ -10,9 +10,9 @@ import type {
   ReviewFinding,
   Severity,
 } from "./types.js";
+import { MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
-const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
@@ -25,6 +25,12 @@ const SEVERITY_ORDER: Record<Severity, number> = {
   LOW: 1,
 };
 const SEVERITIES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
+const SEVERITY_ICON: Record<Severity, string> = {
+  CRITICAL: "🚨",
+  HIGH: "🔴",
+  MODERATE: "🟠",
+  LOW: "🟡",
+};
 
 function stableDigest(value: string): string {
   let hash = 14_695_981_039_346_656_037n;
@@ -150,8 +156,13 @@ function normalizeFinding(
       ? finding.body
       : `**Location could not be verified against the pull request diff (claimed: ${claimedLocation}).**\n\n${finding.body}`;
   return {
-    ...finding,
+    title: finding.title,
+    severity: finding.severity,
     body,
+    ...(finding.path === undefined ? {} : { path: finding.path }),
+    ...(finding.line === undefined ? {} : { line: finding.line }),
+    ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+    ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
     goals: [goalIndex],
     locationVerified: false,
   };
@@ -237,6 +248,9 @@ function mergeFindings(findings: readonly AggregatedFinding[]): readonly Aggrega
       ...existing,
       severity,
       body,
+      ...(existing.suggestion === undefined && finding.suggestion !== undefined
+        ? { suggestion: finding.suggestion }
+        : {}),
       goals: [...new Set([...existing.goals, ...finding.goals])].sort(
         (left, right) => left - right,
       ),
@@ -260,6 +274,10 @@ function findingSort(left: AggregatedFinding, right: AggregatedFinding): number 
 
 function severityLabel(severity: Severity): string {
   return `${severity.slice(0, 1)}${severity.slice(1).toLowerCase()}`;
+}
+
+function severityHeading(severity: Severity): string {
+  return `${SEVERITY_ICON[severity]} ${severityLabel(severity)}`;
 }
 
 function joinNaturalLanguage(values: readonly string[]): string {
@@ -287,7 +305,7 @@ function formatFinding(finding: AggregatedFinding, index: number): string {
     finding.locationVerified && finding.path && finding.line
       ? ` (${finding.path}:${finding.line})`
       : "";
-  return `### ${index + 1}. ${severityLabel(finding.severity)} · ${finding.title}${location}\n\n${finding.body}`;
+  return `### ${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}\n\n${finding.body}`;
 }
 
 export function aggregateReview(
@@ -333,7 +351,7 @@ function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
         finding.path === undefined
           ? ""
           : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
-      return `${index + 1}. ${severityLabel(finding.severity)} · ${finding.title}${location}`;
+      return `${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}`;
     })
     .join("\n");
 }
@@ -445,9 +463,30 @@ export function buildRunSummary(
 }
 
 function inlineCommentBody(finding: AggregatedFinding): string {
-  const body = `**${severityLabel(finding.severity)} · ${finding.title}**\n\n${finding.body}`;
-  if (body.length <= MAX_INLINE_COMMENT_LENGTH) return body;
-  return `${body.slice(0, MAX_INLINE_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
+  const heading = `${severityHeading(finding.severity)} **${finding.title}**`;
+  const body = `${heading}\n\n${finding.body}`;
+  if (finding.suggestion === undefined) {
+    if (body.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) return body;
+    return `${body.slice(0, MAX_INLINE_REVIEW_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
+  }
+
+  let longestBacktickRun = 0;
+  for (const match of finding.suggestion.matchAll(/`+/gu)) {
+    longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
+  }
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  const trailingNewline = finding.suggestion.endsWith("\n") ? "" : "\n";
+  const suggestion = `\n\n**Suggested change:**\n\n${fence}suggestion\n${finding.suggestion}${trailingNewline}${fence}`;
+  if (body.length + suggestion.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) {
+    return `${body}${suggestion}`;
+  }
+
+  const notice = "\n\n> Additional duplicate evidence omitted to preserve the suggestion.";
+  const available = MAX_INLINE_REVIEW_COMMENT_LENGTH - suggestion.length - notice.length;
+  if (available < heading.length) {
+    throw new Error("The inline suggestion exceeds GitHub's review comment capacity.");
+  }
+  return `${body.slice(0, available)}${notice}${suggestion}`;
 }
 
 export function buildReviewRequest(

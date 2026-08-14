@@ -72,6 +72,9 @@ function redactGoals(
               ...finding,
               title: redact(finding.title, secrets),
               body: redact(finding.body, secrets),
+              ...(finding.suggestion === undefined
+                ? {}
+                : { suggestion: redact(finding.suggestion, secrets) }),
             })),
           },
         }),
@@ -289,5 +292,6 @@ export const indexInternals = {
   writeRunSummary,
   inputSecretCandidates,
   redact,
+  redactGoals,
   reviewSecrets: reviewSecretCandidates,
 };

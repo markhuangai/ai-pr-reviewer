@@ -118,15 +118,15 @@ test("formats four public severities without exposing goal provenance", () => {
     /Found \*\*4 actionable issues\*\* — 1 critical, 1 high, 1 moderate, and 1 low\./u,
   );
   assert.match(request.body, /See the inline comments and findings below for details\./u);
-  assert.match(request.body, /Moderate · Cancellation is ignored/u);
-  assert.match(request.body, /Low · Error loses its reason/u);
+  assert.match(request.body, /🟠 Moderate: Cancellation is ignored/u);
+  assert.match(request.body, /🟡 Low: Error loses its reason/u);
   assert.equal(
     request.comments[0]?.body,
-    "**Critical · Authorization can be bypassed**\n\nThe caller can cross the repository boundary.",
+    "🚨 Critical **Authorization can be bypassed**\n\nThe caller can cross the repository boundary.",
   );
   assert.equal(
     request.comments[1]?.body,
-    "**High · Failure leaves stale state**\n\nThe failure path preserves the previous success state.",
+    "🔴 High **Failure leaves stale state**\n\nThe failure path preserves the previous success state.",
   );
   assert.doesNotMatch(
     `${request.body}\n${request.comments.map((comment) => comment.body).join("\n")}`,
@@ -251,7 +251,7 @@ test("does not include secrets in duplicate markers", () => {
   );
 });
 
-test("maps verified multi-line findings to GitHub review ranges", () => {
+test("maps verified multi-line findings to GitHub review ranges with safe suggestion fences", () => {
   const review = aggregateReview(context, config, files, [
     {
       prompt: "range",
@@ -263,6 +263,7 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
             title: "Range",
             severity: "MODERATE",
             body: "The whole changed block is affected.",
+            suggestion: "replacement one\n```\nreplacement three",
             path: "src/change.ts",
             line: 1,
             endLine: 2,
@@ -282,6 +283,7 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
             title: "Range",
             severity: "MODERATE",
             body: "The whole changed block is affected.",
+            suggestion: "replacement one\n```\nreplacement three",
             path: "src/change.ts",
             line: 1,
             endLine: 2,
@@ -298,6 +300,11 @@ test("maps verified multi-line findings to GitHub review ranges", () => {
     start_side: "RIGHT",
     body: request.comments[0]?.body,
   });
+  assert.match(
+    request.comments[0]?.body ?? "",
+    /````suggestion\nreplacement one\n```\nreplacement three\n````/u,
+  );
+  assert.match(request.comments[0]?.body ?? "", /Suggested change/u);
 });
 
 test("rejects oversized finding ranges before location verification", () => {
@@ -323,6 +330,39 @@ test("rejects oversized finding ranges before location verification", () => {
   assert.equal(review.findings[0]?.locationVerified, false);
   assert.equal(review.inlineFindings.length, 0);
   assert.match(review.bodyFindings[0]?.body ?? "", /Location could not be verified/);
+});
+
+test("omits apply suggestions when the inline range cannot be verified", () => {
+  const review = aggregateReview(context, config, files, [
+    {
+      prompt: "invalid suggestion location",
+      status: "completed",
+      submission: {
+        summary: "invalid suggestion location",
+        findings: [
+          {
+            title: "Unverified replacement",
+            severity: "HIGH",
+            body: "The claimed line is outside the diff.",
+            suggestion: "replacement",
+            path: "src/change.ts",
+            line: 99,
+          },
+        ],
+      },
+    },
+  ]);
+  const request = buildReviewRequest(context, review, [
+    {
+      prompt: "invalid suggestion location",
+      status: "completed",
+      submission: { summary: "unused", findings: [] },
+    },
+  ]);
+
+  assert.equal(review.findings[0]?.suggestion, undefined);
+  assert.equal(request.comments.length, 0);
+  assert.doesNotMatch(request.body, /```suggestion/u);
 });
 
 test("keeps verified findings at separate locations distinct", () => {
@@ -611,7 +651,7 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
   assert.match(summary, /additional findings? (?:was|were) omitted/u);
   for (let index = 0; index < goals.length; index += 1) {
     const identifier = String(index).padStart(3, "0");
-    const hasHeading = summary.includes(`Low · Finding ${identifier}`);
+    const hasHeading = summary.includes(`🟡 Low: Finding ${identifier}`);
     assert.equal(summary.includes(`BEGIN-${identifier}:`), hasHeading);
     assert.equal(summary.includes(`:END-${identifier}`), hasHeading);
     if (hasHeading) included += 1;
