@@ -3,9 +3,19 @@ import { promisify } from "node:util";
 
 import * as core from "@actions/core";
 
-import { aggregateReview, buildReviewRequest, reviewMarker } from "./lib/aggregate.js";
+import {
+  aggregateReview,
+  buildReviewRequest,
+  buildRunSummary,
+  reviewMarker,
+} from "./lib/aggregate.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
-import { readPullRequestContext } from "./lib/github-event.js";
+import {
+  parsePullRequestUrl,
+  readPullRequestContext,
+  readPullRequestEventContext,
+  samePullRequest,
+} from "./lib/github-event.js";
 import {
   inputSecretCandidates,
   readReviewConfig,
@@ -13,6 +23,7 @@ import {
   type InputReader,
 } from "./lib/input.js";
 import { runReviewGoals } from "./runtime/agent.js";
+import { createPullRequestWorkspace } from "./lib/pull-request-workspace.js";
 import type {
   GoalResult,
   PullRequestContext,
@@ -124,6 +135,14 @@ async function assertWorkspace(
   }
 }
 
+async function writeRunSummary(
+  context: PullRequestContext,
+  review: NonNullable<ReviewRunResult["review"]>,
+  goals: readonly GoalResult[],
+): Promise<void> {
+  await core.summary.addRaw(buildRunSummary(context, review, goals), true).write();
+}
+
 function actionInputReader(): InputReader {
   return { get: (name) => core.getInput(name) };
 }
@@ -135,64 +154,121 @@ function registerInputSecrets(secrets: readonly string[]): void {
 export async function runAction(
   reader: InputReader = actionInputReader(),
   inputSecrets: readonly string[] = inputSecretCandidates(reader),
+  dependencies: ActionDependencies = defaultActionDependencies,
 ): Promise<ReviewRunResult> {
   registerInputSecrets(inputSecrets);
   const config = readReviewConfig(reader);
   const secrets = reviewSecretCandidates(config);
   registerInputSecrets(secrets);
-  const context = await readPullRequestContext();
-  const api = new GitHubApi(config.githubToken);
-  await assertCurrentHead(api, context);
-  await assertWorkspace(context);
-  const authenticatedLogin = await api.getAuthenticatedUserLogin();
-  const marker = reviewMarker(context, config);
-  const existingReviews = await api.listReviews(context);
+  const api = dependencies.createApi(config.githubToken);
+  const eventContext = await dependencies.readEventContext();
+  const locator =
+    config.pullRequestUrl === undefined ? undefined : parsePullRequestUrl(config.pullRequestUrl);
   if (
-    existingReviews.some(
-      (review) =>
-        review.authorLogin.toLowerCase() === authenticatedLogin.toLowerCase() &&
-        review.state !== "DISMISSED" &&
-        review.commitId === context.headSha &&
-        review.body.includes(marker),
-    )
+    eventContext !== undefined &&
+    locator !== undefined &&
+    !samePullRequest(eventContext, locator)
   ) {
-    core.info("An identical review already exists for this pull request head; skipping.");
-    return { skipped: true };
+    throw new Error(
+      "Input 'pull-request-url' must identify the pull request that triggered this workflow.",
+    );
   }
-
-  await assertCurrentHead(api, context);
-  await assertWorkspace(context);
-  const files = await api.getPullRequestFiles(context);
-  core.info(
-    `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
-  );
-  const rawGoals = await runReviewGoals(context, files, config);
-  const goals = redactGoals(rawGoals, secrets);
-  const review = aggregateReview(context, config, files, goals);
-  if (review.allGoalsFailed) {
-    throw new Error("All review goals failed; no pull request review was posted.");
-  }
-
-  const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
-  await assertCurrentHead(api, context);
-  await assertWorkspace(context);
+  const context =
+    locator === undefined
+      ? (eventContext ?? (await readPullRequestContext()))
+      : await api.getPullRequestContext(locator);
+  const temporaryWorkspace =
+    locator === undefined
+      ? undefined
+      : await dependencies.createWorkspace(context, config.githubToken);
+  const workspace = temporaryWorkspace?.path ?? process.env.GITHUB_WORKSPACE ?? process.cwd();
   try {
-    await api.createReview(context, request);
-  } catch (error) {
-    if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
-    core.warning("GitHub rejected the approval review; retrying as a comment review.");
     await assertCurrentHead(api, context);
-    await assertWorkspace(context);
-    await api.createReview(context, {
-      ...request,
-      event: "COMMENT",
-      body: `${request.body}\n\n> GitHub rejected the requested approval, so this result was posted as a comment.`,
-    });
+    await assertWorkspace(context, workspace);
+    if (config.interactWithPullRequest) {
+      const authenticatedLogin = await api.getAuthenticatedUserLogin();
+      const marker = reviewMarker(context, config);
+      const existingReviews = await api.listReviews(context);
+      if (
+        existingReviews.some(
+          (review) =>
+            review.authorLogin.toLowerCase() === authenticatedLogin.toLowerCase() &&
+            review.state !== "DISMISSED" &&
+            review.commitId === context.headSha &&
+            review.body.includes(marker),
+        )
+      ) {
+        core.info("An identical review already exists for this pull request head; skipping.");
+        return { skipped: true };
+      }
+    }
+
+    await assertCurrentHead(api, context);
+    await assertWorkspace(context, workspace);
+    const files = await api.getPullRequestFiles(context);
+    core.info(
+      `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
+    );
+    const rawGoals = await dependencies.runGoals(context, files, config, workspace);
+    const goals = redactGoals(rawGoals, secrets);
+    const review = aggregateReview(context, config, files, goals);
+    if (!config.interactWithPullRequest) {
+      await assertCurrentHead(api, context);
+      await assertWorkspace(context, workspace);
+      await dependencies.writeSummary(context, review, goals);
+      if (review.allGoalsFailed) {
+        throw new Error("All review goals failed; the result was written to the run summary.");
+      }
+      if (review.partial) {
+        throw new Error(
+          "The review was written as a partial result, but one or more goals failed.",
+        );
+      }
+      return { skipped: false, review };
+    }
+    if (review.allGoalsFailed) {
+      throw new Error("All review goals failed; no pull request review was posted.");
+    }
+
+    const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
+    await assertCurrentHead(api, context);
+    await assertWorkspace(context, workspace);
+    try {
+      await api.createReview(context, request);
+    } catch (error) {
+      if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
+      core.warning("GitHub rejected the approval review; retrying as a comment review.");
+      await assertCurrentHead(api, context);
+      await assertWorkspace(context, workspace);
+      await api.createReview(context, {
+        ...request,
+        event: "COMMENT",
+        body: `${request.body}\n\n> GitHub rejected the requested approval, so this result was posted as a comment.`,
+      });
+    }
+    if (review.partial)
+      throw new Error("The review was posted as a partial result, but one or more goals failed.");
+    return { skipped: false, review };
+  } finally {
+    await temporaryWorkspace?.cleanup();
   }
-  if (review.partial)
-    throw new Error("The review was posted as a partial result, but one or more goals failed.");
-  return { skipped: false, review };
 }
+
+interface ActionDependencies {
+  readonly createApi: (token: string) => GitHubApi;
+  readonly readEventContext: () => Promise<PullRequestContext | undefined>;
+  readonly createWorkspace: typeof createPullRequestWorkspace;
+  readonly runGoals: typeof runReviewGoals;
+  readonly writeSummary: typeof writeRunSummary;
+}
+
+const defaultActionDependencies: ActionDependencies = {
+  createApi: (token) => new GitHubApi(token),
+  readEventContext: () => readPullRequestEventContext(),
+  createWorkspace: createPullRequestWorkspace,
+  runGoals: runReviewGoals,
+  writeSummary: writeRunSummary,
+};
 
 export async function main(): Promise<void> {
   let inputSecrets: readonly string[] = [];
@@ -210,6 +286,7 @@ export async function main(): Promise<void> {
 
 export const indexInternals = {
   assertWorkspace,
+  writeRunSummary,
   inputSecretCandidates,
   redact,
   reviewSecrets: reviewSecretCandidates,

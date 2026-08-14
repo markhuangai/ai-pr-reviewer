@@ -1,7 +1,9 @@
 import { strict as assert } from "node:assert";
+import { createServer } from "node:http";
 import test from "node:test";
 
-import { githubApiInternals } from "../src/lib/github-api.js";
+import { GitHubApi, githubApiInternals } from "../src/lib/github-api.js";
+import type { PullRequestLocator } from "../src/lib/types.js";
 
 test("extracts added line numbers from a unified diff", () => {
   const lines = githubApiInternals.parseAddedLines(
@@ -128,4 +130,71 @@ test("reads the live pull request head SHA", () => {
     "fedcba9876543210",
   );
   assert.equal(githubApiInternals.readBaseSha({ base: { sha: "" } }), undefined);
+});
+
+test("retrieves complete pull request metadata through the GitHub HTTP client", async (t) => {
+  const requests: Array<{
+    readonly method: string | undefined;
+    readonly path: string | undefined;
+    readonly authorization: string | undefined;
+  }> = [];
+  const server = createServer((request, response) => {
+    requests.push({
+      method: request.method,
+      path: request.url,
+      authorization: request.headers.authorization,
+    });
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "application/json");
+    response.end(
+      JSON.stringify({
+        title: "External change",
+        changed_files: 17,
+        head: { sha: "b".repeat(40) },
+        base: { sha: "a".repeat(40), ref: "release/next" },
+      }),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error === undefined) resolve();
+          else reject(error);
+        });
+      }),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const locator: PullRequestLocator = {
+    repository: "target/project",
+    owner: "target",
+    name: "project",
+    number: 73,
+    htmlUrl: "https://github.com/target/project/pull/73",
+  };
+
+  const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`);
+  assert.deepEqual(await api.getPullRequestContext(locator), {
+    ...locator,
+    title: "External change",
+    changedFiles: 17,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "release/next",
+  });
+  assert.deepEqual(requests, [
+    {
+      method: "GET",
+      path: "/repos/target/project/pulls/73",
+      authorization: "Bearer test-token",
+    },
+  ]);
 });

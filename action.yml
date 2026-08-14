@@ -3,7 +3,7 @@ description: Goal-driven pull request reviews with isolated AI sessions and MCP-
 author: MarkHuang.ai
 inputs:
   github-pat:
-    description: A GitHub PAT that can read the pull request and create pull request reviews.
+    description: A GitHub PAT that can read the target repository and optionally create pull request reviews.
     required: true
   ai-base-url:
     description: Anthropic Messages API-compatible base URL.
@@ -33,6 +33,13 @@ inputs:
     description: Approve only a complete review with no Critical, High, or Medium findings.
     required: false
     default: "false"
+  interact-with-pr:
+    description: Post the review to the pull request; when false, write the result only to the run summary.
+    required: false
+    default: "true"
+  pull-request-url:
+    description: Optional same-host GitHub pull request URL to review instead of inferring the target from the event.
+    required: false
   mcp-servers:
     description: Strict YAML mapping of optional HTTP MCP servers.
     required: false

@@ -16,6 +16,7 @@ const MAX_INLINE_COMMENT_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
+const MAX_RUN_SUMMARY_BYTES = 1_000_000;
 const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 4,
@@ -375,6 +376,60 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
   const body = sections.join("\n");
   if (body.length <= MAX_REVIEW_BODY_LENGTH) return body;
   return `${body.slice(0, MAX_REVIEW_BODY_LENGTH - 120)}\n\n> Review body truncated at 60 KB; see inline comments for the highest-severity findings.`;
+}
+
+function runSummaryHeading(review: AggregatedReview): string {
+  if (review.allGoalsFailed) return "## ⚠️ AI review failed";
+  if (review.partial) return "## ⚠️ AI review incomplete";
+  if (review.findings.length === 0) return "## ✨ AI review complete";
+  return "## 🔎 AI review";
+}
+
+export function buildRunSummary(
+  context: PullRequestContext,
+  review: AggregatedReview,
+  goals: readonly GoalResult[],
+): string {
+  const completed = goals.filter((goal) => goal.status === "completed").length;
+  const lines = [
+    runSummaryHeading(review),
+    "",
+    `- Pull request: [${context.repository}#${context.number}](${context.htmlUrl})`,
+    `- Reviewed head: \`${context.headSha}\``,
+    `- Checks completed: ${completed} of ${goals.length}`,
+    `- Result: ${review.allGoalsFailed ? "failed" : review.partial ? "incomplete" : "complete"}`,
+    "",
+    review.allGoalsFailed && review.findings.length === 0
+      ? "No review goal completed; see the step logs for redacted diagnostics."
+      : review.partial && review.findings.length === 0
+        ? "No actionable issues were reported by the completed checks."
+        : review.summary,
+  ];
+  if (review.findings.length === 0) return lines.join("\n");
+
+  lines.push("", "### Findings", "");
+  const fixed = `${lines.join("\n")}\n`;
+  const findings: string[] = [];
+  for (let index = 0; index < review.findings.length; index += 1) {
+    const finding = review.findings[index];
+    if (finding === undefined) break;
+    const block = formatFinding(finding, index);
+    const candidateFindings = [...findings, block];
+    const omitted = review.findings.length - candidateFindings.length;
+    const notice =
+      omitted === 0
+        ? ""
+        : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
+    const candidate = `${fixed}${candidateFindings.join("\n\n")}${notice}`;
+    if (Buffer.byteLength(candidate, "utf8") > MAX_RUN_SUMMARY_BYTES) break;
+    findings.push(block);
+  }
+  const omitted = review.findings.length - findings.length;
+  const notice =
+    omitted === 0
+      ? ""
+      : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
+  return `${fixed}${findings.join("\n\n")}${notice}`;
 }
 
 function inlineCommentBody(finding: AggregatedFinding): string {

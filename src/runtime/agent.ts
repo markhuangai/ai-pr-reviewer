@@ -923,7 +923,10 @@ function toSubmission(input: SubmissionInput): GoalSubmission {
   return { summary: input.summary, findings };
 }
 
-function safeAgentEnvironment(config: ReviewConfig): Record<string, string | undefined> {
+function safeAgentEnvironment(
+  config: ReviewConfig,
+  cwd: string,
+): Record<string, string | undefined> {
   const environment: Record<string, string | undefined> = { ...process.env };
   for (const key of Object.keys(environment)) {
     if (key.startsWith("INPUT_")) Reflect.deleteProperty(environment, key);
@@ -951,6 +954,7 @@ function safeAgentEnvironment(config: ReviewConfig): Record<string, string | und
   environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   environment.CLAUDE_CODE_AUTO_COMPACT = "1";
   environment.CLAUDE_AGENT_SDK_CLIENT_APP = "ai-pr-reviewer/0.1";
+  environment.GITHUB_WORKSPACE = cwd;
   return environment;
 }
 
@@ -1263,7 +1267,7 @@ function makeOptions(
   const externalNames = Object.keys(config.mcpServers).map((name) => `mcp__${name}__*`);
   return {
     cwd,
-    env: safeAgentEnvironment(config),
+    env: safeAgentEnvironment(config, cwd),
     model: config.model,
     maxTurns: config.maxTurns,
     tools: ["Read", "Glob", "Grep"],
@@ -1623,4 +1627,5 @@ export const agentInternals = {
   isWithinRepository,
   makeUserMessage,
   repairPrompt,
+  safeAgentEnvironment,
 };
