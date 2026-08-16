@@ -117,6 +117,12 @@ test("validates every required pull request event field", async (t) => {
   );
   assert.equal((await readPullRequestEventContext(path, "owner/repository"))?.number, 8);
 
+  const previousRepository = process.env.GITHUB_REPOSITORY;
+  t.after(() => {
+    if (previousRepository === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = previousRepository;
+  });
+  delete process.env.GITHUB_REPOSITORY;
   for (const repository of [undefined, "owner", "owner/repository/extra"]) {
     await assert.rejects(readPullRequestEventContext(path, repository), /GITHUB_REPOSITORY/u);
   }

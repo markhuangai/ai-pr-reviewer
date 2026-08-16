@@ -350,13 +350,13 @@ test("validates bootstrap asset metadata, headers, checksums, and HTTP failures"
   );
 
   const originalToken = process.env["INPUT_GITHUB-PAT"];
-  delete process.env["INPUT_GITHUB-PAT"];
-  assert.equal(bootstrapInternals.apiRequestHeaders().has("authorization"), false);
-  process.env["INPUT_GITHUB-PAT"] = "bootstrap-token";
   t.after(() => {
     if (originalToken === undefined) delete process.env["INPUT_GITHUB-PAT"];
     else process.env["INPUT_GITHUB-PAT"] = originalToken;
   });
+  delete process.env["INPUT_GITHUB-PAT"];
+  assert.equal(bootstrapInternals.apiRequestHeaders().has("authorization"), false);
+  process.env["INPUT_GITHUB-PAT"] = "bootstrap-token";
   assert.equal(
     bootstrapInternals.apiRequestHeaders().get("authorization"),
     "Bearer bootstrap-token",
