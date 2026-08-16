@@ -665,16 +665,45 @@ test("workspace validation rejects a different HEAD", async (t) => {
   );
 });
 
-test("main reports input failures without throwing secrets", async () => {
+test("main reports input failures without throwing secrets", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-index-main-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const previousInputs = Object.entries(process.env).filter(([key]) => key.startsWith("INPUT_"));
+  const previousEventPath = process.env.GITHUB_EVENT_PATH;
   const previousExitCode = process.exitCode;
-  const previousSecret = process.env.INPUT_TEST_SECRET;
-  process.env.INPUT_TEST_SECRET = "environment-secret";
-  try {
-    await main();
-    assert.equal(process.exitCode, 1);
-  } finally {
+  const output: string[] = [];
+  t.after(() => {
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("INPUT_")) Reflect.deleteProperty(process.env, key);
+    }
+    for (const [key, value] of previousInputs) process.env[key] = value;
+    if (previousEventPath === undefined) delete process.env.GITHUB_EVENT_PATH;
+    else process.env.GITHUB_EVENT_PATH = previousEventPath;
     process.exitCode = previousExitCode;
-    if (previousSecret === undefined) delete process.env.INPUT_TEST_SECRET;
-    else process.env.INPUT_TEST_SECRET = previousSecret;
+  });
+
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("INPUT_")) Reflect.deleteProperty(process.env, key);
   }
+  Object.assign(process.env, {
+    "INPUT_GITHUB-PAT": "github-test-token",
+    "INPUT_AI-BASE-URL": "https://ai.example.test",
+    "INPUT_AI-SECRET": "ai-test-secret",
+    INPUT_MODEL: "test-model",
+    "INPUT_REVIEW-PROMPTS": "correctness",
+    INPUT_TEST_SECRET: "environment-secret",
+  });
+  process.env.GITHUB_EVENT_PATH = join(root, "environment-secret-missing-event.json");
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+
+  await main();
+
+  const failureOutput = output.join("");
+  assert.equal(process.exitCode, 1);
+  assert.doesNotMatch(failureOutput, /environment-secret/u);
+  assert.match(failureOutput, /\[REDACTED\]-missing-event\.json/u);
 });
