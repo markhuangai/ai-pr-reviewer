@@ -1,7 +1,12 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
-import { inputInternals, inputSecretCandidates, readReviewConfig } from "../src/lib/input.js";
+import {
+  inputInternals,
+  inputSecretCandidates,
+  readReviewConfig,
+  reviewSecretCandidates,
+} from "../src/lib/input.js";
 
 function reader(values: Record<string, string>) {
   return { get: (name: string): string => values[name] ?? "" };
@@ -125,4 +130,211 @@ test("reads summary-only and pull request URL inputs", () => {
   );
   assert.equal(config.interactWithPullRequest, false);
   assert.equal(config.pullRequestUrl, "https://github.com/owner/repository/pull/42");
+});
+
+test("accepts every supported MCP policy and optional field", () => {
+  const servers = inputInternals.parseMcpServers(`
+security:
+  type: http
+  url: https://mcp.example.test/path///
+  headers:
+    X-Test: value
+  tools:
+    - name: allow
+      permission_policy: always_allow
+      org_max_permission: allow
+    - name: ask
+      permission_policy: always_ask
+      org_max_permission: ask
+    - name: deny
+      permission_policy: always_deny
+      org_max_permission: blocked
+    - name: default
+  timeout: 1000
+  alwaysLoad: false
+`);
+  assert.deepEqual(servers.security, {
+    type: "http",
+    url: "https://mcp.example.test/path",
+    headers: { "X-Test": "value" },
+    tools: [
+      { name: "allow", permission_policy: "always_allow", org_max_permission: "allow" },
+      { name: "ask", permission_policy: "always_ask", org_max_permission: "ask" },
+      { name: "deny", permission_policy: "always_deny", org_max_permission: "blocked" },
+      { name: "default" },
+    ],
+    timeout: 1000,
+    alwaysLoad: false,
+  });
+});
+
+test("rejects malformed MCP maps, headers, policies, and optional values", () => {
+  assert.throws(() => inputInternals.parseMcpServers("[]"), /must be a mapping of server names/u);
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        Array.from(
+          { length: 21 },
+          (_, index) => `server${index}:\n  type: http\n  url: https://example.test/${index}`,
+        ).join("\n"),
+      ),
+    /too many servers/u,
+  );
+  assert.throws(
+    () => inputInternals.parseMcpServers('"bad name": { type: http, url: https://example.test }'),
+    /not a valid server name/u,
+  );
+  assert.throws(() => inputInternals.parseMcpServers("server: value"), /server must be a mapping/u);
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        "server:\n  type: http\n  url: https://example.test\n  headers: []",
+      ),
+    /headers must be a mapping/u,
+  );
+  const manyHeaders = Array.from({ length: 51 }, (_, index) => `    X-${index}: value`).join("\n");
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        `server:\n  type: http\n  url: https://example.test\n  headers:\n${manyHeaders}`,
+      ),
+    /too many headers/u,
+  );
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        'server:\n  type: http\n  url: https://example.test\n  headers:\n    "Bad Header": value',
+      ),
+    /not a valid HTTP header name/u,
+  );
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        "server:\n  type: http\n  url: https://example.test\n  headers:\n    X-Test: ''",
+      ),
+    /must be a non-empty string/u,
+  );
+
+  for (const [tools, message] of [
+    ["value", /tools must be a sequence/u],
+    ["\n    - value", /tools\[0\] must be a mapping/u],
+    ["\n    - name: tool\n      extra: true", /tools\[0\]\.extra is not supported/u],
+    ["\n    - name: ''", /tools\[0\]\.name must be a non-empty string/u],
+    ["\n    - name: tool\n      permission_policy: sometimes", /permission_policy is invalid/u],
+    ["\n    - name: tool\n      org_max_permission: sometimes", /org_max_permission is invalid/u],
+  ] as const) {
+    assert.throws(
+      () =>
+        inputInternals.parseMcpServers(
+          `server:\n  type: http\n  url: https://example.test\n  tools: ${tools}`,
+        ),
+      message,
+    );
+  }
+  const manyTools = Array.from({ length: 101 }, () => "    - name: tool").join("\n");
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        `server:\n  type: http\n  url: https://example.test\n  tools:\n${manyTools}`,
+      ),
+    /too many tool policies/u,
+  );
+  for (const [field, value, message] of [
+    ["timeout", "999", /timeout must be an integer between/u],
+    ["timeout", "value", /timeout must be an integer between/u],
+    ["alwaysLoad", "value", /alwaysLoad must be a boolean/u],
+  ] as const) {
+    assert.throws(
+      () =>
+        inputInternals.parseMcpServers(
+          `server:\n  type: http\n  url: https://example.test\n  ${field}: ${value}`,
+        ),
+      message,
+    );
+  }
+});
+
+test("rejects malformed URLs, prompts, required values, and auth modes", () => {
+  const base = {
+    "github-pat": "token",
+    "ai-base-url": "https://ai.example.test",
+    "ai-secret": "secret",
+    model: "model",
+    "review-prompts": "goal",
+  };
+  for (const [value, message] of [
+    ["not-a-url", /absolute HTTP\(S\) URL/u],
+    ["ftp://example.test", /must use http:\/\/ or https:\/\//u],
+    ["https://user:pass@example.test", /must not contain URL credentials/u],
+  ] as const) {
+    assert.throws(() => readReviewConfig(reader({ ...base, "ai-base-url": value })), message);
+  }
+  assert.throws(
+    () =>
+      inputInternals.parseMcpServers(
+        "server:\n  type: http\n  url: https://user:pass@example.test",
+      ),
+    /must not contain URL credentials/u,
+  );
+  assert.throws(
+    () => readReviewConfig(reader({ ...base, model: " " })),
+    /Input 'model' is required/u,
+  );
+  assert.throws(
+    () => readReviewConfig(reader({ ...base, "ai-auth-mode": "oauth" })),
+    /ai-auth-mode.*api-key.*auth-token/u,
+  );
+  assert.equal(
+    readReviewConfig(reader({ ...base, "ai-auth-mode": " AUTH-TOKEN " })).aiAuthMode,
+    "auth-token",
+  );
+
+  for (const [value, message] of [
+    ["", /at least one prompt/u],
+    ["{}", /JSON string array/u],
+    ["[]", /JSON string array/u],
+    [JSON.stringify(Array.from({ length: 51 }, () => "goal")), /at most 50 prompts/u],
+    [JSON.stringify([1]), /must be a non-empty string/u],
+    [JSON.stringify([" "]), /must be a non-empty string/u],
+    [JSON.stringify(["x".repeat(12_001)]), /must not exceed 12000 characters/u],
+  ] as const) {
+    assert.throws(() => inputInternals.parseReviewPrompts(value), message);
+  }
+  assert.throws(
+    () => readReviewConfig(reader({ ...base, "parallel-count": "1.5" })),
+    /parallel-count.*integer/u,
+  );
+  assert.throws(
+    () => readReviewConfig(reader({ ...base, "max-turns": "101" })),
+    /max-turns.*between 2 and 100/u,
+  );
+});
+
+test("extracts only credential-shaped endpoint and authorization secrets", () => {
+  const config = readReviewConfig(
+    reader({
+      "github-pat": "token",
+      "ai-base-url": "https://ai.example.test?flag&apiKey=encoded%2Fsecret&tenant=public&token=",
+      "ai-secret": 'secret"with-escape',
+      model: "model",
+      "review-prompts": "goal",
+      "mcp-servers": `
+server:
+  type: http
+  url: https://mcp.example.test?signature=raw%2Fsignature
+  headers:
+    Authorization: Bearer header-secret
+    X-Public: public-value
+`,
+    }),
+  );
+  const secrets = reviewSecretCandidates(config);
+  assert.ok(secrets.includes("encoded%2Fsecret"));
+  assert.ok(secrets.includes("encoded/secret"));
+  assert.ok(secrets.includes("raw%2Fsignature"));
+  assert.ok(secrets.includes("raw/signature"));
+  assert.ok(secrets.includes("header-secret"));
+  assert.ok(secrets.includes('secret\\"with-escape'));
+  assert.equal(secrets.includes("public"), false);
+  assert.equal(secrets.includes("public-value"), true);
 });

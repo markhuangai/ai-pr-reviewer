@@ -40,18 +40,26 @@ export async function verifyReleaseSource(
   return { sourceCommit, tree: sourceTree };
 }
 
-function argument(name: string): string {
-  const index = process.argv.indexOf(name);
-  const value = index < 0 ? undefined : process.argv[index + 1];
+function argument(args: readonly string[], name: string): string {
+  const index = args.indexOf(name);
+  const value = index < 0 ? undefined : args[index + 1];
   if (!value) throw new Error(`Missing required ${name} argument.`);
   return value;
 }
 
+export async function verifyReleaseSourceCli(
+  args: readonly string[],
+  cwd = process.cwd(),
+): Promise<{ readonly sourceCommit: string; readonly tree: string }> {
+  return verifyReleaseSource(
+    argument(args, "--source-rc-tag"),
+    argument(args, "--stable-commit"),
+    cwd,
+  );
+}
+
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(entry).href) {
-  const result = await verifyReleaseSource(
-    argument("--source-rc-tag"),
-    argument("--stable-commit"),
-  );
+  const result = await verifyReleaseSourceCli(process.argv.slice(2));
   process.stdout.write(JSON.stringify(result));
 }

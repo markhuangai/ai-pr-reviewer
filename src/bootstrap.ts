@@ -286,11 +286,18 @@ async function runRuntime(
   });
 }
 
-async function main(): Promise<void> {
-  const releaseRef = process.env.GITHUB_ACTION_REF;
-  const requestedRelease = await resolveActionRelease(releaseRef);
+export interface BootstrapRuntimeOptions {
+  readonly releaseRef?: string;
+  readonly temporaryRoot?: string;
+  readonly getJson?: JsonFetcher;
+}
+
+export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): Promise<number> {
+  const releaseRef = options.releaseRef ?? process.env.GITHUB_ACTION_REF;
+  const getJson = options.getJson ?? fetchJson;
+  const requestedRelease = await resolveActionRelease(releaseRef, getJson);
   const assetName = platformAssetName();
-  const release = await fetchJson<ReleasePayload>(
+  const release = await getJson<ReleasePayload>(
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
   );
   if (
@@ -309,7 +316,7 @@ async function main(): Promise<void> {
     throw new Error("Runtime asset is larger than the safety limit.");
   const checksum = await readChecksum(`${asset.browser_download_url}.sha256`);
   const cacheRoot = join(
-    process.env.RUNNER_TEMP ?? tmpdir(),
+    options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(),
     "ai-pr-reviewer-runtime",
     requestedRelease.tag,
     assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
@@ -337,12 +344,31 @@ async function main(): Promise<void> {
       throw new Error("Runtime bundle manifest verification failed.");
     }
     const sourceCommit = manifest.sourceCommit;
-    const code = await runRuntime(extracted, sourceCommit);
-    if (code !== 0) process.exitCode = code;
+    return await runRuntime(extracted, sourceCommit);
   } finally {
     await rm(extracted, { recursive: true, force: true });
   }
 }
+
+async function main(): Promise<void> {
+  const code = await bootstrapRuntime();
+  if (code !== 0) process.exitCode = code;
+}
+
+export const bootstrapInternals = {
+  apiRequestHeaders,
+  download,
+  expectedDigest,
+  extract,
+  fetchJson,
+  gitObject,
+  platformAssetName,
+  readAsset,
+  readChecksum,
+  requestHeaders,
+  runRuntime,
+  sha256,
+};
 
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(entry).href) {

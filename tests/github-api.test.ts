@@ -2,8 +2,12 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import test from "node:test";
 
-import { GitHubApi, githubApiInternals } from "../src/lib/github-api.js";
-import type { PullRequestLocator } from "../src/lib/types.js";
+import { GitHubApi, GitHubApiError, githubApiInternals } from "../src/lib/github-api.js";
+import type {
+  PullRequestContext,
+  PullRequestLocator,
+  PullRequestReviewRequest,
+} from "../src/lib/types.js";
 
 test("extracts added line numbers from a unified diff", () => {
   const lines = githubApiInternals.parseAddedLines(
@@ -197,4 +201,288 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
       authorization: "Bearer test-token",
     },
   ]);
+});
+
+test("paginates changed files and reviews and creates a review", async (t) => {
+  const requests: Array<{
+    readonly method: string | undefined;
+    readonly url: string | undefined;
+    readonly body: string;
+  }> = [];
+  let serverOrigin = "";
+  const file = (index: number) => ({
+    filename: `src/file-${index}.ts`,
+    ...(index === 0 ? { previous_filename: "src/old.ts" } : {}),
+    status: index === 0 ? "renamed" : "modified",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    patch: "@@ -0,0 +1 @@\n+added",
+  });
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
+    });
+    request.on("end", () => {
+      requests.push({ method: request.method, url: request.url, body });
+      response.setHeader("content-type", "application/json");
+      if (request.url === "/api/user") {
+        response.end(JSON.stringify({ login: "review-owner" }));
+        return;
+      }
+      if (request.url?.includes("/files?per_page=100&page=1")) {
+        response.setHeader(
+          "link",
+          `<${serverOrigin}/api/repos/owner/repository/pulls/11/files?per_page=100&page=2>; rel="next"`,
+        );
+        response.end(JSON.stringify(Array.from({ length: 100 }, (_, index) => file(index))));
+        return;
+      }
+      if (request.url?.includes("/files?per_page=100&page=2")) {
+        response.end(JSON.stringify([file(100)]));
+        return;
+      }
+      if (request.url?.includes("/reviews?per_page=100&page=1")) {
+        response.end(
+          JSON.stringify([
+            {
+              user: { login: "reviewer" },
+              body: "First review",
+              commit_id: "b".repeat(40),
+            },
+            ...Array.from({ length: 99 }, () => null),
+          ]),
+        );
+        return;
+      }
+      if (request.url?.includes("/reviews?per_page=100&page=2")) {
+        response.end(
+          JSON.stringify([
+            {
+              user: { login: "second" },
+              body: "Second review",
+              commit_id: "c".repeat(40),
+              state: "APPROVED",
+            },
+          ]),
+        );
+        return;
+      }
+      if (request.method === "POST" && request.url?.endsWith("/reviews")) {
+        response.end("{}");
+        return;
+      }
+      response.end(
+        JSON.stringify({
+          title: "Paginated change",
+          changed_files: 101,
+          head: { sha: "b".repeat(40) },
+          base: { sha: "a".repeat(40), ref: "main" },
+        }),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  serverOrigin = `http://127.0.0.1:${address.port}`;
+  const api = new GitHubApi("test-token", `${serverOrigin}/api/`);
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 11,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    changedFiles: 101,
+    title: "Paginated change",
+    htmlUrl: "https://github.com/owner/repository/pull/11",
+  };
+
+  assert.equal(await api.getAuthenticatedUserLogin(), "review-owner");
+  assert.deepEqual(await api.getPullRequestRefs(context), {
+    headSha: context.headSha,
+    baseSha: context.baseSha,
+  });
+  assert.equal(await api.getPullRequestHeadSha(context), context.headSha);
+  const files = await api.getPullRequestFiles(context);
+  assert.equal(files.length, 101);
+  assert.equal(files[0]?.previousPath, "src/old.ts");
+  assert.deepEqual([...(files[100]?.addedLines ?? [])], [1]);
+  assert.deepEqual(await api.listReviews(context), [
+    {
+      authorLogin: "reviewer",
+      body: "First review",
+      commitId: "b".repeat(40),
+      state: "UNKNOWN",
+    },
+    {
+      authorLogin: "second",
+      body: "Second review",
+      commitId: "c".repeat(40),
+      state: "APPROVED",
+    },
+  ]);
+  const reviewRequest: PullRequestReviewRequest = {
+    commit_id: context.headSha,
+    body: "Review body",
+    event: "COMMENT",
+    comments: [],
+  };
+  await api.createReview(context, reviewRequest);
+  const posted = requests.find((request) => request.method === "POST");
+  assert.deepEqual(JSON.parse(posted?.body ?? "{}"), reviewRequest);
+});
+
+test("reports malformed GitHub responses and file-count inconsistencies", async (t) => {
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/user") {
+      response.end("{}");
+      return;
+    }
+    if (request.method === "POST") {
+      response.statusCode = request.url?.includes("/pulls/8/") ? 500 : 422;
+      response.end(
+        request.url?.includes("/pulls/8/")
+          ? "not-json"
+          : JSON.stringify({
+              message: "Validation Failed",
+              errors: ["plain error", { message: "inline error" }, {}],
+            }),
+      );
+      return;
+    }
+    const number = /\/pulls\/(\d+)/u.exec(request.url ?? "")?.[1];
+    if (request.url?.includes("/files?")) {
+      if (number === "3") response.end("{}");
+      else if (number === "5") response.end("[null]");
+      else if (number === "6") response.end("[{}]");
+      else
+        response.end(
+          JSON.stringify([
+            {
+              filename: "one.ts",
+              status: "modified",
+              additions: -1,
+              deletions: "invalid",
+              changes: 1.5,
+            },
+          ]),
+        );
+      return;
+    }
+    if (request.url?.includes("/reviews?")) {
+      response.end("{}");
+      return;
+    }
+    if (number === "1") response.end("null");
+    else if (number === "2")
+      response.end(JSON.stringify({ head: { sha: "head" }, base: { sha: "base" } }));
+    else response.end(JSON.stringify({ head: {}, base: {} }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const api = new GitHubApi("token", `http://127.0.0.1:${address.port}`);
+  const locator = (number: number): PullRequestLocator => ({
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number,
+    htmlUrl: `https://github.com/owner/repository/pull/${number}`,
+  });
+  const context = (number: number, changedFiles?: number): PullRequestContext => ({
+    ...locator(number),
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    ...(changedFiles === undefined ? {} : { changedFiles }),
+    title: "Malformed response",
+  });
+
+  await assert.rejects(api.getAuthenticatedUserLogin(), /no authenticated user login/u);
+  await assert.rejects(api.getPullRequestContext(locator(1)), /invalid pull request metadata/u);
+  await assert.rejects(api.getPullRequestContext(locator(2)), /incomplete pull request ref/u);
+  await assert.rejects(api.getPullRequestRefs(context(1)), /incomplete pull request ref/u);
+  await assert.rejects(api.getPullRequestFiles(context(3)), /invalid pull request files/u);
+  await assert.rejects(api.listReviews(context(4)), /invalid pull request reviews/u);
+  await assert.rejects(api.getPullRequestFiles(context(5)), /invalid changed-file record/u);
+  await assert.rejects(api.getPullRequestFiles(context(6)), /without a filename/u);
+  await assert.rejects(
+    api.getPullRequestFiles(context(9, 2)),
+    /incomplete pull request file list/u,
+  );
+  await assert.rejects(
+    api.getPullRequestFiles(context(10, 0)),
+    /more files than the pull request metadata/u,
+  );
+  await assert.rejects(
+    api.createReview(context(7), {
+      commit_id: "b".repeat(40),
+      body: "body",
+      event: "COMMENT",
+      comments: [],
+    }),
+    (error: unknown) =>
+      error instanceof GitHubApiError &&
+      error.status === 422 &&
+      /Validation Failed; plain error; inline error/u.test(error.message),
+  );
+  await assert.rejects(
+    api.createReview(context(8), {
+      commit_id: "b".repeat(40),
+      body: "body",
+      event: "COMMENT",
+      comments: [],
+    }),
+    /GitHub API request failed \(500\)/u,
+  );
+});
+
+test("handles uncommon patch and pagination shapes", () => {
+  assert.deepEqual(githubApiInternals.parsePatchCounts(undefined), {
+    additions: 0,
+    deletions: 0,
+    complete: false,
+  });
+  assert.equal(
+    githubApiInternals.parsePatchCounts("@@ -1 +1 @@\n context\n+extra").complete,
+    false,
+  );
+  assert.equal(githubApiInternals.parsePatchCounts("not a patch").complete, false);
+  assert.equal(
+    githubApiInternals.nextPagePath(
+      '<https://api.example.test/root>; rel="last"',
+      "https://api.example.test/api",
+    ),
+    undefined,
+  );
+  assert.equal(
+    githubApiInternals.nextPagePath(
+      '<https://api.example.test/other?page=2>; rel="next"',
+      "https://api.example.test/api",
+    ),
+    "/other?page=2",
+  );
 });

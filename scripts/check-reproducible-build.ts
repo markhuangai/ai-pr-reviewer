@@ -2,13 +2,13 @@ import { cp, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-const snapshotRoot = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-repro-"));
 
-function run(command: string, args: string[]): Promise<void> {
+function run(command: string, args: string[], cwd: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit", windowsHide: true });
+    const child = spawn(command, args, { cwd, stdio: "inherit", windowsHide: true });
     let settled = false;
     child.once("error", (error) => {
       if (settled) return;
@@ -42,17 +42,33 @@ async function snapshot(root: string): Promise<ReadonlyMap<string, string>> {
   return result;
 }
 
-await run(npmCommand, ["run", "build"]);
-await cp("build", join(snapshotRoot, "first"), { recursive: true });
-const first = await snapshot(join(snapshotRoot, "first"));
-await run(npmCommand, ["run", "build"]);
-const second = await snapshot("build");
-if (
-  first.size !== second.size ||
-  [...first].some(([path, content]) => second.get(path) !== content)
-) {
-  await rm(snapshotRoot, { recursive: true, force: true });
-  throw new Error("Compiled runtime is not reproducible between two builds.");
+export async function verifyReproducibleBuild(
+  cwd = process.cwd(),
+  command = npmCommand,
+): Promise<number> {
+  const snapshotRoot = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-repro-"));
+  try {
+    await run(command, ["run", "build"], cwd);
+    await cp(join(cwd, "build"), join(snapshotRoot, "first"), { recursive: true });
+    const first = await snapshot(join(snapshotRoot, "first"));
+    await run(command, ["run", "build"], cwd);
+    const second = await snapshot(join(cwd, "build"));
+    if (
+      first.size !== second.size ||
+      [...first].some(([path, content]) => second.get(path) !== content)
+    ) {
+      throw new Error("Compiled runtime is not reproducible between two builds.");
+    }
+    return first.size;
+  } finally {
+    await rm(snapshotRoot, { recursive: true, force: true });
+  }
 }
-await rm(snapshotRoot, { recursive: true, force: true });
-console.log(`Reproducible build verified for ${first.size} compiled files.`);
+
+export const reproducibleBuildInternals = { files, run, snapshot };
+
+const entry = process.argv[1];
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  const count = await verifyReproducibleBuild();
+  console.log(`Reproducible build verified for ${count} compiled files.`);
+}

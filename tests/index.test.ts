@@ -5,14 +5,80 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
-import { indexInternals, runAction } from "../src/index.js";
-import { buildRunSummary } from "../src/lib/aggregate.js";
-import { GitHubApi } from "../src/lib/github-api.js";
-import type { GoalResult, PullRequestContext, ReviewConfig } from "../src/lib/types.js";
+import { indexInternals, main, runAction } from "../src/index.js";
+import { buildRunSummary, reviewMarker } from "../src/lib/aggregate.js";
+import { GitHubApi, GitHubApiError } from "../src/lib/github-api.js";
+import { readReviewConfig, type InputReader } from "../src/lib/input.js";
+import type {
+  GoalResult,
+  PullRequestContext,
+  PullRequestReviewRequest,
+  ReviewConfig,
+} from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
+
+function actionReader(overrides: Readonly<Record<string, string>> = {}): InputReader {
+  const values: Readonly<Record<string, string>> = {
+    "github-pat": "test-token",
+    "ai-base-url": "https://ai.example.test",
+    "ai-secret": "test-ai-secret",
+    model: "review-model",
+    "review-prompts": "correctness",
+    ...overrides,
+  };
+  return { get: (name) => values[name] ?? "" };
+}
+
+async function cleanWorkspace(t: TestContext) {
+  const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-index-clean-"));
+  t.after(() => rm(workspace, { force: true, recursive: true }));
+  await execFileAsync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: workspace });
+  await writeFile(join(workspace, "review.txt"), "head\n");
+  await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
+  await execFileAsync(
+    "git",
+    [
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.test",
+      "commit",
+      "--quiet",
+      "--message=head",
+    ],
+    { cwd: workspace },
+  );
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: workspace,
+    encoding: "utf8",
+  });
+  const headSha = stdout.trim();
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 9,
+    headSha,
+    baseSha: headSha,
+    baseRef: "main",
+    title: "Action flow",
+    htmlUrl: "https://github.com/owner/repository/pull/9",
+  };
+  return { context, workspace };
+}
+
+function useWorkspace(t: TestContext, path: string): void {
+  const previous = process.env.GITHUB_WORKSPACE;
+  process.env.GITHUB_WORKSPACE = path;
+  t.after(() => {
+    if (previous === undefined) delete process.env.GITHUB_WORKSPACE;
+    else process.env.GITHUB_WORKSPACE = previous;
+  });
+}
 
 const config: ReviewConfig = {
   githubToken: "github-secret",
@@ -87,7 +153,7 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   );
 });
 
-test("omits apply suggestions changed by secret redaction", () => {
+test("redacts generated AI prompts without dropping them", () => {
   const [goal] = indexInternals.redactGoals(
     [
       {
@@ -99,8 +165,9 @@ test("omits apply suggestions changed by secret redaction", () => {
             {
               title: "Replace secret",
               severity: "HIGH",
-              body: "The value is exposed.",
-              suggestion: 'token := "private-token"',
+              body: "The value private-token is exposed.",
+              agentPrompt:
+                "Impact: private-token is exposed.\nRequested fix: Remove private-token.",
               path: "src/change.ts",
               line: 1,
             },
@@ -108,7 +175,7 @@ test("omits apply suggestions changed by secret redaction", () => {
               title: "Keep safe replacement",
               severity: "LOW",
               body: "The value is stale.",
-              suggestion: "return currentValue;",
+              agentPrompt: "Impact: The value is stale.\nRequested fix: Return the current value.",
               path: "src/change.ts",
               line: 2,
             },
@@ -119,8 +186,15 @@ test("omits apply suggestions changed by secret redaction", () => {
     ["private-token"],
   );
 
-  assert.equal(goal?.submission?.findings[0]?.suggestion, undefined);
-  assert.equal(goal?.submission?.findings[1]?.suggestion, "return currentValue;");
+  assert.equal(goal?.submission?.findings[0]?.body, "The value [REDACTED] is exposed.");
+  assert.equal(
+    goal?.submission?.findings[0]?.agentPrompt,
+    "Impact: [REDACTED] is exposed.\nRequested fix: Remove [REDACTED].",
+  );
+  assert.equal(
+    goal?.submission?.findings[1]?.agentPrompt,
+    "Impact: The value is stale.\nRequested fix: Return the current value.",
+  );
 });
 
 test("workspace validation rejects ignored content", async (t) => {
@@ -354,4 +428,253 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     requests.some((request) => request.path?.endsWith("/reviews") === true),
     false,
   );
+});
+
+test("skips an identical current-head review by the authenticated user", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const reader = actionReader();
+  const marker = reviewMarker(context, readReviewConfig(reader));
+  let goalRuns = 0;
+  const api = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getAuthenticatedUserLogin: () => Promise.resolve("Review-Owner"),
+    listReviews: () =>
+      Promise.resolve([
+        {
+          authorLogin: "review-owner",
+          body: marker,
+          commitId: context.headSha,
+          state: "COMMENTED",
+        },
+      ]),
+  } as unknown as GitHubApi;
+
+  const result = await runAction(reader, [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () => {
+      goalRuns += 1;
+      return Promise.resolve([]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.deepEqual(result, { skipped: true });
+  assert.equal(goalRuns, 0);
+});
+
+test("falls back from a rejected approval to a comment review", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const requests: PullRequestReviewRequest[] = [];
+  const api = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
+    listReviews: () => Promise.resolve([]),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
+      requests.push(request);
+      if (requests.length === 1) {
+        return Promise.reject(
+          new GitHubApiError(422, "GitHub API request failed: Reviews may not be approved"),
+        );
+      }
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader({ "auto-approve": "true" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.equal(result.skipped, false);
+  assert.deepEqual(
+    requests.map((request) => request.event),
+    ["APPROVE", "COMMENT"],
+  );
+  assert.match(requests[1]?.body ?? "", /rejected the requested approval/u);
+});
+
+test("propagates non-approval review failures", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const api = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
+    listReviews: () => Promise.resolve([]),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: () => Promise.reject(new GitHubApiError(500, "GitHub unavailable")),
+  } as unknown as GitHubApi;
+  await assert.rejects(
+    runAction(actionReader(), [], {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: () =>
+        Promise.resolve([
+          {
+            prompt: "correctness",
+            status: "completed",
+            submission: { summary: "finding", findings: [] },
+          },
+        ]),
+      writeSummary: () => Promise.resolve(),
+    }),
+    /GitHub unavailable/u,
+  );
+});
+
+test("fails closed for stale refs and mismatched event URL targets", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const staleApi = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha }),
+  } as unknown as GitHubApi;
+  await assert.rejects(
+    runAction(actionReader(), [], {
+      createApi: () => staleApi,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: () => Promise.resolve([]),
+      writeSummary: () => Promise.resolve(),
+    }),
+    /refs changed during review/u,
+  );
+
+  const previousServer = process.env.GITHUB_SERVER_URL;
+  process.env.GITHUB_SERVER_URL = "https://github.com";
+  t.after(() => {
+    if (previousServer === undefined) delete process.env.GITHUB_SERVER_URL;
+    else process.env.GITHUB_SERVER_URL = previousServer;
+  });
+  await assert.rejects(
+    runAction(
+      actionReader({ "pull-request-url": "https://github.com/other/repository/pull/10" }),
+      [],
+      {
+        createApi: () => staleApi,
+        readEventContext: () => Promise.resolve(context),
+        createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+        runGoals: () => Promise.resolve([]),
+        writeSummary: () => Promise.resolve(),
+      },
+    ),
+    /must identify the pull request that triggered/u,
+  );
+});
+
+test("writes failed and partial summary-only results before reporting failure", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const api = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getPullRequestFiles: () => Promise.resolve([]),
+  } as unknown as GitHubApi;
+  const summaries: string[] = [];
+  const dependencies = (goals: readonly GoalResult[]) => ({
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () => Promise.resolve(goals),
+    writeSummary: (
+      summaryContext: PullRequestContext,
+      review: NonNullable<Awaited<ReturnType<typeof runAction>>["review"]>,
+      completedGoals: readonly GoalResult[],
+    ) => {
+      summaries.push(buildRunSummary(summaryContext, review, completedGoals));
+      return Promise.resolve();
+    },
+  });
+
+  await assert.rejects(
+    runAction(
+      actionReader({ "interact-with-pr": "false" }),
+      [],
+      dependencies([{ prompt: "correctness", status: "failed", error: "provider failed" }]),
+    ),
+    /All review goals failed/u,
+  );
+  await assert.rejects(
+    runAction(
+      actionReader({ "interact-with-pr": "false", "review-prompts": "one\ntwo" }),
+      [],
+      dependencies([
+        { prompt: "one", status: "completed", submission: { summary: "clean", findings: [] } },
+        { prompt: "two", status: "failed", error: "provider failed" },
+      ]),
+    ),
+    /partial result/u,
+  );
+  assert.equal(summaries.length, 2);
+  assert.match(summaries[0] ?? "", /AI review failed/u);
+  assert.match(summaries[1] ?? "", /AI review incomplete/u);
+});
+
+test("does not post an interactive review when every goal fails", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  let reviews = 0;
+  const api = {
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
+    listReviews: () => Promise.resolve([]),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: () => {
+      reviews += 1;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  await assert.rejects(
+    runAction(actionReader(), [], {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: () =>
+        Promise.resolve([{ prompt: "correctness", status: "failed", error: "failed" }]),
+      writeSummary: () => Promise.resolve(),
+    }),
+    /no pull request review was posted/u,
+  );
+  assert.equal(reviews, 0);
+});
+
+test("workspace validation rejects a different HEAD", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  await assert.rejects(
+    indexInternals.assertWorkspace({ ...context, headSha: "f".repeat(40) }, workspace),
+    /does not match pull request head/u,
+  );
+});
+
+test("main reports input failures without throwing secrets", async () => {
+  const previousExitCode = process.exitCode;
+  const previousSecret = process.env.INPUT_TEST_SECRET;
+  process.env.INPUT_TEST_SECRET = "environment-secret";
+  try {
+    await main();
+    assert.equal(process.exitCode, 1);
+  } finally {
+    process.exitCode = previousExitCode;
+    if (previousSecret === undefined) delete process.env.INPUT_TEST_SECRET;
+    else process.env.INPUT_TEST_SECRET = previousSecret;
+  }
 });

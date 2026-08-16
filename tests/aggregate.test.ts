@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import test from "node:test";
 
 import {
+  aggregateInternals,
   aggregateReview,
   buildReviewBody,
   buildReviewRequest,
@@ -209,7 +210,7 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
   assert.match(request.body, /Location could not be verified/);
 });
 
-test("keeps an adopted duplicate suggestion paired with its verified range", () => {
+test("keeps a generated AI prompt paired with its verified range while merging duplicates", () => {
   const goals: readonly GoalResult[] = [
     {
       prompt: "correctness",
@@ -221,6 +222,7 @@ test("keeps an adopted duplicate suggestion paired with its verified range", () 
             title: "Unchecked result",
             severity: "HIGH",
             body: "The result is ignored.",
+            agentPrompt: "Target: `@src/change.ts:1`\nFinding: Unchecked result",
             path: "src/change.ts",
             line: 1,
           },
@@ -237,7 +239,7 @@ test("keeps an adopted duplicate suggestion paired with its verified range", () 
             title: "Unchecked result",
             severity: "MODERATE",
             body: "The result is ignored in this path.",
-            suggestion: "replacement one\nreplacement two",
+            agentPrompt: "Target: `@src/change.ts:1-2`\nFinding: Unchecked result",
             path: "src/change.ts",
             line: 1,
             endLine: 2,
@@ -249,12 +251,16 @@ test("keeps an adopted duplicate suggestion paired with its verified range", () 
 
   const review = aggregateReview(context, config, files, goals);
   assert.equal(review.findings.length, 1);
-  assert.equal(review.findings[0]?.suggestion, "replacement one\nreplacement two");
+  assert.equal(
+    review.findings[0]?.agentPrompt,
+    "Target: `@src/change.ts:1`\nFinding: Unchecked result",
+  );
   assert.equal(review.findings[0]?.line, 1);
-  assert.equal(review.findings[0]?.endLine, 2);
+  assert.equal(review.findings[0]?.endLine, undefined);
   const request = buildReviewRequest(context, review, goals);
-  assert.equal(request.comments[0]?.start_line, 1);
-  assert.equal(request.comments[0]?.line, 2);
+  assert.equal(request.comments[0]?.start_line, undefined);
+  assert.equal(request.comments[0]?.line, 1);
+  assert.match(request.comments[0]?.body ?? "", /Target: `@src\/change\.ts:1`/u);
 });
 
 test("does not include secrets in duplicate markers", () => {
@@ -299,8 +305,8 @@ test("does not include secrets in duplicate markers", () => {
   );
 });
 
-test("maps verified multi-line findings to GitHub review ranges with safe suggestion fences", () => {
-  const review = aggregateReview(context, config, files, [
+test("maps ranges and renders default-collapsed AI prompts with safe fences", () => {
+  const goals: readonly GoalResult[] = [
     {
       prompt: "range",
       status: "completed",
@@ -311,7 +317,15 @@ test("maps verified multi-line findings to GitHub review ranges with safe sugges
             title: "Range",
             severity: "MODERATE",
             body: "The whole changed block is affected.",
-            suggestion: "replacement one\n```\nreplacement three",
+            agentPrompt: [
+              "Verify this finding against the current code. Fix it only if it is still valid,",
+              "keep the change minimal, and run the relevant tests.",
+              "",
+              "Target: `@src/change.ts:1-2`",
+              "Finding: A ``` marker breaks a fixed fence",
+              "Impact: The comment can render incorrectly.",
+              "Requested fix: Size the text fence from the complete prompt.",
+            ].join("\n"),
             path: "src/change.ts",
             line: 1,
             endLine: 2,
@@ -319,27 +333,9 @@ test("maps verified multi-line findings to GitHub review ranges with safe sugges
         ],
       },
     },
-  ]);
-  const request = buildReviewRequest(context, review, [
-    {
-      prompt: "range",
-      status: "completed",
-      submission: {
-        summary: "range",
-        findings: [
-          {
-            title: "Range",
-            severity: "MODERATE",
-            body: "The whole changed block is affected.",
-            suggestion: "replacement one\n```\nreplacement three",
-            path: "src/change.ts",
-            line: 1,
-            endLine: 2,
-          },
-        ],
-      },
-    },
-  ]);
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const request = buildReviewRequest(context, review, goals);
   assert.deepEqual(request.comments[0], {
     path: "src/change.ts",
     line: 2,
@@ -350,9 +346,11 @@ test("maps verified multi-line findings to GitHub review ranges with safe sugges
   });
   assert.match(
     request.comments[0]?.body ?? "",
-    /````suggestion\nreplacement one\n```\nreplacement three\n````/u,
+    /<details>\n<summary>🤖 Prompt for AI Agents<\/summary>\n\n````text\n[\s\S]*Finding: A ``` marker breaks a fixed fence[\s\S]*\n````\n\n<\/details>/u,
   );
-  assert.match(request.comments[0]?.body ?? "", /Suggested change/u);
+  assert.doesNotMatch(request.comments[0]?.body ?? "", /<details open|```suggestion/u);
+  assert.doesNotMatch(buildReviewBody(review, goals), /Prompt for AI Agents/u);
+  assert.doesNotMatch(buildRunSummary(context, review, goals), /Prompt for AI Agents/u);
 });
 
 test("rejects oversized finding ranges before location verification", () => {
@@ -380,7 +378,7 @@ test("rejects oversized finding ranges before location verification", () => {
   assert.match(review.bodyFindings[0]?.body ?? "", /Location could not be verified/);
 });
 
-test("omits apply suggestions when the inline range cannot be verified", () => {
+test("omits AI prompts when the inline range cannot be verified", () => {
   const review = aggregateReview(context, config, files, [
     {
       prompt: "invalid suggestion location",
@@ -392,7 +390,7 @@ test("omits apply suggestions when the inline range cannot be verified", () => {
             title: "Unverified replacement",
             severity: "HIGH",
             body: "The claimed line is outside the diff.",
-            suggestion: "replacement",
+            agentPrompt: "Target: `@src/change.ts:99`\nFinding: Unverified replacement",
             path: "src/change.ts",
             line: 99,
           },
@@ -408,9 +406,9 @@ test("omits apply suggestions when the inline range cannot be verified", () => {
     },
   ]);
 
-  assert.equal(review.findings[0]?.suggestion, undefined);
+  assert.equal(review.findings[0]?.agentPrompt, undefined);
   assert.equal(request.comments.length, 0);
-  assert.doesNotMatch(request.body, /```suggestion/u);
+  assert.doesNotMatch(request.body, /Prompt for AI Agents|```suggestion/u);
 });
 
 test("keeps verified findings at separate locations distinct", () => {
@@ -811,4 +809,44 @@ test("binary changed-file metadata does not block an otherwise qualified approva
   );
   assert.equal(review.partial, false);
   assert.equal(review.event, "APPROVE");
+});
+
+test("bounds oversized inline prose while preserving a generated AI prompt", () => {
+  const finding = {
+    title: "Large inline finding",
+    severity: "HIGH" as const,
+    body: "evidence ".repeat(8_000),
+    path: "src/change.ts",
+    line: 1,
+    goals: [0],
+    locationVerified: true,
+  };
+  const withoutPrompt = aggregateInternals.inlineCommentBody(finding);
+  assert.ok(withoutPrompt.length <= 60_000);
+  assert.match(withoutPrompt, /Inline finding truncated at 60 KB/u);
+
+  const withPrompt = aggregateInternals.inlineCommentBody({
+    ...finding,
+    agentPrompt: "Target: `@src/change.ts:1`\n",
+  });
+  assert.ok(withPrompt.length <= 60_000);
+  assert.match(withPrompt, /duplicate evidence omitted to preserve the AI prompt/u);
+  assert.match(withPrompt, /Target: `@src\/change\.ts:1`\n```\n\n<\/details>/u);
+});
+
+test("rejects an AI prompt that cannot fit in an inline comment", () => {
+  assert.throws(
+    () =>
+      aggregateInternals.inlineCommentBody({
+        title: "Oversized prompt",
+        severity: "HIGH",
+        body: "body",
+        agentPrompt: "x".repeat(60_000),
+        path: "src/change.ts",
+        line: 1,
+        goals: [0],
+        locationVerified: true,
+      }),
+    /AI prompt exceeds GitHub's review comment capacity/u,
+  );
 });

@@ -88,24 +88,28 @@ export function selectReleaseAlias(
   };
 }
 
-function argument(name: string): string {
-  const index = process.argv.indexOf(name);
-  const value = index < 0 ? undefined : process.argv[index + 1];
+function argument(args: readonly string[], name: string): string {
+  const index = args.indexOf(name);
+  const value = index < 0 ? undefined : args[index + 1];
   if (!value) throw new Error(`Missing required ${name} argument.`);
   return value;
 }
 
-async function main(): Promise<void> {
-  const requestedTag = argument("--release-tag");
-  const releases = JSON.parse(await readFile(argument("--releases"), "utf8")) as unknown;
+export async function selectReleaseAliasCli(
+  args: readonly string[],
+  outputPath = process.env.GITHUB_OUTPUT,
+): Promise<ReleaseAliasSelection> {
+  const requestedTag = argument(args, "--release-tag");
+  const releases = JSON.parse(await readFile(argument(args, "--releases"), "utf8")) as unknown;
   const result = selectReleaseAlias(requestedTag, releases);
   const output = `${Object.entries(result)
     .map(([key, value]) => `${key}=${value}`)
     .join("\n")}\n`;
-  const outputPath = process.env.GITHUB_OUTPUT;
   if (outputPath) await appendFile(outputPath, output);
-  process.stdout.write(JSON.stringify(result));
+  return result;
 }
 
 const entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) await main();
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  process.stdout.write(JSON.stringify(await selectReleaseAliasCli(process.argv.slice(2))));
+}
