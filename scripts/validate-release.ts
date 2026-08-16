@@ -245,27 +245,31 @@ export function validateReleaseRequest(
   };
 }
 
-function argument(name: string): string {
-  const index = process.argv.indexOf(name);
-  const value = index < 0 ? undefined : process.argv[index + 1];
+function argument(args: readonly string[], name: string): string {
+  const index = args.indexOf(name);
+  const value = index < 0 ? undefined : args[index + 1];
   if (!value) fail(`Missing required ${name} argument.`);
   return value;
 }
 
-async function main(): Promise<void> {
-  const version = argument("--version");
-  const branch = argument("--branch");
-  const channel = argument("--channel");
-  const releases = JSON.parse(await readFile(argument("--releases"), "utf8")) as unknown;
-  const tags = JSON.parse(await readFile(argument("--tags"), "utf8")) as unknown;
+export async function validateReleaseCli(
+  args: readonly string[],
+  outputPath = process.env.GITHUB_OUTPUT,
+): Promise<ValidationResult> {
+  const version = argument(args, "--version");
+  const branch = argument(args, "--branch");
+  const channel = argument(args, "--channel");
+  const releases = JSON.parse(await readFile(argument(args, "--releases"), "utf8")) as unknown;
+  const tags = JSON.parse(await readFile(argument(args, "--tags"), "utf8")) as unknown;
   const result = validateReleaseRequest(version, branch, channel, releases, tags);
   const output = `${Object.entries(result)
     .map(([key, value]) => `${key}=${String(value)}`)
     .join("\n")}\n`;
-  const outputPath = process.env.GITHUB_OUTPUT;
   if (outputPath) await appendFile(outputPath, output);
-  process.stdout.write(JSON.stringify(result));
+  return result;
 }
 
 const entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) await main();
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  process.stdout.write(JSON.stringify(await validateReleaseCli(process.argv.slice(2))));
+}

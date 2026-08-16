@@ -26,7 +26,6 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 import { reviewSecretCandidates } from "../lib/input.js";
-import { MAX_INLINE_REVIEW_COMMENT_LENGTH, suggestionFenceLength } from "../lib/types.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -50,7 +49,6 @@ const MAX_AGENT_LOG_PROJECTION_NODES = 100;
 const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
 const MAX_FINDING_TITLE_LENGTH = 120;
 const MAX_FINDING_PROSE_LENGTH = 500;
-const FINDING_COMMENT_FORMAT_OVERHEAD = 256;
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 const SEVERITY_VALUES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
 const SEVERITY_GUIDANCE = `- CRITICAL: a credible immediate risk of compromise, irreversible data loss, or broad outage.
@@ -82,43 +80,12 @@ const findingSchema = z
       .min(1)
       .max(MAX_FINDING_PROSE_LENGTH)
       .describe("One or two direct sentences explaining how to fix the defect."),
-    suggestion: z
-      .string()
-      .min(1)
-      .optional()
-      .describe(
-        "Optional raw replacement text for the exact contiguous path and line range. Do not include Markdown fences or diff markers.",
-      ),
     path: z.string().min(1).max(500).optional(),
     line: z.number().int().min(1).max(1_000_000).optional(),
     endLine: z.number().int().min(1).max(1_000_000).optional(),
     confidence: z.enum(["high", "medium", "low"]).optional(),
   })
-  .strict()
-  .refine(
-    (finding) =>
-      finding.suggestion === undefined ||
-      (finding.path !== undefined && finding.line !== undefined),
-    {
-      message: "A suggestion requires an inline path and line.",
-      path: ["suggestion"],
-    },
-  )
-  .refine(
-    (finding) =>
-      finding.suggestion === undefined ||
-      finding.title.length +
-        finding.why.length +
-        finding.fix.length +
-        finding.suggestion.length +
-        suggestionFenceLength(finding.suggestion) * 2 +
-        FINDING_COMMENT_FORMAT_OVERHEAD <=
-        MAX_INLINE_REVIEW_COMMENT_LENGTH,
-    {
-      message: "The finding and suggestion exceed GitHub's inline comment capacity.",
-      path: ["suggestion"],
-    },
-  );
+  .strict();
 
 const submissionSchema = z
   .object({
@@ -128,6 +95,7 @@ const submissionSchema = z
   .strict();
 
 type SubmissionInput = z.infer<typeof submissionSchema>;
+export type AgentQuery = typeof sdkQuery;
 
 class PromptStream implements AsyncIterable<SDKUserMessage> {
   private readonly queue: SDKUserMessage[] = [];
@@ -957,16 +925,41 @@ const repositoryReadHook: HookCallback = async (input: HookInput) => {
 };
 
 function toSubmission(input: SubmissionInput): GoalSubmission {
-  const findings: ReviewFinding[] = input.findings.map((finding) => ({
-    title: finding.title.replace(/\s+/gu, " ").trim(),
-    severity: finding.severity,
-    body: `**Why it matters:** ${finding.why.replace(/\s+/gu, " ").trim()}\n\n**Fix:** ${finding.fix.replace(/\s+/gu, " ").trim()}`,
-    ...(finding.suggestion === undefined ? {} : { suggestion: finding.suggestion }),
-    ...(finding.path === undefined ? {} : { path: finding.path }),
-    ...(finding.line === undefined ? {} : { line: finding.line }),
-    ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
-    ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
-  }));
+  const findings: ReviewFinding[] = input.findings.map((finding) => {
+    const title = finding.title.replace(/\s+/gu, " ").trim();
+    const why = finding.why.replace(/\s+/gu, " ").trim();
+    const fix = finding.fix.replace(/\s+/gu, " ").trim();
+    const target =
+      finding.path !== undefined && finding.line !== undefined
+        ? `@${finding.path}:${finding.line}${
+            finding.endLine !== undefined && finding.endLine > finding.line
+              ? `-${finding.endLine}`
+              : ""
+          }`
+        : undefined;
+    const agentPrompt =
+      target === undefined
+        ? undefined
+        : [
+            "Verify this finding against the current code. Fix it only if it is still valid,",
+            "keep the change minimal, and run the relevant tests.",
+            "",
+            `Target: \`${target}\``,
+            `Finding: ${title}`,
+            `Impact: ${why}`,
+            `Requested fix: ${fix}`,
+          ].join("\n");
+    return {
+      title,
+      severity: finding.severity,
+      body: `**Why it matters:** ${why}\n\n**Fix:** ${fix}`,
+      ...(agentPrompt === undefined ? {} : { agentPrompt }),
+      ...(finding.path === undefined ? {} : { path: finding.path }),
+      ...(finding.line === undefined ? {} : { line: finding.line }),
+      ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+      ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
+    };
+  });
   return { summary: input.summary, findings };
 }
 
@@ -1272,7 +1265,7 @@ Read the relevant changed files and nearby definitions before deciding. This ses
 Classify each finding with exactly one of these severities:
 ${SEVERITY_GUIDANCE}
 
-After reading the complete diff, call mcp__review_output__submit_review exactly once. Submit only actionable, evidence-based findings. Keep each title short. State why the defect matters and how to fix it in one or two direct sentences each. Use a changed-file path and an added-line number only when the line is present in the supplied pull-request diff; otherwise omit the location. When the complete fix is one contiguous replacement at that location, include suggestion as the raw replacement text and set line and endLine to the full replaced range. Do not include Markdown fences or diff markers in suggestion. Omit suggestion for multi-file, noncontiguous, or uncertain fixes. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
+After reading the complete diff, call mcp__review_output__submit_review exactly once. Submit only actionable, evidence-based findings. Keep each title short. State why the defect matters and how to fix it in one or two direct sentences each. Use a changed-file path and an added-line number only when the line is present in the supplied pull-request diff; otherwise omit the location. Set endLine only when the finding spans a contiguous range of added lines in the same file. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
 }
 
 function reviewSubmissionRejection(
@@ -1292,7 +1285,7 @@ function repairPrompt(attempt: number, diffComplete: boolean): string {
   const nextAction = diffComplete
     ? "Do not continue investigating. Call mcp__review_output__submit_review now"
     : "Continue calling mcp__review_output__read_pr_diff until it returns done=true, then call mcp__review_output__submit_review";
-  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Each finding needs title, severity, why, and fix; suggestion is optional raw replacement text for one exact contiguous inline range. Severity must be ${SEVERITY_VALUES.join(", ")}; MEDIUM and INFO are invalid. Use an empty findings array if no issue is supported by the evidence.`;
+  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Each finding needs title, severity, why, and fix; path, line, and endLine are optional location fields. Severity must be ${SEVERITY_VALUES.join(", ")}; MEDIUM and INFO are invalid. Use an empty findings array if no issue is supported by the evidence.`;
 }
 
 function makeUserMessage(text: string): SDKUserMessage {
@@ -1396,6 +1389,7 @@ export async function runReviewGoal(
   config: ReviewConfig,
   diff: PullRequestDiffArtifact,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
+  queryAgent: AgentQuery = sdkQuery,
 ): Promise<GoalResult> {
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
@@ -1420,7 +1414,7 @@ export async function runReviewGoal(
   );
   const outputTool = tool(
     "submit_review",
-    "Submit concise validated findings and optional GitHub apply suggestions for this isolated review goal.",
+    "Submit concise validated findings for this isolated review goal.",
     submissionSchema.shape,
     (input): Promise<CallToolResult> => {
       const rejection = reviewSubmissionRejection(
@@ -1470,7 +1464,7 @@ export async function runReviewGoal(
         write,
       );
     });
-    const session = sdkQuery({
+    const session = queryAgent({
       prompt: input,
       options: makeOptions(config, cwd, mcpServers, outputServerName),
     });
@@ -1615,6 +1609,7 @@ export async function runReviewGoals(
   files: readonly ChangedFile[],
   config: ReviewConfig,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
+  queryAgent: AgentQuery = sdkQuery,
 ): Promise<readonly GoalResult[]> {
   const diff = await createPullRequestDiff(context, cwd);
   const results: Array<GoalResult | undefined> = Array.from(
@@ -1628,7 +1623,16 @@ export async function runReviewGoals(
       cursor += 1;
       const prompt = config.reviewPrompts[index];
       if (prompt === undefined) return;
-      results[index] = await runReviewGoal(prompt, index, context, files, config, diff, cwd);
+      results[index] = await runReviewGoal(
+        prompt,
+        index,
+        context,
+        files,
+        config,
+        diff,
+        cwd,
+        queryAgent,
+      );
     }
   };
   try {
@@ -1658,6 +1662,7 @@ export const agentInternals = {
   logAgentLifecycleMessage,
   logAgentMessage,
   logAgentMessageSafely,
+  logAgentEventSafely,
   logQueuedUserMessage,
   PullRequestDiffReader,
   startReviewPrompt,
@@ -1674,6 +1679,9 @@ export const agentInternals = {
   isSafeResolvedPath,
   isWithinRepository,
   makeUserMessage,
+  makeOptions,
   repairPrompt,
+  repositoryReadHook,
   safeAgentEnvironment,
+  toSdkMcpServer,
 };

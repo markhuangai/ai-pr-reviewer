@@ -223,11 +223,12 @@ async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER
         });
     });
 }
-async function main() {
-    const releaseRef = process.env.GITHUB_ACTION_REF;
-    const requestedRelease = await resolveActionRelease(releaseRef);
+export async function bootstrapRuntime(options = {}) {
+    const releaseRef = options.releaseRef ?? process.env.GITHUB_ACTION_REF;
+    const getJson = options.getJson ?? fetchJson;
+    const requestedRelease = await resolveActionRelease(releaseRef, getJson);
     const assetName = platformAssetName();
-    const release = await fetchJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`);
+    const release = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`);
     if (release.tag_name !== requestedRelease.tag ||
         release.draft !== false ||
         release.prerelease !== requestedRelease.prerelease ||
@@ -241,7 +242,7 @@ async function main() {
     if (typeof asset.size === "number" && asset.size > MAX_ARCHIVE_BYTES)
         throw new Error("Runtime asset is larger than the safety limit.");
     const checksum = await readChecksum(`${asset.browser_download_url}.sha256`);
-    const cacheRoot = join(process.env.RUNNER_TEMP ?? tmpdir(), "ai-pr-reviewer-runtime", requestedRelease.tag, assetName.replace(/[^A-Za-z0-9_.-]/g, "_"));
+    const cacheRoot = join(options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(), "ai-pr-reviewer-runtime", requestedRelease.tag, assetName.replace(/[^A-Za-z0-9_.-]/g, "_"));
     const archive = join(cacheRoot, assetName);
     const bytes = await download(asset.browser_download_url, archive);
     const actualDigest = sha256(bytes);
@@ -263,14 +264,31 @@ async function main() {
             throw new Error("Runtime bundle manifest verification failed.");
         }
         const sourceCommit = manifest.sourceCommit;
-        const code = await runRuntime(extracted, sourceCommit);
-        if (code !== 0)
-            process.exitCode = code;
+        return await runRuntime(extracted, sourceCommit);
     }
     finally {
         await rm(extracted, { recursive: true, force: true });
     }
 }
+async function main() {
+    const code = await bootstrapRuntime();
+    if (code !== 0)
+        process.exitCode = code;
+}
+export const bootstrapInternals = {
+    apiRequestHeaders,
+    download,
+    expectedDigest,
+    extract,
+    fetchJson,
+    gitObject,
+    platformAssetName,
+    readAsset,
+    readChecksum,
+    requestHeaders,
+    runRuntime,
+    sha256,
+};
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(entry).href) {
     main().catch((error) => {

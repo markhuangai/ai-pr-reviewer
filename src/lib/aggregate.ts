@@ -10,7 +10,7 @@ import type {
   ReviewFinding,
   Severity,
 } from "./types.js";
-import { MAX_INLINE_REVIEW_COMMENT_LENGTH, suggestionFenceLength } from "./types.js";
+import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
@@ -244,26 +244,21 @@ function mergeFindings(findings: readonly AggregatedFinding[]): readonly Aggrega
         ? finding.severity
         : existing.severity;
     const body = mergeFindingBodies(existing.body, finding.body);
-    const adoptSuggestion = existing.suggestion === undefined && finding.suggestion !== undefined;
     const mergedFinding: AggregatedFinding = {
       ...existing,
       severity,
       body,
-      ...(adoptSuggestion
-        ? {
-            suggestion: finding.suggestion,
-            path: finding.path,
-            line: finding.line,
-            endLine: finding.endLine,
-            locationVerified: finding.locationVerified,
-          }
-        : {}),
       goals: [...new Set([...existing.goals, ...finding.goals])].sort(
         (left, right) => left - right,
       ),
       locationVerified: existing.locationVerified || finding.locationVerified,
       ...(existing.path === undefined && finding.path !== undefined && finding.locationVerified
-        ? { path: finding.path, line: finding.line, endLine: finding.endLine }
+        ? {
+            path: finding.path,
+            line: finding.line,
+            endLine: finding.endLine,
+            agentPrompt: finding.agentPrompt,
+          }
         : {}),
     };
     merged[duplicate] = mergedFinding;
@@ -478,24 +473,24 @@ export function buildRunSummary(
 function inlineCommentBody(finding: AggregatedFinding): string {
   const heading = `${severityHeading(finding.severity)} **${finding.title}**`;
   const body = `${heading}\n\n${finding.body}`;
-  if (finding.suggestion === undefined) {
+  if (finding.agentPrompt === undefined) {
     if (body.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) return body;
     return `${body.slice(0, MAX_INLINE_REVIEW_COMMENT_LENGTH - 120)}\n\n> Inline finding truncated at 60 KB.`;
   }
 
-  const fence = "`".repeat(suggestionFenceLength(finding.suggestion));
-  const trailingNewline = finding.suggestion.endsWith("\n") ? "" : "\n";
-  const suggestion = `\n\n**Suggested change:**\n\n${fence}suggestion\n${finding.suggestion}${trailingNewline}${fence}`;
-  if (body.length + suggestion.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) {
-    return `${body}${suggestion}`;
+  const fence = "`".repeat(markdownFenceLength(finding.agentPrompt));
+  const trailingNewline = finding.agentPrompt.endsWith("\n") ? "" : "\n";
+  const prompt = `\n\n<details>\n<summary>🤖 Prompt for AI Agents</summary>\n\n${fence}text\n${finding.agentPrompt}${trailingNewline}${fence}\n\n</details>`;
+  if (body.length + prompt.length <= MAX_INLINE_REVIEW_COMMENT_LENGTH) {
+    return `${body}${prompt}`;
   }
 
-  const notice = "\n\n> Additional duplicate evidence omitted to preserve the suggestion.";
-  const available = MAX_INLINE_REVIEW_COMMENT_LENGTH - suggestion.length - notice.length;
+  const notice = "\n\n> Additional duplicate evidence omitted to preserve the AI prompt.";
+  const available = MAX_INLINE_REVIEW_COMMENT_LENGTH - prompt.length - notice.length;
   if (available < heading.length) {
-    throw new Error("The inline suggestion exceeds GitHub's review comment capacity.");
+    throw new Error("The inline AI prompt exceeds GitHub's review comment capacity.");
   }
-  return `${body.slice(0, available)}${notice}${suggestion}`;
+  return `${body.slice(0, available)}${notice}${prompt}`;
 }
 
 export function buildReviewRequest(
@@ -525,6 +520,7 @@ export function buildReviewRequest(
 }
 
 export const aggregateInternals = {
+  inlineCommentBody,
   normalizeFinding,
   verifyLocation,
   sameFinding,

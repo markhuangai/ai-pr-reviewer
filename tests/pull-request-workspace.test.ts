@@ -8,7 +8,10 @@ import test from "node:test";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
-import { pullRequestWorkspaceInternals } from "../src/lib/pull-request-workspace.js";
+import {
+  createPullRequestWorkspace,
+  pullRequestWorkspaceInternals,
+} from "../src/lib/pull-request-workspace.js";
 import type { PullRequestContext } from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -136,5 +139,102 @@ test("sanitizes inherited Git repository and transport controls", () => {
     else process.env.GIT_TRACE_CURL = previous.traceCurl;
     if (previous.curlVerbose === undefined) delete process.env.GIT_CURL_VERBOSE;
     else process.env.GIT_CURL_VERBOSE = previous.curlVerbose;
+  }
+});
+
+test("validates server URLs and workspace boundaries", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  assert.equal(
+    pullRequestWorkspaceInternals.remoteUrl(
+      fixture.context,
+      "https://github.example.test/ignored/path/",
+    ),
+    "https://github.example.test/owner/repository.git",
+  );
+  assert.throws(
+    () => pullRequestWorkspaceInternals.remoteUrl(fixture.context, "ftp://example.test"),
+    /must use http/u,
+  );
+  assert.throws(
+    () =>
+      pullRequestWorkspaceInternals.remoteUrl(fixture.context, "https://user:pass@example.test"),
+    /must not contain URL credentials/u,
+  );
+  assert.equal(pullRequestWorkspaceInternals.isWithin("/workspace", "/workspace"), true);
+  assert.equal(pullRequestWorkspaceInternals.isWithin("/workspace", "/workspace/child"), true);
+  assert.equal(pullRequestWorkspaceInternals.isWithin("/workspace", "/other"), false);
+  await assert.rejects(
+    createPullRequestWorkspace(fixture.context, "token", "", fixture.temporary),
+    /GITHUB_SERVER_URL is not set/u,
+  );
+
+  const caller = join(fixture.temporary, "caller");
+  const nestedTemporary = join(caller, "temporary");
+  await mkdir(nestedTemporary, { recursive: true });
+  const previousWorkspace = process.env.GITHUB_WORKSPACE;
+  process.env.GITHUB_WORKSPACE = caller;
+  try {
+    await assert.rejects(
+      createPullRequestWorkspace(fixture.context, "token", "https://github.com", nestedTemporary),
+      /must be outside GITHUB_WORKSPACE/u,
+    );
+  } finally {
+    if (previousWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+    else process.env.GITHUB_WORKSPACE = previousWorkspace;
+  }
+});
+
+test("removes partial workspaces for invalid refs and Git failures", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  await assert.rejects(
+    pullRequestWorkspaceInternals.createFromRemote(
+      { ...fixture.context, baseSha: fixture.context.baseSha.slice(0, 12) },
+      "token",
+      pathToFileURL(fixture.remote).href,
+      fixture.temporary,
+    ),
+    /not a full commit SHA/u,
+  );
+  await assert.rejects(
+    pullRequestWorkspaceInternals.createFromRemote(
+      { ...fixture.context, baseRef: "../invalid" },
+      "token",
+      pathToFileURL(fixture.remote).href,
+      fixture.temporary,
+    ),
+    /Git check-ref-format failed/u,
+  );
+  await assert.rejects(
+    pullRequestWorkspaceInternals.createFromRemote(
+      fixture.context,
+      "token",
+      pathToFileURL(join(fixture.temporary, "missing.git")).href,
+      fixture.temporary,
+    ),
+    /Git fetch failed/u,
+  );
+  assert.deepEqual(await readdir(fixture.temporary), []);
+});
+
+test("removes inherited numbered Git configuration", () => {
+  const previousKey = process.env.GIT_CONFIG_KEY_99;
+  const previousValue = process.env.GIT_CONFIG_VALUE_99;
+  process.env.GIT_CONFIG_KEY_99 = "core.hooksPath";
+  process.env.GIT_CONFIG_VALUE_99 = "/tmp/untrusted";
+  try {
+    const environment = pullRequestWorkspaceInternals.gitEnvironment(
+      "token",
+      "https://github.com/owner/repository.git",
+      "/tmp/global.gitconfig",
+      "/tmp/hooks",
+    );
+    assert.equal(environment.GIT_CONFIG_KEY_99, undefined);
+    assert.equal(environment.GIT_CONFIG_VALUE_99, undefined);
+    assert.equal(environment.GIT_CONFIG_COUNT, "10");
+  } finally {
+    if (previousKey === undefined) delete process.env.GIT_CONFIG_KEY_99;
+    else process.env.GIT_CONFIG_KEY_99 = previousKey;
+    if (previousValue === undefined) delete process.env.GIT_CONFIG_VALUE_99;
+    else process.env.GIT_CONFIG_VALUE_99 = previousValue;
   }
 });
