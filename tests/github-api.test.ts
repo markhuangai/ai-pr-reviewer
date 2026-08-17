@@ -203,7 +203,7 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
   ]);
 });
 
-test("paginates changed files and reviews and creates a review", async (t) => {
+test("paginates files and conversation records and creates a review", async (t) => {
   const requests: Array<{
     readonly method: string | undefined;
     readonly url: string | undefined;
@@ -244,14 +244,20 @@ test("paginates changed files and reviews and creates a review", async (t) => {
         return;
       }
       if (request.url?.includes("/reviews?per_page=100&page=1")) {
+        response.setHeader(
+          "link",
+          `<${serverOrigin}/api/repos/owner/repository/pulls/11/reviews?per_page=100&page=2>; rel="next"`,
+        );
         response.end(
           JSON.stringify([
             {
-              user: { login: "reviewer" },
+              id: 1,
+              user: { login: "reviewer", type: "User" },
               body: "First review",
               commit_id: "b".repeat(40),
+              state: "COMMENTED",
+              submitted_at: "2026-08-17T00:00:00Z",
             },
-            ...Array.from({ length: 99 }, () => null),
           ]),
         );
         return;
@@ -260,10 +266,81 @@ test("paginates changed files and reviews and creates a review", async (t) => {
         response.end(
           JSON.stringify([
             {
-              user: { login: "second" },
+              id: 2,
+              user: { login: "second", type: "User" },
               body: "Second review",
               commit_id: "c".repeat(40),
               state: "APPROVED",
+              submitted_at: null,
+            },
+          ]),
+        );
+        return;
+      }
+      if (request.url?.includes("/pulls/11/comments?per_page=100&page=1")) {
+        response.setHeader(
+          "link",
+          `<${serverOrigin}/api/repos/owner/repository/pulls/11/comments?per_page=100&page=2>; rel="next"`,
+        );
+        response.end(
+          JSON.stringify([
+            {
+              id: 10,
+              pull_request_review_id: 1,
+              in_reply_to_id: null,
+              user: { login: "review-bot", type: "Bot" },
+              body: "Inline finding",
+              commit_id: "b".repeat(40),
+              original_commit_id: "a".repeat(40),
+              path: "src/file-0.ts",
+              line: 2,
+              original_line: null,
+              created_at: "2026-08-17T00:01:00Z",
+              updated_at: "2026-08-17T00:01:01Z",
+            },
+          ]),
+        );
+        return;
+      }
+      if (request.url?.includes("/pulls/11/comments?per_page=100&page=2")) {
+        response.end(
+          JSON.stringify([
+            {
+              id: 11,
+              pull_request_review_id: 1,
+              in_reply_to_id: 10,
+              user: { login: "owner", type: "User" },
+              body: "Owner reply",
+              commit_id: "b".repeat(40),
+              original_commit_id: "a".repeat(40),
+              path: "src/file-0.ts",
+              line: null,
+              original_line: 2,
+              created_at: "2026-08-17T00:02:00Z",
+              updated_at: "2026-08-17T00:02:01Z",
+            },
+          ]),
+        );
+        return;
+      }
+      if (request.url?.includes("/issues/11/comments?")) {
+        response.end(
+          JSON.stringify([
+            {
+              id: 20,
+              user: { login: "owner", type: "User" },
+              body: "PR-level context",
+              created_at: "2026-08-17T00:03:00Z",
+              updated_at: "2026-08-17T00:03:01Z",
+              performed_via_github_app: null,
+            },
+            {
+              id: 21,
+              user: null,
+              body: null,
+              created_at: "2026-08-17T00:04:00Z",
+              updated_at: "2026-08-17T00:04:01Z",
+              performed_via_github_app: { id: 1 },
             },
           ]),
         );
@@ -322,16 +399,63 @@ test("paginates changed files and reviews and creates a review", async (t) => {
   assert.deepEqual([...(files[100]?.addedLines ?? [])], [1]);
   assert.deepEqual(await api.listReviews(context), [
     {
-      authorLogin: "reviewer",
+      id: 1,
+      author: { login: "reviewer", type: "User" },
       body: "First review",
       commitId: "b".repeat(40),
-      state: "UNKNOWN",
+      state: "COMMENTED",
+      submittedAt: "2026-08-17T00:00:00Z",
     },
     {
-      authorLogin: "second",
+      id: 2,
+      author: { login: "second", type: "User" },
       body: "Second review",
       commitId: "c".repeat(40),
       state: "APPROVED",
+    },
+  ]);
+  assert.deepEqual(await api.listReviewComments(context), [
+    {
+      id: 10,
+      reviewId: 1,
+      author: { login: "review-bot", type: "Bot" },
+      body: "Inline finding",
+      commitId: "b".repeat(40),
+      originalCommitId: "a".repeat(40),
+      path: "src/file-0.ts",
+      line: 2,
+      createdAt: "2026-08-17T00:01:00Z",
+      updatedAt: "2026-08-17T00:01:01Z",
+    },
+    {
+      id: 11,
+      reviewId: 1,
+      inReplyToId: 10,
+      author: { login: "owner", type: "User" },
+      body: "Owner reply",
+      commitId: "b".repeat(40),
+      originalCommitId: "a".repeat(40),
+      path: "src/file-0.ts",
+      originalLine: 2,
+      createdAt: "2026-08-17T00:02:00Z",
+      updatedAt: "2026-08-17T00:02:01Z",
+    },
+  ]);
+  assert.deepEqual(await api.listIssueComments(context), [
+    {
+      id: 20,
+      author: { login: "owner", type: "User" },
+      body: "PR-level context",
+      createdAt: "2026-08-17T00:03:00Z",
+      updatedAt: "2026-08-17T00:03:01Z",
+      performedViaGitHubApp: false,
+    },
+    {
+      id: 21,
+      body: "",
+      createdAt: "2026-08-17T00:04:00Z",
+      updatedAt: "2026-08-17T00:04:01Z",
+      performedViaGitHubApp: true,
     },
   ]);
   const reviewRequest: PullRequestReviewRequest = {
@@ -365,6 +489,7 @@ test("reports malformed GitHub responses and file-count inconsistencies", async 
       return;
     }
     const number = /\/pulls\/(\d+)/u.exec(request.url ?? "")?.[1];
+    const issueNumber = /\/issues\/(\d+)/u.exec(request.url ?? "")?.[1];
     if (request.url?.includes("/files?")) {
       if (number === "3") response.end("{}");
       else if (number === "5") response.end("[null]");
@@ -384,7 +509,15 @@ test("reports malformed GitHub responses and file-count inconsistencies", async 
       return;
     }
     if (request.url?.includes("/reviews?")) {
-      response.end("{}");
+      response.end(number === "11" ? "[{}]" : "{}");
+      return;
+    }
+    if (request.url?.includes("/pulls/") && request.url.includes("/comments?")) {
+      response.end(number === "13" ? "[{}]" : "{}");
+      return;
+    }
+    if (request.url?.includes("/issues/") && request.url.includes("/comments?")) {
+      response.end(issueNumber === "15" ? "[{}]" : "{}");
       return;
     }
     if (number === "1") response.end("null");
@@ -427,6 +560,23 @@ test("reports malformed GitHub responses and file-count inconsistencies", async 
   await assert.rejects(api.getPullRequestRefs(context(1)), /incomplete pull request ref/u);
   await assert.rejects(api.getPullRequestFiles(context(3)), /invalid pull request files/u);
   await assert.rejects(api.listReviews(context(4)), /invalid pull request reviews/u);
+  await assert.rejects(api.listReviews(context(11)), /invalid review user at index 0/u);
+  await assert.rejects(
+    api.listReviewComments(context(12)),
+    /invalid pull request review comments/u,
+  );
+  await assert.rejects(
+    api.listReviewComments(context(13)),
+    /invalid pull request review comment user at index 0/u,
+  );
+  await assert.rejects(
+    api.listIssueComments(context(14)),
+    /invalid pull request conversation comments/u,
+  );
+  await assert.rejects(
+    api.listIssueComments(context(15)),
+    /invalid pull request conversation comment user at index 0/u,
+  );
   await assert.rejects(api.getPullRequestFiles(context(5)), /invalid changed-file record/u);
   await assert.rejects(api.getPullRequestFiles(context(6)), /without a filename/u);
   await assert.rejects(

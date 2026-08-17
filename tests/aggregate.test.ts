@@ -266,7 +266,7 @@ test("keeps a generated AI prompt paired with its verified range while merging d
 test("does not include secrets in duplicate markers", () => {
   const marker = reviewMarker(context, config);
   assert.doesNotMatch(marker, /github-secret|ai-secret/);
-  assert.match(marker, /ai-pr-reviewer:v2/);
+  assert.match(marker, /ai-pr-reviewer:v3:[0-9a-f]{40}:[0-9a-f]{64}/u);
   assert.notEqual(
     marker,
     reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),
@@ -289,6 +289,13 @@ test("does not include secrets in duplicate markers", () => {
         },
       },
     }),
+  );
+  const contextualMarker = reviewMarker(context, config, "conversation-a");
+  assert.notEqual(contextualMarker, marker);
+  assert.notEqual(contextualMarker, reviewMarker(context, config, "conversation-b"));
+  assert.equal(
+    aggregateReview(context, config, files, [], "conversation-a").marker,
+    contextualMarker,
   );
   assert.notEqual(
     marker,
@@ -777,7 +784,7 @@ test("partial goals force a comment and remain actionable", () => {
   assert.equal(review.event, "COMMENT");
   assert.match(body, /^## ⚠️ Review incomplete\n\n1 of 2 checks completed\./u);
   assert.match(body, /Partial finding/u);
-  assert.doesNotMatch(body, /✨ Good job|ai-pr-reviewer:v2|PRIVATE COMPLETED GOAL/u);
+  assert.doesNotMatch(body, /✨ Good job|ai-pr-reviewer:v3|PRIVATE COMPLETED GOAL/u);
   assert.doesNotMatch(
     body,
     /PRIVATE FAILED GOAL|PRIVATE PARTIAL SUMMARY|PRIVATE FAILURE ERROR|Found by goal|### Goals/u,

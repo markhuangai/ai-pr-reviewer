@@ -16,9 +16,35 @@ interface PullRequestFilePayload {
 }
 
 interface ReviewPayload {
+  readonly id?: unknown;
   readonly body?: unknown;
   readonly commit_id?: unknown;
   readonly state?: unknown;
+  readonly submitted_at?: unknown;
+  readonly user?: unknown;
+}
+
+interface ReviewCommentPayload {
+  readonly id?: unknown;
+  readonly pull_request_review_id?: unknown;
+  readonly in_reply_to_id?: unknown;
+  readonly body?: unknown;
+  readonly commit_id?: unknown;
+  readonly original_commit_id?: unknown;
+  readonly path?: unknown;
+  readonly line?: unknown;
+  readonly original_line?: unknown;
+  readonly created_at?: unknown;
+  readonly updated_at?: unknown;
+  readonly user?: unknown;
+}
+
+interface IssueCommentPayload {
+  readonly id?: unknown;
+  readonly body?: unknown;
+  readonly created_at?: unknown;
+  readonly updated_at?: unknown;
+  readonly performed_via_github_app?: unknown;
   readonly user?: unknown;
 }
 
@@ -45,6 +71,24 @@ function readLogin(value: unknown): string | undefined {
     return undefined;
   }
   return value.login;
+}
+
+function readUser(value: unknown): GitHubCommentAuthor | undefined {
+  const login = readLogin(value);
+  if (login === undefined || !isRecord(value) || typeof value.type !== "string") return undefined;
+  return { login, type: value.type };
+}
+
+function positiveId(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`GitHub returned an invalid ${path}.`);
+  }
+  return value;
+}
+
+function requiredString(value: unknown, path: string): string {
+  if (typeof value !== "string") throw new Error(`GitHub returned an invalid ${path}.`);
+  return value;
 }
 
 function errorDetails(payload: unknown, statusText: string): string {
@@ -209,11 +253,150 @@ function readFilePayload(value: unknown, index: number): ChangedFile {
   };
 }
 
+export interface GitHubCommentAuthor {
+  readonly login: string;
+  readonly type: string;
+}
+
 export interface ExistingReview {
-  readonly authorLogin: string;
+  readonly id: number;
+  readonly author?: GitHubCommentAuthor;
   readonly body: string;
   readonly commitId: string;
   readonly state: string;
+  readonly submittedAt?: string;
+}
+
+export interface PullRequestReviewCommentRecord {
+  readonly id: number;
+  readonly reviewId: number;
+  readonly inReplyToId?: number;
+  readonly author?: GitHubCommentAuthor;
+  readonly body: string;
+  readonly commitId: string;
+  readonly originalCommitId: string;
+  readonly path: string;
+  readonly line?: number;
+  readonly originalLine?: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PullRequestIssueCommentRecord {
+  readonly id: number;
+  readonly author?: GitHubCommentAuthor;
+  readonly body: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly performedViaGitHubApp: boolean;
+}
+
+function optionalUser(value: unknown, path: string): GitHubCommentAuthor | undefined {
+  if (value === null) return undefined;
+  const user = readUser(value);
+  if (user === undefined) throw new Error(`GitHub returned an invalid ${path}.`);
+  return user;
+}
+
+function optionalId(value: unknown, path: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return positiveId(value, path);
+}
+
+function readReviewPayload(value: unknown, index: number): ExistingReview {
+  if (!isRecord(value)) throw new Error(`GitHub returned an invalid review at index ${index}.`);
+  const review = value as ReviewPayload;
+  const submittedAt =
+    review.submitted_at === undefined || review.submitted_at === null
+      ? undefined
+      : requiredString(review.submitted_at, `review submitted_at at index ${index}`);
+  const author = optionalUser(review.user, `review user at index ${index}`);
+  return {
+    id: positiveId(review.id, `review id at index ${index}`),
+    ...(author === undefined ? {} : { author }),
+    body: requiredString(review.body, `review body at index ${index}`),
+    commitId: requiredString(review.commit_id, `review commit_id at index ${index}`),
+    state: requiredString(review.state, `review state at index ${index}`),
+    ...(submittedAt === undefined ? {} : { submittedAt }),
+  };
+}
+
+function readReviewCommentPayload(value: unknown, index: number): PullRequestReviewCommentRecord {
+  if (!isRecord(value)) {
+    throw new Error(`GitHub returned an invalid pull request review comment at index ${index}.`);
+  }
+  const comment = value as ReviewCommentPayload;
+  const inReplyToId = optionalId(
+    comment.in_reply_to_id,
+    `pull request review comment in_reply_to_id at index ${index}`,
+  );
+  const line = optionalId(comment.line, `pull request review comment line at index ${index}`);
+  const originalLine = optionalId(
+    comment.original_line,
+    `pull request review comment original_line at index ${index}`,
+  );
+  const author = optionalUser(comment.user, `pull request review comment user at index ${index}`);
+  return {
+    id: positiveId(comment.id, `pull request review comment id at index ${index}`),
+    reviewId: positiveId(
+      comment.pull_request_review_id,
+      `pull request review comment review id at index ${index}`,
+    ),
+    ...(inReplyToId === undefined ? {} : { inReplyToId }),
+    ...(author === undefined ? {} : { author }),
+    body: requiredString(comment.body, `pull request review comment body at index ${index}`),
+    commitId: requiredString(
+      comment.commit_id,
+      `pull request review comment commit_id at index ${index}`,
+    ),
+    originalCommitId: requiredString(
+      comment.original_commit_id,
+      `pull request review comment original_commit_id at index ${index}`,
+    ),
+    path: requiredString(comment.path, `pull request review comment path at index ${index}`),
+    ...(line === undefined ? {} : { line }),
+    ...(originalLine === undefined ? {} : { originalLine }),
+    createdAt: requiredString(
+      comment.created_at,
+      `pull request review comment created_at at index ${index}`,
+    ),
+    updatedAt: requiredString(
+      comment.updated_at,
+      `pull request review comment updated_at at index ${index}`,
+    ),
+  };
+}
+
+function readIssueCommentPayload(value: unknown, index: number): PullRequestIssueCommentRecord {
+  if (!isRecord(value)) {
+    throw new Error(
+      `GitHub returned an invalid pull request conversation comment at index ${index}.`,
+    );
+  }
+  const comment = value as IssueCommentPayload;
+  const body =
+    comment.body === undefined || comment.body === null
+      ? ""
+      : requiredString(comment.body, `pull request conversation comment body at index ${index}`);
+  const author = optionalUser(
+    comment.user,
+    `pull request conversation comment user at index ${index}`,
+  );
+  return {
+    id: positiveId(comment.id, `pull request conversation comment id at index ${index}`),
+    ...(author === undefined ? {} : { author }),
+    body,
+    createdAt: requiredString(
+      comment.created_at,
+      `pull request conversation comment created_at at index ${index}`,
+    ),
+    updatedAt: requiredString(
+      comment.updated_at,
+      `pull request conversation comment updated_at at index ${index}`,
+    ),
+    performedViaGitHubApp:
+      comment.performed_via_github_app !== undefined && comment.performed_via_github_app !== null,
+  };
 }
 
 interface RequestPage<T> {
@@ -306,6 +489,30 @@ export class GitHubApi {
     return (await this.requestPage<T>(path, init)).payload;
   }
 
+  private async listRecords<T>(
+    pathForPage: (page: number) => string,
+    responseName: string,
+    read: (value: unknown, index: number) => T,
+  ): Promise<readonly T[]> {
+    const records: T[] = [];
+    let page = 1;
+    let path = pathForPage(page);
+    let hasNext = true;
+    while (hasNext) {
+      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
+      if (!Array.isArray(response.payload)) {
+        throw new Error(`GitHub returned an invalid ${responseName} response.`);
+      }
+      records.push(...response.payload.map((item, index) => read(item, records.length + index)));
+      const nextPath = nextPagePath(response.headers.get("link"), this.apiUrl);
+      hasNext = nextPath !== undefined || response.payload.length === 100;
+      if (!hasNext) continue;
+      page += 1;
+      path = nextPath ?? pathForPage(page);
+    }
+    return records;
+  }
+
   async getPullRequestFiles(context: PullRequestContext): Promise<readonly ChangedFile[]> {
     const files: ChangedFile[] = [];
     let page = 1;
@@ -339,46 +546,34 @@ export class GitHubApi {
   }
 
   async listReviews(context: PullRequestContext): Promise<readonly ExistingReview[]> {
-    const reviews: ExistingReview[] = [];
-    let page = 1;
-    let path = `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`;
-    let hasNext = true;
-    while (hasNext) {
-      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
-      const payload = response.payload;
-      if (!Array.isArray(payload))
-        throw new Error("GitHub returned an invalid pull request reviews response.");
-      reviews.push(
-        ...payload.flatMap((item): ExistingReview[] => {
-          if (!isRecord(item)) return [];
-          const review = item as ReviewPayload;
-          const authorLogin = readLogin(review.user);
-          if (
-            authorLogin === undefined ||
-            typeof review.body !== "string" ||
-            typeof review.commit_id !== "string"
-          )
-            return [];
-          return [
-            {
-              authorLogin,
-              body: review.body,
-              commitId: review.commit_id,
-              state: typeof review.state === "string" ? review.state : "UNKNOWN",
-            },
-          ];
-        }),
-      );
-      if (payload.length < 100) {
-        hasNext = false;
-        continue;
-      }
-      page += 1;
-      path =
-        nextPagePath(response.headers.get("link"), this.apiUrl) ??
-        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`;
-    }
-    return reviews;
+    return this.listRecords(
+      (page) =>
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`,
+      "pull request reviews",
+      readReviewPayload,
+    );
+  }
+
+  async listReviewComments(
+    context: PullRequestContext,
+  ): Promise<readonly PullRequestReviewCommentRecord[]> {
+    return this.listRecords(
+      (page) =>
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/comments?per_page=100&page=${page}`,
+      "pull request review comments",
+      readReviewCommentPayload,
+    );
+  }
+
+  async listIssueComments(
+    context: PullRequestContext,
+  ): Promise<readonly PullRequestIssueCommentRecord[]> {
+    return this.listRecords(
+      (page) =>
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${context.number}/comments?per_page=100&page=${page}`,
+      "pull request conversation comments",
+      readIssueCommentPayload,
+    );
   }
 
   async createReview(
@@ -403,4 +598,8 @@ export const githubApiInternals = {
   errorDetails,
   readHeadSha,
   readLogin,
+  readIssueCommentPayload,
+  readReviewCommentPayload,
+  readReviewPayload,
+  readUser,
 };
