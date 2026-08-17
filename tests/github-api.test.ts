@@ -269,7 +269,7 @@ test("paginates files and conversation records and creates a review", async (t) 
               id: 2,
               user: { login: "second", type: "User" },
               body: "Second review",
-              commit_id: "c".repeat(40),
+              commit_id: null,
               state: "APPROVED",
               submitted_at: null,
             },
@@ -307,7 +307,7 @@ test("paginates files and conversation records and creates a review", async (t) 
           JSON.stringify([
             {
               id: 11,
-              pull_request_review_id: 1,
+              pull_request_review_id: null,
               in_reply_to_id: 10,
               user: { login: "owner", type: "User" },
               body: "Owner reply",
@@ -410,7 +410,7 @@ test("paginates files and conversation records and creates a review", async (t) 
       id: 2,
       author: { login: "second", type: "User" },
       body: "Second review",
-      commitId: "c".repeat(40),
+      commitId: null,
       state: "APPROVED",
     },
   ]);
@@ -429,7 +429,6 @@ test("paginates files and conversation records and creates a review", async (t) 
     },
     {
       id: 11,
-      reviewId: 1,
       inReplyToId: 10,
       author: { login: "owner", type: "User" },
       body: "Owner reply",
@@ -567,7 +566,7 @@ test("reports malformed GitHub responses and file-count inconsistencies", async 
   );
   await assert.rejects(
     api.listReviewComments(context(13)),
-    /invalid pull request review comment user at index 0/u,
+    /invalid pull request review comment review id at index 0/u,
   );
   await assert.rejects(
     api.listIssueComments(context(14)),

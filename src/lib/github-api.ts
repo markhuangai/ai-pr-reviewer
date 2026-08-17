@@ -91,6 +91,11 @@ function requiredString(value: unknown, path: string): string {
   return value;
 }
 
+function nullableString(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  return requiredString(value, path);
+}
+
 function errorDetails(payload: unknown, statusText: string): string {
   if (!isRecord(payload)) return statusText;
   const details: string[] = [];
@@ -262,14 +267,14 @@ export interface ExistingReview {
   readonly id: number;
   readonly author?: GitHubCommentAuthor;
   readonly body: string;
-  readonly commitId: string;
+  readonly commitId: string | null;
   readonly state: string;
   readonly submittedAt?: string;
 }
 
 export interface PullRequestReviewCommentRecord {
   readonly id: number;
-  readonly reviewId: number;
+  readonly reviewId?: number;
   readonly inReplyToId?: number;
   readonly author?: GitHubCommentAuthor;
   readonly body: string;
@@ -303,6 +308,11 @@ function optionalId(value: unknown, path: string): number | undefined {
   return positiveId(value, path);
 }
 
+function nullableId(value: unknown, path: string): number | undefined {
+  if (value === null) return undefined;
+  return positiveId(value, path);
+}
+
 function readReviewPayload(value: unknown, index: number): ExistingReview {
   if (!isRecord(value)) throw new Error(`GitHub returned an invalid review at index ${index}.`);
   const review = value as ReviewPayload;
@@ -315,7 +325,7 @@ function readReviewPayload(value: unknown, index: number): ExistingReview {
     id: positiveId(review.id, `review id at index ${index}`),
     ...(author === undefined ? {} : { author }),
     body: requiredString(review.body, `review body at index ${index}`),
-    commitId: requiredString(review.commit_id, `review commit_id at index ${index}`),
+    commitId: nullableString(review.commit_id, `review commit_id at index ${index}`),
     state: requiredString(review.state, `review state at index ${index}`),
     ...(submittedAt === undefined ? {} : { submittedAt }),
   };
@@ -335,13 +345,14 @@ function readReviewCommentPayload(value: unknown, index: number): PullRequestRev
     comment.original_line,
     `pull request review comment original_line at index ${index}`,
   );
+  const reviewId = nullableId(
+    comment.pull_request_review_id,
+    `pull request review comment review id at index ${index}`,
+  );
   const author = optionalUser(comment.user, `pull request review comment user at index ${index}`);
   return {
     id: positiveId(comment.id, `pull request review comment id at index ${index}`),
-    reviewId: positiveId(
-      comment.pull_request_review_id,
-      `pull request review comment review id at index ${index}`,
-    ),
+    ...(reviewId === undefined ? {} : { reviewId }),
     ...(inReplyToId === undefined ? {} : { inReplyToId }),
     ...(author === undefined ? {} : { author }),
     body: requiredString(comment.body, `pull request review comment body at index ${index}`),

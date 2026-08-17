@@ -103,7 +103,7 @@ export function reviewMarker(
     baseSha: context.baseSha,
     model: config.model,
     aiBaseUrl: config.aiBaseUrl,
-    aiAuthMode: config.aiAuthMode,
+    usesAuthToken: config.aiAuthMode === "auth-token",
     prompts: config.reviewPrompts,
     parallelCount: config.parallelCount,
     maxTurns: config.maxTurns,

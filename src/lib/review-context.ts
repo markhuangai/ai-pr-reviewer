@@ -18,7 +18,7 @@ export interface ConversationMessage {
   readonly body: string;
   readonly createdAt: string;
   readonly updatedAt: string;
-  readonly commitId?: string;
+  readonly commitId?: string | null;
   readonly originalCommitId?: string;
   readonly path?: string;
   readonly line?: number;
@@ -48,7 +48,7 @@ export interface PullRequestReviewBody {
   readonly id: number;
   readonly createdAt: string;
   readonly state: string;
-  readonly commitId: string;
+  readonly commitId: string | null;
   readonly message: ConversationMessage;
 }
 
@@ -65,7 +65,7 @@ export interface ReviewConversationSnapshot {
 const ACTION_MARKER = /<!--\s*ai-pr-reviewer:v\d+:/u;
 
 function sameLogin(left: string, right: string): boolean {
-  return left.localeCompare(right, undefined, { sensitivity: "accent" }) === 0;
+  return left.toLowerCase() === right.toLowerCase();
 }
 
 function authorRole(
@@ -112,14 +112,16 @@ function reviewCommentMessage(
 ): ConversationMessage {
   return {
     id: comment.id,
-    reviewId: comment.reviewId,
+    ...(comment.reviewId === undefined ? {} : { reviewId: comment.reviewId }),
     ...(comment.inReplyToId === undefined ? {} : { inReplyToId: comment.inReplyToId }),
     ...messageAuthor(comment.author),
     authorRole: authorRole(
       comment.author,
       authenticatedLogin,
       false,
-      comment.inReplyToId === undefined && actionReviewIds.has(comment.reviewId),
+      comment.inReplyToId === undefined &&
+        comment.reviewId !== undefined &&
+        actionReviewIds.has(comment.reviewId),
     ),
     body: comment.body,
     createdAt: comment.createdAt,

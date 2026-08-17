@@ -38,7 +38,7 @@ function review(
 
 function reviewComment(
   id: number,
-  reviewId: number,
+  reviewId: number | undefined,
   authorLogin: string | undefined,
   body: string,
   overrides: Partial<PullRequestReviewCommentRecord> = {},
@@ -46,7 +46,7 @@ function reviewComment(
 ): PullRequestReviewCommentRecord {
   return {
     id,
-    reviewId,
+    ...(reviewId === undefined ? {} : { reviewId }),
     ...(authorLogin === undefined ? {} : { author: author(authorLogin) }),
     body,
     commitId: `commit-${id}`,
@@ -158,7 +158,7 @@ test("includes human PR comments and review bodies plus complete replied-to inli
 test("keeps orphaned human reply threads and produces a canonical digest", () => {
   const orphan = reviewComment(
     51,
-    8,
+    undefined,
     "pr-owner",
     "Context for an unavailable root",
     {
@@ -173,7 +173,9 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
     inReplyToId: 60,
     createdAt: "2026-08-17T00:04:01Z",
   });
-  const reviews = [review(9, "reviewer", "Human review", "2026-08-17T00:03:00Z")];
+  const reviews = [
+    { ...review(9, "reviewer", "Human review", "2026-08-17T00:03:00Z"), commitId: null },
+  ];
   const issues = [issueComment(70, "pr-owner", "Human comment")];
 
   const forward = buildReviewConversation("review-action", reviews, [orphan, root, reply], issues);
