@@ -22,6 +22,11 @@ import {
   reviewSecretCandidates,
   type InputReader,
 } from "./lib/input.js";
+import {
+  buildReviewConversation,
+  mapConversationBodies,
+  type ReviewConversationSnapshot,
+} from "./lib/review-context.js";
 import { runReviewGoals } from "./runtime/agent.js";
 import { createPullRequestWorkspace } from "./lib/pull-request-workspace.js";
 import type {
@@ -112,6 +117,41 @@ async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): P
   }
 }
 
+interface LoadedConversation {
+  readonly reviews: Awaited<ReturnType<GitHubApi["listReviews"]>>;
+  readonly snapshot: ReviewConversationSnapshot;
+}
+
+async function loadConversation(
+  api: GitHubApi,
+  context: PullRequestContext,
+  authenticatedLogin: string,
+): Promise<LoadedConversation> {
+  const [reviews, reviewComments, issueComments] = await Promise.all([
+    api.listReviews(context),
+    api.listReviewComments(context),
+    api.listIssueComments(context),
+  ]);
+  return {
+    reviews,
+    snapshot: buildReviewConversation(authenticatedLogin, reviews, reviewComments, issueComments),
+  };
+}
+
+async function assertCurrentConversation(
+  api: GitHubApi,
+  context: PullRequestContext,
+  authenticatedLogin: string,
+  expectedDigest: string,
+): Promise<void> {
+  const current = await loadConversation(api, context, authenticatedLogin);
+  if (current.snapshot.digest !== expectedDigest) {
+    throw new Error(
+      "Pull request discussion changed during review; refusing to publish a result without the latest context. Rerun the workflow.",
+    );
+  }
+}
+
 async function assertWorkspace(
   context: PullRequestContext,
   cwd: string = process.env.GITHUB_WORKSPACE ?? process.cwd(),
@@ -188,14 +228,14 @@ export async function runAction(
   try {
     await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
+    const authenticatedLogin = await api.getAuthenticatedUserLogin();
+    const conversation = await loadConversation(api, context, authenticatedLogin);
     if (config.interactWithPullRequest) {
-      const authenticatedLogin = await api.getAuthenticatedUserLogin();
-      const marker = reviewMarker(context, config);
-      const existingReviews = await api.listReviews(context);
+      const marker = reviewMarker(context, config, conversation.snapshot.digest);
       if (
-        existingReviews.some(
+        conversation.reviews.some(
           (review) =>
-            review.authorLogin.toLowerCase() === authenticatedLogin.toLowerCase() &&
+            review.author?.login.toLowerCase() === authenticatedLogin.toLowerCase() &&
             review.state !== "DISMISSED" &&
             review.commitId === context.headSha &&
             review.body.includes(marker),
@@ -210,14 +250,29 @@ export async function runAction(
     await assertWorkspace(context, workspace);
     const files = await api.getPullRequestFiles(context);
     core.info(
-      `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
+      `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
     );
-    const rawGoals = await dependencies.runGoals(context, files, config, workspace);
+    const redactedConversation = mapConversationBodies(conversation.snapshot, (body) =>
+      redact(body, secrets),
+    );
+    const rawGoals = await dependencies.runGoals(
+      context,
+      files,
+      redactedConversation,
+      config,
+      workspace,
+    );
     const goals = redactGoals(rawGoals, secrets);
-    const review = aggregateReview(context, config, files, goals);
+    const review = aggregateReview(context, config, files, goals, conversation.snapshot.digest);
     if (!config.interactWithPullRequest) {
       await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
+      await assertCurrentConversation(
+        api,
+        context,
+        authenticatedLogin,
+        conversation.snapshot.digest,
+      );
       await dependencies.writeSummary(context, review, goals);
       if (review.allGoalsFailed) {
         throw new Error("All review goals failed; the result was written to the run summary.");
@@ -236,6 +291,7 @@ export async function runAction(
     const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
     await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
+    await assertCurrentConversation(api, context, authenticatedLogin, conversation.snapshot.digest);
     try {
       await api.createReview(context, request);
     } catch (error) {
@@ -243,6 +299,12 @@ export async function runAction(
       core.warning("GitHub rejected the approval review; retrying as a comment review.");
       await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
+      await assertCurrentConversation(
+        api,
+        context,
+        authenticatedLogin,
+        conversation.snapshot.digest,
+      );
       await api.createReview(context, {
         ...request,
         event: "COMMENT",
@@ -289,6 +351,8 @@ export async function main(): Promise<void> {
 
 export const indexInternals = {
   assertWorkspace,
+  assertCurrentConversation,
+  loadConversation,
   writeRunSummary,
   inputSecretCandidates,
   redact,

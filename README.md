@@ -2,7 +2,7 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary.
+Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), the relevant pull request conversation, and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary.
 
 ## Consumer workflow
 
@@ -65,17 +65,17 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
 | `review-prompts`   | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                                |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
-| `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, diff reading, and output repair.               |
+| `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, context and diff reading, and output repair.   |
 | `auto-approve`     | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.    |
-| `interact-with-pr` | no       | `true`    | When `false`, do not list or create reviews; write all findings only to the workflow run summary.         |
+| `interact-with-pr` | no       | `true`    | When `false`, do not create a review; write all findings only to the workflow run summary.                |
 | `pull-request-url` | no       |           | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.       |
 | `mcp-servers`      | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                           |
 
-Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review if the same head and configuration marker already exist. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
+Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, and qualifying conversation digest already exist. An owner reply therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
 
 ### Summary-only event review
 
-Set `interact-with-pr: false` to keep the result out of the pull request. The action still reads PR metadata and changed files, but it does not look up the authenticated user, list existing reviews, post a review, add inline comments, or approve the PR. Complete, partial, and failed results are written to the workflow run summary; partial and failed reviews still fail the action after the summary is written.
+Set `interact-with-pr: false` to keep the result out of the pull request. The action still reads PR metadata, changed files, reviews, inline replies, PR-level comments, and the authenticated PAT identity so each goal receives the same conversation context. It does not post a review, add inline comments, or approve the PR. Complete, partial, and failed results are written to the workflow run summary; partial and failed reviews still fail the action after the summary is written.
 
 ```yaml
 - uses: markhuangai/ai-pr-reviewer@v1-prerelease
@@ -149,14 +149,18 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
 - Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
-- The action streams one immutable merge-base-to-head Git text diff outside the checkout. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. Every goal reads the complete diff through its own ordered, bounded internal reader before `submit_review` is accepted; there is no fixed aggregate character limit.
+- The action includes non-empty PR-level comments and review bodies from human users other than the authenticated PAT identity. An inline thread is included when it has a qualifying human reply; the complete selected thread is preserved so the finding and all replies remain together. Bot, GitHub App, and action-authored content cannot select context on their own.
+- Conversation text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
+- The action streams one immutable conversation snapshot and one immutable merge-base-to-head Git text diff to every goal through independent ordered, bounded readers. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. `submit_review` is rejected until both inputs have been read to completion; there is no fixed aggregate character limit.
+- The conversation is fetched again before a review or run summary is published. If qualifying discussion changed during the review, the action fails closed and requires a rerun so the new context is considered.
+- The action does not add comment-event triggers. Replies affect the next pull request update, workflow rerun, or separately configured dispatch that invokes the action.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - The action writes the full secret-redacted system prompt, `/goal`, review and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, goal iterations, turn results, repairs, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews; hidden model reasoning is not logged.
 - Findings use four severities: Critical for credible immediate compromise, irreversible data loss, or broad outage; High for serious impact on a reachable path; Moderate for bounded impact or a less likely trigger; and Low for a limited-impact but actionable defect. Informational observations, style preferences, and nits are omitted.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. Each comment uses a severity marker, a short impact statement, and a short fix. Every verified inline finding also includes a default-collapsed prompt that an AI coding agent can use to validate and address it; the prompt is generated from the finding and verified location rather than authored by the review model. A location that is not an added line in the pull request diff is moved into the review body without the prompt.
 - Public reviews never include review prompts, model summaries, goal errors, or goal provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count and rerun guidance; full secret-redacted diagnostics remain in the GitHub Actions log.
-- If a goal cannot read the text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
+- If a goal cannot read the conversation and text diff to completion within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
 - When interaction is enabled, a partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - In summary-only mode, every finding is included in the run summary rather than split between body and inline destinations. The summary is capped below GitHub's 1 MiB per-step limit and omits only whole findings when needed.
 - If GitHub rejects an approval, the action retries once as a comment review.

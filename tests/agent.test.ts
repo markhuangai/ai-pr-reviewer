@@ -21,9 +21,15 @@ import {
   runReviewGoals,
   type AgentQuery,
 } from "../src/runtime/agent.js";
+import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import type { ChangedFile, PullRequestContext, ReviewConfig } from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
+
+const emptyConversation: ReviewConversationSnapshot = {
+  digest: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8eacb808f73f18510b2e0b23",
+  entries: [],
+};
 
 async function git(cwd: string, args: readonly string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
@@ -137,16 +143,24 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
     };
     const tools = outputServer.instance._registeredTools;
     const preflight = scenario.preflightTools
-      ? Promise.all([tools.read_pr_diff?.handler({}), tools.submit_review?.handler({})])
+      ? Promise.all([
+          tools.read_pr_conversation?.handler({}),
+          tools.read_pr_diff?.handler({}),
+          tools.submit_review?.handler({}),
+        ])
       : undefined;
     const session = {
       async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
         assert.equal((await messages.next()).done, false);
         assert.equal((await messages.next()).done, false);
         if (preflight !== undefined) {
-          const [readResult, submitResult] = await preflight;
+          const [conversationResult, diffResult, submitResult] = await preflight;
           assert.equal(
-            readResult?.content[0]?.text,
+            conversationResult?.content[0]?.text,
+            "Wait for the full review prompt before reading.",
+          );
+          assert.equal(
+            diffResult?.content[0]?.text,
             "Wait for the full review prompt before reading.",
           );
           assert.equal(
@@ -156,15 +170,25 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
         }
         if (scenario.readerError) throw scenario.readerError;
         if (scenario.submission !== undefined) {
-          const readTool = tools.read_pr_diff;
+          const conversationTool = tools.read_pr_conversation;
+          const diffTool = tools.read_pr_diff;
           const submitTool = tools.submit_review;
-          assert.ok(readTool);
+          assert.ok(conversationTool);
+          assert.ok(diffTool);
           assert.ok(submitTool);
-          let done = false;
-          while (!done) {
-            const result = await readTool.handler({});
+          let conversationDone = false;
+          while (!conversationDone) {
+            const result = await conversationTool.handler({});
+            const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+              readonly done?: unknown;
+            };
+            conversationDone = page.done === true;
+          }
+          let diffDone = false;
+          while (!diffDone) {
+            const result = await diffTool.handler({});
             const page = JSON.parse(result.content[0]?.text ?? "{}") as { readonly done?: unknown };
-            done = page.done === true;
+            diffDone = page.done === true;
           }
           const result = await submitTool.handler(scenario.submission);
           assert.equal(result.content[0]?.text, "Review submission accepted.");
@@ -284,6 +308,49 @@ test("returns one completed page for an empty diff", async (t) => {
   } finally {
     await artifact.cleanup();
   }
+});
+
+test("streams empty and multi-page Unicode pull request conversations", () => {
+  const emptyReader = new agentInternals.PullRequestConversationReader(emptyConversation);
+  assert.deepEqual(emptyReader.readNext(), {
+    page: 1,
+    content: '{"entries":[]}',
+    done: true,
+  });
+  assert.equal(emptyReader.complete, true);
+  assert.deepEqual(emptyReader.readNext(), { page: 1, content: "", done: true });
+
+  const body = `Owner context: ${"🙂".repeat(20_000)}`;
+  const reader = new agentInternals.PullRequestConversationReader({
+    digest: "conversation-digest",
+    entries: [
+      {
+        kind: "pr_comment",
+        id: 1,
+        createdAt: "2026-08-17T00:00:00Z",
+        message: {
+          id: 1,
+          authorLogin: "owner",
+          authorRole: "human",
+          body,
+          createdAt: "2026-08-17T00:00:00Z",
+          updatedAt: "2026-08-17T00:00:00Z",
+        },
+      },
+    ],
+  });
+  let content = "";
+  let pages = 0;
+  while (!reader.complete) {
+    const page = reader.readNext();
+    pages += 1;
+    assert.equal(page.page, pages);
+    content += page.content;
+  }
+  assert.ok(pages > 1);
+  assert.equal(content.includes("�"), false);
+  const parsed = JSON.parse(content) as { entries: [{ message: { body: string } }] };
+  assert.equal(parsed.entries[0].message.body, body);
 });
 
 test("includes deletions and renames in the fenced Git diff", async (t) => {
@@ -540,6 +607,7 @@ test("queues both initial prompts before activating the review gate", () => {
     context,
     [],
     context.baseSha,
+    1,
     0,
     [],
     () => events.push("activate"),
@@ -551,6 +619,10 @@ test("queues both initial prompts before activating the review gate", () => {
   assert.match(
     (queued[1] as { message: { content: string } }).message.content,
     /isolated pull-request reviewer/u,
+  );
+  assert.match(
+    (queued[1] as { message: { content: string } }).message.content,
+    /1 qualifying pull request conversation entry/u,
   );
 });
 
@@ -801,15 +873,22 @@ test("contains agent logging failures without failing the review turn", () => {
   assert.match(warnings[0] ?? "", /\[\d+ chars\]$/u);
 });
 
-test("rejects review submission until the prompt is active and the diff reaches EOF", () => {
+test("rejects review submission until the prompt, conversation, and diff are complete", () => {
   assert.equal(
-    agentInternals.reviewSubmissionRejection(false, false),
+    agentInternals.reviewSubmissionRejection(false, false, false),
     "Wait for the full review prompt before submitting.",
   );
-  assert.match(agentInternals.reviewSubmissionRejection(true, false) ?? "", /done=true/u);
-  assert.equal(agentInternals.reviewSubmissionRejection(true, true), undefined);
   assert.match(
-    agentInternals.reviewSubmissionRejection(true, true, true) ?? "",
+    agentInternals.reviewSubmissionRejection(true, false, true) ?? "",
+    /conversation until done=true/u,
+  );
+  assert.match(
+    agentInternals.reviewSubmissionRejection(true, true, false) ?? "",
+    /diff until done=true/u,
+  );
+  assert.equal(agentInternals.reviewSubmissionRejection(true, true, true), undefined);
+  assert.match(
+    agentInternals.reviewSubmissionRejection(true, true, true, true) ?? "",
     /already been accepted/u,
   );
 });
@@ -969,6 +1048,7 @@ test("teaches the four severity definitions before review submission", () => {
     [],
     context.baseSha,
     0,
+    0,
     [],
     () => events.push("activate"),
     () => undefined,
@@ -981,9 +1061,15 @@ test("teaches the four severity definitions before review submission", () => {
   assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
   assert.match(prompt, /Set endLine only when the finding spans a contiguous range/u);
   assert.doesNotMatch(prompt, /raw replacement text|apply suggestions/u);
-  assert.match(agentInternals.repairPrompt(1, true), /MEDIUM and INFO are invalid/u);
-  assert.match(agentInternals.repairPrompt(1, true), /path, line, and endLine are optional/u);
-  assert.doesNotMatch(agentInternals.repairPrompt(1, true), /suggestion/u);
+  assert.match(agentInternals.repairPrompt(1, true, true), /MEDIUM and INFO are invalid/u);
+  assert.match(agentInternals.repairPrompt(1, true, true), /path, line, and endLine are optional/u);
+  assert.doesNotMatch(agentInternals.repairPrompt(1, true, true), /suggestion/u);
+  assert.match(agentInternals.repairPrompt(1, false, true), /read_pr_conversation/u);
+  assert.match(agentInternals.repairPrompt(1, true, false), /read_pr_diff/u);
+  assert.match(
+    agentInternals.repairPrompt(1, false, false),
+    /read_pr_conversation and mcp__review_output__read_pr_diff/u,
+  );
 });
 
 test("starts each review with a bounded Claude goal command", () => {
@@ -1054,7 +1140,7 @@ test("reports the reviewed checkout as the subprocess workspace", () => {
 async function makeReviewDiff(
   t: TestContext,
   content = "diff --git a/src/change.ts b/src/change.ts\n+changed\n",
-): Promise<Parameters<typeof runReviewGoal>[5]> {
+): Promise<Parameters<typeof runReviewGoal>[6]> {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-goal-diff-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "pull-request.diff");
@@ -1065,7 +1151,7 @@ async function makeReviewDiff(
     size: Buffer.byteLength(content),
     createReader: () => new agentInternals.PullRequestDiffReader(path, Buffer.byteLength(content)),
     cleanup: () => rm(root, { recursive: true, force: true }),
-  } as Parameters<typeof runReviewGoal>[5];
+  } as Parameters<typeof runReviewGoal>[6];
 }
 
 const goalContext: PullRequestContext = {
@@ -1127,6 +1213,7 @@ test("runs a complete SDK review turn through the real diff and submission tools
     0,
     goalContext,
     [],
+    emptyConversation,
     config,
     diff,
     "/workspace/repository",
@@ -1144,6 +1231,7 @@ test("reports configured MCP failures after accepting a real submission", async 
     0,
     goalContext,
     [],
+    emptyConversation,
     reviewConfig({
       mcpServers: { security: { type: "http", url: "https://mcp.example.test" } },
     }),
@@ -1166,6 +1254,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     0,
     goalContext,
     [],
+    emptyConversation,
     config,
     await makeReviewDiff(t),
     "/workspace/repository",
@@ -1179,6 +1268,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     1,
     goalContext,
     [],
+    emptyConversation,
     config,
     await makeReviewDiff(t),
     "/workspace/repository",
@@ -1192,6 +1282,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     2,
     goalContext,
     [],
+    emptyConversation,
     config,
     await makeReviewDiff(t),
     "/workspace/repository",
@@ -1205,6 +1296,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     3,
     goalContext,
     [],
+    emptyConversation,
     config,
     await makeReviewDiff(t),
     "/workspace/repository",
@@ -1221,6 +1313,7 @@ test("runs parallel review goals over independent readers and cleans the shared 
   const results = await runReviewGoals(
     repository.context,
     [],
+    emptyConversation,
     reviewConfig({
       reviewPrompts: ["correctness", "security", "reliability"],
       parallelCount: 2,
@@ -1469,6 +1562,7 @@ test("handles sparse goal arrays without leaking the shared diff", async (t) => 
   const results = await runReviewGoals(
     repository.context,
     [],
+    emptyConversation,
     reviewConfig({ reviewPrompts: prompts }),
     repository.root,
     fakeAgentQuery({ submission: { summary: "unused", findings: [] } }),

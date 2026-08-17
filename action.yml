@@ -1,5 +1,5 @@
 name: Goal-Driven AI PR Reviewer
-description: Goal-driven pull request reviews with isolated AI sessions and MCP-enabled tools.
+description: Conversation-aware pull request reviews with isolated AI sessions and MCP-enabled tools.
 author: MarkHuang.ai
 inputs:
   github-pat:
@@ -26,7 +26,7 @@ inputs:
     required: false
     default: "5"
   max-turns:
-    description: Maximum Claude Agent SDK turns per goal session, including /goal, diff reading, and output repair.
+    description: Maximum Claude Agent SDK turns per goal session, including /goal, conversation and diff reading, and output repair.
     required: false
     default: "50"
   auto-approve:
@@ -34,7 +34,7 @@ inputs:
     required: false
     default: "false"
   interact-with-pr:
-    description: Post the review to the pull request; when false, write the result only to the run summary.
+    description: Post the review to the pull request; when false, still read its conversation but write the result only to the run summary.
     required: false
     default: "true"
   pull-request-url:

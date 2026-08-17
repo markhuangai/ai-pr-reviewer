@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   AggregatedFinding,
   AggregatedReview,
@@ -32,14 +34,7 @@ const SEVERITY_ICON: Record<Severity, string> = {
   LOW: "🟡",
 };
 
-function stableDigest(value: string): string {
-  let hash = 14_695_981_039_346_656_037n;
-  for (const character of value) {
-    hash ^= BigInt(character.codePointAt(0) ?? 0);
-    hash = BigInt.asUintN(64, hash * 1_099_511_628_211n);
-  }
-  return hash.toString(16).padStart(16, "0");
-}
+const EMPTY_CONVERSATION_DIGEST = createHash("sha256").update("[]").digest("hex");
 
 function normalizeText(value: string): string {
   return value
@@ -99,21 +94,26 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
   );
 }
 
-export function reviewMarker(context: PullRequestContext, config: ReviewConfig): string {
+export function reviewMarker(
+  context: PullRequestContext,
+  config: ReviewConfig,
+  conversationDigest = EMPTY_CONVERSATION_DIGEST,
+): string {
   const fingerprint = JSON.stringify({
     baseSha: context.baseSha,
     model: config.model,
     aiBaseUrl: config.aiBaseUrl,
-    aiAuthMode: config.aiAuthMode,
+    usesAuthToken: config.aiAuthMode === "auth-token",
     prompts: config.reviewPrompts,
     parallelCount: config.parallelCount,
     maxTurns: config.maxTurns,
     autoApprove: config.autoApprove,
     buildId: process.env.AI_PR_REVIEWER_BUILD_ID?.trim() || "source",
     mcpServers: stableMcpShape(config.mcpServers),
+    conversationDigest,
   });
-  const digest = stableDigest(fingerprint);
-  return `<!-- ai-pr-reviewer:v2:${context.headSha}:${digest} -->`;
+  const digest = createHash("sha256").update(fingerprint).digest("hex");
+  return `<!-- ai-pr-reviewer:v3:${context.headSha}:${digest} -->`;
 }
 
 function changedFileFor(
@@ -321,8 +321,9 @@ export function aggregateReview(
   config: ReviewConfig,
   files: readonly ChangedFile[],
   goals: readonly GoalResult[],
+  conversationDigest = EMPTY_CONVERSATION_DIGEST,
 ): AggregatedReview {
-  const marker = reviewMarker(context, config);
+  const marker = reviewMarker(context, config, conversationDigest);
   const normalized = goals.flatMap(
     (goal, index) =>
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],

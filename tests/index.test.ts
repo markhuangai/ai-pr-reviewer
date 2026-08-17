@@ -105,6 +105,15 @@ const config: ReviewConfig = {
   },
 };
 
+function emptyConversationApi(login = "review-owner") {
+  return {
+    getAuthenticatedUserLogin: () => Promise.resolve(login),
+    listReviews: () => Promise.resolve([]),
+    listReviewComments: () => Promise.resolve([]),
+    listIssueComments: () => Promise.resolve([]),
+  };
+}
+
 test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
   assert.ok(secrets.includes(config.aiBaseUrl));
@@ -296,6 +305,33 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     });
     response.statusCode = 200;
     response.setHeader("Content-Type", "application/json");
+    if (request.url === "/user") {
+      response.end(JSON.stringify({ login: "review-action" }));
+      return;
+    }
+    if (request.url?.includes("/reviews?")) {
+      response.end("[]");
+      return;
+    }
+    if (request.url?.includes("/pulls/9/comments?")) {
+      response.end("[]");
+      return;
+    }
+    if (request.url?.includes("/issues/9/comments?")) {
+      response.end(
+        JSON.stringify([
+          {
+            id: 1,
+            user: { login: "pr-owner", type: "User" },
+            body: "Owner context contains test-ai-secret.",
+            created_at: "2026-08-17T00:00:00Z",
+            updated_at: "2026-08-17T00:00:00Z",
+            performed_via_github_app: null,
+          },
+        ]),
+      );
+      return;
+    }
     if (request.url?.includes("/files?")) {
       response.end(
         JSON.stringify([
@@ -391,10 +427,15 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
         },
       });
     },
-    runGoals: (context, files, _config, cwd) => {
+    runGoals: (context, files, conversation, _config, cwd) => {
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
       assert.equal(files.length, 1);
+      assert.equal(conversation.entries.length, 1);
+      const entry = conversation.entries[0];
+      assert.equal(entry?.kind, "pr_comment");
+      if (entry?.kind !== "pr_comment") assert.fail("Expected a PR-level comment.");
+      assert.equal(entry.message.body, "Owner context contains [REDACTED].");
       assert.equal(cwd, workspace);
       return Promise.resolve(goals);
     },
@@ -411,7 +452,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 5);
+  assert.equal(requests.length, 12);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,
@@ -422,11 +463,19 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
   assert.equal(
     requests.some((request) => request.path === "/user"),
-    false,
+    true,
   );
   assert.equal(
-    requests.some((request) => request.path?.endsWith("/reviews") === true),
-    false,
+    requests.filter((request) => request.path?.includes("/reviews?") === true).length,
+    2,
+  );
+  assert.equal(
+    requests.filter((request) => request.path?.includes("/pulls/9/comments?") === true).length,
+    2,
+  );
+  assert.equal(
+    requests.filter((request) => request.path?.includes("/issues/9/comments?") === true).length,
+    2,
   );
 });
 
@@ -437,13 +486,14 @@ test("skips an identical current-head review by the authenticated user", async (
   const marker = reviewMarker(context, readReviewConfig(reader));
   let goalRuns = 0;
   const api = {
+    ...emptyConversationApi("Review-Owner"),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
-    getAuthenticatedUserLogin: () => Promise.resolve("Review-Owner"),
     listReviews: () =>
       Promise.resolve([
         {
-          authorLogin: "review-owner",
+          id: 1,
+          author: { login: "review-owner", type: "User" },
           body: marker,
           commitId: context.headSha,
           state: "COMMENTED",
@@ -471,10 +521,9 @@ test("falls back from a rejected approval to a comment review", async (t) => {
   useWorkspace(t, workspace);
   const requests: PullRequestReviewRequest[] = [];
   const api = {
+    ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
-    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
-    listReviews: () => Promise.resolve([]),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
       requests.push(request);
@@ -514,10 +563,9 @@ test("propagates non-approval review failures", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   const api = {
+    ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
-    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
-    listReviews: () => Promise.resolve([]),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: () => Promise.reject(new GitHubApiError(500, "GitHub unavailable")),
   } as unknown as GitHubApi;
@@ -538,6 +586,60 @@ test("propagates non-approval review failures", async (t) => {
     }),
     /GitHub unavailable/u,
   );
+});
+
+test("rejects a review result when the pull request discussion changes", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  let issueCommentReads = 0;
+  let postedReviews = 0;
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getPullRequestFiles: () => Promise.resolve([]),
+    listIssueComments: () => {
+      issueCommentReads += 1;
+      return Promise.resolve(
+        issueCommentReads === 1
+          ? []
+          : [
+              {
+                id: 1,
+                author: { login: "pr-owner", type: "User" },
+                body: "New owner context",
+                createdAt: "2026-08-17T00:00:00Z",
+                updatedAt: "2026-08-17T00:00:00Z",
+                performedViaGitHubApp: false,
+              },
+            ],
+      );
+    },
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  await assert.rejects(
+    runAction(actionReader(), [], {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: () =>
+        Promise.resolve([
+          {
+            prompt: "correctness",
+            status: "completed",
+            submission: { summary: "clean", findings: [] },
+          },
+        ]),
+      writeSummary: () => Promise.resolve(),
+    }),
+    /discussion changed during review/u,
+  );
+  assert.equal(issueCommentReads, 2);
+  assert.equal(postedReviews, 0);
 });
 
 test("fails closed for stale refs and mismatched event URL targets", async (t) => {
@@ -584,6 +686,7 @@ test("writes failed and partial summary-only results before reporting failure", 
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   const api = {
+    ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
     getPullRequestFiles: () => Promise.resolve([]),
@@ -633,10 +736,9 @@ test("does not post an interactive review when every goal fails", async (t) => {
   useWorkspace(t, workspace);
   let reviews = 0;
   const api = {
+    ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
-    getAuthenticatedUserLogin: () => Promise.resolve("review-owner"),
-    listReviews: () => Promise.resolve([]),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: () => {
       reviews += 1;
