@@ -1,6 +1,13 @@
 import { parseDocument } from "yaml";
 
-import type { AuthMode, HttpMcpServer, McpToolPolicy, ReviewConfig } from "./types.js";
+import type {
+  AuthMode,
+  HttpMcpServer,
+  McpToolPolicy,
+  ModelPricingConfig,
+  ModelPricingRates,
+  ReviewConfig,
+} from "./types.js";
 
 export interface InputReader {
   get(name: string): string;
@@ -10,6 +17,9 @@ const MAX_PROMPTS = 50;
 const MAX_PROMPT_LENGTH = 12_000;
 const MAX_MCP_SERVERS = 20;
 const MAX_MCP_HEADERS = 50;
+const MAX_PRICED_MODELS = 100;
+const MAX_MODEL_NAME_LENGTH = 500;
+const MAX_CURRENCY_LENGTH = 32;
 
 function required(value: string, name: string): string {
   const trimmed = value.trim();
@@ -284,6 +294,83 @@ function parseReviewPrompts(raw: string): readonly string[] {
   );
 }
 
+function parseModelPricing(raw: string): ModelPricingConfig | undefined {
+  if (raw.trim().length === 0) return undefined;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("Input 'model-pricing' must be valid JSON.");
+  }
+  const duplicateCheck = parseDocument(raw, {
+    prettyErrors: false,
+    schema: "json",
+    uniqueKeys: true,
+    version: "1.2",
+  });
+  if (duplicateCheck.errors.length > 0) {
+    throw new Error("Input 'model-pricing' must be valid JSON with unique object keys.");
+  }
+  if (!isRecord(value)) throw new Error("Input 'model-pricing' must be a JSON object.");
+
+  const rootKeys = new Set(["currency", "models"]);
+  for (const key of Object.keys(value)) {
+    if (!rootKeys.has(key)) throw new Error(`model-pricing.${key} is not supported.`);
+  }
+  if (typeof value.currency !== "string" || value.currency.length === 0) {
+    throw new Error("model-pricing.currency must be a non-empty string.");
+  }
+  if (value.currency.length > MAX_CURRENCY_LENGTH) {
+    throw new Error(`model-pricing.currency must not exceed ${MAX_CURRENCY_LENGTH} characters.`);
+  }
+  if (!isRecord(value.models)) throw new Error("model-pricing.models must be an object.");
+
+  const modelEntries = Object.entries(value.models);
+  if (modelEntries.length === 0) {
+    throw new Error("model-pricing.models must contain at least one model.");
+  }
+  if (modelEntries.length > MAX_PRICED_MODELS) {
+    throw new Error(`model-pricing.models supports at most ${MAX_PRICED_MODELS} models.`);
+  }
+
+  const models = Object.create(null) as Record<string, ModelPricingRates>;
+  const rateKeys = new Set(["input", "output", "cache-hit", "cache-creation"]);
+  for (const [model, rawRates] of modelEntries) {
+    const modelPath = `model-pricing.models[${JSON.stringify(model)}]`;
+    if (model.trim().length === 0) {
+      throw new Error("model-pricing.models keys must be non-empty model identifiers.");
+    }
+    if (model.length > MAX_MODEL_NAME_LENGTH) {
+      throw new Error(
+        `model-pricing.models keys must not exceed ${MAX_MODEL_NAME_LENGTH} characters.`,
+      );
+    }
+    if (!isRecord(rawRates)) {
+      throw new Error(`${modelPath} must be an object.`);
+    }
+    for (const key of Object.keys(rawRates)) {
+      if (!rateKeys.has(key)) {
+        throw new Error(`${modelPath}[${JSON.stringify(key)}] is not supported.`);
+      }
+    }
+    const readRate = (key: string): number => {
+      const rate = rawRates[key];
+      if (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0) {
+        throw new Error(`${modelPath}.${key} must be a finite non-negative number.`);
+      }
+      return rate;
+    };
+    models[model] = {
+      input: readRate("input"),
+      output: readRate("output"),
+      cacheHit: readRate("cache-hit"),
+      cacheCreation: readRate("cache-creation"),
+    };
+  }
+  return { currency: value.currency, models };
+}
+
 function readAuthMode(value: string): AuthMode {
   const mode = value.trim().toLowerCase();
   if (mode === "api-key" || mode === "auth-token") return mode;
@@ -292,12 +379,14 @@ function readAuthMode(value: string): AuthMode {
 
 export function readReviewConfig(reader: InputReader): ReviewConfig {
   const pullRequestUrl = reader.get("pull-request-url").trim();
+  const modelPricing = parseModelPricing(reader.get("model-pricing"));
   return {
     githubToken: required(reader.get("github-pat"), "github-pat"),
     aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
     aiSecret: required(reader.get("ai-secret"), "ai-secret"),
     aiAuthMode: readAuthMode(reader.get("ai-auth-mode") || "api-key"),
     model: required(reader.get("model"), "model"),
+    ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
     maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 100),
@@ -312,5 +401,6 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
 
 export const inputInternals = {
   parseMcpServers,
+  parseModelPricing,
   parseReviewPrompts,
 };

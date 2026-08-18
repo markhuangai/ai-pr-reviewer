@@ -48,6 +48,98 @@ test("accepts JSON goal arrays", () => {
   assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), ["one", "two"]);
 });
 
+test("reads strict model pricing while preserving the currency prefix", () => {
+  const pricing = inputInternals.parseModelPricing(
+    JSON.stringify({
+      currency: "USD ",
+      models: {
+        "review-model": {
+          input: 1.2,
+          output: 2,
+          "cache-hit": 0.12,
+          "cache-creation": 0.6,
+        },
+      },
+    }),
+  );
+  assert.ok(pricing);
+  assert.equal(pricing.currency, "USD ");
+  assert.deepEqual(pricing.models["review-model"], {
+    input: 1.2,
+    output: 2,
+    cacheHit: 0.12,
+    cacheCreation: 0.6,
+  });
+  assert.equal(Object.getPrototypeOf(pricing.models), null);
+  assert.equal(inputInternals.parseModelPricing(""), undefined);
+
+  const config = readReviewConfig(
+    reader({
+      "github-pat": "token",
+      "ai-base-url": "https://ai.example.test",
+      "ai-secret": "secret",
+      model: "review-model",
+      "model-pricing": JSON.stringify({
+        currency: "$",
+        models: {
+          "review-model": {
+            input: 0,
+            output: 0,
+            "cache-hit": 0,
+            "cache-creation": 0,
+          },
+        },
+      }),
+      "review-prompts": "goal",
+    }),
+  );
+  assert.equal(config.modelPricing?.currency, "$");
+});
+
+test("rejects malformed, duplicate, and unsupported model pricing JSON", () => {
+  for (const [value, message] of [
+    ["{currency: '$'}", /must be valid JSON/u],
+    ['{"currency":"$","currency":"USD","models":{}}', /unique object keys/u],
+    [
+      '{"currency":"$","models":{"model":{"input":1,"input":2,"output":2,"cache-hit":0.1,"cache-creation":0.2}}}',
+      /unique object keys/u,
+    ],
+    ['{"currency":"$","models":{},"extra":true}', /model-pricing\.extra is not supported/u],
+    ['{"currency":"$","models":[]}', /models must be an object/u],
+    ['{"currency":"$","models":{}}', /must contain at least one model/u],
+    [
+      '{"currency":"$","models":{"model":{"input":1,"output":2,"cache-hit":0.1,"cache-creation":0.2,"extra":3}}}',
+      /extra.*is not supported/u,
+    ],
+  ] as const) {
+    assert.throws(() => inputInternals.parseModelPricing(value), message);
+  }
+});
+
+test("requires every model pricing rate to be finite and non-negative", () => {
+  const makePricing = (rates: Record<string, unknown>): string =>
+    JSON.stringify({ currency: "$", models: { model: rates } });
+  const valid = { input: 1, output: 2, "cache-hit": 0.1, "cache-creation": 0.2 };
+  for (const [field, value] of [
+    ["input", -1],
+    ["output", "2"],
+    ["cache-hit", null],
+    ["cache-creation", undefined],
+  ] as const) {
+    assert.throws(
+      () => inputInternals.parseModelPricing(makePricing({ ...valid, [field]: value })),
+      new RegExp(`${field} must be a finite non-negative number`, "u"),
+    );
+  }
+  assert.throws(
+    () =>
+      inputInternals.parseModelPricing(
+        '{"currency":"$","models":{"model":{"input":1e400,"output":2,"cache-hit":0.1,"cache-creation":0.2}}}',
+      ),
+    /input must be a finite non-negative number/u,
+  );
+});
+
 test("registers direct secret inputs before configuration parsing", () => {
   const values = {
     "github-pat": "ghp_test",

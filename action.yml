@@ -18,6 +18,9 @@ inputs:
   model:
     description: Model identifier accepted by the configured AI endpoint.
     required: true
+  model-pricing:
+    description: Optional strict JSON model pricing configuration with rates per one million tokens.
+    required: false
   review-prompts:
     description: A JSON string array or newline-separated list of review goals.
     required: true

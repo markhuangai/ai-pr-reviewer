@@ -121,8 +121,10 @@ interface RegisteredTool {
 interface FakeQueryScenario {
   readonly submission?: Record<string, unknown>;
   readonly resultSubtypes?: readonly string[];
+  readonly modelUsages?: readonly Readonly<Record<string, Readonly<Record<string, unknown>>>>[];
   readonly mcpStatuses?: readonly Record<string, unknown>[];
   readonly readerError?: Error;
+  readonly readerErrorAfterResults?: Error;
   readonly queryError?: Error;
   readonly preflightTools?: boolean;
   readonly inspectOptions?: (options: Options) => void;
@@ -206,9 +208,19 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             is_error: subtype !== "success",
             session_id: "test-session",
             uuid: `result-${index}`,
+            modelUsage: scenario.modelUsages?.[index] ?? {
+              "review-model": {
+                inputTokens: 10 * (index + 1),
+                outputTokens: 2 * (index + 1),
+                cacheReadInputTokens: 4 * (index + 1),
+                cacheCreationInputTokens: index + 1,
+                canonicalModel: "canonical-review-model",
+              },
+            },
           } as unknown as SDKResultMessage;
           if (index + 1 < subtypes.length) assert.equal((await messages.next()).done, false);
         }
+        if (scenario.readerErrorAfterResults) throw scenario.readerErrorAfterResults;
       },
       mcpServerStatus: () => Promise.resolve(scenario.mcpStatuses ?? []),
     };
@@ -1223,6 +1235,19 @@ test("runs a complete SDK review turn through the real diff and submission tools
   assert.equal(result.submission?.findings[0]?.title, "Wrong role accessor");
   assert.match(result.submission?.findings[0]?.agentPrompt ?? "", /credential\.GetRole\(\)/u);
   assert.match(result.submission?.findings[0]?.agentPrompt ?? "", /@credential\.go:12/u);
+  assert.deepEqual(result.tokenUsage, {
+    complete: true,
+    models: [
+      {
+        model: "review-model",
+        canonicalModel: "canonical-review-model",
+        inputTokens: 10,
+        outputTokens: 2,
+        cacheReadInputTokens: 4,
+        cacheCreationInputTokens: 1,
+      },
+    ],
+  });
 });
 
 test("reports configured MCP failures after accepting a real submission", async (t) => {
@@ -1245,6 +1270,8 @@ test("reports configured MCP failures after accepting a real submission", async 
   assert.equal(result.status, "failed");
   assert.ok(result.submission);
   assert.match(result.error ?? "", /security: connection refused/u);
+  assert.equal(result.tokenUsage?.complete, true);
+  assert.equal(result.tokenUsage?.models[0]?.inputTokens, 10);
 });
 
 test("handles provider failures, repair exhaustion, reader failures, and query failures", async (t) => {
@@ -1262,6 +1289,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   );
   assert.equal(providerFailure.status, "failed");
   assert.match(providerFailure.error ?? "", /provider returned error_max_turns/u);
+  assert.equal(providerFailure.tokenUsage?.complete, true);
 
   const repairFailure = await runReviewGoal(
     "Repair failure.",
@@ -1276,6 +1304,8 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   );
   assert.equal(repairFailure.status, "failed");
   assert.match(repairFailure.error ?? "", /five repair attempts/u);
+  assert.equal(repairFailure.tokenUsage?.complete, true);
+  assert.equal(repairFailure.tokenUsage?.models[0]?.inputTokens, 60);
 
   const readerFailure = await runReviewGoal(
     "Reader failure.",
@@ -1290,6 +1320,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   );
   assert.equal(readerFailure.status, "failed");
   assert.equal(readerFailure.error, "reader stopped");
+  assert.deepEqual(readerFailure.tokenUsage, { models: [], complete: false });
 
   const queryFailure = await runReviewGoal(
     "Query failure.",
@@ -1304,6 +1335,72 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   );
   assert.equal(queryFailure.status, "failed");
   assert.equal(queryFailure.error, "query setup failed");
+  assert.deepEqual(queryFailure.tokenUsage, { models: [], complete: false });
+});
+
+test("preserves the latest cumulative usage snapshot when the SDK reader crashes", async (t) => {
+  const result = await runReviewGoal(
+    "Crash after accounting.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig(),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    fakeAgentQuery({ readerErrorAfterResults: new Error("reader crashed after result") }),
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.error, "reader crashed after result");
+  assert.deepEqual(result.tokenUsage, {
+    complete: false,
+    models: [
+      {
+        model: "review-model",
+        canonicalModel: "canonical-review-model",
+        inputTokens: 10,
+        outputTokens: 2,
+        cacheReadInputTokens: 4,
+        cacheCreationInputTokens: 1,
+      },
+    ],
+  });
+});
+
+test("accepts only complete non-negative SDK model usage snapshots", () => {
+  assert.deepEqual(
+    agentInternals.modelUsageSnapshot({
+      alias: {
+        inputTokens: 1,
+        outputTokens: 2,
+        cacheReadInputTokens: 3,
+        cacheCreationInputTokens: 4,
+        canonicalModel: "canonical",
+      },
+    }),
+    [
+      {
+        model: "alias",
+        canonicalModel: "canonical",
+        inputTokens: 1,
+        outputTokens: 2,
+        cacheReadInputTokens: 3,
+        cacheCreationInputTokens: 4,
+      },
+    ],
+  );
+  assert.equal(
+    agentInternals.modelUsageSnapshot({
+      alias: {
+        inputTokens: -1,
+        outputTokens: 2,
+        cacheReadInputTokens: 3,
+        cacheCreationInputTokens: 4,
+      },
+    }),
+    undefined,
+  );
 });
 
 test("runs parallel review goals over independent readers and cleans the shared diff", async (t) => {

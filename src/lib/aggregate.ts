@@ -2,15 +2,20 @@ import { createHash } from "node:crypto";
 
 import type {
   AggregatedFinding,
+  AggregatedModelUsage,
   AggregatedReview,
+  AggregatedTokenUsage,
   ChangedFile,
   GoalResult,
   HttpMcpServer,
+  ModelPricingConfig,
   PullRequestContext,
   PullRequestReviewRequest,
   ReviewConfig,
   ReviewFinding,
+  ReviewModelUsage,
   Severity,
+  TokenCounts,
 } from "./types.js";
 import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
 
@@ -19,6 +24,8 @@ const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
 const MAX_RUN_SUMMARY_BYTES = 1_000_000;
+const MAX_TOKEN_USAGE_DETAILS_LENGTH = 20_000;
+const MAX_DISPLAY_MODEL_LENGTH = 500;
 const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
 const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 4,
@@ -94,6 +101,26 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
   );
 }
 
+function stableModelPricing(pricing: ModelPricingConfig | undefined): unknown {
+  if (pricing === undefined) return undefined;
+  return {
+    currency: pricing.currency,
+    models: Object.fromEntries(
+      Object.entries(pricing.models)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([model, rates]) => [
+          model,
+          {
+            input: rates.input,
+            output: rates.output,
+            cacheHit: rates.cacheHit,
+            cacheCreation: rates.cacheCreation,
+          },
+        ]),
+    ),
+  };
+}
+
 export function reviewMarker(
   context: PullRequestContext,
   config: ReviewConfig,
@@ -108,12 +135,102 @@ export function reviewMarker(
     parallelCount: config.parallelCount,
     maxTurns: config.maxTurns,
     autoApprove: config.autoApprove,
+    modelPricing: stableModelPricing(config.modelPricing),
     buildId: process.env.AI_PR_REVIEWER_BUILD_ID?.trim() || "source",
     mcpServers: stableMcpShape(config.mcpServers),
     conversationDigest,
   });
   const digest = createHash("sha256").update(fingerprint).digest("hex");
   return `<!-- ai-pr-reviewer:v3:${context.headSha}:${digest} -->`;
+}
+
+function emptyTokenCounts(): TokenCounts {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+  };
+}
+
+function addTokenCounts(left: TokenCounts, right: TokenCounts): TokenCounts {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cacheReadInputTokens: left.cacheReadInputTokens + right.cacheReadInputTokens,
+    cacheCreationInputTokens: left.cacheCreationInputTokens + right.cacheCreationInputTokens,
+  };
+}
+
+function modelUsageKey(usage: ReviewModelUsage): string {
+  return JSON.stringify([usage.model, usage.canonicalModel ?? null]);
+}
+
+function configuredRates(
+  pricing: ModelPricingConfig,
+  usage: ReviewModelUsage,
+): { readonly model: string; readonly rates: ModelPricingConfig["models"][string] } | undefined {
+  if (Object.hasOwn(pricing.models, usage.model)) {
+    const rates = pricing.models[usage.model];
+    if (rates !== undefined) return { model: usage.model, rates };
+  }
+  if (usage.canonicalModel !== undefined && Object.hasOwn(pricing.models, usage.canonicalModel)) {
+    const rates = pricing.models[usage.canonicalModel];
+    if (rates !== undefined) return { model: usage.canonicalModel, rates };
+  }
+  return undefined;
+}
+
+function aggregateTokenUsage(
+  goals: readonly GoalResult[],
+  pricing: ModelPricingConfig | undefined,
+): AggregatedTokenUsage {
+  const modelsByKey = new Map<string, ReviewModelUsage>();
+  for (const goal of goals) {
+    for (const usage of goal.tokenUsage?.models ?? []) {
+      const key = modelUsageKey(usage);
+      const existing = modelsByKey.get(key);
+      modelsByKey.set(
+        key,
+        existing === undefined
+          ? usage
+          : {
+              ...existing,
+              ...addTokenCounts(existing, usage),
+            },
+      );
+    }
+  }
+
+  let estimatedCost = 0;
+  let totals = emptyTokenCounts();
+  const models: AggregatedModelUsage[] = [...modelsByKey.values()]
+    .sort(
+      (left, right) =>
+        left.model.localeCompare(right.model) ||
+        (left.canonicalModel ?? "").localeCompare(right.canonicalModel ?? ""),
+    )
+    .map((usage) => {
+      totals = addTokenCounts(totals, usage);
+      if (pricing === undefined) return usage;
+      const configured = configuredRates(pricing, usage);
+      if (configured === undefined) return usage;
+      estimatedCost +=
+        (usage.inputTokens * configured.rates.input +
+          usage.outputTokens * configured.rates.output +
+          usage.cacheReadInputTokens * configured.rates.cacheHit +
+          usage.cacheCreationInputTokens * configured.rates.cacheCreation) /
+        1_000_000;
+      return { ...usage, pricingModel: configured.model, pricing: configured.rates };
+    });
+
+  const complete = goals.length > 0 && goals.every((goal) => goal.tokenUsage?.complete === true);
+  return {
+    models,
+    totals,
+    complete,
+    ...(pricing === undefined ? {} : { currency: pricing.currency, estimatedCost }),
+  };
 }
 
 function changedFileFor(
@@ -350,6 +467,7 @@ export function aggregateReview(
     event,
     partial,
     allGoalsFailed,
+    tokenUsage: aggregateTokenUsage(goals, config.modelPricing),
   };
 }
 
@@ -372,10 +490,134 @@ function findingDestination(review: AggregatedReview): string {
   return "See the findings below for details.";
 }
 
+const TOKEN_FORMATTER = new Intl.NumberFormat("en-US");
+const COST_FORMATTER = new Intl.NumberFormat("en-US", {
+  useGrouping: false,
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+function totalTokens(counts: TokenCounts): number {
+  return (
+    counts.inputTokens +
+    counts.outputTokens +
+    counts.cacheReadInputTokens +
+    counts.cacheCreationInputTokens
+  );
+}
+
+function escapeHtmlText(value: string): string {
+  return value
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/\r/gu, "&#13;")
+    .replace(/\n/gu, "&#10;");
+}
+
+function escapeMarkdownText(value: string): string {
+  return escapeHtmlText(value.replace(/[-\\`*_[\]{}()#+.!|]/gu, "\\$&"));
+}
+
+function modelCode(value: string): string {
+  const display =
+    value.length <= MAX_DISPLAY_MODEL_LENGTH
+      ? value
+      : `${value.slice(0, MAX_DISPLAY_MODEL_LENGTH - 1)}…`;
+  return `<code>${escapeHtmlText(display)}</code>`;
+}
+
+function tokenLine(label: string, tokens: number): string {
+  return `  - ${label}: ${TOKEN_FORMATTER.format(tokens)}`;
+}
+
+function rateLine(currency: string, label: string, rate: number): string {
+  return `${label} ${escapeMarkdownText(currency)}${String(rate)}`;
+}
+
+function modelUsageBlock(usage: AggregatedModelUsage, currency: string | undefined): string {
+  const lines = [
+    `- ${modelCode(usage.model)}: ${TOKEN_FORMATTER.format(totalTokens(usage))} tokens`,
+    tokenLine("Input", usage.inputTokens),
+    tokenLine("Output", usage.outputTokens),
+    tokenLine("Cache hit", usage.cacheReadInputTokens),
+    tokenLine("Cache creation", usage.cacheCreationInputTokens),
+  ];
+  if (usage.canonicalModel !== undefined && usage.canonicalModel !== usage.model) {
+    lines.push(`  - Canonical model: ${modelCode(usage.canonicalModel)}`);
+  }
+  if (currency !== undefined) {
+    if (usage.pricing === undefined) {
+      lines.push("  - Pricing: **unpriced**");
+    } else {
+      if (usage.pricingModel !== usage.model && usage.pricingModel !== undefined) {
+        lines.push(`  - Pricing match: ${modelCode(usage.pricingModel)}`);
+      }
+      lines.push(
+        `  - Rates per 1M tokens: ${[
+          rateLine(currency, "input", usage.pricing.input),
+          rateLine(currency, "output", usage.pricing.output),
+          rateLine(currency, "cache hit", usage.pricing.cacheHit),
+          rateLine(currency, "cache creation", usage.pricing.cacheCreation),
+        ].join("; ")}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildTokenUsageDetails(usage: AggregatedTokenUsage): string {
+  const hasPricing = usage.currency !== undefined && usage.estimatedCost !== undefined;
+  const hasUnpricedModels = hasPricing && usage.models.some((model) => model.pricing === undefined);
+  const isLowerBound = hasUnpricedModels || !usage.complete;
+  const lines = [
+    "<details>",
+    `<summary>${hasPricing ? "Token usage and estimated cost" : "Token usage"}</summary>`,
+    "",
+  ];
+  if (hasPricing) {
+    lines.push(
+      `- Estimated cost: **${isLowerBound ? "at least " : ""}${escapeMarkdownText(usage.currency ?? "")}${COST_FORMATTER.format(usage.estimatedCost ?? 0)}**`,
+    );
+  }
+  lines.push(
+    `- Total tokens: **${TOKEN_FORMATTER.format(totalTokens(usage.totals))}**`,
+    tokenLine("Input", usage.totals.inputTokens),
+    tokenLine("Output", usage.totals.outputTokens),
+    tokenLine("Cache hit", usage.totals.cacheReadInputTokens),
+    tokenLine("Cache creation", usage.totals.cacheCreationInputTokens),
+    usage.complete
+      ? "- SDK accounting: complete"
+      : "- SDK accounting: incomplete; totals include only the last valid cumulative snapshot available from each goal.",
+    "- Scope: Claude Agent SDK model usage; external MCP service usage is excluded.",
+    "",
+    "#### Models",
+    "",
+  );
+
+  const modelBlocks = usage.models.map((model) => modelUsageBlock(model, usage.currency));
+  if (modelBlocks.length === 0) modelBlocks.push("- No SDK model usage was reported.");
+  let included = 0;
+  for (const block of modelBlocks) {
+    const omittedAfter = modelBlocks.length - included - 1;
+    const omission =
+      omittedAfter === 0 ? "" : `\n\n- ${omittedAfter} additional model rows omitted.`;
+    const candidate = `${lines.join("\n")}${included === 0 ? "" : "\n\n"}${block}${omission}\n\n</details>`;
+    if (candidate.length > MAX_TOKEN_USAGE_DETAILS_LENGTH) break;
+    lines.push(...(included === 0 ? [] : [""]), block);
+    included += 1;
+  }
+  const omitted = modelBlocks.length - included;
+  if (omitted > 0) lines.push("", `- ${omitted} additional model rows omitted.`);
+  lines.push("", "</details>");
+  return lines.join("\n");
+}
+
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
+  const tokenUsage = buildTokenUsageDetails(review.tokenUsage);
   if (!review.partial && review.findings.length === 0)
-    return [review.marker, "## ✨ Good job!", "", review.summary].join("\n");
+    return [review.marker, "## ✨ Good job!", "", review.summary, "", tokenUsage].join("\n");
 
   const sections = review.partial
     ? [
@@ -388,6 +630,7 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
   if (review.findings.length > 0) {
     sections.push("", review.summary, "", findingDestination(review));
   }
+  sections.push("", tokenUsage);
   if (review.bodyFindings.length > 0) {
     sections.push(
       "",
@@ -424,6 +667,7 @@ export function buildRunSummary(
   goals: readonly GoalResult[],
 ): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
+  const tokenUsage = buildTokenUsageDetails(review.tokenUsage);
   const lines = [
     runSummaryHeading(review),
     "",
@@ -437,6 +681,8 @@ export function buildRunSummary(
       : review.partial && review.findings.length === 0
         ? "No actionable issues were reported by the completed checks."
         : review.summary,
+    "",
+    tokenUsage,
   ];
   if (review.findings.length === 0) return lines.join("\n");
 
@@ -521,6 +767,8 @@ export function buildReviewRequest(
 }
 
 export const aggregateInternals = {
+  aggregateTokenUsage,
+  buildTokenUsageDetails,
   inlineCommentBody,
   normalizeFinding,
   verifyLocation,

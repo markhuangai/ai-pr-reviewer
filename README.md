@@ -2,7 +2,7 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), the relevant pull request conversation, and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary.
+Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), the relevant pull request conversation, and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Claude Agent SDK token usage is combined across every goal and included in a default-collapsed section in both destinations.
 
 ## Consumer workflow
 
@@ -63,6 +63,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `ai-secret`        | yes      |           | API key or auth token for that endpoint.                                                                  |
 | `ai-auth-mode`     | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                             |
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
+| `model-pricing`    | no       |           | Strict JSON with a currency prefix and per-model rates per one million tokens.                            |
 | `review-prompts`   | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                                |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
 | `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, context and diff reading, and output repair.   |
@@ -72,6 +73,62 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `mcp-servers`      | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                           |
 
 Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, and qualifying conversation digest already exist. An owner reply therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
+
+### Token usage and model pricing
+
+The action always combines the latest cumulative SDK usage snapshot from every isolated goal. Configure `model-pricing` to add an estimated cost; omit it to show tokens without any cost text. Every rate is required, must be a finite non-negative JSON number, and is interpreted per one million tokens.
+
+```yaml
+model-pricing: |
+  {
+    "currency": "$",
+    "models": {
+      "review-model": {
+        "input": 1.2,
+        "output": 2,
+        "cache-hit": 0.12,
+        "cache-creation": 0.6
+      }
+    }
+  }
+```
+
+`currency` is preserved as an exact prefix. For example, `$` produces `$0.36`, `USD` produces `USD0.36`, and <code>USD&nbsp;</code> (with a trailing space) produces `USD 0.36`. Model matching is case-sensitive. The raw SDK model ID is checked first, then its canonical model ID. A model without a matching price remains in the token total, is marked `unpriced`, and makes the estimated cost a lower bound. Incomplete SDK accounting also makes the estimate a lower bound.
+
+For 100,000 input tokens, 50,000 output tokens, 1,000,000 cache-hit tokens, and 30,000 cache-creation tokens, the PR review and run summary include this default-collapsed source:
+
+```markdown
+<details>
+<summary>Token usage and estimated cost</summary>
+
+- Estimated cost: **$0.36**
+- Total tokens: **1,180,000**
+  - Input: 100,000
+  - Output: 50,000
+  - Cache hit: 1,000,000
+  - Cache creation: 30,000
+- SDK accounting: complete
+- Scope: Claude Agent SDK model usage; external MCP service usage is excluded.
+
+#### Models
+
+- <code>review-model</code>: 1,180,000 tokens
+  - Input: 100,000
+  - Output: 50,000
+  - Cache hit: 1,000,000
+  - Cache creation: 30,000
+  - Rates per 1M tokens: input $1.2; output $2; cache hit $0.12; cache creation $0.6
+
+</details>
+```
+
+The calculation sums unrounded model costs and rounds only the grand total to two decimal places:
+
+```text
+(input × input rate + output × output rate + cache hit × cache-hit rate + cache creation × cache-creation rate) / 1,000,000
+```
+
+Failed goals still contribute a valid SDK snapshot. If a goal crashes after reporting usage, the last valid cumulative snapshot is retained and SDK accounting is marked incomplete. Usage incurred inside an external MCP service is outside the SDK totals.
 
 ### Summary-only event review
 
@@ -149,6 +206,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
 - Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
+- Claude Agent SDK model usage is cumulative within each goal session, so only its latest valid result snapshot is retained before usage is combined across goals. Repair-turn results are never added together.
 - The action includes non-empty PR-level comments and review bodies from human users other than the authenticated PAT identity. An inline thread is included when it has a qualifying human reply; the complete selected thread is preserved so the finding and all replies remain together. Bot, GitHub App, and action-authored content cannot select context on their own.
 - Conversation text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
 - The action streams one immutable conversation snapshot and one immutable merge-base-to-head Git text diff to every goal through independent ordered, bounded readers. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. `submit_review` is rejected until both inputs have been read to completion; there is no fixed aggregate character limit.

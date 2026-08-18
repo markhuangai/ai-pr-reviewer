@@ -68,6 +68,20 @@ function redactGoals(
   return goals.map((goal) => ({
     ...goal,
     ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
+    ...(goal.tokenUsage === undefined
+      ? {}
+      : {
+          tokenUsage: {
+            ...goal.tokenUsage,
+            models: goal.tokenUsage.models.map((usage) => ({
+              ...usage,
+              model: redact(usage.model, secrets),
+              ...(usage.canonicalModel === undefined
+                ? {}
+                : { canonicalModel: redact(usage.canonicalModel, secrets) }),
+            })),
+          },
+        }),
     ...(goal.submission === undefined
       ? {}
       : {
@@ -285,7 +299,18 @@ export async function runAction(
       return { skipped: false, review };
     }
     if (review.allGoalsFailed) {
-      throw new Error("All review goals failed; no pull request review was posted.");
+      await assertCurrentHead(api, context);
+      await assertWorkspace(context, workspace);
+      await assertCurrentConversation(
+        api,
+        context,
+        authenticatedLogin,
+        conversation.snapshot.digest,
+      );
+      await dependencies.writeSummary(context, review, goals);
+      throw new Error(
+        "All review goals failed; no pull request review was posted, and the result was written to the run summary.",
+      );
     }
 
     const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
