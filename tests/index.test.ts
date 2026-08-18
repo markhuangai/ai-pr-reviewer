@@ -750,6 +750,7 @@ test("does not post an interactive review when every goal fails", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   let reviews = 0;
+  const summaries: string[] = [];
   const api = {
     ...emptyConversationApi(),
     getPullRequestRefs: () =>
@@ -766,12 +767,36 @@ test("does not post an interactive review when every goal fails", async (t) => {
       readEventContext: () => Promise.resolve(context),
       createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
       runGoals: () =>
-        Promise.resolve([{ prompt: "correctness", status: "failed", error: "failed" }]),
-      writeSummary: () => Promise.resolve(),
+        Promise.resolve([
+          {
+            prompt: "correctness",
+            status: "failed",
+            error: "failed",
+            tokenUsage: {
+              complete: true,
+              models: [
+                {
+                  model: "review-model",
+                  inputTokens: 4,
+                  outputTokens: 3,
+                  cacheReadInputTokens: 2,
+                  cacheCreationInputTokens: 1,
+                },
+              ],
+            },
+          },
+        ]),
+      writeSummary: (summaryContext, review, goals) => {
+        summaries.push(buildRunSummary(summaryContext, review, goals));
+        return Promise.resolve();
+      },
     }),
     /no pull request review was posted/u,
   );
   assert.equal(reviews, 0);
+  assert.equal(summaries.length, 1);
+  assert.match(summaries[0] ?? "", /AI review failed/u);
+  assert.match(summaries[0] ?? "", /Total tokens: \*\*10\*\*/u);
 });
 
 test("workspace validation rejects a different HEAD", async (t) => {

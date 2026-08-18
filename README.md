@@ -93,7 +93,7 @@ model-pricing: |
   }
 ```
 
-`currency` is preserved as an exact prefix. For example, `$` produces `$0.36`, `USD` produces `USD0.36`, and `USD ` produces `USD 0.36`. Model matching is case-sensitive. The raw SDK model ID is checked first, then its canonical model ID. A model without a matching price remains in the token total, is marked `unpriced`, and makes the estimated cost a lower bound. Incomplete SDK accounting also makes the estimate a lower bound.
+`currency` is preserved as an exact prefix. For example, `$` produces `$0.36`, `USD` produces `USD0.36`, and <code>USD&nbsp;</code> (with a trailing space) produces `USD 0.36`. Model matching is case-sensitive. The raw SDK model ID is checked first, then its canonical model ID. A model without a matching price remains in the token total, is marked `unpriced`, and makes the estimated cost a lower bound. Incomplete SDK accounting also makes the estimate a lower bound.
 
 For 100,000 input tokens, 50,000 output tokens, 1,000,000 cache-hit tokens, and 30,000 cache-creation tokens, the PR review and run summary include this default-collapsed source:
 
