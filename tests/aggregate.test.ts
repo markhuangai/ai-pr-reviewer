@@ -65,9 +65,197 @@ test("renders a clean review without exposing goal internals", () => {
   const review = aggregateReview(context, config, files, goals);
   const body = buildReviewBody(review, goals);
 
-  assert.equal(body, `${review.marker}\n## ✨ Good job!\n\nNo actionable issues found.`);
+  assert.match(body, new RegExp(`^${review.marker}\\n## ✨ Good job!`, "u"));
+  assert.match(body, /<summary>Token usage<\/summary>/u);
+  assert.doesNotMatch(body, /estimated cost|Pricing:|Rates per 1M/iu);
   assert.equal(review.event, "APPROVE");
   assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
+});
+
+test("combines token usage across every goal without showing cost when pricing is absent", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "one",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+      tokenUsage: {
+        complete: true,
+        models: [
+          {
+            model: "review-model",
+            canonicalModel: "canonical-model",
+            inputTokens: 100,
+            outputTokens: 20,
+            cacheReadInputTokens: 300,
+            cacheCreationInputTokens: 40,
+          },
+        ],
+      },
+    },
+    {
+      prompt: "two",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+      tokenUsage: {
+        complete: true,
+        models: [
+          {
+            model: "review-model",
+            canonicalModel: "canonical-model",
+            inputTokens: 5,
+            outputTokens: 2,
+            cacheReadInputTokens: 30,
+            cacheCreationInputTokens: 4,
+          },
+        ],
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.deepEqual(review.tokenUsage.totals, {
+    inputTokens: 105,
+    outputTokens: 22,
+    cacheReadInputTokens: 330,
+    cacheCreationInputTokens: 44,
+  });
+  assert.equal(review.tokenUsage.models.length, 1);
+  assert.equal(review.tokenUsage.complete, true);
+  for (const rendered of [body, summary]) {
+    assert.match(rendered, /<details>\n<summary>Token usage<\/summary>/u);
+    assert.doesNotMatch(rendered, /<details open/iu);
+    assert.match(rendered, /- Total tokens: \*\*501\*\*/u);
+    assert.match(rendered, /<code>review-model<\/code>: 501 tokens/u);
+    assert.doesNotMatch(rendered, /cost|Pricing:|unpriced|Rates per 1M/iu);
+  }
+});
+
+test("prices raw model IDs before canonical IDs and labels unknown models as a lower bound", () => {
+  const pricedConfig: ReviewConfig = {
+    ...config,
+    modelPricing: {
+      currency: "$",
+      models: {
+        alias: { input: 1, output: 0, cacheHit: 0, cacheCreation: 0 },
+        canonical: { input: 100, output: 0, cacheHit: 0, cacheCreation: 0 },
+        "canonical-only": { input: 2, output: 0, cacheHit: 0, cacheCreation: 0 },
+      },
+    },
+  };
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "pricing",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+      tokenUsage: {
+        complete: true,
+        models: [
+          {
+            model: "alias",
+            canonicalModel: "canonical",
+            inputTokens: 1_000_000,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+          {
+            model: "provider-id",
+            canonicalModel: "canonical-only",
+            inputTokens: 1_000_000,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+          {
+            model: "ALIAS",
+            canonicalModel: "CANONICAL",
+            inputTokens: 1_000_000,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        ],
+      },
+    },
+  ];
+  const review = aggregateReview(context, pricedConfig, files, goals);
+  const body = buildReviewBody(review, goals);
+
+  assert.equal(review.tokenUsage.estimatedCost, 3);
+  assert.equal(
+    review.tokenUsage.models.find((usage) => usage.model === "alias")?.pricingModel,
+    "alias",
+  );
+  assert.equal(
+    review.tokenUsage.models.find((usage) => usage.model === "provider-id")?.pricingModel,
+    "canonical-only",
+  );
+  assert.equal(
+    review.tokenUsage.models.find((usage) => usage.model === "ALIAS")?.pricing,
+    undefined,
+  );
+  assert.match(body, /Estimated cost: \*\*at least \$3\.00\*\*/u);
+  assert.match(body, /<code>ALIAS<\/code>:[\s\S]*Pricing: \*\*unpriced\*\*/u);
+  assert.match(body, /Pricing match: <code>canonical-only<\/code>/u);
+});
+
+test("rounds only the grand total and preserves escaped currency and model text", () => {
+  const dangerousModel = "</details>\n# injected";
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "pricing",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+      tokenUsage: {
+        complete: true,
+        models: [
+          {
+            model: dangerousModel,
+            inputTokens: 100_000,
+            outputTokens: 50_000,
+            cacheReadInputTokens: 1_000_000,
+            cacheCreationInputTokens: 30_000,
+          },
+        ],
+      },
+    },
+  ];
+  const rates = { input: 1.2, output: 2, cacheHit: 0.12, cacheCreation: 0.6 };
+  for (const [currency, expected] of [
+    ["$", "$0.36"],
+    ["USD", "USD0.36"],
+    ["USD ", "USD 0.36"],
+  ] as const) {
+    const review = aggregateReview(
+      context,
+      { ...config, modelPricing: { currency, models: { [dangerousModel]: rates } } },
+      files,
+      goals,
+    );
+    const body = buildReviewBody(review, goals);
+    const summary = buildRunSummary(context, review, goals);
+    assert.ok(Math.abs((review.tokenUsage.estimatedCost ?? 0) - 0.358) < 1e-12);
+    for (const rendered of [body, summary]) {
+      assert.ok(rendered.includes(`Estimated cost: **${expected}**`));
+      assert.match(rendered, /Rates per 1M tokens: input/u);
+      assert.doesNotMatch(rendered, /calculated line item/iu);
+      assert.match(rendered, /<code>&lt;\/details&gt;&#10;# injected<\/code>/u);
+      assert.doesNotMatch(rendered, /<\/details>\n# injected/u);
+    }
+  }
+
+  const escaped = aggregateReview(
+    context,
+    {
+      ...config,
+      modelPricing: { currency: "</summary>\n# cost ", models: { [dangerousModel]: rates } },
+    },
+    files,
+    goals,
+  );
+  assert.match(buildReviewBody(escaped, goals), /&lt;\/summary&gt;&#10;\\# cost 0\.36/u);
 });
 
 test("formats four public severities without exposing goal provenance", () => {
@@ -306,6 +494,58 @@ test("does not include secrets in duplicate markers", () => {
           type: "http",
           url: "https://mcp.example.test",
           headers: { Authorization: "tenant-a" },
+        },
+      },
+    }),
+  );
+});
+
+test("includes stable pricing configuration in duplicate marker identity", () => {
+  const first: ReviewConfig = {
+    ...config,
+    modelPricing: {
+      currency: "$",
+      models: {
+        beta: { input: 2, output: 3, cacheHit: 0.2, cacheCreation: 0.4 },
+        alpha: { input: 1, output: 4, cacheHit: 0.1, cacheCreation: 0.5 },
+      },
+    },
+  };
+  const reordered: ReviewConfig = {
+    ...config,
+    modelPricing: {
+      currency: "$",
+      models: {
+        alpha: { input: 1, output: 4, cacheHit: 0.1, cacheCreation: 0.5 },
+        beta: { input: 2, output: 3, cacheHit: 0.2, cacheCreation: 0.4 },
+      },
+    },
+  };
+
+  assert.equal(reviewMarker(context, first), reviewMarker(context, reordered));
+  assert.notEqual(reviewMarker(context, first), reviewMarker(context, config));
+  assert.notEqual(
+    reviewMarker(context, first),
+    reviewMarker(context, {
+      ...reordered,
+      modelPricing: {
+        currency: "$",
+        models: {
+          alpha: { input: 1, output: 4, cacheHit: 0.1, cacheCreation: 0.5 },
+          beta: { input: 2.1, output: 3, cacheHit: 0.2, cacheCreation: 0.4 },
+        },
+      },
+    }),
+  );
+  assert.notEqual(
+    reviewMarker(context, first),
+    reviewMarker(context, {
+      ...reordered,
+      modelPricing: {
+        currency: "USD",
+        models: {
+          alpha: { input: 1, output: 4, cacheHit: 0.1, cacheCreation: 0.5 },
+          beta: { input: 2, output: 3, cacheHit: 0.2, cacheCreation: 0.4 },
         },
       },
     }),
@@ -676,6 +916,86 @@ test("labels partial and all-failed run summaries", () => {
   assert.match(failedSummary, /- Result: failed/u);
   assert.match(failedSummary, /see the step logs for redacted diagnostics/u);
   assert.doesNotMatch(failedSummary, /PRIVATE FAILURE/u);
+});
+
+test("includes failed-goal snapshots and marks crashed accounting incomplete", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "provider failure",
+      status: "failed",
+      error: "provider failed",
+      tokenUsage: {
+        complete: true,
+        models: [
+          {
+            model: "review-model",
+            inputTokens: 10,
+            outputTokens: 2,
+            cacheReadInputTokens: 3,
+            cacheCreationInputTokens: 4,
+          },
+        ],
+      },
+    },
+    {
+      prompt: "reader crash",
+      status: "failed",
+      error: "reader crashed",
+      tokenUsage: {
+        complete: false,
+        models: [
+          {
+            model: "review-model",
+            inputTokens: 20,
+            outputTokens: 4,
+            cacheReadInputTokens: 6,
+            cacheCreationInputTokens: 8,
+          },
+        ],
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.deepEqual(review.tokenUsage.totals, {
+    inputTokens: 30,
+    outputTokens: 6,
+    cacheReadInputTokens: 9,
+    cacheCreationInputTokens: 12,
+  });
+  assert.equal(review.tokenUsage.complete, false);
+  assert.match(summary, /Total tokens: \*\*57\*\*/u);
+  assert.match(summary, /SDK accounting: incomplete/u);
+});
+
+test("keeps the collapsed token block within review and run-summary limits", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "many models",
+      status: "completed",
+      submission: { summary: "clean", findings: [] },
+      tokenUsage: {
+        complete: true,
+        models: Array.from({ length: 1_000 }, (_, index) => ({
+          model: `model-${String(index).padStart(4, "0")}-${"界".repeat(1_000)}`,
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 1,
+          cacheCreationInputTokens: 1,
+        })),
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.ok(body.length <= 60_000);
+  assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
+  assert.match(body, /additional model rows omitted/u);
+  assert.match(body, /<details>\n<summary>Token usage<\/summary>[\s\S]*<\/details>/u);
+  assert.doesNotMatch(body, /<details open/iu);
 });
 
 test("caps run summaries by UTF-8 bytes without cutting a finding", () => {

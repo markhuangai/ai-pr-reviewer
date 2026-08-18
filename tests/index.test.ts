@@ -168,6 +168,19 @@ test("redacts generated AI prompts without dropping them", () => {
       {
         prompt: "security",
         status: "completed",
+        tokenUsage: {
+          complete: true,
+          models: [
+            {
+              model: "provider-private-token",
+              canonicalModel: "private-token-canonical",
+              inputTokens: 1,
+              outputTokens: 2,
+              cacheReadInputTokens: 3,
+              cacheCreationInputTokens: 4,
+            },
+          ],
+        },
         submission: {
           summary: "finding",
           findings: [
@@ -196,6 +209,8 @@ test("redacts generated AI prompts without dropping them", () => {
   );
 
   assert.equal(goal?.submission?.findings[0]?.body, "The value [REDACTED] is exposed.");
+  assert.equal(goal?.tokenUsage?.models[0]?.model, "provider-[REDACTED]");
+  assert.equal(goal?.tokenUsage?.models[0]?.canonicalModel, "[REDACTED]-canonical");
   assert.equal(
     goal?.submission?.findings[0]?.agentPrompt,
     "Impact: [REDACTED] is exposed.\nRequested fix: Remove [REDACTED].",

@@ -35,6 +35,7 @@ import type {
   PullRequestContext,
   ReviewConfig,
   ReviewFinding,
+  ReviewModelUsage,
 } from "../lib/types.js";
 
 const MAX_REPAIR_ATTEMPTS = 5;
@@ -811,6 +812,57 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function modelUsageSnapshot(value: unknown): readonly ReviewModelUsage[] | undefined {
+  if (!isRecord(value)) return undefined;
+  const models: ReviewModelUsage[] = [];
+  for (const [model, rawUsage] of Object.entries(value)) {
+    if (!isRecord(rawUsage)) return undefined;
+    const inputTokens = rawUsage.inputTokens;
+    const outputTokens = rawUsage.outputTokens;
+    const cacheReadInputTokens = rawUsage.cacheReadInputTokens;
+    const cacheCreationInputTokens = rawUsage.cacheCreationInputTokens;
+    if (
+      !isTokenCount(inputTokens) ||
+      !isTokenCount(outputTokens) ||
+      !isTokenCount(cacheReadInputTokens) ||
+      !isTokenCount(cacheCreationInputTokens)
+    ) {
+      return undefined;
+    }
+    if (
+      rawUsage.canonicalModel !== undefined &&
+      (typeof rawUsage.canonicalModel !== "string" || rawUsage.canonicalModel.length === 0)
+    ) {
+      return undefined;
+    }
+    models.push({
+      model,
+      ...(rawUsage.canonicalModel === undefined ? {} : { canonicalModel: rawUsage.canonicalModel }),
+      inputTokens,
+      outputTokens,
+      cacheReadInputTokens,
+      cacheCreationInputTokens,
+    });
+  }
+  return models.sort(
+    (left, right) =>
+      left.model.localeCompare(right.model) ||
+      (left.canonicalModel ?? "").localeCompare(right.canonicalModel ?? ""),
+  );
+}
+
+function withTokenUsage(
+  result: Omit<GoalResult, "tokenUsage">,
+  models: readonly ReviewModelUsage[],
+  complete: boolean,
+): GoalResult {
+  return { ...result, tokenUsage: { models, complete } };
+}
+
 function isWithinRepository(cwd: string, candidate: string): boolean {
   const root = resolve(cwd);
   const target = resolve(root, candidate);
@@ -1526,6 +1578,10 @@ export async function runReviewGoal(
   let turn = deferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
+  const tokenUsageState: {
+    models: readonly ReviewModelUsage[];
+    latestSnapshotValid: boolean;
+  } = { models: [], latestSnapshotValid: false };
   let repairAttempts = 0;
   try {
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
@@ -1554,6 +1610,9 @@ export async function runReviewGoal(
             logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
           });
           if (message.type === "result") {
+            const snapshot = modelUsageSnapshot(message.modelUsage);
+            tokenUsageState.latestSnapshotValid = snapshot !== undefined;
+            if (snapshot !== undefined) tokenUsageState.models = snapshot;
             const completedTurn = turn;
             turn = deferred<SDKResultMessage>();
             completedTurn.resolve(message);
@@ -1597,36 +1656,48 @@ export async function runReviewGoal(
         input.finish();
         await reader;
         if (mcpFailures.length > 0) {
-          return {
-            prompt: goal,
-            status: "failed",
-            submission,
-            error: `Configured MCP server failure: ${mcpFailures.map((status) => `${status.name}: ${status.error ?? status.status}`).join("; ")}`,
-          };
+          return withTokenUsage(
+            {
+              prompt: goal,
+              status: "failed",
+              submission,
+              error: `Configured MCP server failure: ${mcpFailures.map((status) => `${status.name}: ${status.error ?? status.status}`).join("; ")}`,
+            },
+            tokenUsageState.models,
+            readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+          );
         }
-        return {
-          prompt: goal,
-          status: "completed",
-          submission,
-        };
+        return withTokenUsage(
+          { prompt: goal, status: "completed", submission },
+          tokenUsageState.models,
+          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+        );
       }
       if (result.subtype !== "success") {
         input.finish();
         await reader;
-        return {
-          prompt: goal,
-          status: "failed",
-          error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
-        };
+        return withTokenUsage(
+          {
+            prompt: goal,
+            status: "failed",
+            error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
+          },
+          tokenUsageState.models,
+          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+        );
       }
       if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
         input.finish();
         await reader;
-        return {
-          prompt: goal,
-          status: "failed",
-          error: "Claude did not submit a valid review after five repair attempts.",
-        };
+        return withTokenUsage(
+          {
+            prompt: goal,
+            status: "failed",
+            error: "Claude did not submit a valid review after five repair attempts.",
+          },
+          tokenUsageState.models,
+          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+        );
       }
       repairAttempts += 1;
       const repairMessage = makeUserMessage(
@@ -1645,11 +1716,15 @@ export async function runReviewGoal(
     }
     input.finish();
     await reader;
-    return {
-      prompt: goal,
-      status: "failed",
-      error: "Claude did not submit a valid review after five repair attempts.",
-    };
+    return withTokenUsage(
+      {
+        prompt: goal,
+        status: "failed",
+        error: "Claude did not submit a valid review after five repair attempts.",
+      },
+      tokenUsageState.models,
+      readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+    );
   } catch (error) {
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       write(
@@ -1665,7 +1740,11 @@ export async function runReviewGoal(
     });
     input.finish();
     if (reader) await reader.catch(() => undefined);
-    return { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) };
+    return withTokenUsage(
+      { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) },
+      tokenUsageState.models,
+      false,
+    );
   } finally {
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -1757,6 +1836,7 @@ export const agentInternals = {
   PullRequestConversationReader,
   PullRequestDiffReader,
   startReviewPrompt,
+  modelUsageSnapshot,
   toSubmission,
   redactAgentLog,
   REVIEW_SYSTEM_PROMPT,

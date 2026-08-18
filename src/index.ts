@@ -68,6 +68,20 @@ function redactGoals(
   return goals.map((goal) => ({
     ...goal,
     ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
+    ...(goal.tokenUsage === undefined
+      ? {}
+      : {
+          tokenUsage: {
+            ...goal.tokenUsage,
+            models: goal.tokenUsage.models.map((usage) => ({
+              ...usage,
+              model: redact(usage.model, secrets),
+              ...(usage.canonicalModel === undefined
+                ? {}
+                : { canonicalModel: redact(usage.canonicalModel, secrets) }),
+            })),
+          },
+        }),
     ...(goal.submission === undefined
       ? {}
       : {

@@ -29,12 +29,39 @@ export interface HttpMcpServer {
   readonly alwaysLoad?: boolean;
 }
 
+export interface ModelPricingRates {
+  readonly input: number;
+  readonly output: number;
+  readonly cacheHit: number;
+  readonly cacheCreation: number;
+}
+
+export interface ModelPricingConfig {
+  readonly currency: string;
+  readonly models: Readonly<Record<string, ModelPricingRates>>;
+}
+
+export interface ReviewModelUsage {
+  readonly model: string;
+  readonly canonicalModel?: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadInputTokens: number;
+  readonly cacheCreationInputTokens: number;
+}
+
+export interface GoalTokenUsage {
+  readonly models: readonly ReviewModelUsage[];
+  readonly complete: boolean;
+}
+
 export interface ReviewConfig {
   readonly githubToken: string;
   readonly aiBaseUrl: string;
   readonly aiSecret: string;
   readonly aiAuthMode: AuthMode;
   readonly model: string;
+  readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly string[];
   readonly parallelCount: number;
   readonly maxTurns: number;
@@ -97,6 +124,27 @@ export interface GoalResult {
   readonly status: "completed" | "failed";
   readonly submission?: GoalSubmission;
   readonly error?: string;
+  readonly tokenUsage?: GoalTokenUsage;
+}
+
+export interface TokenCounts {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadInputTokens: number;
+  readonly cacheCreationInputTokens: number;
+}
+
+export interface AggregatedModelUsage extends ReviewModelUsage {
+  readonly pricingModel?: string;
+  readonly pricing?: ModelPricingRates;
+}
+
+export interface AggregatedTokenUsage {
+  readonly models: readonly AggregatedModelUsage[];
+  readonly totals: TokenCounts;
+  readonly complete: boolean;
+  readonly currency?: string;
+  readonly estimatedCost?: number;
 }
 
 export interface AggregatedFinding extends ReviewFinding {
@@ -113,6 +161,7 @@ export interface AggregatedReview {
   readonly event: ReviewEvent;
   readonly partial: boolean;
   readonly allGoalsFailed: boolean;
+  readonly tokenUsage: AggregatedTokenUsage;
 }
 
 export interface PullRequestReviewComment {
