@@ -287,18 +287,14 @@ function readContextFilePath(value: unknown, path: string): string {
 
 function parseReviewGoal(value: unknown, index: number): ReviewGoal {
   const path = `review-prompts[${index}]`;
-  if (typeof value === "string") {
-    return { prompt: readString(value, path, MAX_PROMPT_LENGTH), files: [] };
-  }
-  if (!isRecord(value)) throw new Error(`${path} must be a string or an object.`);
+  if (!isRecord(value)) throw new Error(`${path} must be an object.`);
   const allowed = new Set(["prompt", "files"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`${path}.${key} is not supported.`);
   }
   const prompt = readString(value.prompt, `${path}.prompt`, MAX_PROMPT_LENGTH);
-  if (!Array.isArray(value.files) || value.files.length === 0) {
-    throw new Error(`${path}.files must be a non-empty array.`);
-  }
+  if (value.files === undefined) return { prompt, files: [] };
+  if (!Array.isArray(value.files)) throw new Error(`${path}.files must be an array.`);
   if (value.files.length > MAX_CONTEXT_FILES_PER_PROMPT) {
     throw new Error(`${path}.files supports at most ${MAX_CONTEXT_FILES_PER_PROMPT} files.`);
   }
@@ -316,34 +312,22 @@ function parseReviewPrompts(raw: string): readonly ReviewGoal[] {
   if (value.length === 0)
     throw new Error("Input 'review-prompts' must contain at least one prompt.");
   let prompts: unknown;
-  let parsedJson = false;
   try {
     prompts = JSON.parse(value) as unknown;
-    parsedJson = true;
   } catch {
-    if (value.startsWith("[") || value.startsWith("{")) {
-      throw new Error("Input 'review-prompts' must be valid JSON.");
-    }
-    prompts = value
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
+    throw new Error("Input 'review-prompts' must be valid JSON.");
   }
-  if (parsedJson) {
-    const document = parseDocument(value, {
-      prettyErrors: false,
-      schema: "json",
-      uniqueKeys: true,
-      version: "1.2",
-    });
-    if (document.errors.length > 0) {
-      throw new Error("Input 'review-prompts' must be valid JSON with unique object keys.");
-    }
+  const document = parseDocument(value, {
+    prettyErrors: false,
+    schema: "json",
+    uniqueKeys: true,
+    version: "1.2",
+  });
+  if (document.errors.length > 0) {
+    throw new Error("Input 'review-prompts' must be valid JSON with unique object keys.");
   }
   if (!Array.isArray(prompts) || prompts.length === 0) {
-    throw new Error(
-      "Input 'review-prompts' must be a JSON array of prompt strings or objects, or one prompt per line.",
-    );
+    throw new Error("Input 'review-prompts' must be a non-empty JSON array of goal objects.");
   }
   if (prompts.length > MAX_PROMPTS)
     throw new Error(`Input 'review-prompts' supports at most ${MAX_PROMPTS} prompts.`);
