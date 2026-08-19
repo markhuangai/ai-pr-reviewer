@@ -12,14 +12,17 @@ function reader(values: Record<string, string>) {
   return { get: (name: string): string => values[name] ?? "" };
 }
 
-test("reads newline-separated goals and strict HTTP MCP configuration", () => {
+test("reads structured goals and strict HTTP MCP configuration", () => {
   const config = readReviewConfig(
     reader({
       "github-pat": "ghp_test",
       "ai-base-url": "https://ai.example.test/v1/",
       "ai-secret": "secret",
       model: "review-model",
-      "review-prompts": "first goal\n\nsecond goal",
+      "review-prompts": JSON.stringify([
+        { prompt: "first goal" },
+        { prompt: "second goal", files: [] },
+      ]),
       "mcp-servers": `
 security:
   type: http
@@ -48,17 +51,38 @@ security:
   );
 });
 
-test("accepts JSON goal arrays", () => {
-  assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), [
-    { prompt: "one", files: [] },
-    { prompt: "two", files: [] },
-  ]);
+test("accepts goals with omitted, empty, and populated context files", () => {
+  assert.deepEqual(
+    inputInternals.parseReviewPrompts(
+      JSON.stringify([
+        { prompt: "omitted files" },
+        { prompt: "empty files", files: [] },
+        { prompt: "populated files", files: ["/tmp/ticket.json"] },
+      ]),
+    ),
+    [
+      { prompt: "omitted files", files: [] },
+      { prompt: "empty files", files: [] },
+      { prompt: "populated files", files: ["/tmp/ticket.json"] },
+    ],
+  );
+});
+
+test("rejects legacy string goals", () => {
+  assert.throws(
+    () => inputInternals.parseReviewPrompts('["one", "two"]'),
+    /review-prompts\[0\] must be an object/u,
+  );
+  assert.throws(() => inputInternals.parseReviewPrompts("one\ntwo"), /must be valid JSON/u);
 });
 
 test("accepts exact context files on individual goals", () => {
   assert.deepEqual(
     inputInternals.parseReviewPrompts(
-      JSON.stringify([{ prompt: "use ticket", files: ["/tmp/ticket.json"] }, "review concurrency"]),
+      JSON.stringify([
+        { prompt: "use ticket", files: ["/tmp/ticket.json"] },
+        { prompt: "review concurrency" },
+      ]),
     ),
     [
       { prompt: "use ticket", files: ["/tmp/ticket.json"] },
@@ -73,7 +97,7 @@ test("reads and validates optional model effort", () => {
     "ai-base-url": "https://ai.example.test",
     "ai-secret": "secret",
     model: "model",
-    "review-prompts": "goal",
+    "review-prompts": JSON.stringify([{ prompt: "goal" }]),
   };
   for (const [input, expected] of [
     ["low", "low"],
@@ -135,7 +159,7 @@ test("reads strict model pricing while preserving the currency prefix", () => {
           },
         },
       }),
-      "review-prompts": "goal",
+      "review-prompts": JSON.stringify([{ prompt: "goal" }]),
     }),
   );
   assert.equal(config.modelPricing?.currency, "$");
@@ -231,7 +255,7 @@ test("rejects invalid numeric and boolean inputs", () => {
     "ai-base-url": "https://ai.example.test",
     "ai-secret": "secret",
     model: "model",
-    "review-prompts": "goal",
+    "review-prompts": JSON.stringify([{ prompt: "goal" }]),
     "parallel-count": "0",
   };
   assert.throws(() => readReviewConfig(reader(values)), /parallel-count.*between 1 and 10/);
@@ -260,7 +284,7 @@ test("reads summary-only and pull request URL inputs", () => {
       "ai-base-url": "https://ai.example.test",
       "ai-secret": "secret",
       model: "model",
-      "review-prompts": "goal",
+      "review-prompts": JSON.stringify([{ prompt: "goal" }]),
       "interact-with-pr": "false",
       "pull-request-url": "https://github.com/owner/repository/pull/42/",
     }),
@@ -397,7 +421,7 @@ test("rejects malformed URLs, prompts, required values, and auth modes", () => {
     "ai-base-url": "https://ai.example.test",
     "ai-secret": "secret",
     model: "model",
-    "review-prompts": "goal",
+    "review-prompts": JSON.stringify([{ prompt: "goal" }]),
   };
   for (const [value, message] of [
     ["not-a-url", /absolute HTTP\(S\) URL/u],
@@ -428,14 +452,17 @@ test("rejects malformed URLs, prompts, required values, and auth modes", () => {
 
   for (const [value, message] of [
     ["", /at least one prompt/u],
-    ["{}", /JSON array/u],
-    ["[]", /JSON array/u],
+    ["goal", /valid JSON/u],
+    ["one\ntwo", /valid JSON/u],
+    ["{}", /non-empty JSON array of goal objects/u],
+    ["[]", /non-empty JSON array of goal objects/u],
     ["[", /valid JSON/u],
-    [JSON.stringify(Array.from({ length: 51 }, () => "goal")), /at most 50 prompts/u],
-    [JSON.stringify([1]), /must be a string or an object/u],
-    [JSON.stringify([" "]), /must be a non-empty string/u],
-    [JSON.stringify(["x".repeat(12_001)]), /must not exceed 12000 characters/u],
-    [JSON.stringify([{ prompt: "goal", files: [] }]), /non-empty array/u],
+    [JSON.stringify(Array.from({ length: 51 }, () => ({ prompt: "goal" }))), /at most 50 prompts/u],
+    [JSON.stringify([1]), /must be an object/u],
+    [JSON.stringify([" "]), /must be an object/u],
+    [JSON.stringify([{ prompt: "x".repeat(12_001) }]), /must not exceed 12000 characters/u],
+    [JSON.stringify([{ prompt: "goal", files: null }]), /files must be an array/u],
+    [JSON.stringify([{ prompt: "goal" }, "legacy"]), /must be an object/u],
     [JSON.stringify([{ prompt: "goal", files: ["relative.txt"] }]), /absolute path/u],
     [JSON.stringify([{ prompt: "goal", files: ["/tmp/../ticket.txt"] }]), /normalized/u],
     [
@@ -485,7 +512,7 @@ test("extracts only credential-shaped endpoint and authorization secrets", () =>
       "ai-base-url": "https://ai.example.test?flag&apiKey=encoded%2Fsecret&tenant=public&token=",
       "ai-secret": 'secret"with-escape',
       model: "model",
-      "review-prompts": "goal",
+      "review-prompts": JSON.stringify([{ prompt: "goal" }]),
       "mcp-servers": `
 server:
   type: http

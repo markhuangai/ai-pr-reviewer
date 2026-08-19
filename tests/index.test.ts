@@ -27,7 +27,7 @@ function actionReader(overrides: Readonly<Record<string, string>> = {}): InputRe
     "ai-base-url": "https://ai.example.test",
     "ai-secret": "test-ai-secret",
     model: "review-model",
-    "review-prompts": "correctness",
+    "review-prompts": JSON.stringify([{ prompt: "correctness" }]),
     ...overrides,
   };
   return { get: (name) => values[name] ?? "" };
@@ -416,7 +416,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     "ai-base-url": "https://ai.example.test",
     "ai-secret": "test-ai-secret",
     model: "review-model",
-    "review-prompts": "correctness",
+    "review-prompts": JSON.stringify([{ prompt: "correctness" }]),
     "interact-with-pr": "false",
     "pull-request-url": "https://github.com/target/project/pull/9",
   };
@@ -807,7 +807,10 @@ test("writes failed and partial summary-only results before reporting failure", 
   );
   await assert.rejects(
     runAction(
-      actionReader({ "interact-with-pr": "false", "review-prompts": "one\ntwo" }),
+      actionReader({
+        "interact-with-pr": "false",
+        "review-prompts": JSON.stringify([{ prompt: "one" }, { prompt: "two" }]),
+      }),
       [],
       dependencies([
         { prompt: "one", status: "completed", submission: { summary: "clean", findings: [] } },
@@ -908,7 +911,7 @@ test("main reports input failures without throwing secrets", async (t) => {
     "INPUT_AI-BASE-URL": "https://ai.example.test",
     "INPUT_AI-SECRET": "ai-test-secret",
     INPUT_MODEL: "test-model",
-    "INPUT_REVIEW-PROMPTS": "correctness",
+    "INPUT_REVIEW-PROMPTS": JSON.stringify([{ prompt: "correctness" }]),
     INPUT_TEST_SECRET: "environment-secret",
   });
   process.env.GITHUB_EVENT_PATH = join(root, "environment-secret-missing-event.json");

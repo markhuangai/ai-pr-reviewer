@@ -39,9 +39,11 @@ jobs:
           model: claude-sonnet-4-5
           effort: high
           review-prompts: |
-            Check changed code for correctness and regressions.
-            Check authentication, authorization, and secret-handling paths.
-            Check tests and failure handling for the changed behavior.
+            [
+              { "prompt": "Check changed code for correctness and regressions." },
+              { "prompt": "Check authentication, authorization, and secret-handling paths." },
+              { "prompt": "Check tests and failure handling for the changed behavior." }
+            ]
 ```
 
 Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` for the newest version-1 release candidate. Use an exact tag when the workflow must remain pinned:
@@ -66,7 +68,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
 | `effort`           | no       |           | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                             |
 | `model-pricing`    | no       |           | Strict JSON with a currency prefix and per-model rates per one million tokens.                            |
-| `review-prompts`   | yes      |           | JSON array of goal strings or `{ "prompt", "files" }` objects, or one goal per non-empty line.            |
+| `review-prompts`   | yes      |           | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                            |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
 | `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, context and diff reading, and output repair.   |
 | `auto-approve`     | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.    |
@@ -78,9 +80,31 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, qualifying conversation digest, and authorized context file snapshots already exist. An owner reply or changed context file therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
 
+### Breaking `review-prompts` input change
+
+`review-prompts` now accepts only a non-empty JSON array of goal objects. Each object requires a non-empty `prompt` and may omit `files`, use an empty `files` array, or list exact context file paths. JSON arrays of strings and newline-separated prompts are no longer accepted.
+
+Migrate legacy input such as:
+
+```yaml
+review-prompts: |
+  Check changed code.
+  Check error handling.
+```
+
+to:
+
+```yaml
+review-prompts: |
+  [
+    { "prompt": "Check changed code." },
+    { "prompt": "Check error handling." }
+  ]
+```
+
 ### Per-goal context files
 
-Use a structured goal when a workflow step produces text that is too large or unnecessary to embed in the prompt. The `files` array grants that goal access to exact paths; mentioning a path only in `prompt` does not grant access. String goals and structured goals can be mixed in one strict JSON array.
+Use the optional `files` array when a workflow step produces text that is too large or unnecessary to embed in the prompt. The array grants that goal access to exact paths; mentioning a path only in `prompt` does not grant access. A goal that only needs the checked-out repository can omit `files`.
 
 ```yaml
 - id: ticket_context
@@ -103,7 +127,9 @@ Use a structured goal when a workflow step produces text that is too large or un
           "prompt": ${{ toJSON(format('Review against the ticket. Read {0} if needed.', steps.ticket_context.outputs.path)) }},
           "files": [${{ toJSON(steps.ticket_context.outputs.path) }}]
         },
-        "Check concurrency behavior."
+        {
+          "prompt": "Check concurrency behavior."
+        }
       ]
 ```
 
@@ -175,7 +201,7 @@ Set `interact-with-pr: false` to keep the result out of the pull request. The ac
     ai-base-url: ${{ secrets.AI_BASE_URL }}
     ai-secret: ${{ secrets.AI_SECRET }}
     model: claude-sonnet-4-5
-    review-prompts: Check changed code for correctness and regressions.
+    review-prompts: '[{"prompt":"Check changed code for correctness and regressions."}]'
     interact-with-pr: false
 ```
 
@@ -207,7 +233,7 @@ jobs:
           ai-base-url: ${{ secrets.AI_BASE_URL }}
           ai-secret: ${{ secrets.AI_SECRET }}
           model: claude-sonnet-4-5
-          review-prompts: Check changed code for correctness and regressions.
+          review-prompts: '[{"prompt":"Check changed code for correctness and regressions."}]'
           pull-request-url: ${{ inputs.pull-request-url }}
           interact-with-pr: false
 ```
