@@ -9,6 +9,7 @@ import {
   buildRunSummary,
   reviewMarker,
 } from "./lib/aggregate.js";
+import { prepareContextFiles, type ContextFileArtifact } from "./lib/context-files.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import {
   parsePullRequestUrl,
@@ -28,7 +29,10 @@ import {
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
 import { runReviewGoals } from "./runtime/agent.js";
-import { createPullRequestWorkspace } from "./lib/pull-request-workspace.js";
+import {
+  createPullRequestWorkspace,
+  type PullRequestWorkspace,
+} from "./lib/pull-request-workspace.js";
 import type {
   GoalResult,
   PullRequestContext,
@@ -208,6 +212,18 @@ function registerInputSecrets(secrets: readonly string[]): void {
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
 }
 
+async function cleanupReviewArtifacts(
+  contextFiles: Pick<ContextFileArtifact, "cleanup"> | undefined,
+  temporaryWorkspace: Pick<PullRequestWorkspace, "cleanup"> | undefined,
+): Promise<void> {
+  const cleanups = await Promise.allSettled([
+    contextFiles?.cleanup(),
+    temporaryWorkspace?.cleanup(),
+  ]);
+  const failure = cleanups.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 export async function runAction(
   reader: InputReader = actionInputReader(),
   inputSecrets: readonly string[] = inputSecretCandidates(reader),
@@ -239,13 +255,23 @@ export async function runAction(
       ? undefined
       : await dependencies.createWorkspace(context, config.githubToken);
   const workspace = temporaryWorkspace?.path ?? process.env.GITHUB_WORKSPACE ?? process.cwd();
+  let contextFiles: ContextFileArtifact | undefined;
   try {
     await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
+    contextFiles = await (dependencies.prepareContextFiles ?? prepareContextFiles)(
+      config.reviewPrompts,
+      workspace,
+    );
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
     const conversation = await loadConversation(api, context, authenticatedLogin);
     if (config.interactWithPullRequest) {
-      const marker = reviewMarker(context, config, conversation.snapshot.digest);
+      const marker = reviewMarker(
+        context,
+        config,
+        conversation.snapshot.digest,
+        contextFiles.identity,
+      );
       if (
         conversation.reviews.some(
           (review) =>
@@ -274,10 +300,18 @@ export async function runAction(
       files,
       redactedConversation,
       config,
+      contextFiles.filesByGoal,
       workspace,
     );
     const goals = redactGoals(rawGoals, secrets);
-    const review = aggregateReview(context, config, files, goals, conversation.snapshot.digest);
+    const review = aggregateReview(
+      context,
+      config,
+      files,
+      goals,
+      conversation.snapshot.digest,
+      contextFiles.identity,
+    );
     if (!config.interactWithPullRequest) {
       await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
@@ -340,7 +374,7 @@ export async function runAction(
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
     return { skipped: false, review };
   } finally {
-    await temporaryWorkspace?.cleanup();
+    await cleanupReviewArtifacts(contextFiles, temporaryWorkspace);
   }
 }
 
@@ -348,6 +382,7 @@ interface ActionDependencies {
   readonly createApi: (token: string) => GitHubApi;
   readonly readEventContext: () => Promise<PullRequestContext | undefined>;
   readonly createWorkspace: typeof createPullRequestWorkspace;
+  readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
   readonly writeSummary: typeof writeRunSummary;
 }
@@ -382,5 +417,6 @@ export const indexInternals = {
   inputSecretCandidates,
   redact,
   redactGoals,
+  cleanupReviewArtifacts,
   reviewSecrets: reviewSecretCandidates,
 };

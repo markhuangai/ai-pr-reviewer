@@ -2,13 +2,13 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), the relevant pull request conversation, and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Claude Agent SDK token usage is combined across every goal and included in a default-collapsed section in both destinations.
+Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, read-only repository tools (`Read`, `Glob`, and `Grep`), the relevant pull request conversation, optional exact workflow-provided context files, and any explicitly configured HTTP MCP servers. Their validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Claude Agent SDK token usage is combined across every goal and included in a default-collapsed section in both destinations.
 
 ## Consumer workflow
 
 For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access; it needs write access only when the action may post a review.
 
-Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review.
+Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review. Workflow-generated review context belongs under `RUNNER_TEMP`, not inside `GITHUB_WORKSPACE`.
 
 ```yaml
 name: AI review
@@ -66,7 +66,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
 | `effort`           | no       |           | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                             |
 | `model-pricing`    | no       |           | Strict JSON with a currency prefix and per-model rates per one million tokens.                            |
-| `review-prompts`   | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                                |
+| `review-prompts`   | yes      |           | JSON array of goal strings or `{ "prompt", "files" }` objects, or one goal per non-empty line.            |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
 | `max-turns`        | no       | `50`      | Integer from 2 to 100 per goal session, including `/goal`, context and diff reading, and output repair.   |
 | `auto-approve`     | no       | `false`   | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.    |
@@ -76,7 +76,42 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
 
-Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, and qualifying conversation digest already exist. An owner reply therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
+Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, qualifying conversation digest, and authorized context file snapshots already exist. An owner reply or changed context file therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
+
+### Per-goal context files
+
+Use a structured goal when a workflow step produces text that is too large or unnecessary to embed in the prompt. The `files` array grants that goal access to exact paths; mentioning a path only in `prompt` does not grant access. String goals and structured goals can be mixed in one strict JSON array.
+
+```yaml
+- id: ticket_context
+  shell: bash
+  run: |
+    context_path="$RUNNER_TEMP/ai-pr-review-context/ticket.json"
+    mkdir -p "$(dirname "$context_path")"
+    your-ticket-tool PROJ-123 > "$context_path"
+    echo "path=$context_path" >> "$GITHUB_OUTPUT"
+
+- uses: markhuangai/ai-pr-reviewer@v1-prerelease
+  with:
+    github-pat: ${{ secrets.PR_REVIEW_PAT }}
+    ai-base-url: ${{ secrets.AI_BASE_URL }}
+    ai-secret: ${{ secrets.AI_SECRET }}
+    model: claude-sonnet-4-5
+    review-prompts: |
+      [
+        {
+          "prompt": ${{ toJSON(format('Review against the ticket. Read {0} if needed.', steps.ticket_context.outputs.path)) }},
+          "files": [${{ toJSON(steps.ticket_context.outputs.path) }}]
+        },
+        "Check concurrency behavior."
+      ]
+```
+
+Every path must be normalized and absolute. Each goal supports 25 files, a run supports 100 unique files, each file is limited to 100 MiB, and their unique total is limited to 500 MiB. Files must be regular, single-link UTF-8 text without NUL bytes; symlinks, hard links, directories, devices, FIFOs, and changing files are rejected.
+
+The action captures private immutable snapshots before duplicate detection and adds only the authorized original paths to the generated goal prompt. A goal can optionally read a snapshot in ordered 48 KiB pages through the internal `read_context_file` tool; native `Read`, `Glob`, and `Grep` remain confined to the pristine checkout. The captured bytes and goal association participate in duplicate-review identity, and snapshots are removed when the action ends.
+
+Context file contents are sent to the configured AI endpoint only when the agent reads them. The action omits the page contents from tool-result logs, but paths are logged and the model may repeat relevant excerpts in assistant text or findings. Treat files as untrusted evidence and never authorize credentials, tokens, or unrelated sensitive data.
 
 ### Token usage and model pricing
 
@@ -205,6 +240,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 - Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
 - Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
+- A structured goal may optionally read only its exact authorized workflow context files. Each goal gets independent readers over immutable snapshots, and submitting a review does not require reading optional files.
 - Claude Agent SDK model usage is cumulative within each goal session, so only its latest valid result snapshot is retained before usage is combined across goals. Repair-turn results are never added together.
 - The action includes non-empty PR-level comments and review bodies from human users other than the authenticated PAT identity. An inline thread is included when it has a qualifying human reply; the complete selected thread is preserved so the finding and all replies remain together. Bot, GitHub App, and action-authored content cannot select context on their own.
 - Conversation text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
@@ -213,7 +249,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - The action does not add comment-event triggers. Replies affect the next pull request update, workflow rerun, or separately configured dispatch that invokes the action.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
-- The action writes the full secret-redacted system prompt, `/goal`, review and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, goal iterations, turn results, repairs, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews; hidden model reasoning is not logged.
+- The action writes the full secret-redacted system prompt, `/goal`, review and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, goal iterations, turn results, repairs, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews. Context file tool results log an omission marker instead of page contents; hidden model reasoning is not logged.
 - Findings use four severities: Critical for credible immediate compromise, irreversible data loss, or broad outage; High for serious impact on a reachable path; Moderate for bounded impact or a less likely trigger; and Low for a limited-impact but actionable defect. Informational observations, style preferences, and nits are omitted.
 - Findings are sorted by severity, deduplicated across goals, and limited to 25 inline comments. Each comment uses a severity marker, a short impact statement, and a short fix. Every verified inline finding also includes a default-collapsed prompt that an AI coding agent can use to validate and address it; the prompt is generated from the finding and verified location rather than authored by the review model. A location that is not an added line in the pull request diff is moved into the review body without the prompt.
 - Public reviews never include review prompts, model summaries, goal errors, or goal provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count and rerun guidance; full secret-redacted diagnostics remain in the GitHub Actions log.

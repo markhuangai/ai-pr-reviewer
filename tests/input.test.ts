@@ -30,7 +30,10 @@ security:
 `,
     }),
   );
-  assert.deepEqual(config.reviewPrompts, ["first goal", "second goal"]);
+  assert.deepEqual(config.reviewPrompts, [
+    { prompt: "first goal", files: [] },
+    { prompt: "second goal", files: [] },
+  ]);
   assert.equal(config.aiBaseUrl, "https://ai.example.test/v1");
   assert.equal(config.mcpServers.security?.type, "http");
   assert.equal(config.mcpServers.security?.headers?.Authorization, "Bearer token");
@@ -46,7 +49,22 @@ security:
 });
 
 test("accepts JSON goal arrays", () => {
-  assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), ["one", "two"]);
+  assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), [
+    { prompt: "one", files: [] },
+    { prompt: "two", files: [] },
+  ]);
+});
+
+test("accepts exact context files on individual goals", () => {
+  assert.deepEqual(
+    inputInternals.parseReviewPrompts(
+      JSON.stringify([{ prompt: "use ticket", files: ["/tmp/ticket.json"] }, "review concurrency"]),
+    ),
+    [
+      { prompt: "use ticket", files: ["/tmp/ticket.json"] },
+      { prompt: "review concurrency", files: [] },
+    ],
+  );
 });
 
 test("reads and validates optional model effort", () => {
@@ -410,12 +428,43 @@ test("rejects malformed URLs, prompts, required values, and auth modes", () => {
 
   for (const [value, message] of [
     ["", /at least one prompt/u],
-    ["{}", /JSON string array/u],
-    ["[]", /JSON string array/u],
+    ["{}", /JSON array/u],
+    ["[]", /JSON array/u],
+    ["[", /valid JSON/u],
     [JSON.stringify(Array.from({ length: 51 }, () => "goal")), /at most 50 prompts/u],
-    [JSON.stringify([1]), /must be a non-empty string/u],
+    [JSON.stringify([1]), /must be a string or an object/u],
     [JSON.stringify([" "]), /must be a non-empty string/u],
     [JSON.stringify(["x".repeat(12_001)]), /must not exceed 12000 characters/u],
+    [JSON.stringify([{ prompt: "goal", files: [] }]), /non-empty array/u],
+    [JSON.stringify([{ prompt: "goal", files: ["relative.txt"] }]), /absolute path/u],
+    [JSON.stringify([{ prompt: "goal", files: ["/tmp/../ticket.txt"] }]), /normalized/u],
+    [
+      JSON.stringify([{ prompt: "goal", files: ["/tmp/ticket.txt", "/tmp/ticket.txt"] }]),
+      /duplicate paths/u,
+    ],
+    [
+      JSON.stringify([{ prompt: "goal", files: ["/tmp/ticket.txt"], other: true }]),
+      /not supported/u,
+    ],
+    ['[{"prompt":"one","prompt":"two","files":["/tmp/ticket.txt"]}]', /unique object keys/u],
+    [
+      JSON.stringify([
+        {
+          prompt: "goal",
+          files: Array.from({ length: 26 }, (_, index) => `/tmp/context-${index}.txt`),
+        },
+      ]),
+      /at most 25 files/u,
+    ],
+    [
+      JSON.stringify(
+        Array.from({ length: 5 }, (_, goal) => ({
+          prompt: `goal-${goal}`,
+          files: Array.from({ length: 21 }, (_, file) => `/tmp/context-${goal}-${file}.txt`),
+        })),
+      ),
+      /at most 100 unique context files/u,
+    ],
   ] as const) {
     assert.throws(() => inputInternals.parseReviewPrompts(value), message);
   }

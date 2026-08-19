@@ -34,7 +34,10 @@ const config: ReviewConfig = {
   aiSecret: "ai-secret",
   aiAuthMode: "api-key",
   model: "review-model",
-  reviewPrompts: ["correctness", "security"],
+  reviewPrompts: [
+    { prompt: "correctness", files: [] },
+    { prompt: "security", files: [] },
+  ],
   parallelCount: 2,
   maxTurns: 50,
   autoApprove: true,
@@ -512,6 +515,35 @@ test("does not include secrets in duplicate markers", () => {
       },
     }),
   );
+});
+
+test("binds duplicate review identity to context contents and goal authorization", () => {
+  const ticket = {
+    path: "/runner/context/ticket.json",
+    sizeBytes: 100,
+    sha256: "a".repeat(64),
+  };
+  const policy = {
+    path: "/runner/context/policy.txt",
+    sizeBytes: 200,
+    sha256: "b".repeat(64),
+  };
+  const first = reviewMarker(context, config, "conversation", [[ticket, policy], []]);
+  assert.equal(first, reviewMarker(context, config, "conversation", [[policy, ticket], []]));
+  assert.notEqual(
+    first,
+    reviewMarker(context, config, "conversation", [
+      [{ ...ticket, sha256: "c".repeat(64) }, policy],
+      [],
+    ]),
+  );
+  assert.notEqual(first, reviewMarker(context, config, "conversation", [[], [ticket, policy]]));
+  assert.equal(
+    aggregateReview(context, config, files, [], "conversation", [[ticket, policy], []]).marker,
+    first,
+  );
+  assert.equal(first.includes(ticket.path), false);
+  assert.equal(first.includes(ticket.sha256), false);
 });
 
 test("includes stable pricing configuration in duplicate marker identity", () => {
