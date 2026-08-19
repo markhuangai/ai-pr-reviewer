@@ -129,6 +129,7 @@ export function reviewMarker(
   const fingerprint = JSON.stringify({
     baseSha: context.baseSha,
     model: config.model,
+    ...(config.effort === undefined ? {} : { effort: config.effort }),
     aiBaseUrl: config.aiBaseUrl,
     usesAuthToken: config.aiAuthMode === "auth-token",
     prompts: config.reviewPrompts,

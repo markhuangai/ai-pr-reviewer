@@ -12,6 +12,8 @@ export function markdownFenceLength(value: string): number {
 
 export type AuthMode = "api-key" | "auth-token";
 
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
 export type ReviewEvent = "APPROVE" | "COMMENT";
 
 export interface McpToolPolicy {
@@ -61,6 +63,7 @@ export interface ReviewConfig {
   readonly aiSecret: string;
   readonly aiAuthMode: AuthMode;
   readonly model: string;
+  readonly effort?: EffortLevel;
   readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly string[];
   readonly parallelCount: number;

@@ -1036,6 +1036,7 @@ function safeAgentEnvironment(
     "NODE_PATH",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_EXECUTABLE",
+    "CLAUDE_CODE_EFFORT_LEVEL",
   ]) {
     Reflect.deleteProperty(environment, key);
   }
@@ -1414,6 +1415,7 @@ function makeOptions(
     cwd,
     env: safeAgentEnvironment(config, cwd),
     model: config.model,
+    ...(config.effort === undefined ? {} : { effort: config.effort }),
     maxTurns: config.maxTurns,
     tools: ["Read", "Glob", "Grep"],
     allowedTools: [

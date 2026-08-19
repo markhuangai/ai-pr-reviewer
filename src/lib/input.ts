@@ -2,6 +2,7 @@ import { parseDocument } from "yaml";
 
 import type {
   AuthMode,
+  EffortLevel,
   HttpMcpServer,
   McpToolPolicy,
   ModelPricingConfig,
@@ -377,15 +378,32 @@ function readAuthMode(value: string): AuthMode {
   throw new Error("Input 'ai-auth-mode' must be 'api-key' or 'auth-token'.");
 }
 
+function readEffort(value: string): EffortLevel | undefined {
+  const effort = value.trim().toLowerCase();
+  if (effort.length === 0) return undefined;
+  if (
+    effort === "low" ||
+    effort === "medium" ||
+    effort === "high" ||
+    effort === "xhigh" ||
+    effort === "max"
+  ) {
+    return effort;
+  }
+  throw new Error("Input 'effort' must be 'low', 'medium', 'high', 'xhigh', or 'max'.");
+}
+
 export function readReviewConfig(reader: InputReader): ReviewConfig {
   const pullRequestUrl = reader.get("pull-request-url").trim();
   const modelPricing = parseModelPricing(reader.get("model-pricing"));
+  const effort = readEffort(reader.get("effort"));
   return {
     githubToken: required(reader.get("github-pat"), "github-pat"),
     aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
     aiSecret: required(reader.get("ai-secret"), "ai-secret"),
     aiAuthMode: readAuthMode(reader.get("ai-auth-mode") || "api-key"),
     model: required(reader.get("model"), "model"),
+    ...(effort === undefined ? {} : { effort }),
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
