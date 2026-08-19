@@ -17,6 +17,7 @@ import type {
   Severity,
   TokenCounts,
 } from "./types.js";
+import type { ContextFileIdentityByGoal } from "./context-files.js";
 import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
@@ -125,14 +126,21 @@ export function reviewMarker(
   context: PullRequestContext,
   config: ReviewConfig,
   conversationDigest = EMPTY_CONVERSATION_DIGEST,
+  contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
 ): string {
+  const stableContextFiles = contextFiles.map((files) =>
+    [...files].sort((left, right) => left.path.localeCompare(right.path)),
+  );
   const fingerprint = JSON.stringify({
     baseSha: context.baseSha,
     model: config.model,
     ...(config.effort === undefined ? {} : { effort: config.effort }),
     aiBaseUrl: config.aiBaseUrl,
     usesAuthToken: config.aiAuthMode === "auth-token",
-    prompts: config.reviewPrompts,
+    prompts: config.reviewPrompts.map((goal) => goal.prompt),
+    ...(stableContextFiles.some((files) => files.length > 0)
+      ? { contextFiles: stableContextFiles }
+      : {}),
     parallelCount: config.parallelCount,
     maxTurns: config.maxTurns,
     autoApprove: config.autoApprove,
@@ -440,8 +448,9 @@ export function aggregateReview(
   files: readonly ChangedFile[],
   goals: readonly GoalResult[],
   conversationDigest = EMPTY_CONVERSATION_DIGEST,
+  contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
 ): AggregatedReview {
-  const marker = reviewMarker(context, config, conversationDigest);
+  const marker = reviewMarker(context, config, conversationDigest, contextFiles);
   const normalized = goals.flatMap(
     (goal, index) =>
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],

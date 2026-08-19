@@ -1,3 +1,5 @@
+import { isAbsolute, normalize } from "node:path";
+
 import { parseDocument } from "yaml";
 
 import type {
@@ -8,6 +10,7 @@ import type {
   ModelPricingConfig,
   ModelPricingRates,
   ReviewConfig,
+  ReviewGoal,
 } from "./types.js";
 
 export interface InputReader {
@@ -16,6 +19,9 @@ export interface InputReader {
 
 const MAX_PROMPTS = 50;
 const MAX_PROMPT_LENGTH = 12_000;
+const MAX_CONTEXT_FILES_PER_PROMPT = 25;
+const MAX_CONTEXT_FILES_PER_RUN = 100;
+const MAX_CONTEXT_FILE_PATH_LENGTH = 4_096;
 const MAX_MCP_SERVERS = 20;
 const MAX_MCP_HEADERS = 50;
 const MAX_PRICED_MODELS = 100;
@@ -272,27 +278,83 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
   return servers;
 }
 
-function parseReviewPrompts(raw: string): readonly string[] {
+function readContextFilePath(value: unknown, path: string): string {
+  const filePath = readString(value, path, MAX_CONTEXT_FILE_PATH_LENGTH);
+  if (!isAbsolute(filePath)) throw new Error(`${path} must be an absolute path.`);
+  if (normalize(filePath) !== filePath) throw new Error(`${path} must be normalized.`);
+  return filePath;
+}
+
+function parseReviewGoal(value: unknown, index: number): ReviewGoal {
+  const path = `review-prompts[${index}]`;
+  if (typeof value === "string") {
+    return { prompt: readString(value, path, MAX_PROMPT_LENGTH), files: [] };
+  }
+  if (!isRecord(value)) throw new Error(`${path} must be a string or an object.`);
+  const allowed = new Set(["prompt", "files"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`${path}.${key} is not supported.`);
+  }
+  const prompt = readString(value.prompt, `${path}.prompt`, MAX_PROMPT_LENGTH);
+  if (!Array.isArray(value.files) || value.files.length === 0) {
+    throw new Error(`${path}.files must be a non-empty array.`);
+  }
+  if (value.files.length > MAX_CONTEXT_FILES_PER_PROMPT) {
+    throw new Error(`${path}.files supports at most ${MAX_CONTEXT_FILES_PER_PROMPT} files.`);
+  }
+  const files = value.files.map((file, fileIndex) =>
+    readContextFilePath(file, `${path}.files[${fileIndex}]`),
+  );
+  if (new Set(files).size !== files.length) {
+    throw new Error(`${path}.files must not contain duplicate paths.`);
+  }
+  return { prompt, files };
+}
+
+function parseReviewPrompts(raw: string): readonly ReviewGoal[] {
   const value = raw.trim();
   if (value.length === 0)
     throw new Error("Input 'review-prompts' must contain at least one prompt.");
   let prompts: unknown;
+  let parsedJson = false;
   try {
     prompts = JSON.parse(value) as unknown;
+    parsedJson = true;
   } catch {
+    if (value.startsWith("[") || value.startsWith("{")) {
+      throw new Error("Input 'review-prompts' must be valid JSON.");
+    }
     prompts = value
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
   }
+  if (parsedJson) {
+    const document = parseDocument(value, {
+      prettyErrors: false,
+      schema: "json",
+      uniqueKeys: true,
+      version: "1.2",
+    });
+    if (document.errors.length > 0) {
+      throw new Error("Input 'review-prompts' must be valid JSON with unique object keys.");
+    }
+  }
   if (!Array.isArray(prompts) || prompts.length === 0) {
-    throw new Error("Input 'review-prompts' must be a JSON string array or one prompt per line.");
+    throw new Error(
+      "Input 'review-prompts' must be a JSON array of prompt strings or objects, or one prompt per line.",
+    );
   }
   if (prompts.length > MAX_PROMPTS)
     throw new Error(`Input 'review-prompts' supports at most ${MAX_PROMPTS} prompts.`);
-  return prompts.map((prompt, index) =>
-    readString(prompt, `review-prompts[${index}]`, MAX_PROMPT_LENGTH),
-  );
+  const goals = prompts.map(parseReviewGoal);
+  const uniqueFiles = new Set(goals.flatMap((goal) => goal.files));
+  if (uniqueFiles.size > MAX_CONTEXT_FILES_PER_RUN) {
+    throw new Error(
+      `Input 'review-prompts' supports at most ${MAX_CONTEXT_FILES_PER_RUN} unique context files.`,
+    );
+  }
+  return goals;
 }
 
 function parseModelPricing(raw: string): ModelPricingConfig | undefined {

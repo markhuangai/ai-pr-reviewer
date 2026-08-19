@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -87,7 +87,7 @@ const config: ReviewConfig = {
   aiSecret: "ai-secret",
   aiAuthMode: "api-key",
   model: "review-model",
-  reviewPrompts: ["security"],
+  reviewPrompts: [{ prompt: "security", files: [] }],
   parallelCount: 1,
   maxTurns: 2,
   autoApprove: false,
@@ -442,7 +442,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
         },
       });
     },
-    runGoals: (context, files, conversation, _config, cwd) => {
+    runGoals: (context, files, conversation, _config, contextFiles, cwd) => {
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
       assert.equal(files.length, 1);
@@ -451,6 +451,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       assert.equal(entry?.kind, "pr_comment");
       if (entry?.kind !== "pr_comment") assert.fail("Expected a PR-level comment.");
       assert.equal(entry.message.body, "Owner context contains [REDACTED].");
+      assert.deepEqual(contextFiles, [[]]);
       assert.equal(cwd, workspace);
       return Promise.resolve(goals);
     },
@@ -529,6 +530,64 @@ test("skips an identical current-head review by the authenticated user", async (
 
   assert.deepEqual(result, { skipped: true });
   assert.equal(goalRuns, 0);
+});
+
+test("passes immutable context snapshots to goals and cleans them after the run", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const contextRoot = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-index-context-"));
+  t.after(() => rm(contextRoot, { force: true, recursive: true }));
+  const contextPath = join(contextRoot, "ticket.json");
+  const originalContent = '{"ticket":"PROJ-123"}\n';
+  await writeFile(contextPath, originalContent);
+  let snapshotPath = "";
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getPullRequestFiles: () => Promise.resolve([]),
+  } as unknown as GitHubApi;
+
+  const result = await runAction(
+    actionReader({
+      "interact-with-pr": "false",
+      "review-prompts": JSON.stringify([
+        { prompt: "Review ticket requirements.", files: [contextPath] },
+      ]),
+    }),
+    [],
+    {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: async (_context, _files, _conversation, config, contextFiles, cwd) => {
+        assert.equal(cwd, workspace);
+        assert.deepEqual(config.reviewPrompts, [
+          { prompt: "Review ticket requirements.", files: [contextPath] },
+        ]);
+        const file = contextFiles[0]?.[0];
+        assert.ok(file);
+        snapshotPath = file.snapshotPath;
+        assert.equal(file.path, contextPath);
+        assert.equal(await readFile(snapshotPath, "utf8"), originalContent);
+        await writeFile(contextPath, "changed after capture\n");
+        assert.equal(await readFile(snapshotPath, "utf8"), originalContent);
+        return [
+          {
+            prompt: "Review ticket requirements.",
+            status: "completed",
+            submission: { summary: "clean", findings: [] },
+          },
+        ];
+      },
+      writeSummary: () => Promise.resolve(),
+    },
+  );
+
+  assert.equal(result.skipped, false);
+  assert.notEqual(snapshotPath, "");
+  await assert.rejects(access(snapshotPath));
+  await indexInternals.assertWorkspace(context, workspace);
 });
 
 test("falls back from a rejected approval to a comment review", async (t) => {

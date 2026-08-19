@@ -9,6 +9,7 @@ import {
   buildRunSummary,
   reviewMarker,
 } from "./lib/aggregate.js";
+import { prepareContextFiles, type ContextFileArtifact } from "./lib/context-files.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import {
   parsePullRequestUrl,
@@ -239,13 +240,23 @@ export async function runAction(
       ? undefined
       : await dependencies.createWorkspace(context, config.githubToken);
   const workspace = temporaryWorkspace?.path ?? process.env.GITHUB_WORKSPACE ?? process.cwd();
+  let contextFiles: ContextFileArtifact | undefined;
   try {
     await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
+    contextFiles = await (dependencies.prepareContextFiles ?? prepareContextFiles)(
+      config.reviewPrompts,
+      workspace,
+    );
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
     const conversation = await loadConversation(api, context, authenticatedLogin);
     if (config.interactWithPullRequest) {
-      const marker = reviewMarker(context, config, conversation.snapshot.digest);
+      const marker = reviewMarker(
+        context,
+        config,
+        conversation.snapshot.digest,
+        contextFiles.identity,
+      );
       if (
         conversation.reviews.some(
           (review) =>
@@ -274,10 +285,18 @@ export async function runAction(
       files,
       redactedConversation,
       config,
+      contextFiles.filesByGoal,
       workspace,
     );
     const goals = redactGoals(rawGoals, secrets);
-    const review = aggregateReview(context, config, files, goals, conversation.snapshot.digest);
+    const review = aggregateReview(
+      context,
+      config,
+      files,
+      goals,
+      conversation.snapshot.digest,
+      contextFiles.identity,
+    );
     if (!config.interactWithPullRequest) {
       await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
@@ -340,6 +359,7 @@ export async function runAction(
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
     return { skipped: false, review };
   } finally {
+    await contextFiles?.cleanup();
     await temporaryWorkspace?.cleanup();
   }
 }
@@ -348,6 +368,7 @@ interface ActionDependencies {
   readonly createApi: (token: string) => GitHubApi;
   readonly readEventContext: () => Promise<PullRequestContext | undefined>;
   readonly createWorkspace: typeof createPullRequestWorkspace;
+  readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
   readonly writeSummary: typeof writeRunSummary;
 }

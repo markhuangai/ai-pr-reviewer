@@ -57,6 +57,11 @@ export interface GoalTokenUsage {
   readonly complete: boolean;
 }
 
+export interface ReviewGoal {
+  readonly prompt: string;
+  readonly files: readonly string[];
+}
+
 export interface ReviewConfig {
   readonly githubToken: string;
   readonly aiBaseUrl: string;
@@ -65,7 +70,7 @@ export interface ReviewConfig {
   readonly model: string;
   readonly effort?: EffortLevel;
   readonly modelPricing?: ModelPricingConfig;
-  readonly reviewPrompts: readonly string[];
+  readonly reviewPrompts: readonly ReviewGoal[];
   readonly parallelCount: number;
   readonly maxTurns: number;
   readonly autoApprove: boolean;

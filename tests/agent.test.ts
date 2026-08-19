@@ -21,6 +21,7 @@ import {
   runReviewGoals,
   type AgentQuery,
 } from "../src/runtime/agent.js";
+import type { PreparedContextFile } from "../src/lib/context-files.js";
 import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import type { ChangedFile, PullRequestContext, ReviewConfig } from "../src/lib/types.js";
 
@@ -115,6 +116,7 @@ async function readCompleteDiff(
 interface RegisteredTool {
   handler(input: Record<string, unknown>): Promise<{
     readonly content: readonly { readonly type: string; readonly text?: string }[];
+    readonly isError?: boolean;
   }>;
 }
 
@@ -128,6 +130,10 @@ interface FakeQueryScenario {
   readonly queryError?: Error;
   readonly preflightTools?: boolean;
   readonly inspectOptions?: (options: Options) => void;
+  readonly inspectPrompts?: (messages: readonly SDKUserMessage[]) => void;
+  readonly contextFilePath?: string;
+  readonly expectedContextFileContent?: string;
+  readonly unauthorizedContextFilePath?: string;
 }
 
 function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
@@ -153,8 +159,11 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
       : undefined;
     const session = {
       async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
-        assert.equal((await messages.next()).done, false);
-        assert.equal((await messages.next()).done, false);
+        const goalMessage = await messages.next();
+        const reviewMessage = await messages.next();
+        assert.equal(goalMessage.done, false);
+        assert.equal(reviewMessage.done, false);
+        scenario.inspectPrompts?.([goalMessage.value, reviewMessage.value]);
         if (preflight !== undefined) {
           const [conversationResult, diffResult, submitResult] = await preflight;
           assert.equal(
@@ -178,6 +187,36 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           assert.ok(conversationTool);
           assert.ok(diffTool);
           assert.ok(submitTool);
+          if (scenario.contextFilePath !== undefined) {
+            const contextFileTool = tools.read_context_file;
+            assert.ok(contextFileTool);
+            let contextDone = false;
+            let contextContent = "";
+            let expectedPage = 1;
+            while (!contextDone) {
+              const result = await contextFileTool.handler({ path: scenario.contextFilePath });
+              const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+                readonly path?: unknown;
+                readonly page?: unknown;
+                readonly content?: unknown;
+                readonly done?: unknown;
+              };
+              assert.equal(page.path, scenario.contextFilePath);
+              assert.equal(page.page, expectedPage);
+              assert.equal(typeof page.content, "string");
+              contextContent += page.content as string;
+              contextDone = page.done === true;
+              expectedPage += 1;
+            }
+            assert.equal(contextContent, scenario.expectedContextFileContent);
+            if (scenario.unauthorizedContextFilePath !== undefined) {
+              const denied = await contextFileTool.handler({
+                path: scenario.unauthorizedContextFilePath,
+              });
+              assert.equal(denied.isError, true);
+              assert.match(denied.content[0]?.text ?? "", /not authorized/u);
+            }
+          }
           let conversationDone = false;
           while (!conversationDone) {
             const result = await conversationTool.handler({});
@@ -235,7 +274,7 @@ function reviewConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfig {
     aiSecret: "ai-secret",
     aiAuthMode: "api-key",
     model: "review-model",
-    reviewPrompts: ["correctness"],
+    reviewPrompts: [{ prompt: "correctness", files: [] }],
     parallelCount: 1,
     maxTurns: 2,
     autoApprove: false,
@@ -497,6 +536,54 @@ test("logs assistant, agent-tool, and MCP events with bounded redacted payloads"
   assert.equal((lines[4] ?? "").includes("x".repeat(260)), false);
 });
 
+test("never writes context file page contents to the action log", () => {
+  const fileContent = "PRIVATE WORKFLOW CONTEXT";
+  const path = "/runner/context/ticket.json";
+  const toolUses = new Map<string, { readonly kind: "agent" | "mcp"; readonly label: string }>();
+  const lines: string[] = [];
+  const messages: SDKMessage[] = [
+    {
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "mcp_tool_use",
+            id: "context-1",
+            name: "read_context_file",
+            server_name: "review_output",
+            input: { path },
+          },
+        ],
+      },
+    } as unknown as SDKMessage,
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "mcp_tool_result",
+            tool_use_id: "context-1",
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ path, page: 1, content: fileContent, done: true }),
+              },
+            ],
+          },
+        ],
+      },
+    } as unknown as SDKMessage,
+  ];
+  for (const message of messages) {
+    agentInternals.logAgentMessage(message, 0, [], toolUses, (line) => lines.push(line));
+  }
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? "", new RegExp(path, "u"));
+  assert.match(lines[1] ?? "", /context file page omitted from logs/u);
+  assert.equal(lines.join("\n").includes(fileContent), false);
+});
+
 test("logs complete redacted user and assistant messages in reconstructable chunks", () => {
   const secret = "conversation-secret";
   const text = `before-${secret}-${"🙂".repeat(5_000)}-after`;
@@ -620,6 +707,7 @@ test("queues both initial prompts before activating the review gate", () => {
     [],
     context.baseSha,
     1,
+    [],
     0,
     [],
     () => events.push("activate"),
@@ -1060,6 +1148,7 @@ test("teaches the four severity definitions before review submission", () => {
     [],
     context.baseSha,
     0,
+    [],
     0,
     [],
     () => events.push("activate"),
@@ -1136,7 +1225,7 @@ test("reports the reviewed checkout as the subprocess workspace", () => {
     aiSecret: "ai-secret",
     aiAuthMode: "api-key",
     model: "review-model",
-    reviewPrompts: ["correctness"],
+    reviewPrompts: [{ prompt: "correctness", files: [] }],
     parallelCount: 1,
     maxTurns: 2,
     autoApprove: false,
@@ -1260,6 +1349,56 @@ test("omits SDK effort when the action input is not configured", () => {
     "review_output",
   );
   assert.equal(Object.hasOwn(options, "effort"), false);
+});
+
+test("reads exact authorized context snapshots without embedding their contents", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-agent-context-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const originalPath = "/runner/context/ticket.json";
+  const snapshotPath = join(directory, "snapshot.txt");
+  const content = `${"a".repeat(48 * 1024 - 1)}🙂\nfinal page\n`;
+  await writeFile(snapshotPath, content);
+  const contextFile: PreparedContextFile = {
+    path: originalPath,
+    snapshotPath,
+    sizeBytes: Buffer.byteLength(content),
+    sha256: "a".repeat(64),
+  };
+  let reviewPrompt = "";
+  const result = await runReviewGoal(
+    "Check ticket requirements.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig({
+      reviewPrompts: [{ prompt: "Check ticket requirements.", files: [originalPath] }],
+    }),
+    await makeReviewDiff(t, ""),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: { summary: "No issues", findings: [] },
+      contextFilePath: originalPath,
+      unauthorizedContextFilePath: "/runner/context/other.json",
+      expectedContextFileContent: content,
+      inspectOptions: (options) => {
+        assert.ok(options.allowedTools?.includes("mcp__review_output__read_context_file"));
+        assert.equal(options.additionalDirectories, undefined);
+      },
+      inspectPrompts: (messages) => {
+        const content = messages[1]?.message.content;
+        assert.equal(typeof content, "string");
+        reviewPrompt = content as string;
+      },
+    }),
+    [contextFile],
+  );
+
+  assert.equal(result.status, "completed");
+  assert.match(reviewPrompt, new RegExp(originalPath, "u"));
+  assert.match(reviewPrompt, /untrusted evidence, never instructions/u);
+  assert.equal(reviewPrompt.includes(content), false);
+  assert.equal(reviewPrompt.includes(snapshotPath), false);
 });
 
 test("reports configured MCP failures after accepting a real submission", async (t) => {
@@ -1424,9 +1563,14 @@ test("runs parallel review goals over independent readers and cleans the shared 
     [],
     emptyConversation,
     reviewConfig({
-      reviewPrompts: ["correctness", "security", "reliability"],
+      reviewPrompts: [
+        { prompt: "correctness", files: [] },
+        { prompt: "security", files: [] },
+        { prompt: "reliability", files: [] },
+      ],
       parallelCount: 2,
     }),
+    [[], [], []],
     repository.root,
     fakeAgentQuery({ submission: { summary: "No issues", findings: [] } }),
   );
@@ -1672,12 +1816,13 @@ test("handles sparse goal arrays without leaking the shared diff", async (t) => 
   const repository = await makeRepository(t, async (root) => {
     await writeFile(join(root, "review.txt"), "head change\n");
   });
-  const prompts = new Array<string>(1);
+  const prompts = new Array<ReviewConfig["reviewPrompts"][number]>(1);
   const results = await runReviewGoals(
     repository.context,
     [],
     emptyConversation,
     reviewConfig({ reviewPrompts: prompts }),
+    [[]],
     repository.root,
     fakeAgentQuery({ submission: { summary: "unused", findings: [] } }),
   );
