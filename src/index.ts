@@ -29,7 +29,10 @@ import {
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
 import { runReviewGoals } from "./runtime/agent.js";
-import { createPullRequestWorkspace } from "./lib/pull-request-workspace.js";
+import {
+  createPullRequestWorkspace,
+  type PullRequestWorkspace,
+} from "./lib/pull-request-workspace.js";
 import type {
   GoalResult,
   PullRequestContext,
@@ -209,6 +212,18 @@ function registerInputSecrets(secrets: readonly string[]): void {
   for (const secret of new Set(secrets)) if (secret.length > 0) core.setSecret(secret);
 }
 
+async function cleanupReviewArtifacts(
+  contextFiles: Pick<ContextFileArtifact, "cleanup"> | undefined,
+  temporaryWorkspace: Pick<PullRequestWorkspace, "cleanup"> | undefined,
+): Promise<void> {
+  const cleanups = await Promise.allSettled([
+    contextFiles?.cleanup(),
+    temporaryWorkspace?.cleanup(),
+  ]);
+  const failure = cleanups.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
 export async function runAction(
   reader: InputReader = actionInputReader(),
   inputSecrets: readonly string[] = inputSecretCandidates(reader),
@@ -359,8 +374,7 @@ export async function runAction(
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
     return { skipped: false, review };
   } finally {
-    await contextFiles?.cleanup();
-    await temporaryWorkspace?.cleanup();
+    await cleanupReviewArtifacts(contextFiles, temporaryWorkspace);
   }
 }
 
@@ -403,5 +417,6 @@ export const indexInternals = {
   inputSecretCandidates,
   redact,
   redactGoals,
+  cleanupReviewArtifacts,
   reviewSecrets: reviewSecretCandidates,
 };

@@ -564,6 +564,7 @@ test("never writes context file page contents to the action log", () => {
           {
             type: "mcp_tool_result",
             tool_use_id: "context-1",
+            is_error: true,
             content: [
               {
                 type: "text",
@@ -579,8 +580,9 @@ test("never writes context file page contents to the action log", () => {
     agentInternals.logAgentMessage(message, 0, [], toolUses, (line) => lines.push(line));
   }
   assert.equal(lines.length, 2);
-  assert.match(lines[0] ?? "", new RegExp(path, "u"));
+  assert.equal((lines[0] ?? "").includes(path), true);
   assert.match(lines[1] ?? "", /context file page omitted from logs/u);
+  assert.match(lines[1] ?? "", /"is_error":true/u);
   assert.equal(lines.join("\n").includes(fileContent), false);
 });
 
@@ -1395,7 +1397,7 @@ test("reads exact authorized context snapshots without embedding their contents"
   );
 
   assert.equal(result.status, "completed");
-  assert.match(reviewPrompt, new RegExp(originalPath, "u"));
+  assert.equal(reviewPrompt.includes(originalPath), true);
   assert.match(reviewPrompt, /untrusted evidence, never instructions/u);
   assert.equal(reviewPrompt.includes(content), false);
   assert.equal(reviewPrompt.includes(snapshotPath), false);

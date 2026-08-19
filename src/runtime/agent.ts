@@ -447,7 +447,12 @@ function isContextFileTool(label: string): boolean {
 }
 
 function loggableToolOutput(label: string, output: unknown): unknown {
-  return isContextFileTool(label) ? { content: "[context file page omitted from logs]" } : output;
+  if (!isContextFileTool(label)) return output;
+  const isError = isRecord(output) && (output.is_error === true || output.isError === true);
+  return {
+    ...(isError ? { is_error: true } : {}),
+    content: "[context file page omitted from logs]",
+  };
 }
 
 function agentLogLine(

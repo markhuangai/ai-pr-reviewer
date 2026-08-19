@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -261,6 +261,22 @@ test("workspace validation rejects ignored content", async (t) => {
     indexInternals.assertWorkspace(context, workspace),
     /tracked, untracked, or ignored content/,
   );
+});
+
+test("attempts workspace cleanup when context cleanup fails", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-cleanup-test-"));
+  const temporaryWorkspace = join(root, "workspace");
+  await mkdir(temporaryWorkspace);
+  t.after(() => rm(root, { force: true, recursive: true }));
+
+  await assert.rejects(
+    indexInternals.cleanupReviewArtifacts(
+      { cleanup: () => Promise.reject(new Error("context cleanup failed")) },
+      { cleanup: () => rm(temporaryWorkspace, { force: true, recursive: true }) },
+    ),
+    /context cleanup failed/u,
+  );
+  await assert.rejects(access(temporaryWorkspace));
 });
 
 test("summary-only URL reviews make GET requests and write one run summary", async (t) => {
