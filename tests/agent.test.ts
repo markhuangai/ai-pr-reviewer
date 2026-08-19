@@ -1181,6 +1181,7 @@ const goalContext: PullRequestContext = {
 test("runs a complete SDK review turn through the real diff and submission tools", async (t) => {
   const diff = await makeReviewDiff(t);
   const config = reviewConfig({
+    effort: "xhigh",
     mcpServers: {
       security: {
         type: "http",
@@ -1210,6 +1211,7 @@ test("runs a complete SDK review turn through the real diff and submission tools
     },
     inspectOptions: (options) => {
       assert.equal(options.cwd, "/workspace/repository");
+      assert.equal(options.effort, "xhigh");
       assert.equal(options.permissionMode, "dontAsk");
       assert.deepEqual(options.tools, ["Read", "Glob", "Grep"]);
       assert.ok(options.allowedTools?.includes("mcp__security__*"));
@@ -1248,6 +1250,16 @@ test("runs a complete SDK review turn through the real diff and submission tools
       },
     ],
   });
+});
+
+test("omits SDK effort when the action input is not configured", () => {
+  const options = agentInternals.makeOptions(
+    reviewConfig(),
+    "/workspace/repository",
+    {},
+    "review_output",
+  );
+  assert.equal(Object.hasOwn(options, "effort"), false);
 });
 
 test("reports configured MCP failures after accepting a real submission", async (t) => {
@@ -1463,9 +1475,11 @@ test("builds an auth-token agent environment without inherited credentials", () 
   const originalInput = process.env.INPUT_PRIVATE_VALUE;
   const originalGitHub = process.env.GITHUB_TOKEN;
   const originalApiKey = process.env.ANTHROPIC_API_KEY;
+  const originalEffort = process.env.CLAUDE_CODE_EFFORT_LEVEL;
   process.env.INPUT_PRIVATE_VALUE = "input-secret";
   process.env.GITHUB_TOKEN = "github-secret";
   process.env.ANTHROPIC_API_KEY = "old-key";
+  process.env.CLAUDE_CODE_EFFORT_LEVEL = "low";
   try {
     const environment = agentInternals.safeAgentEnvironment(
       reviewConfig({ aiAuthMode: "auth-token", aiSecret: "auth-secret" }),
@@ -1475,6 +1489,7 @@ test("builds an auth-token agent environment without inherited credentials", () 
     assert.equal(environment.GITHUB_TOKEN, undefined);
     assert.equal(environment.ANTHROPIC_API_KEY, undefined);
     assert.equal(environment.ANTHROPIC_AUTH_TOKEN, "auth-secret");
+    assert.equal(environment.CLAUDE_CODE_EFFORT_LEVEL, undefined);
   } finally {
     if (originalInput === undefined) delete process.env.INPUT_PRIVATE_VALUE;
     else process.env.INPUT_PRIVATE_VALUE = originalInput;
@@ -1482,6 +1497,8 @@ test("builds an auth-token agent environment without inherited credentials", () 
     else process.env.GITHUB_TOKEN = originalGitHub;
     if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
+    if (originalEffort === undefined) delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    else process.env.CLAUDE_CODE_EFFORT_LEVEL = originalEffort;
   }
 });
 

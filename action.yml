@@ -18,6 +18,9 @@ inputs:
   model:
     description: Model identifier accepted by the configured AI endpoint.
     required: true
+  effort:
+    description: "Optional Claude reasoning effort level: low, medium, high, xhigh, or max."
+    required: false
   model-pricing:
     description: Optional strict JSON model pricing configuration with rates per one million tokens.
     required: false

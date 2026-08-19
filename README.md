@@ -37,6 +37,7 @@ jobs:
           ai-base-url: ${{ secrets.AI_BASE_URL }}
           ai-secret: ${{ secrets.AI_SECRET }}
           model: claude-sonnet-4-5
+          effort: high
           review-prompts: |
             Check changed code for correctness and regressions.
             Check authentication, authorization, and secret-handling paths.
@@ -63,6 +64,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `ai-secret`        | yes      |           | API key or auth token for that endpoint.                                                                  |
 | `ai-auth-mode`     | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                             |
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
+| `effort`           | no       |           | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                             |
 | `model-pricing`    | no       |           | Strict JSON with a currency prefix and per-model rates per one million tokens.                            |
 | `review-prompts`   | yes      |           | JSON array or one goal per non-empty line; each goal gets its own session.                                |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
@@ -71,6 +73,8 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `interact-with-pr` | no       | `true`    | When `false`, do not create a review; write all findings only to the workflow run summary.                |
 | `pull-request-url` | no       |           | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.       |
 | `mcp-servers`      | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                           |
+
+`effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
 
 Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, and qualifying conversation digest already exist. An owner reply therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
 

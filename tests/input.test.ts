@@ -35,6 +35,7 @@ security:
   assert.equal(config.mcpServers.security?.type, "http");
   assert.equal(config.mcpServers.security?.headers?.Authorization, "Bearer token");
   assert.equal(config.interactWithPullRequest, true);
+  assert.equal(config.effort, undefined);
   assert.equal(config.pullRequestUrl, undefined);
   assert.equal(
     inputInternals.parseMcpServers(
@@ -46,6 +47,32 @@ security:
 
 test("accepts JSON goal arrays", () => {
   assert.deepEqual(inputInternals.parseReviewPrompts('["one", "two"]'), ["one", "two"]);
+});
+
+test("reads and validates optional model effort", () => {
+  const values = {
+    "github-pat": "ghp_test",
+    "ai-base-url": "https://ai.example.test",
+    "ai-secret": "secret",
+    model: "model",
+    "review-prompts": "goal",
+  };
+  for (const [input, expected] of [
+    ["low", "low"],
+    [" MEDIUM ", "medium"],
+    ["High", "high"],
+    ["xhigh", "xhigh"],
+    ["MAX", "max"],
+  ] as const) {
+    assert.equal(readReviewConfig(reader({ ...values, effort: input })).effort, expected);
+  }
+  assert.equal(readReviewConfig(reader({ ...values, effort: " " })).effort, undefined);
+  for (const effort of ["auto", "ultracode", "highest"]) {
+    assert.throws(
+      () => readReviewConfig(reader({ ...values, effort })),
+      /effort.*low.*medium.*high.*xhigh.*max/u,
+    );
+  }
 });
 
 test("reads strict model pricing while preserving the currency prefix", () => {
