@@ -25,7 +25,7 @@ inputs:
     description: Optional strict JSON model pricing configuration with rates per one million tokens.
     required: false
   review-prompts:
-    description: A non-empty JSON array of review goal objects with a prompt and optional exact context file paths.
+    description: A non-empty JSON array of review goal objects with a non-empty prompt and optional exact context file paths.
     required: true
   parallel-count:
     description: Maximum number of isolated goal sessions running concurrently.

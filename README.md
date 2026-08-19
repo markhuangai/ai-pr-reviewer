@@ -31,7 +31,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      - uses: markhuangai/ai-pr-reviewer@v1.0.0
+      - uses: markhuangai/ai-pr-reviewer@v1-prerelease
         with:
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
           ai-base-url: ${{ secrets.AI_BASE_URL }}
