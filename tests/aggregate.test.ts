@@ -66,7 +66,7 @@ test("renders a clean review without exposing goal internals", () => {
   const body = buildReviewBody(review, goals);
 
   assert.match(body, new RegExp(`^${review.marker}\\n## ✨ Good job!`, "u"));
-  assert.match(body, /<summary>Token usage<\/summary>/u);
+  assert.match(body, /<summary>📊 Token usage · 0 tokens<\/summary>/u);
   assert.doesNotMatch(body, /estimated cost|Pricing:|Rates per 1M/iu);
   assert.equal(review.event, "APPROVE");
   assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
@@ -124,10 +124,13 @@ test("combines token usage across every goal without showing cost when pricing i
   assert.equal(review.tokenUsage.models.length, 1);
   assert.equal(review.tokenUsage.complete, true);
   for (const rendered of [body, summary]) {
-    assert.match(rendered, /<details>\n<summary>Token usage<\/summary>/u);
+    assert.match(rendered, /<details>\n<summary>📊 Token usage · 501 tokens<\/summary>/u);
     assert.doesNotMatch(rendered, /<details open/iu);
-    assert.match(rendered, /- Total tokens: \*\*501\*\*/u);
-    assert.match(rendered, /<code>review-model<\/code>: 501 tokens/u);
+    assert.match(
+      rendered,
+      /\| <code>review-model<\/code><br><sub>canonical: <code>canonical-model<\/code><\/sub> \| 105 \| 22 \| 330 \| 44 \| \*\*501\*\* \|/u,
+    );
+    assert.doesNotMatch(rendered, /- Total tokens:|#### Models|Rates per/iu);
     assert.doesNotMatch(rendered, /cost|Pricing:|unpriced|Rates per 1M/iu);
   }
 });
@@ -196,9 +199,17 @@ test("prices raw model IDs before canonical IDs and labels unknown models as a l
     review.tokenUsage.models.find((usage) => usage.model === "ALIAS")?.pricing,
     undefined,
   );
-  assert.match(body, /Estimated cost: \*\*at least \$3\.00\*\*/u);
-  assert.match(body, /<code>ALIAS<\/code>:[\s\S]*Pricing: \*\*unpriced\*\*/u);
-  assert.match(body, /Pricing match: <code>canonical-only<\/code>/u);
+  assert.match(
+    body,
+    /<summary>📊 Token usage · 3,000,000 tokens · 💰 Estimated at least \$3\.00<\/summary>/u,
+  );
+  assert.match(body, /\| <code>ALIAS<\/code><br><sub>⚠️ unpriced<\/sub> \| — \| — \| — \| — \|/u);
+  assert.match(
+    body,
+    /\| <code>provider-id<\/code><br><sub>match: <code>canonical-only<\/code><\/sub> \| \$2 \| \$0 \| \$0 \| \$0 \|/u,
+  );
+  assert.match(body, /\| \*\*Total\*\* \| \*\*3,000,000\*\*/u);
+  assert.doesNotMatch(body, /Pricing:|Rates per/iu);
 });
 
 test("rounds only the grand total and preserves escaped currency and model text", () => {
@@ -238,8 +249,8 @@ test("rounds only the grand total and preserves escaped currency and model text"
     const summary = buildRunSummary(context, review, goals);
     assert.ok(Math.abs((review.tokenUsage.estimatedCost ?? 0) - 0.358) < 1e-12);
     for (const rendered of [body, summary]) {
-      assert.ok(rendered.includes(`Estimated cost: **${expected}**`));
-      assert.match(rendered, /Rates per 1M tokens: input/u);
+      assert.ok(rendered.includes(`💰 Estimated ${expected}`));
+      assert.match(rendered, /\| Model \| Input \| Output \| Cache hit \| Cache creation \|/u);
       assert.doesNotMatch(rendered, /calculated line item/iu);
       assert.match(rendered, /<code>&lt;\/details&gt;&#10;# injected<\/code>/u);
       assert.doesNotMatch(rendered, /<\/details>\n# injected/u);
@@ -255,7 +266,7 @@ test("rounds only the grand total and preserves escaped currency and model text"
     files,
     goals,
   );
-  assert.match(buildReviewBody(escaped, goals), /&lt;\/summary&gt;&#10;\\# cost 0\.36/u);
+  assert.match(buildReviewBody(escaped, goals), /&lt;\/summary&gt;&#10;# cost 0\.36/u);
 });
 
 test("formats four public severities without exposing goal provenance", () => {
@@ -965,8 +976,8 @@ test("includes failed-goal snapshots and marks crashed accounting incomplete", (
     cacheCreationInputTokens: 12,
   });
   assert.equal(review.tokenUsage.complete, false);
-  assert.match(summary, /Total tokens: \*\*57\*\*/u);
-  assert.match(summary, /SDK accounting: incomplete/u);
+  assert.match(summary, /<summary>📊 Token usage · 57 tokens<\/summary>/u);
+  assert.match(summary, /> ⚠️ \*\*Incomplete SDK accounting\*\*/u);
 });
 
 test("keeps the collapsed token block within review and run-summary limits", () => {
@@ -994,7 +1005,7 @@ test("keeps the collapsed token block within review and run-summary limits", () 
   assert.ok(body.length <= 60_000);
   assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
   assert.match(body, /additional model rows omitted/u);
-  assert.match(body, /<details>\n<summary>Token usage<\/summary>[\s\S]*<\/details>/u);
+  assert.match(body, /<details>\n<summary>📊 Token usage[\s\S]*<\/summary>[\s\S]*<\/details>/u);
   assert.doesNotMatch(body, /<details open/iu);
 });
 

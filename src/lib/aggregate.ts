@@ -527,90 +527,138 @@ function modelCode(value: string): string {
   return `<code>${escapeHtmlText(display)}</code>`;
 }
 
-function tokenLine(label: string, tokens: number): string {
-  return `  - ${label}: ${TOKEN_FORMATTER.format(tokens)}`;
+function tableModelCode(value: string): string {
+  return modelCode(value).replace(/\|/gu, "&#124;");
 }
 
-function rateLine(currency: string, label: string, rate: number): string {
-  return `${label} ${escapeMarkdownText(currency)}${String(rate)}`;
+function tableToken(value: number, emphasize = false): string {
+  const formatted = TOKEN_FORMATTER.format(value);
+  return emphasize ? `**${formatted}**` : formatted;
 }
 
-function modelUsageBlock(usage: AggregatedModelUsage, currency: string | undefined): string {
-  const lines = [
-    `- ${modelCode(usage.model)}: ${TOKEN_FORMATTER.format(totalTokens(usage))} tokens`,
-    tokenLine("Input", usage.inputTokens),
-    tokenLine("Output", usage.outputTokens),
-    tokenLine("Cache hit", usage.cacheReadInputTokens),
-    tokenLine("Cache creation", usage.cacheCreationInputTokens),
-  ];
+function modelUsageCell(usage: AggregatedModelUsage): string {
+  const lines = [tableModelCode(usage.model)];
   if (usage.canonicalModel !== undefined && usage.canonicalModel !== usage.model) {
-    lines.push(`  - Canonical model: ${modelCode(usage.canonicalModel)}`);
+    lines.push(`<br><sub>canonical: ${tableModelCode(usage.canonicalModel)}</sub>`);
   }
-  if (currency !== undefined) {
-    if (usage.pricing === undefined) {
-      lines.push("  - Pricing: **unpriced**");
-    } else {
-      if (usage.pricingModel !== usage.model && usage.pricingModel !== undefined) {
-        lines.push(`  - Pricing match: ${modelCode(usage.pricingModel)}`);
-      }
+  return lines.join("");
+}
+
+function modelUsageRow(usage: AggregatedModelUsage): string {
+  return `| ${modelUsageCell(usage)} | ${tableToken(usage.inputTokens)} | ${tableToken(usage.outputTokens)} | ${tableToken(usage.cacheReadInputTokens)} | ${tableToken(usage.cacheCreationInputTokens)} | ${tableToken(totalTokens(usage), true)} |`;
+}
+
+function tokenUsageTable(
+  models: readonly AggregatedModelUsage[],
+  totals: TokenCounts,
+  includeTotal: boolean,
+): string[] {
+  const lines = [
+    "| Model | Input | Output | Cache hit | Cache creation | Total |",
+    "|:--|--:|--:|--:|--:|--:|",
+  ];
+  if (models.length === 0) {
+    lines.push("| _No SDK model usage reported._ | — | — | — | — | — |");
+  } else {
+    lines.push(...models.map(modelUsageRow));
+    if (includeTotal) {
       lines.push(
-        `  - Rates per 1M tokens: ${[
-          rateLine(currency, "input", usage.pricing.input),
-          rateLine(currency, "output", usage.pricing.output),
-          rateLine(currency, "cache hit", usage.pricing.cacheHit),
-          rateLine(currency, "cache creation", usage.pricing.cacheCreation),
-        ].join("; ")}`,
+        `| **Total** | ${tableToken(totals.inputTokens, true)} | ${tableToken(totals.outputTokens, true)} | ${tableToken(totals.cacheReadInputTokens, true)} | ${tableToken(totals.cacheCreationInputTokens, true)} | ${tableToken(totalTokens(totals), true)} |`,
       );
     }
   }
-  return lines.join("\n");
+  return lines;
 }
 
-function buildTokenUsageDetails(usage: AggregatedTokenUsage): string {
+function pricingModelCell(usage: AggregatedModelUsage): string {
+  const lines = [tableModelCode(usage.model)];
+  if (usage.pricing === undefined) {
+    lines.push("<br><sub>⚠️ unpriced</sub>");
+  } else if (usage.pricingModel !== undefined && usage.pricingModel !== usage.model) {
+    lines.push(`<br><sub>match: ${tableModelCode(usage.pricingModel)}</sub>`);
+  }
+  return lines.join("");
+}
+
+function pricingRateCell(currency: string, rate: number | undefined): string {
+  return rate === undefined ? "—" : `${escapeMarkdownText(currency)}${String(rate)}`;
+}
+
+function pricingTable(models: readonly AggregatedModelUsage[], currency: string): string[] {
+  const lines = [
+    "#### 💳 Pricing per 1M tokens",
+    "",
+    "| Model | Input | Output | Cache hit | Cache creation |",
+    "|:--|--:|--:|--:|--:|",
+  ];
+  for (const usage of models) {
+    lines.push(
+      `| ${pricingModelCell(usage)} | ${pricingRateCell(currency, usage.pricing?.input)} | ${pricingRateCell(currency, usage.pricing?.output)} | ${pricingRateCell(currency, usage.pricing?.cacheHit)} | ${pricingRateCell(currency, usage.pricing?.cacheCreation)} |`,
+    );
+  }
+  return lines;
+}
+
+function accountingCallout(usage: AggregatedTokenUsage, hasUnpricedModels: boolean): string[] {
+  const accounting = usage.complete
+    ? "✅ **Complete SDK accounting**"
+    : "⚠️ **Incomplete SDK accounting** · Totals include only the last valid cumulative snapshot available from each goal.";
+  const lowerBound = hasUnpricedModels
+    ? "> ⚠️ **Estimated cost is a lower bound** · One or more models are unpriced."
+    : undefined;
+  return [
+    `> ${accounting}`,
+    ...(lowerBound === undefined ? [] : [lowerBound]),
+    "> ℹ️ Claude Agent SDK model usage only; external MCP service usage is excluded.",
+  ];
+}
+
+function tokenUsageSummary(usage: AggregatedTokenUsage, isLowerBound: boolean): string {
+  const summary = [`📊 Token usage · ${TOKEN_FORMATTER.format(totalTokens(usage.totals))} tokens`];
+  if (usage.currency !== undefined && usage.estimatedCost !== undefined) {
+    summary.push(
+      `💰 Estimated ${isLowerBound ? "at least " : ""}${escapeHtmlText(usage.currency)}${COST_FORMATTER.format(usage.estimatedCost)}`,
+    );
+  }
+  return summary.join(" · ");
+}
+
+function renderTokenUsageDetails(
+  usage: AggregatedTokenUsage,
+  models: readonly AggregatedModelUsage[],
+  omitted: number,
+): string {
   const hasPricing = usage.currency !== undefined && usage.estimatedCost !== undefined;
   const hasUnpricedModels = hasPricing && usage.models.some((model) => model.pricing === undefined);
   const isLowerBound = hasUnpricedModels || !usage.complete;
   const lines = [
     "<details>",
-    `<summary>${hasPricing ? "Token usage and estimated cost" : "Token usage"}</summary>`,
+    `<summary>${tokenUsageSummary(usage, isLowerBound)}</summary>`,
     "",
+    ...tokenUsageTable(models, usage.totals, omitted === 0 && usage.models.length > 1),
   ];
-  if (hasPricing) {
-    lines.push(
-      `- Estimated cost: **${isLowerBound ? "at least " : ""}${escapeMarkdownText(usage.currency ?? "")}${COST_FORMATTER.format(usage.estimatedCost ?? 0)}**`,
-    );
+  if (hasPricing && models.length > 0)
+    lines.push("", ...pricingTable(models, usage.currency ?? ""));
+  lines.push("", ...accountingCallout(usage, hasUnpricedModels));
+  if (omitted > 0) {
+    lines.push("", `> … ${omitted} additional model rows omitted to keep this section compact.`);
   }
-  lines.push(
-    `- Total tokens: **${TOKEN_FORMATTER.format(totalTokens(usage.totals))}**`,
-    tokenLine("Input", usage.totals.inputTokens),
-    tokenLine("Output", usage.totals.outputTokens),
-    tokenLine("Cache hit", usage.totals.cacheReadInputTokens),
-    tokenLine("Cache creation", usage.totals.cacheCreationInputTokens),
-    usage.complete
-      ? "- SDK accounting: complete"
-      : "- SDK accounting: incomplete; totals include only the last valid cumulative snapshot available from each goal.",
-    "- Scope: Claude Agent SDK model usage; external MCP service usage is excluded.",
-    "",
-    "#### Models",
-    "",
-  );
-
-  const modelBlocks = usage.models.map((model) => modelUsageBlock(model, usage.currency));
-  if (modelBlocks.length === 0) modelBlocks.push("- No SDK model usage was reported.");
-  let included = 0;
-  for (const block of modelBlocks) {
-    const omittedAfter = modelBlocks.length - included - 1;
-    const omission =
-      omittedAfter === 0 ? "" : `\n\n- ${omittedAfter} additional model rows omitted.`;
-    const candidate = `${lines.join("\n")}${included === 0 ? "" : "\n\n"}${block}${omission}\n\n</details>`;
-    if (candidate.length > MAX_TOKEN_USAGE_DETAILS_LENGTH) break;
-    lines.push(...(included === 0 ? [] : [""]), block);
-    included += 1;
-  }
-  const omitted = modelBlocks.length - included;
-  if (omitted > 0) lines.push("", `- ${omitted} additional model rows omitted.`);
   lines.push("", "</details>");
   return lines.join("\n");
+}
+
+function buildTokenUsageDetails(usage: AggregatedTokenUsage): string {
+  let rendered = renderTokenUsageDetails(usage, [], usage.models.length);
+  for (let included = 1; included <= usage.models.length; included += 1) {
+    const candidate = renderTokenUsageDetails(
+      usage,
+      usage.models.slice(0, included),
+      usage.models.length - included,
+    );
+    if (candidate.length > MAX_TOKEN_USAGE_DETAILS_LENGTH) break;
+    rendered = candidate;
+  }
+  return rendered;
 }
 
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {

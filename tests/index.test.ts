@@ -796,7 +796,7 @@ test("does not post an interactive review when every goal fails", async (t) => {
   assert.equal(reviews, 0);
   assert.equal(summaries.length, 1);
   assert.match(summaries[0] ?? "", /AI review failed/u);
-  assert.match(summaries[0] ?? "", /Total tokens: \*\*10\*\*/u);
+  assert.match(summaries[0] ?? "", /📊 Token usage · 10 tokens/u);
 });
 
 test("workspace validation rejects a different HEAD", async (t) => {

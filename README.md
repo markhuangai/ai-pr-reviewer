@@ -99,25 +99,20 @@ For 100,000 input tokens, 50,000 output tokens, 1,000,000 cache-hit tokens, and 
 
 ```markdown
 <details>
-<summary>Token usage and estimated cost</summary>
+<summary>📊 Token usage · 1,180,000 tokens · 💰 Estimated $0.36</summary>
 
-- Estimated cost: **$0.36**
-- Total tokens: **1,180,000**
-  - Input: 100,000
-  - Output: 50,000
-  - Cache hit: 1,000,000
-  - Cache creation: 30,000
-- SDK accounting: complete
-- Scope: Claude Agent SDK model usage; external MCP service usage is excluded.
+| Model                     |   Input | Output | Cache hit | Cache creation |         Total |
+| :------------------------ | ------: | -----: | --------: | -------------: | ------------: |
+| <code>review-model</code> | 100,000 | 50,000 | 1,000,000 |         30,000 | **1,180,000** |
 
-#### Models
+#### 💳 Pricing per 1M tokens
 
-- <code>review-model</code>: 1,180,000 tokens
-  - Input: 100,000
-  - Output: 50,000
-  - Cache hit: 1,000,000
-  - Cache creation: 30,000
-  - Rates per 1M tokens: input $1.2; output $2; cache hit $0.12; cache creation $0.6
+| Model                     | Input | Output | Cache hit | Cache creation |
+| :------------------------ | ----: | -----: | --------: | -------------: |
+| <code>review-model</code> |  $1.2 |     $2 |     $0.12 |           $0.6 |
+
+> ✅ **Complete SDK accounting**
+> ℹ️ Claude Agent SDK model usage only; external MCP service usage is excluded.
 
 </details>
 ```
