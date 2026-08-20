@@ -7,6 +7,10 @@ export async function copyBootstrap(source = "build", destination = "dist"): Pro
   await mkdir(join(destination, "lib/bootstrap"), { recursive: true });
   await cp(join(source, "bootstrap.js"), join(destination, "bootstrap.js"));
   await cp(join(source, "lib/bootstrap/archive.js"), join(destination, "lib/bootstrap/archive.js"));
+  await cp(
+    join(source, "lib/bootstrap/cancellation.js"),
+    join(destination, "lib/bootstrap/cancellation.js"),
+  );
   await cp(join(source, "lib/bootstrap/version.js"), join(destination, "lib/bootstrap/version.js"));
 }
 

@@ -21,6 +21,7 @@ import test, { type TestContext } from "node:test";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { promisify } from "node:util";
 
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import type { ReviewGoal } from "../src/lib/types.js";
 
@@ -88,6 +89,21 @@ test("accepts an empty UTF-8 context file", async (t) => {
   t.after(() => artifact.cleanup());
   assert.equal(artifact.filesByGoal[0]?.[0]?.sizeBytes, 0);
   assert.equal(await readFile(artifact.filesByGoal[0]?.[0]?.snapshotPath ?? "", "utf8"), "");
+});
+
+test("does not create context snapshots after cancellation", async (t) => {
+  const { root, snapshots, workspace } = await fixture(t);
+  const path = join(root, "ticket.txt");
+  await writeFile(path, "ticket\n");
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGTERM");
+  controller.abort(reason);
+
+  await assert.rejects(
+    prepareContextFiles([goal("cancelled", [path])], workspace, snapshots, controller.signal),
+    (error: unknown) => error === reason,
+  );
+  assert.deepEqual(await readdir(snapshots), []);
 });
 
 test("rejects links and non-regular context paths", async (t) => {

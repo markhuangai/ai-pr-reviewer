@@ -1,14 +1,21 @@
 import { strict as assert } from "node:assert";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "../src/lib/bootstrap/archive.js";
+import {
+  cancellationReason,
+  CancellationError,
+  installCancellationHandlers,
+} from "../src/lib/bootstrap/cancellation.js";
 import {
   aliasAcceptsRelease,
   isCompatibleRuntimeManifest,
@@ -26,6 +33,20 @@ async function closeServer(server: Server): Promise<void> {
       else resolve();
     });
   });
+}
+
+async function waitForPath(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (
+      await access(path).then(
+        () => true,
+        () => false,
+      )
+    )
+      return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for ${path}.`);
 }
 
 test("allows npm bin symlinks that resolve inside the archive", () => {
@@ -451,6 +472,90 @@ test("rejects unsafe archives and reports runtime process outcomes", async (t) =
   await mkdir(join(signaled, "runtime"), { recursive: true });
   await writeFile(join(signaled, "runtime/index.js"), 'process.kill(process.pid, "SIGTERM");\n');
   assert.equal(await bootstrapInternals.runRuntime(signaled), 1);
+});
+
+test("turns the first process signal into graceful cancellation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-cancellation-signal-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cleaned = join(root, "cleaned.txt");
+  const cancellationModule = new URL("../src/lib/bootstrap/cancellation.js", import.meta.url).href;
+  const script = `
+    import { writeFile } from "node:fs/promises";
+    import { installCancellationHandlers } from ${JSON.stringify(cancellationModule)};
+    const cancellation = installCancellationHandlers();
+    const aborted = new Promise((resolve) => {
+      const active = setInterval(() => undefined, 1_000);
+      cancellation.controller.signal.addEventListener("abort", () => {
+        clearInterval(active);
+        resolve();
+      }, { once: true });
+    });
+    process.stdout.write("ready\\n");
+    await aborted;
+    await writeFile(${JSON.stringify(cleaned)}, cancellation.controller.signal.reason.message);
+    cancellation.dispose();
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+  });
+  const [ready] = (await once(child.stdout, "data")) as [Buffer];
+  assert.equal(ready.toString("utf8"), "ready\n");
+  const processSignal: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGTERM";
+  assert.equal(child.kill(processSignal), true);
+  const [code, exitSignal] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
+  assert.equal(code, 0);
+  assert.equal(exitSignal, null);
+  assert.match(await readFile(cleaned, "utf8"), new RegExp(processSignal, "u"));
+});
+
+test("normalizes cancellation reasons and disposes pre-cancelled handlers", () => {
+  const active = new AbortController();
+  assert.match(cancellationReason(active.signal).message, /cancelled/u);
+
+  const primitive = new AbortController();
+  primitive.abort("cancelled");
+  assert.match(cancellationReason(primitive.signal).message, /cancelled/u);
+
+  const reason = new CancellationError("SIGTERM");
+  const cancelled = new AbortController();
+  cancelled.abort(reason);
+  const handlers = installCancellationHandlers(cancelled);
+  handlers.dispose();
+  handlers.dispose();
+  assert.equal(cancellationReason(cancelled.signal), reason);
+});
+
+test("propagates bootstrap cancellation to the runtime child over IPC", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-cancellation-ipc-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ready = join(root, "ready.txt");
+  const cleaned = join(root, "cleaned.txt");
+  const cancellationModule = new URL("../src/lib/bootstrap/cancellation.js", import.meta.url).href;
+  await mkdir(join(root, "runtime"), { recursive: true });
+  await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
+  await writeFile(
+    join(root, "runtime/index.js"),
+    `
+      import { writeFile } from "node:fs/promises";
+      import { installCancellationHandlers } from ${JSON.stringify(cancellationModule)};
+      const cancellation = installCancellationHandlers();
+      const aborted = new Promise((resolve) => cancellation.controller.signal.addEventListener("abort", resolve, { once: true }));
+      await writeFile(${JSON.stringify(ready)}, "ready");
+      await aborted;
+      await writeFile(${JSON.stringify(cleaned)}, cancellation.controller.signal.reason.message);
+      cancellation.dispose();
+    `,
+  );
+  const controller = new AbortController();
+  const running = bootstrapInternals.runRuntime(root, "source", controller.signal);
+  await waitForPath(ready);
+  controller.abort(new CancellationError("SIGTERM"));
+
+  assert.equal(await running, 0);
+  assert.match(await readFile(cleaned, "utf8"), /SIGTERM/u);
 });
 
 test("rejects release and manifest mismatches before runtime execution", async (t) => {

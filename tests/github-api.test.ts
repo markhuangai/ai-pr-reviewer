@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import test from "node:test";
 
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import { GitHubApi, GitHubApiError, githubApiInternals } from "../src/lib/github-api.js";
 import type {
   PullRequestContext,
@@ -201,6 +202,60 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
       authorization: "Bearer test-token",
     },
   ]);
+});
+
+test("aborts in-flight GitHub requests and blocks later writes", async (t) => {
+  let requests = 0;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const server = createServer((request, response) => {
+    requests += 1;
+    markStarted?.();
+    request.once("aborted", () => response.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const controller = new AbortController();
+  const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`, controller.signal);
+  const pending = api.getAuthenticatedUserLogin();
+  await started;
+  const reason = new CancellationError("SIGTERM");
+  controller.abort(reason);
+  await assert.rejects(pending, (error: unknown) => error === reason);
+
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "Cancelled review",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+  await assert.rejects(
+    api.createReview(context, {
+      commit_id: context.headSha,
+      body: "body",
+      event: "COMMENT",
+      comments: [],
+    }),
+    (error: unknown) => error === reason,
+  );
+  assert.equal(requests, 1);
 });
 
 test("paginates files and conversation records and creates a review", async (t) => {

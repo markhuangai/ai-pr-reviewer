@@ -4,6 +4,7 @@ import type {
   PullRequestLocator,
   PullRequestReviewRequest,
 } from "./types.js";
+import { throwIfAborted } from "./bootstrap/cancellation.js";
 
 interface PullRequestFilePayload {
   readonly filename?: unknown;
@@ -434,10 +435,16 @@ function nextPagePath(link: string | null, apiUrl: string): string | undefined {
 export class GitHubApi {
   private readonly apiUrl: string;
   private readonly token: string;
+  private readonly signal: AbortSignal | undefined;
 
-  constructor(token: string, apiUrl = process.env.GITHUB_API_URL ?? "https://api.github.com") {
+  constructor(
+    token: string,
+    apiUrl = process.env.GITHUB_API_URL ?? "https://api.github.com",
+    signal?: AbortSignal,
+  ) {
     this.apiUrl = apiUrl.replace(/\/$/, "");
     this.token = token;
+    this.signal = signal;
   }
 
   async getAuthenticatedUserLogin(): Promise<string> {
@@ -472,13 +479,20 @@ export class GitHubApi {
   }
 
   private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
+    const signal = init.signal ?? this.signal;
+    throwIfAborted(signal ?? undefined);
     const headers = new Headers(init.headers);
     headers.set("Accept", "application/vnd.github+json");
     headers.set("Authorization", `Bearer ${this.token}`);
     headers.set("X-GitHub-Api-Version", "2022-11-28");
     if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    const response = await fetch(`${this.apiUrl}${path}`, { ...init, headers });
+    const response = await fetch(`${this.apiUrl}${path}`, {
+      ...init,
+      headers,
+      ...(signal === undefined ? {} : { signal }),
+    });
     const text = await response.text();
+    throwIfAborted(signal ?? undefined);
     let payload: unknown = undefined;
     if (text.length > 0) {
       try {

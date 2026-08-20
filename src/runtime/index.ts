@@ -1,8 +1,17 @@
 import { main } from "../index.js";
 import { pathToFileURL } from "node:url";
 
-export async function runRuntimeEntry(run: () => Promise<void> = main): Promise<void> {
-  await run();
+import { installCancellationHandlers } from "../lib/bootstrap/cancellation.js";
+
+export async function runRuntimeEntry(
+  run: (controller: AbortController) => Promise<void> = main,
+): Promise<void> {
+  const cancellation = installCancellationHandlers();
+  try {
+    await run(cancellation.controller);
+  } finally {
+    cancellation.dispose();
+  }
 }
 
 const entry = process.argv[1];

@@ -9,6 +9,7 @@ import {
   buildRunSummary,
   reviewMarker,
 } from "./lib/aggregate.js";
+import { throwIfAborted } from "./lib/bootstrap/cancellation.js";
 import { prepareContextFiles, type ContextFileArtifact } from "./lib/context-files.js";
 import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
 import {
@@ -150,22 +151,40 @@ async function loadConversation(
 async function assertWorkspace(
   context: PullRequestContext,
   cwd: string = process.env.GITHUB_WORKSPACE ?? process.cwd(),
+  signal?: AbortSignal,
 ): Promise<void> {
-  const { stdout: head } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024,
-  });
+  throwIfAborted(signal);
+  let head: string;
+  try {
+    ({ stdout: head } = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+      ...(signal === undefined ? {} : { signal }),
+    }));
+  } catch (error) {
+    throwIfAborted(signal);
+    throw error;
+  }
+  throwIfAborted(signal);
   if (head.trim() !== context.headSha) {
     throw new Error(
       `Workspace HEAD ${head.trim()} does not match pull request head ${context.headSha}; refusing to review a mismatched checkout.`,
     );
   }
-  const { stdout: status } = await execFileAsync("git", ["status", "--porcelain", "--ignored"], {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024,
-  });
+  let status: string;
+  try {
+    ({ stdout: status } = await execFileAsync("git", ["status", "--porcelain", "--ignored"], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+      ...(signal === undefined ? {} : { signal }),
+    }));
+  } catch (error) {
+    throwIfAborted(signal);
+    throw error;
+  }
+  throwIfAborted(signal);
   if (status.trim().length > 0) {
     throw new Error(
       "The checked-out workspace has tracked, untracked, or ignored content; refusing to review it.",
@@ -205,13 +224,17 @@ export async function runAction(
   reader: InputReader = actionInputReader(),
   inputSecrets: readonly string[] = inputSecretCandidates(reader),
   dependencies: ActionDependencies = defaultActionDependencies,
+  abortController = new AbortController(),
 ): Promise<ReviewRunResult> {
+  const { signal } = abortController;
+  throwIfAborted(signal);
   registerInputSecrets(inputSecrets);
   const config = readReviewConfig(reader);
   const secrets = reviewSecretCandidates(config);
   registerInputSecrets(secrets);
-  const api = dependencies.createApi(config.githubToken);
-  const eventContext = await dependencies.readEventContext();
+  const api = dependencies.createApi(config.githubToken, signal);
+  const eventContext = await dependencies.readEventContext(signal);
+  throwIfAborted(signal);
   const locator =
     config.pullRequestUrl === undefined ? undefined : parsePullRequestUrl(config.pullRequestUrl);
   if (
@@ -225,22 +248,34 @@ export async function runAction(
   }
   const context =
     locator === undefined
-      ? (eventContext ?? (await readPullRequestContext()))
+      ? (eventContext ?? (await readPullRequestContext(undefined, undefined, signal)))
       : await api.getPullRequestContext(locator);
+  throwIfAborted(signal);
   const temporaryWorkspace =
     locator === undefined
       ? undefined
-      : await dependencies.createWorkspace(context, config.githubToken);
+      : await dependencies.createWorkspace(
+          context,
+          config.githubToken,
+          undefined,
+          undefined,
+          signal,
+        );
   const workspace = temporaryWorkspace?.path ?? process.env.GITHUB_WORKSPACE ?? process.cwd();
   let contextFiles: ContextFileArtifact | undefined;
   try {
-    await assertWorkspace(context, workspace);
+    throwIfAborted(signal);
+    await assertWorkspace(context, workspace, signal);
     contextFiles = await (dependencies.prepareContextFiles ?? prepareContextFiles)(
       config.reviewPrompts,
       workspace,
+      undefined,
+      signal,
     );
+    throwIfAborted(signal);
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
     const conversation = await loadConversation(api, context, authenticatedLogin);
+    throwIfAborted(signal);
     if (config.interactWithPullRequest) {
       const marker = reviewMarker(
         context,
@@ -262,8 +297,9 @@ export async function runAction(
       }
     }
 
-    await assertWorkspace(context, workspace);
+    await assertWorkspace(context, workspace, signal);
     const files = await api.getPullRequestFiles(context);
+    throwIfAborted(signal);
     core.info(
       `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
     );
@@ -277,7 +313,10 @@ export async function runAction(
       config,
       contextFiles.filesByGoal,
       workspace,
+      undefined,
+      abortController,
     );
+    throwIfAborted(signal);
     const goals = redactGoals(rawGoals, secrets);
     const review = aggregateReview(
       context,
@@ -288,8 +327,10 @@ export async function runAction(
       contextFiles.identity,
     );
     if (!config.interactWithPullRequest) {
-      await assertWorkspace(context, workspace);
+      await assertWorkspace(context, workspace, signal);
+      throwIfAborted(signal);
       await dependencies.writeSummary(context, review, goals);
+      throwIfAborted(signal);
       if (review.allGoalsFailed) {
         throw new Error("All review goals failed; the result was written to the run summary.");
       }
@@ -301,26 +342,33 @@ export async function runAction(
       return { skipped: false, review };
     }
     if (review.allGoalsFailed) {
-      await assertWorkspace(context, workspace);
+      await assertWorkspace(context, workspace, signal);
+      throwIfAborted(signal);
       await dependencies.writeSummary(context, review, goals);
+      throwIfAborted(signal);
       throw new Error(
         "All review goals failed; no pull request review was posted, and the result was written to the run summary.",
       );
     }
 
     const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
-    await assertWorkspace(context, workspace);
+    await assertWorkspace(context, workspace, signal);
+    throwIfAborted(signal);
     try {
       await api.createReview(context, request);
+      throwIfAborted(signal);
     } catch (error) {
+      throwIfAborted(signal);
       if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
       core.warning("GitHub rejected the approval review; retrying as a comment review.");
-      await assertWorkspace(context, workspace);
+      await assertWorkspace(context, workspace, signal);
+      throwIfAborted(signal);
       await api.createReview(context, {
         ...request,
         event: "COMMENT",
         body: `${request.body}\n\n> GitHub rejected the requested approval, so this result was posted as a comment.`,
       });
+      throwIfAborted(signal);
     }
     if (review.partial)
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
@@ -331,8 +379,8 @@ export async function runAction(
 }
 
 interface ActionDependencies {
-  readonly createApi: (token: string) => GitHubApi;
-  readonly readEventContext: () => Promise<PullRequestContext | undefined>;
+  readonly createApi: (token: string, signal?: AbortSignal) => GitHubApi;
+  readonly readEventContext: (signal?: AbortSignal) => Promise<PullRequestContext | undefined>;
   readonly createWorkspace: typeof createPullRequestWorkspace;
   readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
@@ -340,20 +388,25 @@ interface ActionDependencies {
 }
 
 const defaultActionDependencies: ActionDependencies = {
-  createApi: (token) => new GitHubApi(token),
-  readEventContext: () => readPullRequestEventContext(),
+  createApi: (token, signal) =>
+    new GitHubApi(token, process.env.GITHUB_API_URL ?? "https://api.github.com", signal),
+  readEventContext: (signal) => readPullRequestEventContext(undefined, undefined, signal),
   createWorkspace: createPullRequestWorkspace,
   runGoals: runReviewGoals,
   writeSummary: writeRunSummary,
 };
 
-export async function main(): Promise<void> {
+export async function main(abortController = new AbortController()): Promise<void> {
   let inputSecrets: readonly string[] = [];
   try {
     const reader = actionInputReader();
     inputSecrets = inputSecretCandidates(reader);
-    await runAction(reader, inputSecrets);
+    await runAction(reader, inputSecrets, defaultActionDependencies, abortController);
   } catch (error) {
+    if (abortController.signal.aborted) {
+      core.info("Pull request review cancelled; no new review or run summary will be published.");
+      return;
+    }
     const environmentInputSecrets = Object.entries(process.env)
       .filter(([key]) => key.startsWith("INPUT_"))
       .map(([, value]) => value ?? "");

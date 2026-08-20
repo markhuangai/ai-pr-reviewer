@@ -4,6 +4,7 @@ import { chmod, lstat, mkdtemp, open, realpath, rm, type FileHandle } from "node
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 
+import { throwIfAborted } from "./bootstrap/cancellation.js";
 import type { ReviewGoal } from "./types.js";
 
 const MAX_CONTEXT_FILES_PER_GOAL = 25;
@@ -81,10 +82,15 @@ function assertRegularSingleLink(file: BigIntStats, path: string): void {
   }
 }
 
-async function preflightContextFiles(paths: readonly string[]): Promise<void> {
+async function preflightContextFiles(
+  paths: readonly string[],
+  signal?: AbortSignal,
+): Promise<void> {
   let totalBytes = 0n;
   for (const path of paths) {
+    throwIfAborted(signal);
     const file = await lstat(path, { bigint: true });
+    throwIfAborted(signal);
     assertRegularSingleLink(file, path);
     if (file.size > BigInt(MAX_CONTEXT_FILE_BYTES)) {
       throw new Error(
@@ -103,10 +109,13 @@ async function writeAll(
   buffer: Buffer,
   length: number,
   position: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   let written = 0;
   while (written < length) {
+    throwIfAborted(signal);
     const result = await file.write(buffer, written, length - written, position + written);
+    throwIfAborted(signal);
     if (result.bytesWritten === 0)
       throw new Error("The context file snapshot could not be written.");
     written += result.bytesWritten;
@@ -117,12 +126,16 @@ async function captureFile(
   path: string,
   snapshotPath: string,
   remainingBytes: number,
+  signal?: AbortSignal,
 ): Promise<PreparedContextFile> {
+  throwIfAborted(signal);
   const before = await lstat(path, { bigint: true });
+  throwIfAborted(signal);
   assertRegularSingleLink(before, path);
   const source = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   let destination: FileHandle | undefined;
   try {
+    throwIfAborted(signal);
     const opened = await source.stat({ bigint: true });
     assertRegularSingleLink(opened, path);
     if (!sameFileIdentity(before, opened)) {
@@ -149,8 +162,10 @@ async function captureFile(
     let offset = 0;
     try {
       while (offset < sizeBytes) {
+        throwIfAborted(signal);
         const length = Math.min(buffer.length, sizeBytes - offset);
         const { bytesRead } = await source.read(buffer, 0, length, offset);
+        throwIfAborted(signal);
         if (bytesRead === 0) {
           throw new Error(`Context file ${JSON.stringify(path)} ended during snapshot capture.`);
         }
@@ -160,7 +175,7 @@ async function captureFile(
         }
         decoder.decode(chunk, { stream: true });
         hash.update(chunk);
-        await writeAll(destination, chunk, bytesRead, offset);
+        await writeAll(destination, chunk, bytesRead, offset, signal);
         offset += bytesRead;
       }
       decoder.decode();
@@ -171,6 +186,7 @@ async function captureFile(
       throw error;
     }
     await destination.sync();
+    throwIfAborted(signal);
     const after = await source.stat({ bigint: true });
     if (!stableFileState(opened, after)) {
       throw new Error(`Context file ${JSON.stringify(path)} changed during snapshot capture.`);
@@ -191,7 +207,9 @@ export async function prepareContextFiles(
   goals: readonly ReviewGoal[],
   workspace: string,
   requestedTemporaryRoot = process.env.RUNNER_TEMP?.trim() || tmpdir(),
+  signal?: AbortSignal,
 ): Promise<ContextFileArtifact> {
+  throwIfAborted(signal);
   if (goals.some((goal) => goal.files.length > MAX_CONTEXT_FILES_PER_GOAL)) {
     throw new Error(`A review goal supports at most ${MAX_CONTEXT_FILES_PER_GOAL} context files.`);
   }
@@ -205,21 +223,29 @@ export async function prepareContextFiles(
     return new ContextFileArtifact(goals.map(() => []));
   }
 
-  await preflightContextFiles(paths);
+  await preflightContextFiles(paths, signal);
 
   const repositoryRoot = await realpath(workspace);
   const temporaryRoot = await realpath(resolve(requestedTemporaryRoot));
+  throwIfAborted(signal);
   if (isWithin(repositoryRoot, temporaryRoot)) {
     throw new Error("The context file temporary directory must be outside the checkout.");
   }
   const directory = await mkdtemp(join(temporaryRoot, "ai-pr-reviewer-context-"));
   await chmod(directory, 0o700);
   try {
+    throwIfAborted(signal);
     const prepared = new Map<string, PreparedContextFile>();
     let totalBytes = 0;
     for (const [index, path] of paths.entries()) {
+      throwIfAborted(signal);
       const snapshotPath = join(directory, `${String(index + 1).padStart(3, "0")}.txt`);
-      const file = await captureFile(path, snapshotPath, MAX_CONTEXT_FILE_TOTAL_BYTES - totalBytes);
+      const file = await captureFile(
+        path,
+        snapshotPath,
+        MAX_CONTEXT_FILE_TOTAL_BYTES - totalBytes,
+        signal,
+      );
       totalBytes += file.sizeBytes;
       prepared.set(path, file);
     }

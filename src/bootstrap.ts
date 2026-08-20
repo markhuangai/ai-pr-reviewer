@@ -7,6 +7,12 @@ import { pathToFileURL } from "node:url";
 
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
 import {
+  cancellationReason,
+  cancellationInternals,
+  installCancellationHandlers,
+  throwIfAborted,
+} from "./lib/bootstrap/cancellation.js";
+import {
   aliasAcceptsRelease,
   isCompatibleRuntimeManifest,
   parseActionReleaseReference,
@@ -64,13 +70,17 @@ function apiRequestHeaders(): Headers {
   return headers;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: apiRequestHeaders() });
+async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  const response = await fetch(url, {
+    headers: apiRequestHeaders(),
+    ...(signal === undefined ? {} : { signal }),
+  });
   if (!response.ok) throw new Error(`Runtime release lookup failed (${response.status}).`);
   return (await response.json()) as T;
 }
 
-type JsonFetcher = <T>(url: string) => Promise<T>;
+type JsonFetcher = <T>(url: string, signal?: AbortSignal) => Promise<T>;
 
 function gitObject(value: unknown, expectedType: "commit" | "tag"): string | undefined {
   if (!isRecord(value) || !isRecord(value.object)) return undefined;
@@ -85,14 +95,17 @@ function gitObject(value: unknown, expectedType: "commit" | "tag"): string | und
 async function resolveAlias(
   alias: ActionReleaseAlias,
   getJson: JsonFetcher,
+  signal?: AbortSignal,
 ): Promise<ActionReleaseVersion> {
   const ref = await getJson<unknown>(
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`,
+    signal,
   );
   const tagObjectSha = gitObject(ref, "tag");
   if (!tagObjectSha) throw new Error("The action release alias is not an annotated Git tag.");
   const tagObject = await getJson<unknown>(
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`,
+    signal,
   );
   if (
     !isRecord(tagObject) ||
@@ -108,6 +121,7 @@ async function resolveAlias(
   }
   const exactRef = await getJson<unknown>(
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`,
+    signal,
   );
   if (gitObject(exactRef, "commit") !== commitSha) {
     throw new Error("The action release alias and exact version resolve to different commits.");
@@ -118,14 +132,16 @@ async function resolveAlias(
 export async function resolveActionRelease(
   value: string | undefined,
   getJson: JsonFetcher = fetchJson,
+  signal?: AbortSignal,
 ): Promise<ActionReleaseVersion> {
+  throwIfAborted(signal);
   const reference: ActionReleaseReference | undefined = parseActionReleaseReference(value);
   if (!reference) {
     throw new Error(
       "This action must be referenced by vN, vN-prerelease, or an exact tag such as v1.0.0 or v1.0.0-rc.0.",
     );
   }
-  return "stableTag" in reference ? reference : resolveAlias(reference, getJson);
+  return "stableTag" in reference ? reference : resolveAlias(reference, getJson, signal);
 }
 
 function readAsset(value: unknown): ReleaseAsset {
@@ -148,8 +164,16 @@ function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function download(url: string, destination: string): Promise<Uint8Array> {
-  const response = await fetch(url, { headers: requestHeaders() });
+async function download(
+  url: string,
+  destination: string,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  throwIfAborted(signal);
+  const response = await fetch(url, {
+    headers: requestHeaders(),
+    ...(signal === undefined ? {} : { signal }),
+  });
   if (!response.ok) throw new Error(`Runtime asset download failed (${response.status}).`);
   const contentLength = Number(response.headers.get("content-length") ?? "0");
   if (contentLength > MAX_ARCHIVE_BYTES)
@@ -158,7 +182,7 @@ async function download(url: string, destination: string): Promise<Uint8Array> {
   if (bytes.byteLength > MAX_ARCHIVE_BYTES)
     throw new Error("Runtime asset is larger than the safety limit.");
   await mkdir(dirname(destination), { recursive: true });
-  await writeFile(destination, bytes);
+  await writeFile(destination, bytes, { signal });
   return bytes;
 }
 
@@ -170,27 +194,43 @@ function expectedDigest(asset: ReleaseAsset, checksumText: string | undefined): 
   return match[1].toLowerCase();
 }
 
-async function readChecksum(url: string): Promise<string | undefined> {
-  const response = await fetch(url, { headers: requestHeaders() });
+async function readChecksum(url: string, signal?: AbortSignal): Promise<string | undefined> {
+  throwIfAborted(signal);
+  const response = await fetch(url, {
+    headers: requestHeaders(),
+    ...(signal === undefined ? {} : { signal }),
+  });
   if (response.status === 404) return undefined;
   if (!response.ok) throw new Error(`Runtime checksum download failed (${response.status}).`);
   return response.text();
 }
 
-async function extract(archive: string, destination: string): Promise<void> {
+async function extract(archive: string, destination: string, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
   await mkdir(destination, { recursive: true });
   await new Promise<void>((resolve, reject) => {
     const child = spawn("tar", ["-tvzf", archive], {
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
+      signal,
     });
     let listing = "";
     child.stdout.on("data", (chunk: Buffer) => {
       listing += chunk.toString("utf8");
       if (listing.length > 1_000_000) child.kill();
     });
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (signal?.aborted) {
+        reject(cancellationReason(signal));
+        return;
+      }
+      reject(error);
+    });
     child.once("exit", (code) => {
+      if (signal?.aborted) {
+        reject(cancellationReason(signal));
+        return;
+      }
       if (code !== 0) {
         reject(new Error("Runtime archive listing failed."));
         return;
@@ -239,6 +279,7 @@ async function extract(archive: string, destination: string): Promise<void> {
       resolve();
     });
   });
+  throwIfAborted(signal);
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
       "tar",
@@ -246,14 +287,25 @@ async function extract(archive: string, destination: string): Promise<void> {
       {
         stdio: ["ignore", "ignore", "pipe"],
         windowsHide: true,
+        signal,
       },
     );
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8").slice(0, 2_000);
     });
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (signal?.aborted) {
+        reject(cancellationReason(signal));
+        return;
+      }
+      reject(error);
+    });
     child.once("exit", (code) => {
+      if (signal?.aborted) {
+        reject(cancellationReason(signal));
+        return;
+      }
       if (code === 0) resolve();
       else
         reject(
@@ -266,12 +318,14 @@ async function extract(archive: string, destination: string): Promise<void> {
 async function runRuntime(
   runtimeDirectory: string,
   buildId = process.env.AI_PR_REVIEWER_BUILD_ID ?? "source",
+  signal?: AbortSignal,
 ): Promise<number> {
+  throwIfAborted(signal);
   const entry = join(runtimeDirectory, "runtime", "index.js");
   const entryStats = await stat(entry).catch(() => undefined);
   if (!entryStats?.isFile()) throw new Error("Runtime bundle is missing runtime/index.js.");
   const child = spawn(process.execPath, [entry], {
-    stdio: "inherit",
+    stdio: ["inherit", "inherit", "inherit", "ipc"],
     env: {
       ...process.env,
       AI_PR_REVIEWER_BUILD_ID: buildId,
@@ -279,8 +333,25 @@ async function runRuntime(
     windowsHide: false,
   });
   return new Promise<number>((resolve, reject) => {
-    child.once("error", reject);
+    const cancelRuntime = (): void => {
+      if (!child.connected) return;
+      child.send(cancellationInternals.cancellationMessage(signal?.reason), () => undefined);
+    };
+    const cleanup = (): void => {
+      signal?.removeEventListener("abort", cancelRuntime);
+    };
+    signal?.addEventListener("abort", cancelRuntime, { once: true });
+    if (signal?.aborted) cancelRuntime();
+    child.once("error", (error) => {
+      cleanup();
+      if (signal?.aborted) {
+        reject(cancellationReason(signal));
+        return;
+      }
+      reject(error);
+    });
     child.once("exit", (code, signal) => {
+      cleanup();
       resolve(code ?? (signal ? 1 : 0));
     });
   });
@@ -290,15 +361,19 @@ export interface BootstrapRuntimeOptions {
   readonly releaseRef?: string;
   readonly temporaryRoot?: string;
   readonly getJson?: JsonFetcher;
+  readonly signal?: AbortSignal;
 }
 
 export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): Promise<number> {
+  const { signal } = options;
+  throwIfAborted(signal);
   const releaseRef = options.releaseRef ?? process.env.GITHUB_ACTION_REF;
   const getJson = options.getJson ?? fetchJson;
-  const requestedRelease = await resolveActionRelease(releaseRef, getJson);
+  const requestedRelease = await resolveActionRelease(releaseRef, getJson, signal);
   const assetName = platformAssetName();
   const release = await getJson<ReleasePayload>(
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
+    signal,
   );
   if (
     release.tag_name !== requestedRelease.tag ||
@@ -314,7 +389,7 @@ export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): P
     throw new Error(`Runtime release has no asset for ${assetName}.`);
   if (typeof asset.size === "number" && asset.size > MAX_ARCHIVE_BYTES)
     throw new Error("Runtime asset is larger than the safety limit.");
-  const checksum = await readChecksum(`${asset.browser_download_url}.sha256`);
+  const checksum = await readChecksum(`${asset.browser_download_url}.sha256`, signal);
   const cacheRoot = join(
     options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(),
     "ai-pr-reviewer-runtime",
@@ -322,15 +397,17 @@ export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): P
     assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
   );
   const archive = join(cacheRoot, assetName);
-  const bytes = await download(asset.browser_download_url, archive);
+  const bytes = await download(asset.browser_download_url, archive, signal);
   const actualDigest = sha256(bytes);
   if (actualDigest !== expectedDigest(asset, checksum))
     throw new Error("Runtime asset SHA-256 verification failed.");
   const extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
   try {
-    await extract(archive, extracted);
+    await extract(archive, extracted, signal);
     const manifestPath = join(extracted, "runtime", "manifest.json");
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+    const manifest = JSON.parse(
+      await readFile(manifestPath, { encoding: "utf8", signal }),
+    ) as unknown;
     if (
       !isRecord(manifest) ||
       !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
@@ -344,15 +421,25 @@ export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): P
       throw new Error("Runtime bundle manifest verification failed.");
     }
     const sourceCommit = manifest.sourceCommit;
-    return await runRuntime(extracted, sourceCommit);
+    const code = await runRuntime(extracted, sourceCommit, signal);
+    throwIfAborted(signal);
+    return code;
   } finally {
     await rm(extracted, { recursive: true, force: true });
   }
 }
 
 async function main(): Promise<void> {
-  const code = await bootstrapRuntime();
-  if (code !== 0) process.exitCode = code;
+  const cancellation = installCancellationHandlers();
+  try {
+    const code = await bootstrapRuntime({ signal: cancellation.controller.signal });
+    if (code !== 0) process.exitCode = code;
+  } catch (error) {
+    if (!cancellation.controller.signal.aborted) throw error;
+    console.log("Pull request review cancelled; cleanup completed.");
+  } finally {
+    cancellation.dispose();
+  }
 }
 
 export const bootstrapInternals = {

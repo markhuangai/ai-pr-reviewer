@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
+import { throwIfAborted } from "./bootstrap/cancellation.js";
 import type { PullRequestContext } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -112,16 +113,21 @@ async function git(
   cwd: string,
   args: readonly string[],
   environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ): Promise<string> {
+  throwIfAborted(signal);
   try {
     const { stdout } = await execFileAsync("git", [...args], {
       cwd,
       env: environment,
       encoding: "utf8",
       maxBuffer: MAX_GIT_OUTPUT_BYTES,
+      ...(signal === undefined ? {} : { signal }),
     });
+    throwIfAborted(signal);
     return stdout.trim();
   } catch (error) {
+    throwIfAborted(signal);
     throw new Error(`Git ${args[0] ?? "command"} failed: ${errorMessage(error)}`);
   }
 }
@@ -132,9 +138,15 @@ async function exactCommit(
   expected: string,
   label: string,
   environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (!COMMIT_SHA_PATTERN.test(expected)) throw new Error(`${label} is not a full commit SHA.`);
-  const resolved = await git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`], environment);
+  const resolved = await git(
+    cwd,
+    ["rev-parse", "--verify", `${ref}^{commit}`],
+    environment,
+    signal,
+  );
   if (!COMMIT_SHA_PATTERN.test(resolved) || resolved.toLowerCase() !== expected.toLowerCase()) {
     throw new Error(`${label} ${resolved || "did not resolve"} does not match ${expected}.`);
   }
@@ -145,7 +157,9 @@ async function createFromRemote(
   token: string,
   repositoryUrl: string,
   temporaryRoot: string,
+  signal?: AbortSignal,
 ): Promise<PullRequestWorkspace> {
+  throwIfAborted(signal);
   if (!COMMIT_SHA_PATTERN.test(context.baseSha)) {
     throw new Error("Pull request base is not a full commit SHA.");
   }
@@ -153,18 +167,20 @@ async function createFromRemote(
     throw new Error("Pull request head is not a full commit SHA.");
   }
   const resolvedTemporaryRoot = await realpath(temporaryRoot);
+  throwIfAborted(signal);
   const root = await mkdtemp(join(resolvedTemporaryRoot, "ai-pr-reviewer-checkout-"));
   const repositoryPath = join(root, "repository");
   const globalConfigPath = join(root, "global.gitconfig");
   const hooksPath = join(root, "hooks");
   try {
+    throwIfAborted(signal);
     await Promise.all([
       mkdir(repositoryPath, { mode: 0o700 }),
       mkdir(hooksPath, { mode: 0o700 }),
       writeFile(globalConfigPath, "", { mode: 0o600 }),
     ]);
     const environment = gitEnvironment(token, repositoryUrl, globalConfigPath, hooksPath);
-    await git(repositoryPath, ["init", "--quiet"], environment);
+    await git(repositoryPath, ["init", "--quiet"], environment, signal);
     await git(
       repositoryPath,
       [
@@ -177,6 +193,7 @@ async function createFromRemote(
         `+${context.headSha}:refs/ai-pr-reviewer/head`,
       ],
       environment,
+      signal,
     );
     await exactCommit(
       repositoryPath,
@@ -184,6 +201,7 @@ async function createFromRemote(
       context.baseSha,
       "Fetched pull request base",
       environment,
+      signal,
     );
     await exactCommit(
       repositoryPath,
@@ -191,11 +209,13 @@ async function createFromRemote(
       context.headSha,
       "Fetched pull request head",
       environment,
+      signal,
     );
     await git(
       repositoryPath,
       ["checkout", "--quiet", "--detach", "refs/ai-pr-reviewer/head"],
       environment,
+      signal,
     );
     return {
       path: repositoryPath,
@@ -212,7 +232,9 @@ export async function createPullRequestWorkspace(
   token: string,
   serverUrl: string | undefined = process.env.GITHUB_SERVER_URL,
   temporaryRoot: string = process.env.RUNNER_TEMP?.trim() || tmpdir(),
+  signal?: AbortSignal,
 ): Promise<PullRequestWorkspace> {
+  throwIfAborted(signal);
   if (!serverUrl) throw new Error("GITHUB_SERVER_URL is not set.");
   const callerWorkspace = process.env.GITHUB_WORKSPACE?.trim();
   if (callerWorkspace) {
@@ -220,11 +242,12 @@ export async function createPullRequestWorkspace(
       realpath(callerWorkspace),
       realpath(temporaryRoot),
     ]);
+    throwIfAborted(signal);
     if (isWithin(resolvedCallerWorkspace, resolvedTemporaryRoot)) {
       throw new Error("The temporary checkout directory must be outside GITHUB_WORKSPACE.");
     }
   }
-  return createFromRemote(context, token, remoteUrl(context, serverUrl), temporaryRoot);
+  return createFromRemote(context, token, remoteUrl(context, serverUrl), temporaryRoot, signal);
 }
 
 export const pullRequestWorkspaceInternals = {

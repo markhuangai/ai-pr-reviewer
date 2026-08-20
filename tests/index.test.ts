@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 
 import { indexInternals, main, runAction } from "../src/index.js";
 import { buildRunSummary, reviewMarker } from "../src/lib/aggregate.js";
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import { GitHubApi, GitHubApiError } from "../src/lib/github-api.js";
 import { readReviewConfig, type InputReader } from "../src/lib/input.js";
 import type {
@@ -764,6 +765,65 @@ test("reviews the captured event refs without querying their live state", async 
   assert.equal(result.skipped, false);
   assert.equal(refReads, 0);
   assert.equal(postedReviews, 1);
+});
+
+test("cancellation prevents new summaries and pull request writes", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+
+  for (const interactWithPullRequest of [true, false]) {
+    const controller = new AbortController();
+    const reason = new CancellationError("SIGTERM");
+    let summaries = 0;
+    let reviews = 0;
+    const api = {
+      ...emptyConversationApi(),
+      getPullRequestFiles: () => Promise.resolve([]),
+      createReview: () => {
+        reviews += 1;
+        return Promise.resolve();
+      },
+    } as unknown as GitHubApi;
+    await assert.rejects(
+      runAction(
+        actionReader({ "interact-with-pr": String(interactWithPullRequest) }),
+        [],
+        {
+          createApi: () => api,
+          readEventContext: () => Promise.resolve(context),
+          createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+          runGoals: (
+            _context,
+            _files,
+            _conversation,
+            _config,
+            _contextFiles,
+            _cwd,
+            _queryAgent,
+            receivedController,
+          ) => {
+            assert.equal(receivedController, controller);
+            controller.abort(reason);
+            return Promise.resolve([
+              {
+                prompt: "correctness",
+                status: "completed",
+                submission: { summary: "clean", findings: [] },
+              },
+            ]);
+          },
+          writeSummary: () => {
+            summaries += 1;
+            return Promise.resolve();
+          },
+        },
+        controller,
+      ),
+      (error: unknown) => error === reason,
+    );
+    assert.equal(summaries, 0);
+    assert.equal(reviews, 0);
+  }
 });
 
 test("rejects mismatched event URL targets", async (t) => {

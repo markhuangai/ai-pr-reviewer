@@ -52,10 +52,15 @@ test("copies bootstrap files, lists archive entries, normalizes modes, and write
   await mkdir(join(source, "lib/bootstrap"), { recursive: true });
   await writeFile(join(source, "bootstrap.js"), "bootstrap\n");
   await writeFile(join(source, "lib/bootstrap/archive.js"), "archive\n");
+  await writeFile(join(source, "lib/bootstrap/cancellation.js"), "cancellation\n");
   await writeFile(join(source, "lib/bootstrap/version.js"), "version\n");
   await copyBootstrap(source, destination);
   assert.equal(await readFile(join(destination, "bootstrap.js"), "utf8"), "bootstrap\n");
   assert.equal(await readFile(join(destination, "lib/bootstrap/archive.js"), "utf8"), "archive\n");
+  assert.equal(
+    await readFile(join(destination, "lib/bootstrap/cancellation.js"), "utf8"),
+    "cancellation\n",
+  );
 
   const archiveRoot = join(root, "archive");
   await mkdir(join(archiveRoot, "nested"), { recursive: true });

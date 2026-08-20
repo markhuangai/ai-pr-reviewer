@@ -8,6 +8,7 @@ import test from "node:test";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import {
   createPullRequestWorkspace,
   pullRequestWorkspaceInternals,
@@ -183,6 +184,24 @@ test("removes a temporary checkout when an API snapshot commit is unavailable", 
       fixture.temporary,
     ),
     /Git fetch failed/u,
+  );
+  assert.deepEqual(await readdir(fixture.temporary), []);
+});
+
+test("does not create a temporary checkout after cancellation", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGINT");
+  controller.abort(reason);
+  await assert.rejects(
+    pullRequestWorkspaceInternals.createFromRemote(
+      fixture.context,
+      "github-secret",
+      pathToFileURL(fixture.remote).href,
+      fixture.temporary,
+      controller.signal,
+    ),
+    (error: unknown) => error === reason,
   );
   assert.deepEqual(await readdir(fixture.temporary), []);
 });
