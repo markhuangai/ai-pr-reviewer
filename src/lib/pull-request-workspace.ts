@@ -146,6 +146,12 @@ async function createFromRemote(
   repositoryUrl: string,
   temporaryRoot: string,
 ): Promise<PullRequestWorkspace> {
+  if (!COMMIT_SHA_PATTERN.test(context.baseSha)) {
+    throw new Error("Pull request base is not a full commit SHA.");
+  }
+  if (!COMMIT_SHA_PATTERN.test(context.headSha)) {
+    throw new Error("Pull request head is not a full commit SHA.");
+  }
   const resolvedTemporaryRoot = await realpath(temporaryRoot);
   const root = await mkdtemp(join(resolvedTemporaryRoot, "ai-pr-reviewer-checkout-"));
   const repositoryPath = join(root, "repository");
@@ -159,7 +165,6 @@ async function createFromRemote(
     ]);
     const environment = gitEnvironment(token, repositoryUrl, globalConfigPath, hooksPath);
     await git(repositoryPath, ["init", "--quiet"], environment);
-    await git(repositoryPath, ["check-ref-format", `refs/heads/${context.baseRef}`], environment);
     await git(
       repositoryPath,
       [
@@ -168,8 +173,8 @@ async function createFromRemote(
         "--no-tags",
         "--no-write-fetch-head",
         repositoryUrl,
-        `+refs/heads/${context.baseRef}:refs/ai-pr-reviewer/base`,
-        `+refs/pull/${context.number}/head:refs/ai-pr-reviewer/head`,
+        `+${context.baseSha}:refs/ai-pr-reviewer/base`,
+        `+${context.headSha}:refs/ai-pr-reviewer/head`,
       ],
       environment,
     );
@@ -224,6 +229,7 @@ export async function createPullRequestWorkspace(
 
 export const pullRequestWorkspaceInternals = {
   createFromRemote,
+  exactCommit,
   gitEnvironment,
   isWithin,
   remoteUrl,

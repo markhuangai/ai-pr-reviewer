@@ -484,7 +484,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 12);
+  assert.equal(requests.length, 6);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,
@@ -499,15 +499,15 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/reviews?") === true).length,
-    2,
+    1,
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/pulls/9/comments?") === true).length,
-    2,
+    1,
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/issues/9/comments?") === true).length,
-    2,
+    1,
   );
 });
 
@@ -678,7 +678,7 @@ test("propagates non-approval review failures", async (t) => {
   );
 });
 
-test("rejects a review result when the pull request discussion changes", async (t) => {
+test("reviews the captured pull request discussion without rechecking it", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   let issueCommentReads = 0;
@@ -711,44 +711,65 @@ test("rejects a review result when the pull request discussion changes", async (
     },
   } as unknown as GitHubApi;
 
-  await assert.rejects(
-    runAction(actionReader(), [], {
-      createApi: () => api,
-      readEventContext: () => Promise.resolve(context),
-      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-      runGoals: () =>
-        Promise.resolve([
-          {
-            prompt: "correctness",
-            status: "completed",
-            submission: { summary: "clean", findings: [] },
-          },
-        ]),
-      writeSummary: () => Promise.resolve(),
-    }),
-    /discussion changed during review/u,
-  );
-  assert.equal(issueCommentReads, 2);
-  assert.equal(postedReviews, 0);
+  const result = await runAction(actionReader(), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(issueCommentReads, 1);
+  assert.equal(postedReviews, 1);
 });
 
-test("fails closed for stale refs and mismatched event URL targets", async (t) => {
+test("reviews the captured event refs without querying their live state", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
-  const staleApi = {
-    getPullRequestRefs: () =>
-      Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha }),
+  let refReads = 0;
+  let postedReviews = 0;
+  const snapshotApi = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () => {
+      refReads += 1;
+      return Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha });
+    },
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
   } as unknown as GitHubApi;
-  await assert.rejects(
-    runAction(actionReader(), [], {
-      createApi: () => staleApi,
-      readEventContext: () => Promise.resolve(context),
-      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-      runGoals: () => Promise.resolve([]),
-      writeSummary: () => Promise.resolve(),
-    }),
-    /refs changed during review/u,
-  );
+  const result = await runAction(actionReader(), [], {
+    createApi: () => snapshotApi,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(refReads, 0);
+  assert.equal(postedReviews, 1);
+});
+
+test("rejects mismatched event URL targets", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const api = emptyConversationApi() as unknown as GitHubApi;
 
   const previousServer = process.env.GITHUB_SERVER_URL;
   process.env.GITHUB_SERVER_URL = "https://github.com";
@@ -761,7 +782,7 @@ test("fails closed for stale refs and mismatched event URL targets", async (t) =
       actionReader({ "pull-request-url": "https://github.com/other/repository/pull/10" }),
       [],
       {
-        createApi: () => staleApi,
+        createApi: () => api,
         readEventContext: () => Promise.resolve(context),
         createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
         runGoals: () => Promise.resolve([]),

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -47,6 +47,7 @@ async function makePullRequestRemote(t: TestContext) {
   await writeFile(join(source, "review.txt"), "base\n");
   const baseSha = await commit(source, "base");
   await git(source, ["push", "--quiet", remote, "HEAD:refs/heads/main"]);
+  await git(source, ["switch", "--quiet", "--create", "pull-request"]);
   await writeFile(join(source, "review.txt"), "head\n");
   const headSha = await commit(source, "head");
   await git(source, ["push", "--quiet", remote, "HEAD:refs/pull/7/head"]);
@@ -61,7 +62,23 @@ async function makePullRequestRemote(t: TestContext) {
     title: "Change",
     htmlUrl: "https://github.com/owner/repository/pull/7",
   };
-  return { context, remote, temporary };
+  return { context, remote, source, temporary };
+}
+
+async function advanceBase(fixture: Awaited<ReturnType<typeof makePullRequestRemote>>) {
+  await git(fixture.source, ["switch", "--quiet", "main"]);
+  await writeFile(join(fixture.source, "base-tip.txt"), "advanced base\n");
+  const sha = await commit(fixture.source, "advance base");
+  await git(fixture.source, ["push", "--quiet", fixture.remote, "HEAD:refs/heads/main"]);
+  return sha;
+}
+
+async function advanceHead(fixture: Awaited<ReturnType<typeof makePullRequestRemote>>) {
+  await git(fixture.source, ["switch", "--quiet", "pull-request"]);
+  await writeFile(join(fixture.source, "review.txt"), "new head\n");
+  const sha = await commit(fixture.source, "advance head");
+  await git(fixture.source, ["push", "--quiet", fixture.remote, "HEAD:refs/pull/7/head"]);
+  return sha;
 }
 
 test("fetches exact pull request refs into an isolated credential-free checkout", async (t) => {
@@ -93,7 +110,70 @@ test("fetches exact pull request refs into an isolated credential-free checkout"
   await assert.rejects(access(root));
 });
 
-test("removes a temporary checkout when fetched refs do not match the API snapshot", async (t) => {
+test("pins the API base after the live base branch advances", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  const liveBaseSha = await advanceBase(fixture);
+  assert.notEqual(liveBaseSha, fixture.context.baseSha);
+
+  const workspace = await pullRequestWorkspaceInternals.createFromRemote(
+    fixture.context,
+    "github-secret",
+    pathToFileURL(fixture.remote).href,
+    fixture.temporary,
+  );
+  assert.equal(await git(workspace.path, ["rev-parse", "HEAD"]), fixture.context.headSha);
+  assert.equal(
+    await git(workspace.path, ["rev-parse", "refs/ai-pr-reviewer/base"]),
+    fixture.context.baseSha,
+  );
+  assert.equal(await readFile(join(workspace.path, "review.txt"), "utf8"), "head\n");
+  await workspace.cleanup();
+});
+
+test("pins the API head after the pull request ref advances", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  const liveHeadSha = await advanceHead(fixture);
+  assert.notEqual(liveHeadSha, fixture.context.headSha);
+
+  const workspace = await pullRequestWorkspaceInternals.createFromRemote(
+    fixture.context,
+    "github-secret",
+    pathToFileURL(fixture.remote).href,
+    fixture.temporary,
+  );
+  assert.equal(await git(workspace.path, ["rev-parse", "HEAD"]), fixture.context.headSha);
+  assert.equal(
+    await git(workspace.path, ["rev-parse", "refs/ai-pr-reviewer/head"]),
+    fixture.context.headSha,
+  );
+  assert.equal(await readFile(join(workspace.path, "review.txt"), "utf8"), "head\n");
+  await workspace.cleanup();
+});
+
+test("retains the exact fetched commit assertion", async (t) => {
+  const fixture = await makePullRequestRemote(t);
+  const globalConfigPath = join(fixture.temporary, "global.gitconfig");
+  const hooksPath = join(fixture.temporary, "hooks");
+  await Promise.all([mkdir(hooksPath), writeFile(globalConfigPath, "")]);
+  const environment = pullRequestWorkspaceInternals.gitEnvironment(
+    "github-secret",
+    pathToFileURL(fixture.remote).href,
+    globalConfigPath,
+    hooksPath,
+  );
+  await assert.rejects(
+    pullRequestWorkspaceInternals.exactCommit(
+      fixture.source,
+      "HEAD",
+      fixture.context.baseSha,
+      "Fetched pull request head",
+      environment,
+    ),
+    /does not match/u,
+  );
+});
+
+test("removes a temporary checkout when an API snapshot commit is unavailable", async (t) => {
   const fixture = await makePullRequestRemote(t);
   await assert.rejects(
     pullRequestWorkspaceInternals.createFromRemote(
@@ -102,7 +182,7 @@ test("removes a temporary checkout when fetched refs do not match the API snapsh
       pathToFileURL(fixture.remote).href,
       fixture.temporary,
     ),
-    /does not match/,
+    /Git fetch failed/u,
   );
   assert.deepEqual(await readdir(fixture.temporary), []);
 });
@@ -184,7 +264,7 @@ test("validates server URLs and workspace boundaries", async (t) => {
   }
 });
 
-test("removes partial workspaces for invalid refs and Git failures", async (t) => {
+test("removes partial workspaces for invalid SHAs and Git failures", async (t) => {
   const fixture = await makePullRequestRemote(t);
   await assert.rejects(
     pullRequestWorkspaceInternals.createFromRemote(
@@ -194,15 +274,6 @@ test("removes partial workspaces for invalid refs and Git failures", async (t) =
       fixture.temporary,
     ),
     /not a full commit SHA/u,
-  );
-  await assert.rejects(
-    pullRequestWorkspaceInternals.createFromRemote(
-      { ...fixture.context, baseRef: "../invalid" },
-      "token",
-      pathToFileURL(fixture.remote).href,
-      fixture.temporary,
-    ),
-    /Git check-ref-format failed/u,
   );
   await assert.rejects(
     pullRequestWorkspaceInternals.createFromRemote(

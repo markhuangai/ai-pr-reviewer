@@ -126,15 +126,6 @@ function isApprovalRejection(error: unknown): error is GitHubApiError {
   );
 }
 
-async function assertCurrentHead(api: GitHubApi, context: PullRequestContext): Promise<void> {
-  const currentRefs = await api.getPullRequestRefs(context);
-  if (currentRefs.headSha !== context.headSha || currentRefs.baseSha !== context.baseSha) {
-    throw new Error(
-      `Pull request refs changed during review (event ${context.baseSha}...${context.headSha}, current ${currentRefs.baseSha}...${currentRefs.headSha}); refusing to review a stale checkout.`,
-    );
-  }
-}
-
 interface LoadedConversation {
   readonly reviews: Awaited<ReturnType<GitHubApi["listReviews"]>>;
   readonly snapshot: ReviewConversationSnapshot;
@@ -154,20 +145,6 @@ async function loadConversation(
     reviews,
     snapshot: buildReviewConversation(authenticatedLogin, reviews, reviewComments, issueComments),
   };
-}
-
-async function assertCurrentConversation(
-  api: GitHubApi,
-  context: PullRequestContext,
-  authenticatedLogin: string,
-  expectedDigest: string,
-): Promise<void> {
-  const current = await loadConversation(api, context, authenticatedLogin);
-  if (current.snapshot.digest !== expectedDigest) {
-    throw new Error(
-      "Pull request discussion changed during review; refusing to publish a result without the latest context. Rerun the workflow.",
-    );
-  }
 }
 
 async function assertWorkspace(
@@ -257,7 +234,6 @@ export async function runAction(
   const workspace = temporaryWorkspace?.path ?? process.env.GITHUB_WORKSPACE ?? process.cwd();
   let contextFiles: ContextFileArtifact | undefined;
   try {
-    await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
     contextFiles = await (dependencies.prepareContextFiles ?? prepareContextFiles)(
       config.reviewPrompts,
@@ -286,7 +262,6 @@ export async function runAction(
       }
     }
 
-    await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
     const files = await api.getPullRequestFiles(context);
     core.info(
@@ -313,14 +288,7 @@ export async function runAction(
       contextFiles.identity,
     );
     if (!config.interactWithPullRequest) {
-      await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
-      await assertCurrentConversation(
-        api,
-        context,
-        authenticatedLogin,
-        conversation.snapshot.digest,
-      );
       await dependencies.writeSummary(context, review, goals);
       if (review.allGoalsFailed) {
         throw new Error("All review goals failed; the result was written to the run summary.");
@@ -333,14 +301,7 @@ export async function runAction(
       return { skipped: false, review };
     }
     if (review.allGoalsFailed) {
-      await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
-      await assertCurrentConversation(
-        api,
-        context,
-        authenticatedLogin,
-        conversation.snapshot.digest,
-      );
       await dependencies.writeSummary(context, review, goals);
       throw new Error(
         "All review goals failed; no pull request review was posted, and the result was written to the run summary.",
@@ -348,22 +309,13 @@ export async function runAction(
     }
 
     const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
-    await assertCurrentHead(api, context);
     await assertWorkspace(context, workspace);
-    await assertCurrentConversation(api, context, authenticatedLogin, conversation.snapshot.digest);
     try {
       await api.createReview(context, request);
     } catch (error) {
       if (request.event !== "APPROVE" || !isApprovalRejection(error)) throw error;
       core.warning("GitHub rejected the approval review; retrying as a comment review.");
-      await assertCurrentHead(api, context);
       await assertWorkspace(context, workspace);
-      await assertCurrentConversation(
-        api,
-        context,
-        authenticatedLogin,
-        conversation.snapshot.digest,
-      );
       await api.createReview(context, {
         ...request,
         event: "COMMENT",
@@ -411,7 +363,6 @@ export async function main(): Promise<void> {
 
 export const indexInternals = {
   assertWorkspace,
-  assertCurrentConversation,
   loadConversation,
   writeRunSummary,
   inputSecretCandidates,
