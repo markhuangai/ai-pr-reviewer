@@ -474,6 +474,8 @@ async function readGitAddedLines(
       "--no-ext-diff",
       "--no-textconv",
       "--no-color",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
       "--find-renames=50%",
       "--inter-hunk-context=0",
       "--unified=0",
@@ -621,6 +623,8 @@ export async function readPullRequestFilesFromCheckout(
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
     "--find-renames=50%",
   ];
   const nameStatuses = parseGitNameStatus(

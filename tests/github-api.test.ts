@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -366,12 +366,14 @@ test("uses the captured merge-base attributes for changed-file metadata", async 
   assert.deepEqual([...notes.addedLines], [1]);
 });
 
-test("decodes quoted UTF-8 paths from Git diff output", async (t) => {
+test("decodes quoted UTF-8 paths and pins diff prefixes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-quoted-path-"));
   t.after(() => rm(root, { force: true, recursive: true }));
   await git(root, ["init", "--quiet", "--initial-branch=main"]);
   await git(root, ["config", "core.quotePath", "true"]);
-  const path = "ümlaut.txt";
+  await mkdir(join(root, "b"));
+  await git(root, ["config", "diff.noprefix", "true"]);
+  const path = "b/ümlaut.txt";
   await writeFile(join(root, path), "before\n");
   const baseSha = await commit(root, "base");
   await writeFile(join(root, path), "after\n");
@@ -395,7 +397,7 @@ test("decodes quoted UTF-8 paths from Git diff output", async (t) => {
   assert.equal(files.length, 1);
   assert.equal(files[0]?.path, path);
   assert.deepEqual([...(files[0]?.addedLines ?? [])], [1]);
-  assert.equal(githubApiInternals.decodeGitPath('"b/\\303\\274mlaut.txt"'), `b/${path}`);
+  assert.equal(githubApiInternals.decodeGitPath('"b/\\303\\274mlaut.txt"'), path);
 });
 
 test("does not infer unchanged lines from merged zero-context hunks", async (t) => {
