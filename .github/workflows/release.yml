@@ -107,7 +107,8 @@ jobs:
       - name: Verify generated bootstrap
         run: >-
           git diff --exit-code -- dist/bootstrap.js
-          dist/lib/bootstrap/archive.js dist/lib/bootstrap/version.js
+          dist/lib/bootstrap/archive.js dist/lib/bootstrap/cancellation.js
+          dist/lib/bootstrap/version.js
 
   build-runtime:
     name: Build ${{ matrix.asset }}

@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 
+import { throwIfAborted } from "./bootstrap/cancellation.js";
 import type { PullRequestContext, PullRequestLocator } from "./types.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -26,8 +27,9 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
 export async function readPullRequestContext(
   eventPath: string | undefined = process.env.GITHUB_EVENT_PATH,
   repository: string | undefined = process.env.GITHUB_REPOSITORY,
+  signal?: AbortSignal,
 ): Promise<PullRequestContext> {
-  const context = await readPullRequestEventContext(eventPath, repository);
+  const context = await readPullRequestEventContext(eventPath, repository, signal);
   if (context === undefined) {
     throw new Error(
       "No pull request target was provided; run this action from a pull_request event or set 'pull-request-url'.",
@@ -39,9 +41,17 @@ export async function readPullRequestContext(
 export async function readPullRequestEventContext(
   eventPath: string | undefined = process.env.GITHUB_EVENT_PATH,
   repository: string | undefined = process.env.GITHUB_REPOSITORY,
+  signal?: AbortSignal,
 ): Promise<PullRequestContext | undefined> {
+  throwIfAborted(signal);
   if (!eventPath) return undefined;
-  const parsed: unknown = JSON.parse(await readFile(eventPath, "utf8"));
+  const parsed: unknown = JSON.parse(
+    await readFile(eventPath, {
+      encoding: "utf8",
+      ...(signal === undefined ? {} : { signal }),
+    }),
+  );
+  throwIfAborted(signal);
   if (!isRecord(parsed) || !isRecord(parsed.pull_request)) return undefined;
   if (!repository || !/^[^/]+\/[^/]+$/.test(repository)) {
     throw new Error("GITHUB_REPOSITORY must be in owner/name form.");

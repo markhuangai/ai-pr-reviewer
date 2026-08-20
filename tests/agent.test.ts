@@ -15,6 +15,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { cancellationReason, CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import {
   agentInternals,
   runReviewGoal,
@@ -1343,6 +1344,57 @@ test("runs a complete SDK review turn through the real diff and submission tools
   });
 });
 
+test("passes cancellation to the SDK and rejects the active goal", async (t) => {
+  const controller = new AbortController();
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const query = ((input: {
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: Options;
+  }) => {
+    assert.equal(input.options.abortController, controller);
+    const messages = input.prompt[Symbol.asyncIterator]();
+    return {
+      async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+        await messages.next();
+        await messages.next();
+        markStarted?.();
+        await new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              reject(cancellationReason(controller.signal));
+            },
+            { once: true },
+          );
+        });
+        yield* [] as SDKResultMessage[];
+      },
+      mcpServerStatus: () => Promise.resolve([]),
+    };
+  }) as unknown as AgentQuery;
+  const running = runReviewGoal(
+    "Check cancellation.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig(),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    query,
+    [],
+    controller,
+  );
+  await started;
+  const reason = new CancellationError("SIGTERM");
+  controller.abort(reason);
+
+  await assert.rejects(running, (error: unknown) => error === reason);
+});
+
 test("omits SDK effort when the action input is not configured", () => {
   const options = agentInternals.makeOptions(
     reviewConfig(),
@@ -1580,6 +1632,73 @@ test("runs parallel review goals over independent readers and cleans the shared 
     results.map((result) => result.status),
     ["completed", "completed", "completed"],
   );
+  assert.deepEqual(await readdir(repository.temporaryRoot), []);
+});
+
+test("stops scheduling review goals after cancellation and removes the shared diff", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "review.txt"), "head change\n");
+  });
+  const previousTemporaryRoot = process.env.RUNNER_TEMP;
+  process.env.RUNNER_TEMP = repository.temporaryRoot;
+  t.after(() => {
+    if (previousTemporaryRoot === undefined) delete process.env.RUNNER_TEMP;
+    else process.env.RUNNER_TEMP = previousTemporaryRoot;
+  });
+  const controller = new AbortController();
+  let queries = 0;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const query = ((input: {
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: Options;
+  }) => {
+    queries += 1;
+    const messages = input.prompt[Symbol.asyncIterator]();
+    return {
+      async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+        await messages.next();
+        await messages.next();
+        markStarted?.();
+        await new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              reject(cancellationReason(controller.signal));
+            },
+            { once: true },
+          );
+        });
+        yield* [] as SDKResultMessage[];
+      },
+      mcpServerStatus: () => Promise.resolve([]),
+    };
+  }) as unknown as AgentQuery;
+  const running = runReviewGoals(
+    repository.context,
+    [],
+    emptyConversation,
+    reviewConfig({
+      reviewPrompts: [
+        { prompt: "one", files: [] },
+        { prompt: "two", files: [] },
+        { prompt: "three", files: [] },
+      ],
+      parallelCount: 1,
+    }),
+    [[], [], []],
+    repository.root,
+    query,
+    controller,
+  );
+  await started;
+  const reason = new CancellationError("SIGINT");
+  controller.abort(reason);
+
+  await assert.rejects(running, (error: unknown) => error === reason);
+  assert.equal(queries, 1);
   assert.deepEqual(await readdir(repository.temporaryRoot), []);
 });
 

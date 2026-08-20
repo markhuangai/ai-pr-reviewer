@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 
 import { indexInternals, main, runAction } from "../src/index.js";
 import { buildRunSummary, reviewMarker } from "../src/lib/aggregate.js";
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import { GitHubApi, GitHubApiError } from "../src/lib/github-api.js";
 import { readReviewConfig, type InputReader } from "../src/lib/input.js";
 import type {
@@ -367,7 +368,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       response.end(
         JSON.stringify([
           {
-            filename: "review.txt",
+            filename: "live-only.txt",
             status: "modified",
             additions: 1,
             deletions: 1,
@@ -462,6 +463,10 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
       assert.equal(files.length, 1);
+      assert.equal(files[0]?.path, "review.txt");
+      assert.equal(files[0]?.additions, 1);
+      assert.equal(files[0]?.deletions, 1);
+      assert.deepEqual([...(files[0]?.addedLines ?? [])], [1]);
       assert.equal(conversation.entries.length, 1);
       const entry = conversation.entries[0];
       assert.equal(entry?.kind, "pr_comment");
@@ -484,7 +489,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 12);
+  assert.equal(requests.length, 5);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,
@@ -499,15 +504,19 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/reviews?") === true).length,
-    2,
+    1,
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/pulls/9/comments?") === true).length,
-    2,
+    1,
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/issues/9/comments?") === true).length,
-    2,
+    1,
+  );
+  assert.equal(
+    requests.some((request) => request.path?.includes("/files?") === true),
+    false,
   );
 });
 
@@ -614,6 +623,7 @@ test("falls back from a rejected approval to a comment review", async (t) => {
     ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
       requests.push(request);
@@ -649,6 +659,78 @@ test("falls back from a rejected approval to a comment review", async (t) => {
   assert.match(requests[1]?.body ?? "", /rejected the requested approval/u);
 });
 
+test("downgrades a stale auto-approval to a captured comment", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const requests: PullRequestReviewRequest[] = [];
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha }),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
+      requests.push(request);
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader({ "auto-approve": "true" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.equal(result.skipped, false);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.event, "COMMENT");
+  assert.match(requests[0]?.body ?? "", /refs changed after capture/u);
+});
+
+test("downgrades approval when the captured base changed", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const requests: PullRequestReviewRequest[] = [];
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: "f".repeat(40) }),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
+      requests.push(request);
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader({ "auto-approve": "true" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.equal(result.skipped, false);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.event, "COMMENT");
+  assert.match(requests[0]?.body ?? "", /refs changed after capture/u);
+});
+
 test("propagates non-approval review failures", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
@@ -678,7 +760,7 @@ test("propagates non-approval review failures", async (t) => {
   );
 });
 
-test("rejects a review result when the pull request discussion changes", async (t) => {
+test("reviews the captured pull request discussion without rechecking it", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   let issueCommentReads = 0;
@@ -711,44 +793,124 @@ test("rejects a review result when the pull request discussion changes", async (
     },
   } as unknown as GitHubApi;
 
-  await assert.rejects(
-    runAction(actionReader(), [], {
-      createApi: () => api,
-      readEventContext: () => Promise.resolve(context),
-      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-      runGoals: () =>
-        Promise.resolve([
-          {
-            prompt: "correctness",
-            status: "completed",
-            submission: { summary: "clean", findings: [] },
-          },
-        ]),
-      writeSummary: () => Promise.resolve(),
-    }),
-    /discussion changed during review/u,
-  );
-  assert.equal(issueCommentReads, 2);
-  assert.equal(postedReviews, 0);
+  const result = await runAction(actionReader(), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(issueCommentReads, 1);
+  assert.equal(postedReviews, 1);
 });
 
-test("fails closed for stale refs and mismatched event URL targets", async (t) => {
+test("reviews the captured event refs without querying their live state", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
-  const staleApi = {
-    getPullRequestRefs: () =>
-      Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha }),
+  let refReads = 0;
+  let postedReviews = 0;
+  const snapshotApi = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () => {
+      refReads += 1;
+      return Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha });
+    },
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
   } as unknown as GitHubApi;
-  await assert.rejects(
-    runAction(actionReader(), [], {
-      createApi: () => staleApi,
-      readEventContext: () => Promise.resolve(context),
-      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-      runGoals: () => Promise.resolve([]),
-      writeSummary: () => Promise.resolve(),
-    }),
-    /refs changed during review/u,
-  );
+  const result = await runAction(actionReader(), [], {
+    createApi: () => snapshotApi,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(refReads, 0);
+  assert.equal(postedReviews, 1);
+});
+
+test("cancellation prevents new summaries and pull request writes", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+
+  for (const interactWithPullRequest of [true, false]) {
+    const controller = new AbortController();
+    const reason = new CancellationError("SIGTERM");
+    let summaries = 0;
+    let reviews = 0;
+    const api = {
+      ...emptyConversationApi(),
+      getPullRequestFiles: () => Promise.resolve([]),
+      createReview: () => {
+        reviews += 1;
+        return Promise.resolve();
+      },
+    } as unknown as GitHubApi;
+    await assert.rejects(
+      runAction(
+        actionReader({ "interact-with-pr": String(interactWithPullRequest) }),
+        [],
+        {
+          createApi: () => api,
+          readEventContext: () => Promise.resolve(context),
+          createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+          runGoals: (
+            _context,
+            _files,
+            _conversation,
+            _config,
+            _contextFiles,
+            _cwd,
+            _queryAgent,
+            receivedController,
+          ) => {
+            assert.equal(receivedController, controller);
+            controller.abort(reason);
+            return Promise.resolve([
+              {
+                prompt: "correctness",
+                status: "completed",
+                submission: { summary: "clean", findings: [] },
+              },
+            ]);
+          },
+          writeSummary: () => {
+            summaries += 1;
+            return Promise.resolve();
+          },
+        },
+        controller,
+      ),
+      (error: unknown) => error === reason,
+    );
+    assert.equal(summaries, 0);
+    assert.equal(reviews, 0);
+  }
+});
+
+test("rejects mismatched event URL targets", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const api = emptyConversationApi() as unknown as GitHubApi;
 
   const previousServer = process.env.GITHUB_SERVER_URL;
   process.env.GITHUB_SERVER_URL = "https://github.com";
@@ -761,7 +923,7 @@ test("fails closed for stale refs and mismatched event URL targets", async (t) =
       actionReader({ "pull-request-url": "https://github.com/other/repository/pull/10" }),
       [],
       {
-        createApi: () => staleApi,
+        createApi: () => api,
         readEventContext: () => Promise.resolve(context),
         createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
         runGoals: () => Promise.resolve([]),
@@ -926,4 +1088,25 @@ test("main reports input failures without throwing secrets", async (t) => {
   assert.equal(process.exitCode, 1);
   assert.doesNotMatch(failureOutput, /environment-secret/u);
   assert.match(failureOutput, /\[REDACTED\]-missing-event\.json/u);
+});
+
+test("main treats cancellation as a clean stop", async (t) => {
+  const output: string[] = [];
+  const previousExitCode = process.exitCode;
+  t.after(() => {
+    process.exitCode = previousExitCode;
+  });
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+  const controller = new AbortController();
+  controller.abort(new CancellationError("SIGTERM"));
+  await main(controller);
+  assert.match(
+    output.join(""),
+    /Pull request review cancelled; no new review or run summary will be published\./u,
+  );
+  assert.doesNotMatch(output.join(""), /::error::/u);
+  assert.equal(process.exitCode, previousExitCode);
 });

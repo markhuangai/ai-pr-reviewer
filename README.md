@@ -46,6 +46,16 @@ jobs:
             ]
 ```
 
+The workflow owns whether a newer event cancels an older review. For example, a pull-request workflow can keep only the newest run for each target:
+
+```yaml
+concurrency:
+  group: ai-pr-review-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+```
+
+The action reviews the immutable event/API snapshot it captured. It does not reread a moving pull request, restart itself, or decide whether a workflow run should be cancelled; the workflow consumer owns that policy.
+
 Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` for the newest version-1 release candidate. Use an exact tag when the workflow must remain pinned:
 
 ```yaml
@@ -207,7 +217,9 @@ Set `interact-with-pr: false` to keep the result out of the pull request. The ac
 
 ### Cross-repository review
 
-`pull-request-url` supports dispatch, schedule, or other non-PR workflows. The target must use the same origin as `GITHUB_SERVER_URL`. The action fetches the target base branch and `refs/pull/<number>/head` into an isolated temporary checkout, verifies both fetched SHAs against live API metadata, reviews that checkout, and removes it afterward. Do not add an `actions/checkout` step for this mode.
+`pull-request-url` supports dispatch, schedule, or other non-PR workflows. The target must use the same origin as `GITHUB_SERVER_URL`. The action reads the pull request metadata once, fetches `base.sha` and `head.sha` by their exact commit IDs into an isolated temporary checkout, asserts that both refs resolve to those IDs, reviews the detached head, and removes it afterward. Do not add an `actions/checkout` step for this mode.
+
+GitHub serves a requested commit SHA only while the object is reachable from the target repository. A force-push that makes either captured commit unavailable, or deletion and pruning that removes it, fails the checkout closed instead of substituting a live branch tip. The fetch is not shallow, so the reachable history needed for `git merge-base(baseSha, headSha)` remains available. The merge-base-to-head boundary is computed from the two captured SHAs and is unchanged if either branch moves after capture. A later push does not restart or invalidate this review; configure workflow `concurrency` or another consumer-owned policy when that is desired.
 
 ```yaml
 name: External PR review
@@ -271,7 +283,8 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - The action includes non-empty PR-level comments and review bodies from human users other than the authenticated PAT identity. An inline thread is included when it has a qualifying human reply; the complete selected thread is preserved so the finding and all replies remain together. Bot, GitHub App, and action-authored content cannot select context on their own.
 - Conversation text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
 - The action streams one immutable conversation snapshot and one immutable merge-base-to-head Git text diff to every goal through independent ordered, bounded readers. Diff attributes are read from the merge base so pull-request changes cannot hide text as binary. `submit_review` is rejected until both inputs have been read to completion; there is no fixed aggregate character limit.
-- The conversation is fetched again before a review or run summary is published. If qualifying discussion changed during the review, the action fails closed and requires a rerun so the new context is considered.
+- The action does not reread live refs or conversation before publishing. Every review and summary describes the captured base, head, files, and conversation; a workflow consumer can use `concurrency.cancel-in-progress` when it wants newer events to supersede an active run.
+- A first `SIGINT`, `SIGTERM`, or Windows `SIGBREAK` starts graceful cancellation across bootstrap, GitHub API/Git work, context capture, diff generation, and Claude sessions. Cancellation stops new goals and writes, and cleanup still runs. A GitHub write accepted immediately before cancellation cannot be undone.
 - The action does not add comment-event triggers. Replies affect the next pull request update, workflow rerun, or separately configured dispatch that invokes the action.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
@@ -288,6 +301,8 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 ## Security and release model
 
 The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. Reference the action with an exact stable or release-candidate tag such as `v1.0.0` or `v1.0.1-rc.0` for reproducible behavior, or use a major alias such as `v1` or `v1-prerelease` to receive the latest stable or prerelease release in that major line. Branches and commit SHAs are not supported. Major aliases are annotated, moving Git tags with no GitHub Release of their own; the bootstrap resolves each alias to its exact compatible release before downloading and verifying the platform runtime. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.
+
+The immutable-snapshot and graceful-cancellation changes are targeted for `v1.1.4-rc.0`; workflows currently pinned to `@v1-prerelease` should receive them when that prerelease becomes the alias target.
 
 Releases are started manually from `main` through the `Release runtime bundles` workflow. Choose the `prerelease` channel with an `X.Y.Z-rc.N` version to create a GitHub prerelease, or choose the `stable` channel with an `X.Y.Z` version to promote the latest matching RC. Stable promotion requires that RC tag to be an ancestor with an identical Git tree and reuses its exact verified assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
 

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { isSafeArchiveEntryPath, isSafeArchiveSymlink } from "./lib/bootstrap/archive.js";
+import { cancellationReason, cancellationInternals, installCancellationHandlers, throwIfAborted, } from "./lib/bootstrap/cancellation.js";
 import { aliasAcceptsRelease, isCompatibleRuntimeManifest, parseActionReleaseReference, parseActionReleaseTag, } from "./lib/bootstrap/version.js";
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
@@ -36,8 +37,12 @@ function apiRequestHeaders() {
         headers.set("Authorization", `Bearer ${token}`);
     return headers;
 }
-async function fetchJson(url) {
-    const response = await fetch(url, { headers: apiRequestHeaders() });
+async function fetchJson(url, signal) {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+        headers: apiRequestHeaders(),
+        ...(signal === undefined ? {} : { signal }),
+    });
     if (!response.ok)
         throw new Error(`Runtime release lookup failed (${response.status}).`);
     return (await response.json());
@@ -52,12 +57,12 @@ function gitObject(value, expectedType) {
         ? sha
         : undefined;
 }
-async function resolveAlias(alias, getJson) {
-    const ref = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`);
+async function resolveAlias(alias, getJson, signal) {
+    const ref = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`, signal);
     const tagObjectSha = gitObject(ref, "tag");
     if (!tagObjectSha)
         throw new Error("The action release alias is not an annotated Git tag.");
-    const tagObject = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`);
+    const tagObject = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`, signal);
     if (!isRecord(tagObject) ||
         tagObject.tag !== alias.tag ||
         typeof tagObject.message !== "string") {
@@ -68,18 +73,19 @@ async function resolveAlias(alias, getJson) {
     if (!release || !commitSha || !aliasAcceptsRelease(alias, release)) {
         throw new Error("The action release alias targets an incompatible exact version.");
     }
-    const exactRef = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`);
+    const exactRef = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`, signal);
     if (gitObject(exactRef, "commit") !== commitSha) {
         throw new Error("The action release alias and exact version resolve to different commits.");
     }
     return release;
 }
-export async function resolveActionRelease(value, getJson = fetchJson) {
+export async function resolveActionRelease(value, getJson = fetchJson, signal) {
+    throwIfAborted(signal);
     const reference = parseActionReleaseReference(value);
     if (!reference) {
         throw new Error("This action must be referenced by vN, vN-prerelease, or an exact tag such as v1.0.0 or v1.0.0-rc.0.");
     }
-    return "stableTag" in reference ? reference : resolveAlias(reference, getJson);
+    return "stableTag" in reference ? reference : resolveAlias(reference, getJson, signal);
 }
 function readAsset(value) {
     if (!isRecord(value) ||
@@ -97,8 +103,12 @@ function readAsset(value) {
 function sha256(value) {
     return createHash("sha256").update(value).digest("hex");
 }
-async function download(url, destination) {
-    const response = await fetch(url, { headers: requestHeaders() });
+async function download(url, destination, signal) {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+        headers: requestHeaders(),
+        ...(signal === undefined ? {} : { signal }),
+    });
     if (!response.ok)
         throw new Error(`Runtime asset download failed (${response.status}).`);
     const contentLength = Number(response.headers.get("content-length") ?? "0");
@@ -108,7 +118,7 @@ async function download(url, destination) {
     if (bytes.byteLength > MAX_ARCHIVE_BYTES)
         throw new Error("Runtime asset is larger than the safety limit.");
     await mkdir(dirname(destination), { recursive: true });
-    await writeFile(destination, bytes);
+    await writeFile(destination, bytes, { signal });
     return bytes;
 }
 function expectedDigest(asset, checksumText) {
@@ -119,20 +129,26 @@ function expectedDigest(asset, checksumText) {
         throw new Error("Runtime release asset has no verifiable SHA-256 digest.");
     return match[1].toLowerCase();
 }
-async function readChecksum(url) {
-    const response = await fetch(url, { headers: requestHeaders() });
+async function readChecksum(url, signal) {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+        headers: requestHeaders(),
+        ...(signal === undefined ? {} : { signal }),
+    });
     if (response.status === 404)
         return undefined;
     if (!response.ok)
         throw new Error(`Runtime checksum download failed (${response.status}).`);
     return response.text();
 }
-async function extract(archive, destination) {
+async function extract(archive, destination, signal) {
+    throwIfAborted(signal);
     await mkdir(destination, { recursive: true });
     await new Promise((resolve, reject) => {
         const child = spawn("tar", ["-tvzf", archive], {
             stdio: ["ignore", "pipe", "ignore"],
             windowsHide: true,
+            signal,
         });
         let listing = "";
         child.stdout.on("data", (chunk) => {
@@ -140,8 +156,18 @@ async function extract(archive, destination) {
             if (listing.length > 1_000_000)
                 child.kill();
         });
-        child.once("error", reject);
+        child.once("error", (error) => {
+            if (signal?.aborted) {
+                reject(cancellationReason(signal));
+                return;
+            }
+            reject(error);
+        });
         child.once("exit", (code) => {
+            if (signal?.aborted) {
+                reject(cancellationReason(signal));
+                return;
+            }
             if (code !== 0) {
                 reject(new Error("Runtime archive listing failed."));
                 return;
@@ -185,17 +211,29 @@ async function extract(archive, destination) {
             resolve();
         });
     });
+    throwIfAborted(signal);
     await new Promise((resolve, reject) => {
         const child = spawn("tar", ["-xzf", archive, "--no-same-owner", "--no-same-permissions", "-C", destination], {
             stdio: ["ignore", "ignore", "pipe"],
             windowsHide: true,
+            signal,
         });
         let stderr = "";
         child.stderr.on("data", (chunk) => {
             stderr += chunk.toString("utf8").slice(0, 2_000);
         });
-        child.once("error", reject);
+        child.once("error", (error) => {
+            if (signal?.aborted) {
+                reject(cancellationReason(signal));
+                return;
+            }
+            reject(error);
+        });
         child.once("exit", (code) => {
+            if (signal?.aborted) {
+                reject(cancellationReason(signal));
+                return;
+            }
             if (code === 0)
                 resolve();
             else
@@ -203,13 +241,14 @@ async function extract(archive, destination) {
         });
     });
 }
-async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER_BUILD_ID ?? "source") {
+async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER_BUILD_ID ?? "source", signal) {
+    throwIfAborted(signal);
     const entry = join(runtimeDirectory, "runtime", "index.js");
     const entryStats = await stat(entry).catch(() => undefined);
     if (!entryStats?.isFile())
         throw new Error("Runtime bundle is missing runtime/index.js.");
     const child = spawn(process.execPath, [entry], {
-        stdio: "inherit",
+        stdio: ["inherit", "inherit", "inherit", "ipc"],
         env: {
             ...process.env,
             AI_PR_REVIEWER_BUILD_ID: buildId,
@@ -217,18 +256,39 @@ async function runRuntime(runtimeDirectory, buildId = process.env.AI_PR_REVIEWER
         windowsHide: false,
     });
     return new Promise((resolve, reject) => {
-        child.once("error", reject);
+        const cancelRuntime = () => {
+            if (!child.connected)
+                return;
+            child.send(cancellationInternals.cancellationMessage(signal?.reason), () => undefined);
+        };
+        const cleanup = () => {
+            signal?.removeEventListener("abort", cancelRuntime);
+        };
+        signal?.addEventListener("abort", cancelRuntime, { once: true });
+        if (signal?.aborted)
+            cancelRuntime();
+        child.once("error", (error) => {
+            cleanup();
+            if (signal?.aborted) {
+                reject(cancellationReason(signal));
+                return;
+            }
+            reject(error);
+        });
         child.once("exit", (code, signal) => {
+            cleanup();
             resolve(code ?? (signal ? 1 : 0));
         });
     });
 }
 export async function bootstrapRuntime(options = {}) {
+    const { signal } = options;
+    throwIfAborted(signal);
     const releaseRef = options.releaseRef ?? process.env.GITHUB_ACTION_REF;
     const getJson = options.getJson ?? fetchJson;
-    const requestedRelease = await resolveActionRelease(releaseRef, getJson);
+    const requestedRelease = await resolveActionRelease(releaseRef, getJson, signal);
     const assetName = platformAssetName();
-    const release = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`);
+    const release = await getJson(`https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`, signal);
     if (release.tag_name !== requestedRelease.tag ||
         release.draft !== false ||
         release.prerelease !== requestedRelease.prerelease ||
@@ -241,18 +301,18 @@ export async function bootstrapRuntime(options = {}) {
         throw new Error(`Runtime release has no asset for ${assetName}.`);
     if (typeof asset.size === "number" && asset.size > MAX_ARCHIVE_BYTES)
         throw new Error("Runtime asset is larger than the safety limit.");
-    const checksum = await readChecksum(`${asset.browser_download_url}.sha256`);
+    const checksum = await readChecksum(`${asset.browser_download_url}.sha256`, signal);
     const cacheRoot = join(options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(), "ai-pr-reviewer-runtime", requestedRelease.tag, assetName.replace(/[^A-Za-z0-9_.-]/g, "_"));
     const archive = join(cacheRoot, assetName);
-    const bytes = await download(asset.browser_download_url, archive);
+    const bytes = await download(asset.browser_download_url, archive, signal);
     const actualDigest = sha256(bytes);
     if (actualDigest !== expectedDigest(asset, checksum))
         throw new Error("Runtime asset SHA-256 verification failed.");
     const extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
     try {
-        await extract(archive, extracted);
+        await extract(archive, extracted, signal);
         const manifestPath = join(extracted, "runtime", "manifest.json");
-        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        const manifest = JSON.parse(await readFile(manifestPath, { encoding: "utf8", signal }));
         if (!isRecord(manifest) ||
             !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
             manifest.asset !== assetName ||
@@ -264,16 +324,29 @@ export async function bootstrapRuntime(options = {}) {
             throw new Error("Runtime bundle manifest verification failed.");
         }
         const sourceCommit = manifest.sourceCommit;
-        return await runRuntime(extracted, sourceCommit);
+        const code = await runRuntime(extracted, sourceCommit, signal);
+        throwIfAborted(signal);
+        return code;
     }
     finally {
         await rm(extracted, { recursive: true, force: true });
     }
 }
 async function main() {
-    const code = await bootstrapRuntime();
-    if (code !== 0)
-        process.exitCode = code;
+    const cancellation = installCancellationHandlers();
+    try {
+        const code = await bootstrapRuntime({ signal: cancellation.controller.signal });
+        if (code !== 0)
+            process.exitCode = code;
+    }
+    catch (error) {
+        if (!cancellation.controller.signal.aborted)
+            throw error;
+        console.log("Pull request review cancelled; cleanup completed.");
+    }
+    finally {
+        cancellation.dispose();
+    }
 }
 export const bootstrapInternals = {
     apiRequestHeaders,

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import {
   parsePullRequestUrl,
   readPullRequestContext,
@@ -162,6 +163,16 @@ test("validates every required pull request event field", async (t) => {
 test("requires a pull request context when no target can be read", async () => {
   assert.equal(await readPullRequestEventContext("", "owner/repository"), undefined);
   await assert.rejects(readPullRequestContext("", "owner/repository"), /No pull request target/u);
+});
+
+test("stops before reading a pull request event after cancellation", async () => {
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGINT");
+  controller.abort(reason);
+  await assert.rejects(
+    readPullRequestEventContext("/missing/event.json", "owner/repository", controller.signal),
+    (error: unknown) => error === reason,
+  );
 });
 
 test("rejects invalid server URLs, repository segments, and pull request numbers", () => {
