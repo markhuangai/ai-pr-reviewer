@@ -293,6 +293,58 @@ test("reads exact changed-file metadata from the captured checkout", async (t) =
   );
 });
 
+test("pins unlimited rename detection for changed-file metadata", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-rename-limit-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await git(root, ["config", "diff.renameLimit", "1"]);
+  for (let index = 1; index <= 3; index += 1) {
+    await writeFile(
+      join(root, `old-${index}.txt`),
+      Array.from({ length: 10 }, (_, line) => `file-${index}-line-${line}\n`).join(""),
+    );
+  }
+  const baseSha = await commit(root, "rename base");
+  for (let index = 1; index <= 3; index += 1) {
+    await execFileAsync("git", ["mv", `old-${index}.txt`, `new-${index}.txt`], { cwd: root });
+    await writeFile(
+      join(root, `new-${index}.txt`),
+      Array.from({ length: 10 }, (_, line) =>
+        line < 7 ? `file-${index}-line-${line}\n` : `changed-${index}-line-${line}\n`,
+      ).join(""),
+    );
+  }
+  const headSha = await commit(root, "rename head");
+
+  const files = await readPullRequestFilesFromCheckout(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      headSha,
+      baseSha,
+      baseRef: "main",
+      changedFiles: 3,
+      title: "Rename limit metadata",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    root,
+  );
+  assert.deepEqual(
+    files.map((file) => ({
+      path: file.path,
+      previousPath: file.previousPath,
+      status: file.status,
+    })),
+    [
+      { path: "new-1.txt", previousPath: "old-1.txt", status: "renamed" },
+      { path: "new-2.txt", previousPath: "old-2.txt", status: "renamed" },
+      { path: "new-3.txt", previousPath: "old-3.txt", status: "renamed" },
+    ],
+  );
+});
+
 test("uses the captured merge base for changed-file metadata", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-merge-base-files-"));
   t.after(() => rm(root, { force: true, recursive: true }));

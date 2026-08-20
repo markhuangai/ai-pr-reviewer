@@ -477,6 +477,7 @@ async function readGitAddedLines(
       "--src-prefix=a/",
       "--dst-prefix=b/",
       "--find-renames=50%",
+      "-l0",
       "--inter-hunk-context=0",
       "--unified=0",
       mergeBaseSha,
@@ -626,6 +627,7 @@ export async function readPullRequestFilesFromCheckout(
     "--src-prefix=a/",
     "--dst-prefix=b/",
     "--find-renames=50%",
+    "-l0",
   ];
   const nameStatuses = parseGitNameStatus(
     await readGitMetadata(
