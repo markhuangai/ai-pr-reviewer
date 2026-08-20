@@ -475,6 +475,7 @@ async function readGitAddedLines(
       "--no-textconv",
       "--no-color",
       "--find-renames=50%",
+      "--inter-hunk-context=0",
       "--unified=0",
       mergeBaseSha,
       headSha,

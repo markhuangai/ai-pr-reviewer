@@ -388,6 +388,34 @@ test("decodes quoted UTF-8 paths from Git diff output", async (t) => {
   assert.equal(githubApiInternals.decodeGitPath('"b/\\303\\274mlaut.txt"'), `b/${path}`);
 });
 
+test("does not infer unchanged lines from merged zero-context hunks", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-inter-hunk-context-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await git(root, ["config", "diff.interHunkContext", "1"]);
+  await writeFile(join(root, "lines.txt"), "one\ntwo\nthree\nfour\n");
+  const baseSha = await commit(root, "base");
+  await writeFile(join(root, "lines.txt"), "ONE\ntwo\nTHREE\nfour\n");
+  const headSha = await commit(root, "two separated changes");
+
+  const files = await readPullRequestFilesFromCheckout(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      headSha,
+      baseSha,
+      baseRef: "main",
+      changedFiles: 1,
+      title: "Inter-hunk context",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    root,
+  );
+  assert.deepEqual([...(files[0]?.addedLines ?? [])], [1, 3]);
+});
+
 test("detects server-truncated patches from GitHub change counts", () => {
   const complete = {
     path: "src/change.ts",
