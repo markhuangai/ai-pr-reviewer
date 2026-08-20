@@ -15,6 +15,7 @@ const MAX_LOCAL_CHANGED_FILES = 3_000;
 const MAX_LOCAL_METADATA_BYTES = 32 * 1024 * 1024;
 const MAX_LOCAL_DIFF_LINE_BYTES = 1_000_000;
 const MAX_LOCAL_ADDED_LINES_PER_FILE = 1_000_000;
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 interface PullRequestFilePayload {
   readonly filename?: unknown;
@@ -290,6 +291,51 @@ function nulTokens(value: string): string[] {
   return tokens;
 }
 
+function decodeGitPath(value: string): string {
+  if (!value.startsWith('"')) return value;
+  if (!value.endsWith('"') || value.length < 2) {
+    throw new Error("Git returned an unterminated quoted path.");
+  }
+  const bytes: number[] = [];
+  for (let index = 1; index < value.length - 1; ) {
+    const character = value[index];
+    if (character !== "\\") {
+      if (character === undefined) throw new Error("Git returned an invalid quoted path.");
+      const codePoint = value.codePointAt(index);
+      if (codePoint === undefined) throw new Error("Git returned an invalid quoted path.");
+      bytes.push(...Buffer.from(String.fromCodePoint(codePoint), "utf8"));
+      index += String.fromCodePoint(codePoint).length;
+      continue;
+    }
+    const escaped = value[index + 1];
+    if (escaped === undefined) throw new Error("Git returned an invalid quoted path escape.");
+    const escapes: Readonly<Record<string, number>> = {
+      a: 0x07,
+      b: 0x08,
+      t: 0x09,
+      n: 0x0a,
+      v: 0x0b,
+      f: 0x0c,
+      r: 0x0d,
+      '"': 0x22,
+      "\\": 0x5c,
+    };
+    const byte = escapes[escaped];
+    if (byte !== undefined) {
+      bytes.push(byte);
+      index += 2;
+      continue;
+    }
+    const octal = value.slice(index + 1, index + 4);
+    if (!/^[0-7]{3}$/u.test(octal)) {
+      throw new Error("Git returned an invalid quoted path escape.");
+    }
+    bytes.push(Number.parseInt(octal, 8));
+    index += 4;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 function gitFileStatus(code: string): string {
   switch (code) {
     case "A":
@@ -393,14 +439,29 @@ function parseGitNumstat(
 
 function diffPath(line: string): string | undefined {
   if (!line.startsWith("+++ ")) return undefined;
-  const path = line.slice(4);
+  const path = decodeGitPath(line.slice(4));
   if (path === "/dev/null") return undefined;
   return path.startsWith("b/") ? path.slice(2) : path;
 }
 
-async function readGitAddedLines(
+async function readGitMergeBase(
   cwd: string,
   baseSha: string,
+  headSha: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const mergeBaseSha = (
+    await readGitMetadata(cwd, ["merge-base", baseSha, headSha], signal)
+  ).trim();
+  if (!COMMIT_SHA_PATTERN.test(mergeBaseSha)) {
+    throw new Error("Git returned an invalid pull request merge base.");
+  }
+  return mergeBaseSha;
+}
+
+async function readGitAddedLines(
+  cwd: string,
+  mergeBaseSha: string,
   headSha: string,
   signal?: AbortSignal,
 ): Promise<ReadonlyMap<string, ReadonlySet<number>>> {
@@ -408,13 +469,14 @@ async function readGitAddedLines(
   const child = spawn(
     "git",
     [
+      `--attr-source=${mergeBaseSha}`,
       "diff",
       "--no-ext-diff",
       "--no-textconv",
       "--no-color",
       "--find-renames=50%",
       "--unified=0",
-      baseSha,
+      mergeBaseSha,
       headSha,
       "--",
     ],
@@ -436,14 +498,13 @@ async function readGitAddedLines(
     if (line.length > MAX_LOCAL_DIFF_LINE_BYTES) {
       throw new Error("Git returned an oversized changed-file diff line.");
     }
-    const path = diffPath(line);
     if (line.startsWith("diff --git ")) {
       currentPath = undefined;
       fileHeaderRead = false;
       return;
     }
     if (!fileHeaderRead && line.startsWith("+++ ")) {
-      currentPath = path;
+      currentPath = diffPath(line);
       fileHeaderRead = true;
       return;
     }
@@ -549,23 +610,31 @@ export async function readPullRequestFilesFromCheckout(
   cwd: string,
   signal?: AbortSignal,
 ): Promise<readonly ChangedFile[]> {
-  const commonArgs = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames=50%"];
+  const mergeBaseSha = await readGitMergeBase(cwd, context.baseSha, context.headSha, signal);
+  const commonArgs = [
+    `--attr-source=${mergeBaseSha}`,
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--find-renames=50%",
+  ];
   const nameStatuses = parseGitNameStatus(
     await readGitMetadata(
       cwd,
-      [...commonArgs, "--name-status", "-z", context.baseSha, context.headSha, "--"],
+      [...commonArgs, "--name-status", "-z", mergeBaseSha, context.headSha, "--"],
       signal,
     ),
   );
   const counts = parseGitNumstat(
     await readGitMetadata(
       cwd,
-      [...commonArgs, "--numstat", "-z", context.baseSha, context.headSha, "--"],
+      [...commonArgs, "--numstat", "-z", mergeBaseSha, context.headSha, "--"],
       signal,
     ),
     nameStatuses,
   );
-  const addedLines = await readGitAddedLines(cwd, context.baseSha, context.headSha, signal);
+  const addedLines = await readGitAddedLines(cwd, mergeBaseSha, context.headSha, signal);
   const knownPaths = new Set(nameStatuses.map((file) => file.path));
   for (const path of addedLines.keys()) {
     if (!knownPaths.has(path)) throw new Error("Git returned an unknown changed-file path.");
@@ -946,7 +1015,9 @@ export class GitHubApi {
 }
 
 export const githubApiInternals = {
+  decodeGitPath,
   diffPath,
+  readGitMergeBase,
   readGitAddedLines,
   readGitMetadata,
   parseGitNameStatus,

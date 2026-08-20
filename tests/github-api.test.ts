@@ -153,7 +153,16 @@ test("validates NUL-delimited Git changed-file metadata", () => {
 
 test("fails closed when local Git metadata commands fail", async () => {
   assert.equal(githubApiInternals.diffPath("+++ odd-path.txt"), "odd-path.txt");
+  assert.equal(githubApiInternals.diffPath("+++ /dev/null"), undefined);
+  assert.equal(githubApiInternals.diffPath('+++ "b/quoted.txt"'), "quoted.txt");
   assert.equal(githubApiInternals.diffPath("not a file header"), undefined);
+  assert.equal(githubApiInternals.decodeGitPath('"a\\tb\\n\\"c\\\\d"'), 'a\tb\n"c\\d');
+  assert.throws(
+    () => githubApiInternals.decodeGitPath('"unterminated'),
+    /unterminated quoted path/u,
+  );
+  assert.throws(() => githubApiInternals.decodeGitPath('"bad\\q"'), /invalid quoted path escape/u);
+  assert.throws(() => githubApiInternals.decodeGitPath('"bad\\'), /unterminated quoted path/u);
   await assert.rejects(
     githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40)),
     /changed-file diff failed/u,
@@ -182,6 +191,10 @@ test("parses streamed Git diff hunks and rejects malformed output", async (t) =>
 
   const parsed = await githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40));
   assert.deepEqual([...(parsed.get("file.txt") ?? [])], [1, 2]);
+  await assert.rejects(
+    githubApiInternals.readGitMergeBase("/tmp", "a".repeat(40), "b".repeat(40)),
+    /invalid pull request merge base/u,
+  );
 
   await writeFile(
     gitPath,
@@ -268,6 +281,111 @@ test("reads exact changed-file metadata from the captured checkout", async (t) =
     readPullRequestFilesFromCheckout({ ...context, changedFiles: 0 }, root),
     /more files than the pull request metadata/u,
   );
+});
+
+test("uses the captured merge base for changed-file metadata", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-merge-base-files-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await writeFile(join(root, "shared.txt"), "shared\n");
+  const mergeBaseSha = await commit(root, "common ancestor");
+  await git(root, ["switch", "--quiet", "--create", "pull-request"]);
+  await writeFile(join(root, "feature.txt"), "feature\n");
+  const headSha = await commit(root, "pull request change");
+  await git(root, ["switch", "--quiet", "main"]);
+  await writeFile(join(root, "base-only.txt"), "base branch change\n");
+  const baseSha = await commit(root, "advance base branch");
+
+  const files = await readPullRequestFilesFromCheckout(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      headSha,
+      baseSha,
+      baseRef: "main",
+      changedFiles: 1,
+      title: "Merge-base metadata",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    root,
+  );
+  assert.deepEqual(
+    files.map((file) => ({
+      path: file.path,
+      additions: file.additions,
+      deletions: file.deletions,
+    })),
+    [{ path: "feature.txt", additions: 1, deletions: 0 }],
+  );
+  assert.equal(await githubApiInternals.readGitMergeBase(root, baseSha, headSha), mergeBaseSha);
+});
+
+test("uses the captured merge-base attributes for changed-file metadata", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-attribute-source-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await writeFile(join(root, ".gitattributes"), "");
+  await writeFile(join(root, "notes.txt"), "before\n");
+  const baseSha = await commit(root, "base");
+  await writeFile(join(root, ".gitattributes"), "*.txt -diff\n");
+  await writeFile(join(root, "notes.txt"), "after\n");
+  const headSha = await commit(root, "head attributes and text change");
+
+  const files = await readPullRequestFilesFromCheckout(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      headSha,
+      baseSha,
+      baseRef: "main",
+      changedFiles: 2,
+      title: "Attribute source metadata",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    root,
+  );
+  const notes = files.find((file) => file.path === "notes.txt");
+  assert.ok(notes);
+  assert.equal(notes.status, "modified");
+  assert.equal(notes.additions, 1);
+  assert.equal(notes.deletions, 1);
+  assert.deepEqual([...notes.addedLines], [1]);
+});
+
+test("decodes quoted UTF-8 paths from Git diff output", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-quoted-path-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await git(root, ["config", "core.quotePath", "true"]);
+  const path = "ümlaut.txt";
+  await writeFile(join(root, path), "before\n");
+  const baseSha = await commit(root, "base");
+  await writeFile(join(root, path), "after\n");
+  const headSha = await commit(root, "quoted path change");
+
+  const files = await readPullRequestFilesFromCheckout(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      headSha,
+      baseSha,
+      baseRef: "main",
+      changedFiles: 1,
+      title: "Quoted path metadata",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    root,
+  );
+  assert.equal(files.length, 1);
+  assert.equal(files[0]?.path, path);
+  assert.deepEqual([...(files[0]?.addedLines ?? [])], [1]);
+  assert.equal(githubApiInternals.decodeGitPath('"b/\\303\\274mlaut.txt"'), `b/${path}`);
 });
 
 test("detects server-truncated patches from GitHub change counts", () => {
