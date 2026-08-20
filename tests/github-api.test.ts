@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -204,6 +204,16 @@ test("parses streamed Git diff hunks and rejects malformed output", async (t) =>
     githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40)),
     /invalid changed-file hunk header/u,
   );
+
+  await writeFile(
+    gitPath,
+    "#!/bin/sh\nprintf '%s\\n' 'diff --git a/file.txt b/file.txt' '+++ b/file.txt'\nprintf '%1000001s' ''\nsleep 1\nprintf marker > \"${0}.marker\"\n",
+  );
+  await assert.rejects(
+    githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40)),
+    /oversized changed-file diff line/u,
+  );
+  await assert.rejects(access(`${gitPath}.marker`));
 });
 
 test("reads exact changed-file metadata from the captured checkout", async (t) => {

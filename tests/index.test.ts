@@ -623,6 +623,7 @@ test("falls back from a rejected approval to a comment review", async (t) => {
     ...emptyConversationApi(),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
       requests.push(request);
@@ -656,6 +657,41 @@ test("falls back from a rejected approval to a comment review", async (t) => {
     ["APPROVE", "COMMENT"],
   );
   assert.match(requests[1]?.body ?? "", /rejected the requested approval/u);
+});
+
+test("downgrades a stale auto-approval to a captured comment", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const requests: PullRequestReviewRequest[] = [];
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestHeadSha: () => Promise.resolve("f".repeat(40)),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
+      requests.push(request);
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader({ "auto-approve": "true" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.equal(result.skipped, false);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.event, "COMMENT");
+  assert.match(requests[0]?.body ?? "", /head advanced after capture/u);
 });
 
 test("propagates non-approval review failures", async (t) => {
@@ -1017,8 +1053,23 @@ test("main reports input failures without throwing secrets", async (t) => {
   assert.match(failureOutput, /\[REDACTED\]-missing-event\.json/u);
 });
 
-test("main treats cancellation as a clean stop", async () => {
+test("main treats cancellation as a clean stop", async (t) => {
+  const output: string[] = [];
+  const previousExitCode = process.exitCode;
+  t.after(() => {
+    process.exitCode = previousExitCode;
+  });
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
   const controller = new AbortController();
   controller.abort(new CancellationError("SIGTERM"));
   await main(controller);
+  assert.match(
+    output.join(""),
+    /Pull request review cancelled; no new review or run summary will be published\./u,
+  );
+  assert.doesNotMatch(output.join(""), /::error::/u);
+  assert.equal(process.exitCode, previousExitCode);
 });

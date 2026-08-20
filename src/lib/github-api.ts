@@ -554,6 +554,9 @@ async function readGitAddedLines(
           consumeLine(line);
           newline = pending.indexOf("\n");
         }
+        if (pending.length > MAX_LOCAL_DIFF_LINE_BYTES) {
+          throw new Error("Git returned an oversized changed-file diff line.");
+        }
       } catch (error) {
         child.kill();
         fail(error, reject);

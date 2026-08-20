@@ -355,9 +355,23 @@ export async function runAction(
       );
     }
 
-    const request = redactRequest(buildReviewRequest(context, review, goals), secrets);
+    let request = redactRequest(buildReviewRequest(context, review, goals), secrets);
     await assertWorkspace(context, workspace, signal);
     throwIfAborted(signal);
+    if (request.event === "APPROVE") {
+      const liveHeadSha = await api.getPullRequestHeadSha(context);
+      throwIfAborted(signal);
+      if (liveHeadSha !== context.headSha) {
+        core.warning(
+          "The pull request head advanced after capture; posting this captured review as a comment instead of an approval.",
+        );
+        request = {
+          ...request,
+          event: "COMMENT",
+          body: `${request.body}\n\n> The pull request head advanced after capture, so this review was posted as a comment.`,
+        };
+      }
+    }
     try {
       await api.createReview(context, request);
       throwIfAborted(signal);
