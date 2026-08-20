@@ -1,14 +1,50 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
-import { GitHubApi, GitHubApiError, githubApiInternals } from "../src/lib/github-api.js";
+import {
+  GitHubApi,
+  GitHubApiError,
+  githubApiInternals,
+  readPullRequestFilesFromCheckout,
+} from "../src/lib/github-api.js";
 import type {
   PullRequestContext,
   PullRequestLocator,
   PullRequestReviewRequest,
 } from "../src/lib/types.js";
+
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", [...args], { cwd, encoding: "utf8" });
+  return stdout.trim();
+}
+
+async function commit(cwd: string, message: string): Promise<string> {
+  await git(cwd, ["add", "--all"]);
+  await execFileAsync(
+    "git",
+    [
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.test",
+      "commit",
+      "--quiet",
+      "--message",
+      message,
+    ],
+    { cwd },
+  );
+  return git(cwd, ["rev-parse", "HEAD"]);
+}
 
 test("extracts added line numbers from a unified diff", () => {
   const lines = githubApiInternals.parseAddedLines(
@@ -27,6 +63,211 @@ test("does not treat file headers as added lines", () => {
 test("counts added lines whose content starts with plus signs", () => {
   const lines = githubApiInternals.parseAddedLines("@@ -0,0 +1 @@\n+++counter");
   assert.deepEqual([...lines], [1]);
+});
+
+test("validates NUL-delimited Git changed-file metadata", () => {
+  assert.deepEqual(
+    githubApiInternals.parseGitNameStatus("A\0added.txt\0T\0typed.txt\0C\0old.txt\0copy.txt"),
+    [
+      { path: "added.txt", status: "added" },
+      { path: "typed.txt", status: "modified" },
+      { path: "copy.txt", previousPath: "old.txt", status: "copied" },
+    ],
+  );
+  assert.throws(() => githubApiInternals.parseGitNameStatus("M\0"), /invalid changed-file path/u);
+  assert.throws(
+    () => githubApiInternals.parseGitNameStatus("\0M\0file.txt\0"),
+    /invalid changed-file status/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNameStatus("R\0old.txt\0"),
+    /invalid changed-file rename path/u,
+  );
+  assert.throws(() => githubApiInternals.parseGitNameStatus("A\0\0"), /invalid changed-file path/u);
+  const tooManyFiles = Array.from({ length: 3_001 }, (_, index) => `M\0file-${index}\0`).join("");
+  assert.throws(
+    () => githubApiInternals.parseGitNameStatus(tooManyFiles),
+    /pull request file limit/u,
+  );
+
+  const modified = [{ path: "file.txt", status: "modified" }];
+  assert.deepEqual(githubApiInternals.parseGitNumstat("1\t2\tfile.txt", modified), [
+    { additions: 1, deletions: 2 },
+  ]);
+  assert.deepEqual(
+    githubApiInternals.parseGitNumstat("-\t-\tbinary.dat", [
+      { path: "binary.dat", status: "modified" },
+    ]),
+    [{ additions: 0, deletions: 0 }],
+  );
+  assert.deepEqual(
+    githubApiInternals.parseGitNumstat("1\t0\t\0old.txt\0new.txt", [
+      { path: "new.txt", previousPath: "old.txt", status: "renamed" },
+    ]),
+    [{ additions: 1, deletions: 0 }],
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("", modified),
+    /incomplete changed-file counts/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("1\tfile.txt", modified),
+    /invalid changed-file counts/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("invalid", modified),
+    /invalid changed-file counts/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("1\t0\t", modified),
+    /invalid changed-file path/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("1\t0\tother.txt", modified),
+    /inconsistent changed-file paths/u,
+  );
+  assert.throws(
+    () =>
+      githubApiInternals.parseGitNumstat("1\t0\t\0different-old.txt\0new.txt", [
+        { path: "new.txt", previousPath: "old.txt", status: "renamed" },
+      ]),
+    /inconsistent changed-file paths/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("1\t0\tfile.txt\0extra", modified),
+    /extra changed-file counts/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("9007199254740992\t0\tfile.txt", modified),
+    /invalid addition count/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("not-a-count\t0\tfile.txt", modified),
+    /invalid addition count/u,
+  );
+  assert.throws(
+    () => githubApiInternals.parseGitNumstat("9007199254740991\t1\tfile.txt", modified),
+    /oversized changed-file counts/u,
+  );
+});
+
+test("fails closed when local Git metadata commands fail", async () => {
+  assert.equal(githubApiInternals.diffPath("+++ odd-path.txt"), "odd-path.txt");
+  assert.equal(githubApiInternals.diffPath("not a file header"), undefined);
+  await assert.rejects(
+    githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40)),
+    /changed-file diff failed/u,
+  );
+  await assert.rejects(
+    githubApiInternals.readGitMetadata("/tmp/ai-pr-reviewer-missing-working-tree", ["status"]),
+    /changed-file metadata failed/u,
+  );
+});
+
+test("parses streamed Git diff hunks and rejects malformed output", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-git-stub-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const gitPath = join(root, "git");
+  await writeFile(
+    gitPath,
+    "#!/bin/sh\nprintf '%s\\n' 'diff --git a/file.txt b/file.txt'\nprintf '%s\\n' '+++ b/file.txt'\nprintf '%s\\n' '@@ -0,0 +1 @@'\nprintf '%s\\n' '+++ foo'\nprintf '%s\\n' '@@ -1,0 +2,1 @@'\nprintf '%s' '+line'\n",
+  );
+  await chmod(gitPath, 0o700);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${root}${previousPath === undefined ? "" : `:${previousPath}`}`;
+  t.after(() => {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  });
+
+  const parsed = await githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40));
+  assert.deepEqual([...(parsed.get("file.txt") ?? [])], [1, 2]);
+
+  await writeFile(
+    gitPath,
+    "#!/bin/sh\nprintf '%s\\n' '+++ b/file.txt'\nprintf '%s\\n' '@@ malformed'\n",
+  );
+  await assert.rejects(
+    githubApiInternals.readGitAddedLines("/tmp", "a".repeat(40), "b".repeat(40)),
+    /invalid changed-file hunk header/u,
+  );
+});
+
+test("reads exact changed-file metadata from the captured checkout", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-files-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await git(root, ["init", "--quiet", "--initial-branch=main"]);
+  await writeFile(join(root, "keep.txt"), "base\n");
+  await writeFile(join(root, "remove.txt"), "remove\n");
+  await writeFile(join(root, "old-name.txt"), "one\ntwo\nthree\n");
+  const baseSha = await commit(root, "base");
+  await writeFile(join(root, "keep.txt"), "head\n");
+  await rm(join(root, "remove.txt"));
+  await execFileAsync("git", ["mv", "old-name.txt", "new-name.txt"], { cwd: root });
+  await writeFile(join(root, "new-name.txt"), "one\ntwo\nthree\nadded\n");
+  const headSha = await commit(root, "head");
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha,
+    baseSha,
+    baseRef: "main",
+    changedFiles: 3,
+    title: "Captured files",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+
+  const files = await readPullRequestFilesFromCheckout(context, root);
+  assert.deepEqual(
+    files.map((file) => ({
+      path: file.path,
+      previousPath: file.previousPath,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      changes: file.changes,
+      addedLines: [...file.addedLines],
+    })),
+    [
+      {
+        path: "keep.txt",
+        previousPath: undefined,
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        addedLines: [1],
+      },
+      {
+        path: "new-name.txt",
+        previousPath: "old-name.txt",
+        status: "renamed",
+        additions: 1,
+        deletions: 0,
+        changes: 1,
+        addedLines: [4],
+      },
+      {
+        path: "remove.txt",
+        previousPath: undefined,
+        status: "removed",
+        additions: 0,
+        deletions: 1,
+        changes: 1,
+        addedLines: [],
+      },
+    ],
+  );
+  await assert.rejects(
+    readPullRequestFilesFromCheckout({ ...context, changedFiles: 4 }, root),
+    /incomplete pull request file list/u,
+  );
+  await assert.rejects(
+    readPullRequestFilesFromCheckout({ ...context, changedFiles: 0 }, root),
+    /more files than the pull request metadata/u,
+  );
 });
 
 test("detects server-truncated patches from GitHub change counts", () => {

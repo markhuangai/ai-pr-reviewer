@@ -1,10 +1,20 @@
+import { execFile, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+import { promisify } from "node:util";
+
 import type {
   ChangedFile,
   PullRequestContext,
   PullRequestLocator,
   PullRequestReviewRequest,
 } from "./types.js";
-import { throwIfAborted } from "./bootstrap/cancellation.js";
+import { cancellationReason, throwIfAborted } from "./bootstrap/cancellation.js";
+
+const execFileAsync = promisify(execFile);
+const MAX_LOCAL_CHANGED_FILES = 3_000;
+const MAX_LOCAL_METADATA_BYTES = 32 * 1024 * 1024;
+const MAX_LOCAL_DIFF_LINE_BYTES = 1_000_000;
+const MAX_LOCAL_ADDED_LINES_PER_FILE = 1_000_000;
 
 interface PullRequestFilePayload {
   readonly filename?: unknown;
@@ -14,6 +24,21 @@ interface PullRequestFilePayload {
   readonly deletions?: unknown;
   readonly changes?: unknown;
   readonly patch?: unknown;
+}
+
+interface GitFileNameStatus {
+  readonly path: string;
+  readonly previousPath?: string;
+  readonly status: string;
+}
+
+interface GitFileNumstat {
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 interface ReviewPayload {
@@ -257,6 +282,314 @@ function readFilePayload(value: unknown, index: number): ChangedFile {
     ...(patch === undefined ? {} : { patch }),
     addedLines: parseAddedLines(patch),
   };
+}
+
+function nulTokens(value: string): string[] {
+  const tokens = value.split("\0");
+  if (tokens.at(-1) === "") tokens.pop();
+  return tokens;
+}
+
+function gitFileStatus(code: string): string {
+  switch (code) {
+    case "A":
+      return "added";
+    case "D":
+      return "removed";
+    case "R":
+      return "renamed";
+    case "C":
+      return "copied";
+    default:
+      return "modified";
+  }
+}
+
+function parseGitNameStatus(value: string): readonly GitFileNameStatus[] {
+  const tokens = nulTokens(value);
+  const files: GitFileNameStatus[] = [];
+  let index = 0;
+  while (index < tokens.length) {
+    const statusToken = tokens[index];
+    index += 1;
+    if (statusToken === undefined || statusToken.length === 0) {
+      throw new Error("Git returned an invalid changed-file status.");
+    }
+    const code = statusToken[0];
+    if (code === undefined) throw new Error("Git returned an invalid changed-file status.");
+    const firstPath = tokens[index];
+    index += 1;
+    if (firstPath === undefined || firstPath.length === 0) {
+      throw new Error("Git returned an invalid changed-file path.");
+    }
+    if (code === "R" || code === "C") {
+      const path = tokens[index];
+      index += 1;
+      if (path === undefined || path.length === 0) {
+        throw new Error("Git returned an invalid changed-file rename path.");
+      }
+      files.push({ path, previousPath: firstPath, status: gitFileStatus(code) });
+    } else {
+      files.push({ path: firstPath, status: gitFileStatus(code) });
+    }
+    if (files.length > MAX_LOCAL_CHANGED_FILES) {
+      throw new Error("Git returned more than the pull request file limit.");
+    }
+  }
+  return files;
+}
+
+function gitCount(value: string, label: string): number {
+  if (value === "-") return 0;
+  if (!/^\d+$/u.test(value)) throw new Error(`Git returned an invalid ${label} count.`);
+  const count = Number(value);
+  if (!Number.isSafeInteger(count)) throw new Error(`Git returned an invalid ${label} count.`);
+  return count;
+}
+
+function parseGitNumstat(
+  value: string,
+  files: readonly GitFileNameStatus[],
+): readonly GitFileNumstat[] {
+  const tokens = nulTokens(value);
+  const counts: GitFileNumstat[] = [];
+  let index = 0;
+  for (const file of files) {
+    const record = tokens[index];
+    index += 1;
+    if (record === undefined) {
+      throw new Error("Git returned incomplete changed-file counts.");
+    }
+    const firstTab = record.indexOf("\t");
+    const secondTab = firstTab < 0 ? -1 : record.indexOf("\t", firstTab + 1);
+    if (firstTab < 1 || secondTab < firstTab + 2) {
+      throw new Error("Git returned invalid changed-file counts.");
+    }
+    const additionsToken = record.slice(0, firstTab);
+    const deletionsToken = record.slice(firstTab + 1, secondTab);
+    const firstPath = record.slice(secondTab + 1);
+    const additions = gitCount(additionsToken, "addition");
+    const deletions = gitCount(deletionsToken, "deletion");
+    if (file.previousPath !== undefined) {
+      if (firstPath.length !== 0) throw new Error("Git returned an invalid changed-file path.");
+      const previousPath = tokens[index];
+      const path = tokens[index + 1];
+      index += 2;
+      if (previousPath !== file.previousPath || path !== file.path) {
+        throw new Error("Git returned inconsistent changed-file paths.");
+      }
+    } else {
+      if (firstPath.length === 0) throw new Error("Git returned an invalid changed-file path.");
+      if (firstPath !== file.path) throw new Error("Git returned inconsistent changed-file paths.");
+    }
+    if (additions > Number.MAX_SAFE_INTEGER - deletions) {
+      throw new Error("Git returned oversized changed-file counts.");
+    }
+    counts.push({ additions, deletions });
+  }
+  if (index !== tokens.length) throw new Error("Git returned extra changed-file counts.");
+  return counts;
+}
+
+function diffPath(line: string): string | undefined {
+  if (!line.startsWith("+++ ")) return undefined;
+  const path = line.slice(4);
+  if (path === "/dev/null") return undefined;
+  return path.startsWith("b/") ? path.slice(2) : path;
+}
+
+async function readGitAddedLines(
+  cwd: string,
+  baseSha: string,
+  headSha: string,
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<string, ReadonlySet<number>>> {
+  throwIfAborted(signal);
+  const child = spawn(
+    "git",
+    [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-color",
+      "--find-renames=50%",
+      "--unified=0",
+      baseSha,
+      headSha,
+      "--",
+    ],
+    {
+      cwd,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(signal === undefined ? {} : { signal }),
+    },
+  );
+  const decoder = new StringDecoder("utf8");
+  const addedLines = new Map<string, Set<number>>();
+  let pending = "";
+  let stderr = "";
+  let currentPath: string | undefined;
+  let fileHeaderRead = false;
+  let settled = false;
+  const consumeLine = (line: string): void => {
+    if (line.length > MAX_LOCAL_DIFF_LINE_BYTES) {
+      throw new Error("Git returned an oversized changed-file diff line.");
+    }
+    const path = diffPath(line);
+    if (line.startsWith("diff --git ")) {
+      currentPath = undefined;
+      fileHeaderRead = false;
+      return;
+    }
+    if (!fileHeaderRead && line.startsWith("+++ ")) {
+      currentPath = path;
+      fileHeaderRead = true;
+      return;
+    }
+    if (currentPath === undefined || !line.startsWith("@@ ")) return;
+    const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/u.exec(line);
+    if (!header) throw new Error("Git returned an invalid changed-file hunk header.");
+    const start = Number(header[1]);
+    const count = Number(header[2] ?? 1);
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(count) ||
+      start < 0 ||
+      count < 0 ||
+      (count > 0 && start < 1)
+    ) {
+      throw new Error("Git returned an invalid changed-file hunk range.");
+    }
+    if (count === 0) return;
+    const end = start + count - 1;
+    if (!Number.isSafeInteger(end) || end > Number.MAX_SAFE_INTEGER) {
+      throw new Error("Git returned an oversized changed-file hunk range.");
+    }
+    const lines = addedLines.get(currentPath) ?? new Set<number>();
+    if (lines.size > MAX_LOCAL_ADDED_LINES_PER_FILE - count) {
+      throw new Error("Git returned too many added lines for a changed file.");
+    }
+    for (let lineNumber = start; lineNumber <= end; lineNumber += 1) {
+      lines.add(lineNumber);
+    }
+    addedLines.set(currentPath, lines);
+  };
+  const fail = (error: unknown, reject: (reason?: unknown) => void): void => {
+    if (settled) return;
+    settled = true;
+    reject(signal?.aborted ? cancellationReason(signal) : error);
+  };
+
+  return new Promise<ReadonlyMap<string, ReadonlySet<number>>>((resolvePromise, reject) => {
+    child.stdout.on("data", (chunk: Buffer) => {
+      try {
+        pending += decoder.write(chunk);
+        let newline = pending.indexOf("\n");
+        while (newline >= 0) {
+          const line = pending.slice(0, newline).replace(/\r$/u, "");
+          pending = pending.slice(newline + 1);
+          consumeLine(line);
+          newline = pending.indexOf("\n");
+        }
+      } catch (error) {
+        child.kill();
+        fail(error, reject);
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < MAX_LOCAL_DIFF_LINE_BYTES) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => {
+      fail(error, reject);
+    });
+    child.once("close", (code, processSignal) => {
+      if (settled) return;
+      try {
+        pending += decoder.end();
+        if (pending.length > 0) consumeLine(pending);
+        if (signal?.aborted) throw cancellationReason(signal);
+        if (code !== 0) {
+          throw new Error(
+            `Git changed-file diff failed (${code ?? processSignal ?? "unknown"}): ${stderr.trim()}`,
+          );
+        }
+        settled = true;
+        resolvePromise(addedLines);
+      } catch (error) {
+        fail(error, reject);
+      }
+    });
+  });
+}
+
+async function readGitMetadata(
+  cwd: string,
+  args: readonly string[],
+  signal?: AbortSignal,
+): Promise<string> {
+  throwIfAborted(signal);
+  try {
+    const { stdout } = await execFileAsync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: MAX_LOCAL_METADATA_BYTES,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    throwIfAborted(signal);
+    return stdout;
+  } catch (error) {
+    throwIfAborted(signal);
+    throw new Error(`Git changed-file metadata failed: ${errorMessage(error)}`);
+  }
+}
+
+export async function readPullRequestFilesFromCheckout(
+  context: PullRequestContext,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<readonly ChangedFile[]> {
+  const commonArgs = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames=50%"];
+  const nameStatuses = parseGitNameStatus(
+    await readGitMetadata(
+      cwd,
+      [...commonArgs, "--name-status", "-z", context.baseSha, context.headSha, "--"],
+      signal,
+    ),
+  );
+  const counts = parseGitNumstat(
+    await readGitMetadata(
+      cwd,
+      [...commonArgs, "--numstat", "-z", context.baseSha, context.headSha, "--"],
+      signal,
+    ),
+    nameStatuses,
+  );
+  const addedLines = await readGitAddedLines(cwd, context.baseSha, context.headSha, signal);
+  const knownPaths = new Set(nameStatuses.map((file) => file.path));
+  for (const path of addedLines.keys()) {
+    if (!knownPaths.has(path)) throw new Error("Git returned an unknown changed-file path.");
+  }
+  const files = nameStatuses.map((file, index) => {
+    const count = counts[index];
+    if (count === undefined) throw new Error("Git returned incomplete changed-file metadata.");
+    return {
+      path: file.path,
+      ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+      status: file.status,
+      additions: count.additions,
+      deletions: count.deletions,
+      changes: count.additions + count.deletions,
+      addedLines: addedLines.get(file.path) ?? new Set<number>(),
+    };
+  });
+  if (context.changedFiles !== undefined && files.length > context.changedFiles) {
+    throw new Error("Git returned more files than the pull request metadata reports.");
+  }
+  if (context.changedFiles !== undefined && context.changedFiles > files.length) {
+    throw new Error("Git returned an incomplete pull request file list.");
+  }
+  return files;
 }
 
 export interface GitHubCommentAuthor {
@@ -613,6 +946,11 @@ export class GitHubApi {
 }
 
 export const githubApiInternals = {
+  diffPath,
+  readGitAddedLines,
+  readGitMetadata,
+  parseGitNameStatus,
+  parseGitNumstat,
   parseAddedLines,
   parsePatchCounts,
   isPatchComplete,

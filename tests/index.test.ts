@@ -368,7 +368,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       response.end(
         JSON.stringify([
           {
-            filename: "review.txt",
+            filename: "live-only.txt",
             status: "modified",
             additions: 1,
             deletions: 1,
@@ -463,6 +463,10 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
       assert.equal(files.length, 1);
+      assert.equal(files[0]?.path, "review.txt");
+      assert.equal(files[0]?.additions, 1);
+      assert.equal(files[0]?.deletions, 1);
+      assert.deepEqual([...(files[0]?.addedLines ?? [])], [1]);
       assert.equal(conversation.entries.length, 1);
       const entry = conversation.entries[0];
       assert.equal(entry?.kind, "pr_comment");
@@ -485,7 +489,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 6);
+  assert.equal(requests.length, 5);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,
@@ -509,6 +513,10 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(
     requests.filter((request) => request.path?.includes("/issues/9/comments?") === true).length,
     1,
+  );
+  assert.equal(
+    requests.some((request) => request.path?.includes("/files?") === true),
+    false,
   );
 });
 
@@ -1007,4 +1015,10 @@ test("main reports input failures without throwing secrets", async (t) => {
   assert.equal(process.exitCode, 1);
   assert.doesNotMatch(failureOutput, /environment-secret/u);
   assert.match(failureOutput, /\[REDACTED\]-missing-event\.json/u);
+});
+
+test("main treats cancellation as a clean stop", async () => {
+  const controller = new AbortController();
+  controller.abort(new CancellationError("SIGTERM"));
+  await main(controller);
 });

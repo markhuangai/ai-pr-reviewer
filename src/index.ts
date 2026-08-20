@@ -11,7 +11,7 @@ import {
 } from "./lib/aggregate.js";
 import { throwIfAborted } from "./lib/bootstrap/cancellation.js";
 import { prepareContextFiles, type ContextFileArtifact } from "./lib/context-files.js";
-import { GitHubApi, GitHubApiError } from "./lib/github-api.js";
+import { GitHubApi, GitHubApiError, readPullRequestFilesFromCheckout } from "./lib/github-api.js";
 import {
   parsePullRequestUrl,
   readPullRequestContext,
@@ -298,7 +298,11 @@ export async function runAction(
     }
 
     await assertWorkspace(context, workspace, signal);
-    const files = await api.getPullRequestFiles(context);
+    const files = await (dependencies.readFiles ?? readPullRequestFilesFromCheckout)(
+      context,
+      workspace,
+      signal,
+    );
     throwIfAborted(signal);
     core.info(
       `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
@@ -382,6 +386,7 @@ interface ActionDependencies {
   readonly createApi: (token: string, signal?: AbortSignal) => GitHubApi;
   readonly readEventContext: (signal?: AbortSignal) => Promise<PullRequestContext | undefined>;
   readonly createWorkspace: typeof createPullRequestWorkspace;
+  readonly readFiles?: typeof readPullRequestFilesFromCheckout;
   readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
   readonly writeSummary: typeof writeRunSummary;
@@ -392,6 +397,7 @@ const defaultActionDependencies: ActionDependencies = {
     new GitHubApi(token, process.env.GITHUB_API_URL ?? "https://api.github.com", signal),
   readEventContext: (signal) => readPullRequestEventContext(undefined, undefined, signal),
   createWorkspace: createPullRequestWorkspace,
+  readFiles: readPullRequestFilesFromCheckout,
   runGoals: runReviewGoals,
   writeSummary: writeRunSummary,
 };
