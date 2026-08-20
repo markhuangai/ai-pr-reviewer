@@ -665,7 +665,8 @@ test("downgrades a stale auto-approval to a captured comment", async (t) => {
   const requests: PullRequestReviewRequest[] = [];
   const api = {
     ...emptyConversationApi(),
-    getPullRequestHeadSha: () => Promise.resolve("f".repeat(40)),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: "f".repeat(40), baseSha: context.baseSha }),
     getPullRequestFiles: () => Promise.resolve([]),
     createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
       requests.push(request);
@@ -691,7 +692,43 @@ test("downgrades a stale auto-approval to a captured comment", async (t) => {
   assert.equal(result.skipped, false);
   assert.equal(requests.length, 1);
   assert.equal(requests[0]?.event, "COMMENT");
-  assert.match(requests[0]?.body ?? "", /head advanced after capture/u);
+  assert.match(requests[0]?.body ?? "", /refs changed after capture/u);
+});
+
+test("downgrades approval when the captured base changed", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const requests: PullRequestReviewRequest[] = [];
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestRefs: () =>
+      Promise.resolve({ headSha: context.headSha, baseSha: "f".repeat(40) }),
+    getPullRequestFiles: () => Promise.resolve([]),
+    createReview: (_context: PullRequestContext, request: PullRequestReviewRequest) => {
+      requests.push(request);
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader({ "auto-approve": "true" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+
+  assert.equal(result.skipped, false);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.event, "COMMENT");
+  assert.match(requests[0]?.body ?? "", /refs changed after capture/u);
 });
 
 test("propagates non-approval review failures", async (t) => {

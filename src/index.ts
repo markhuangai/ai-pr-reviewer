@@ -359,16 +359,16 @@ export async function runAction(
     await assertWorkspace(context, workspace, signal);
     throwIfAborted(signal);
     if (request.event === "APPROVE") {
-      const liveHeadSha = await api.getPullRequestHeadSha(context);
+      const liveRefs = await api.getPullRequestRefs(context);
       throwIfAborted(signal);
-      if (liveHeadSha !== context.headSha) {
+      if (liveRefs.headSha !== context.headSha || liveRefs.baseSha !== context.baseSha) {
         core.warning(
-          "The pull request head advanced after capture; posting this captured review as a comment instead of an approval.",
+          "The pull request refs changed after capture; posting this captured review as a comment instead of an approval.",
         );
         request = {
           ...request,
           event: "COMMENT",
-          body: `${request.body}\n\n> The pull request head advanced after capture, so this review was posted as a comment.`,
+          body: `${request.body}\n\n> The pull request refs changed after capture, so this review was posted as a comment.`,
         };
       }
     }
