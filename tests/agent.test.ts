@@ -1344,6 +1344,37 @@ test("runs a complete SDK review turn through the real diff and submission tools
   });
 });
 
+test("uses and logs a configured system prompt with known secrets redacted", async (t) => {
+  const output: string[] = [];
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+  const systemPrompt = "Custom reviewer guidance containing github-secret.";
+  const result = await runReviewGoal(
+    "Check the configured prompt.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig({ systemPrompt }),
+    await makeReviewDiff(t, ""),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: { summary: "No issues", findings: [] },
+      inspectOptions: (options) => {
+        assert.equal(options.systemPrompt, systemPrompt);
+      },
+    }),
+  );
+
+  assert.equal(result.status, "completed");
+  const logs = output.join("");
+  assert.match(logs, /system message review text:.*Custom reviewer guidance/u);
+  assert.doesNotMatch(logs, /github-secret/u);
+  assert.match(logs, /\[REDACTED\]/u);
+});
+
 test("passes cancellation to the SDK and rejects the active goal", async (t) => {
   const controller = new AbortController();
   let markStarted: (() => void) | undefined;
@@ -1414,6 +1445,15 @@ test("wires the shared zero-trust prompt into review sessions", () => {
   );
 
   assert.equal(options.systemPrompt, agentInternals.REVIEW_SYSTEM_PROMPT);
+  assert.equal(
+    agentInternals.makeOptions(
+      reviewConfig({ systemPrompt: "custom prompt" }),
+      "/workspace/repository",
+      {},
+      "review_output",
+    ).systemPrompt,
+    "custom prompt",
+  );
 });
 
 test("defines the zero-trust evidence and falsification contract", () => {

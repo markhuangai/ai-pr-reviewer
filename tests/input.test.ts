@@ -117,6 +117,27 @@ test("reads and validates optional model effort", () => {
   }
 });
 
+test("reads an optional replacement system prompt without an application length cap", () => {
+  const values = {
+    "github-pat": "ghp_test",
+    "ai-base-url": "https://ai.example.test",
+    "ai-secret": "secret",
+    model: "model",
+    "review-prompts": JSON.stringify([{ prompt: "goal" }]),
+  };
+  assert.equal(readReviewConfig(reader(values)).systemPrompt, undefined);
+  assert.equal(
+    readReviewConfig(reader({ ...values, "system-prompt": "   " })).systemPrompt,
+    undefined,
+  );
+
+  const prompt = `  first line\n  second line\n${"x".repeat(12_001)}  `;
+  assert.equal(
+    readReviewConfig(reader({ ...values, "system-prompt": prompt })).systemPrompt,
+    `first line\n  second line\n${"x".repeat(12_001)}`,
+  );
+});
+
 test("reads strict model pricing while preserving the currency prefix", () => {
   const pricing = inputInternals.parseModelPricing(
     JSON.stringify({

@@ -69,6 +69,7 @@ export interface ReviewConfig {
   readonly aiAuthMode: AuthMode;
   readonly model: string;
   readonly effort?: EffortLevel;
+  readonly systemPrompt?: string;
   readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly ReviewGoal[];
   readonly parallelCount: number;
