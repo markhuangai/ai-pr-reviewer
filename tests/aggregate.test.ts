@@ -478,6 +478,14 @@ test("does not include secrets in duplicate markers", () => {
   const highEffortMarker = reviewMarker(context, { ...config, effort: "high" });
   assert.notEqual(marker, highEffortMarker);
   assert.notEqual(highEffortMarker, reviewMarker(context, { ...config, effort: "medium" }));
+  const customPrompt = "custom reviewer prompt";
+  const customPromptMarker = reviewMarker(context, { ...config, systemPrompt: customPrompt });
+  assert.notEqual(marker, customPromptMarker);
+  assert.notEqual(
+    customPromptMarker,
+    reviewMarker(context, { ...config, systemPrompt: "another prompt" }),
+  );
+  assert.doesNotMatch(customPromptMarker, /custom reviewer prompt/u);
   assert.notEqual(
     marker,
     reviewMarker({ ...context, baseSha: "1111111111111111111111111111111111111111" }, config),

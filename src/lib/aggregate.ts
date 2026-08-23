@@ -135,6 +135,7 @@ export function reviewMarker(
     baseSha: context.baseSha,
     model: config.model,
     ...(config.effort === undefined ? {} : { effort: config.effort }),
+    ...(config.systemPrompt === undefined ? {} : { systemPrompt: config.systemPrompt }),
     aiBaseUrl: config.aiBaseUrl,
     usesAuthToken: config.aiAuthMode === "auth-token",
     prompts: config.reviewPrompts.map((goal) => goal.prompt),

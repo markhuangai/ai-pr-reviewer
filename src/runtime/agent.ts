@@ -1569,6 +1569,7 @@ function makeOptions(
   outputServerName: string,
   hasContextFiles = false,
   abortController?: AbortController,
+  systemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT,
 ): Options {
   const externalNames = Object.keys(config.mcpServers).map((name) => `mcp__${name}__*`);
   return {
@@ -1611,7 +1612,7 @@ function makeOptions(
     },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
-    systemPrompt: REVIEW_SYSTEM_PROMPT,
+    systemPrompt,
   };
 }
 
@@ -1673,6 +1674,7 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   let reviewPromptActive = false;
   const logSecrets = reviewSecretCandidates(config);
+  const effectiveSystemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT;
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
   const conversationReader = new PullRequestConversationReader(conversation);
@@ -1831,7 +1833,7 @@ export async function runReviewGoal(
         "system message",
         "review",
         "text",
-        REVIEW_SYSTEM_PROMPT,
+        effectiveSystemPrompt,
         logSecrets,
         write,
       );
@@ -1845,6 +1847,7 @@ export async function runReviewGoal(
         outputServerName,
         contextFiles.length > 0,
         abortController,
+        effectiveSystemPrompt,
       ),
     });
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));

@@ -77,6 +77,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `ai-auth-mode`     | no       | `api-key` | `api-key` sets `ANTHROPIC_API_KEY`; `auth-token` sets `ANTHROPIC_AUTH_TOKEN`.                             |
 | `model`            | yes      |           | Model name understood by the endpoint.                                                                    |
 | `effort`           | no       |           | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                             |
+| `system-prompt`    | no       |           | Full replacement; written to the redacted action log.                                                     |
 | `model-pricing`    | no       |           | Strict JSON with a currency prefix and per-model rates per one million tokens.                            |
 | `review-prompts`   | yes      |           | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                            |
 | `parallel-count`   | no       | `5`       | Integer from 1 to 10; limits concurrently running goal sessions.                                          |
@@ -87,6 +88,18 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `mcp-servers`      | no       | empty     | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                           |
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
+
+### Custom system prompt
+
+Use `system-prompt` when the built-in reviewer instructions should be replaced for every isolated goal session:
+
+```yaml
+system-prompt: |
+  You are a reviewer for this repository. Inspect evidence before reporting a defect.
+  Return only actionable findings supported by the configured review contract.
+```
+
+This is a full replacement, not an addition to the built-in zero-trust guidance. The action still enforces its read-only tools, review completion gates, schema validation, and repair behavior, but the replacement prompt is responsible for any additional model guidance. The effective system prompt is written to the secret-redacted GitHub Actions log, so do not include credentials or other secrets. There is no application-level character cap; GitHub Actions, the Claude Agent SDK, and the configured endpoint may impose their own input or context limits.
 
 Without `pull-request-url`, the action infers the repository, pull request number, base SHA, and head SHA from the pull request event. When interaction is enabled, it skips a duplicate review only when the same head, configuration, qualifying conversation digest, and authorized context file snapshots already exist. An owner reply or changed context file therefore makes a later run distinct even when the head SHA is unchanged. When a PR event and `pull-request-url` are both present, they must identify the same pull request.
 

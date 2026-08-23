@@ -443,6 +443,7 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
   const pullRequestUrl = reader.get("pull-request-url").trim();
   const modelPricing = parseModelPricing(reader.get("model-pricing"));
   const effort = readEffort(reader.get("effort"));
+  const systemPrompt = reader.get("system-prompt").trim();
   return {
     githubToken: required(reader.get("github-pat"), "github-pat"),
     aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
@@ -450,6 +451,7 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     aiAuthMode: readAuthMode(reader.get("ai-auth-mode") || "api-key"),
     model: required(reader.get("model"), "model"),
     ...(effort === undefined ? {} : { effort }),
+    ...(systemPrompt.length === 0 ? {} : { systemPrompt }),
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),

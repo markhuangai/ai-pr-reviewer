@@ -21,6 +21,9 @@ inputs:
   effort:
     description: "Optional Claude reasoning effort level: low, medium, high, xhigh, or max."
     required: false
+  system-prompt:
+    description: Optional full replacement for the built-in review system prompt; the effective prompt is written to the redacted action log.
+    required: false
   model-pricing:
     description: Optional strict JSON model pricing configuration with rates per one million tokens.
     required: false
