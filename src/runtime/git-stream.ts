@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import { cancellationReason, throwIfAborted } from "../lib/bootstrap/cancellation.js";
@@ -16,6 +17,7 @@ export async function streamGitToFile(
   outputPath: string,
   failureLabel: string,
   signal?: AbortSignal,
+  maxBytes?: number,
 ): Promise<void> {
   throwIfAborted(signal);
   const child = spawn("git", args, {
@@ -48,10 +50,28 @@ export async function streamGitToFile(
     });
   });
   const output = createWriteStream(outputPath, { flags: "wx", mode: 0o600 });
+  let streamedBytes = 0;
+  const limiter =
+    maxBytes === undefined
+      ? undefined
+      : new Transform({
+          transform(chunk: Buffer, _encoding, callback): void {
+            if (chunk.length > maxBytes - streamedBytes) {
+              callback(new Error(`${failureLabel} exceeded the configured output byte limit.`));
+              return;
+            }
+            streamedBytes += chunk.length;
+            callback(null, chunk);
+          },
+        });
   const streamed = (
-    signal === undefined
-      ? pipeline(child.stdout, output)
-      : pipeline(child.stdout, output, { signal })
+    limiter === undefined
+      ? signal === undefined
+        ? pipeline(child.stdout, output)
+        : pipeline(child.stdout, output, { signal })
+      : signal === undefined
+        ? pipeline(child.stdout, limiter, output)
+        : pipeline(child.stdout, limiter, output, { signal })
   ).catch((error: unknown) => {
     if (child.exitCode === null && child.signalCode === null) child.kill();
     throw error;

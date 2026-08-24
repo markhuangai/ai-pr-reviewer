@@ -91,6 +91,7 @@ export class RepositorySnapshot {
   readonly mergeBaseSha: string;
   private readonly allowedPaths: ReadonlySet<string>;
   private readonly queryDirectories = new Set<string>();
+  private queryOperation: Promise<void> = Promise.resolve();
   private queryStorageBytes = 0;
 
   constructor(
@@ -125,7 +126,16 @@ export class RepositorySnapshot {
     return revision === "base" ? this.mergeBaseSha : this.headSha;
   }
 
-  private async query(args: readonly string[]): Promise<RepositoryQuerySource> {
+  private query(args: readonly string[]): Promise<RepositoryQuerySource> {
+    const result = this.queryOperation.then(() => this.runQuery(args));
+    this.queryOperation = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async runQuery(args: readonly string[]): Promise<RepositoryQuerySource> {
     throwIfAborted(this.signal);
     let directory: string | undefined;
     try {
@@ -139,7 +149,15 @@ export class RepositorySnapshot {
       );
       directory = createdDirectory;
       const outputPath = join(createdDirectory, "output");
-      await streamGitToFile(this.cwd, args, outputPath, "Git snapshot query", this.signal);
+      const remainingBytes = this.maxQueryStorageBytes - this.queryStorageBytes;
+      await streamGitToFile(
+        this.cwd,
+        args,
+        outputPath,
+        "Git snapshot query",
+        this.signal,
+        remainingBytes,
+      );
       const { size: sizeBytes } = await stat(outputPath);
       if (sizeBytes > this.maxQueryStorageBytes - this.queryStorageBytes) {
         throw new Error("Repository query storage exceeds the per-goal limit.");
@@ -210,6 +228,7 @@ export class RepositorySnapshot {
   }
 
   async cleanup(): Promise<void> {
+    await this.queryOperation;
     const directories = [...this.queryDirectories];
     this.queryDirectories.clear();
     this.queryStorageBytes = 0;

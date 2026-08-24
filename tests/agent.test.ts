@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -515,6 +516,12 @@ test("preserves Git stream failures and cleans conflicting outputs", async (t) =
     const fakeOutput = join(root, "fake-output");
     await streamGitToFile(root, ["whatever"], fakeOutput, "Git test");
     assert.equal(await readFile(fakeOutput, "utf8"), "output");
+    const limitedOutput = join(root, "limited-output");
+    await assert.rejects(
+      streamGitToFile(root, ["whatever"], limitedOutput, "Git test", undefined, 3),
+      /configured output byte limit/u,
+    );
+    assert.ok((await stat(limitedOutput)).size <= 3);
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
@@ -2977,10 +2984,7 @@ test("bounds aggregate repository query storage until sources are cleaned", asyn
 
   const first = await snapshot.file("head", "bounded.txt");
   assert.ok(first.source);
-  await assert.rejects(
-    snapshot.file("head", "bounded.txt"),
-    /repository query storage exceeds the per-goal limit/iu,
-  );
+  await assert.rejects(snapshot.file("head", "bounded.txt"), /configured output byte limit/iu);
   await first.source.cleanup();
 
   const retry = await snapshot.file("head", "bounded.txt");
