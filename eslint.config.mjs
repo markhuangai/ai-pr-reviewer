@@ -13,6 +13,11 @@ export default tseslint.config(
     ],
   },
   eslint.configs.recommended,
+  {
+    rules: {
+      "max-lines": ["error", { max: 1_000, skipBlankLines: false, skipComments: false }],
+    },
+  },
   ...tseslint.configs.strictTypeChecked.map((config) => ({ ...config, files: ["**/*.ts"] })),
   {
     files: ["**/*.ts"],
