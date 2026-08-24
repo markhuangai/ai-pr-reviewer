@@ -2633,6 +2633,16 @@ test("bounds serialized full-diff pages before advancing the reader", async (t) 
   assert.equal(actual, content);
 });
 
+test("rejects an oversized empty full-diff page without advancing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-empty-diff-page-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "diff");
+  await writeFile(path, "");
+  const reader = new agentInternals.PullRequestDiffReader(path, 0);
+  await assert.rejects(reader.readNext({ metadata: "x".repeat(30_000) }), /bounded result size/u);
+  await reader.close();
+});
+
 test("reads fixed changed paths at the merge base and head, including binary metadata", async (t) => {
   const repository = await makeRepository(
     t,
@@ -2807,6 +2817,15 @@ test("pages spooled repository sources and rejects in-checkout query roots", asy
   });
   await emptyReader.close();
   await emptyReader.close();
+  const oversizedEmptyReader = new agentInternals.RepositoryFilePageReader(
+    empty.source.path,
+    empty.source.sizeBytes,
+  );
+  await assert.rejects(
+    oversizedEmptyReader.readNext({ metadata: "x".repeat(30_000) }),
+    /bounded result size/u,
+  );
+  await oversizedEmptyReader.close();
   await empty.source.cleanup();
 
   const controls = await snapshot.file("head", "controls.txt");
@@ -2879,6 +2898,8 @@ test("pages spooled repository sources and rejects in-checkout query roots", asy
   const signaledFile = await signaled.file("head", "empty.txt");
   assert.ok(signaledFile.source);
   await signaledFile.source.cleanup();
+  signaledController.abort();
+  await assert.rejects(signaled.file("head", "empty.txt"));
   await signaled.cleanup();
 
   const inside = new RepositorySnapshot(

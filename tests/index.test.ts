@@ -165,7 +165,7 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
 });
 
 test("redacts generated AI prompts without dropping them", () => {
-  const [goal] = indexInternals.redactGoals(
+  const [goal, failedGoal] = indexInternals.redactGoals(
     [
       {
         prompt: "security",
@@ -206,6 +206,23 @@ test("redacts generated AI prompts without dropping them", () => {
           ],
         },
       },
+      {
+        prompt: "failure",
+        status: "failed",
+        error: "private-token failed",
+        tokenUsage: {
+          complete: false,
+          models: [
+            {
+              model: "private-token-model",
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+            },
+          ],
+        },
+      },
     ],
     ["private-token"],
   );
@@ -221,6 +238,9 @@ test("redacts generated AI prompts without dropping them", () => {
     goal?.submission?.findings[1]?.agentPrompt,
     "Impact: The value is stale.\nRequested fix: Return the current value.",
   );
+  assert.equal(failedGoal?.error, "[REDACTED] failed");
+  assert.equal(failedGoal?.tokenUsage?.models[0]?.model, "[REDACTED]-model");
+  assert.equal(failedGoal?.submission, undefined);
 });
 
 test("workspace validation rejects ignored content", async (t) => {
