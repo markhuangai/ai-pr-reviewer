@@ -87,6 +87,20 @@ test("discovers same-repository issue references while ignoring code and other r
     }),
     { numbers: [12], truncated: false },
   );
+  assert.deepEqual(
+    discoverLinkedIssueNumbers({
+      ...context,
+      body: "````\n#17\n```\n#18\n````\nFixes #12",
+    }),
+    { numbers: [12], truncated: false },
+  );
+  assert.deepEqual(
+    discoverLinkedIssueNumbers({
+      ...context,
+      body: "~~~~\n#19\n~~~\n#20\n~~~~\nFixes #12",
+    }),
+    { numbers: [12], truncated: false },
+  );
 });
 
 test("handles empty briefing inputs and malformed linked issue payloads", () => {

@@ -739,6 +739,38 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
   }
 });
 
+test("bounds aggregate briefing records with an explicit truncation marker", () => {
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 43,
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    baseRef: "main",
+    title: "Large briefing",
+    htmlUrl: "https://github.com/owner/repository/pull/43",
+  };
+  const files: readonly ChangedFile[] = Array.from({ length: 5_000 }, (_, index) => ({
+    path: `src/file-${index}.ts`,
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    addedLines: new Set([1]),
+  }));
+  const reader = new agentInternals.ReviewBriefingReader(context, files, emptyConversation, {
+    linkedIssues: [],
+    linkedIssueReferencesTruncated: false,
+  });
+  const records: Record<string, unknown>[] = [];
+  while (!reader.complete) records.push(...reader.readNext().records);
+  const marker = records.find((record) => record.kind === "briefing_truncated");
+  assert.ok(marker);
+  assert.ok(Number(marker.omittedRecords) > 0);
+  assert.ok(records.filter((record) => record.kind === "changed_file").length < files.length);
+});
+
 test("splits UTF-8 strings without replacement characters", () => {
   const value = "a🙂界".repeat(2_000);
   const parts = agentInternals.splitUtf8(value, 17);
