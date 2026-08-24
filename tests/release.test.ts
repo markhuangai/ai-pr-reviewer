@@ -76,7 +76,7 @@ test("exposes explicit release channels and forwards them to every validation", 
   assert.equal(workflowText.match(/--channel "\$\{REQUESTED_CHANNEL\}"/g)?.length, 3);
 });
 
-test("targets pull request automation only at main", async () => {
+test("targets pull request automation only at main with one grouped update pull request", async () => {
   const [ciText, dependabotText, codeRabbitText] = await Promise.all([
     readFile(".github/workflows/ci.yml", "utf8"),
     readFile(".github/dependabot.yml", "utf8"),
@@ -86,7 +86,12 @@ test("targets pull request automation only at main", async () => {
     on?: { pull_request?: { branches?: string[] } };
   };
   const dependabot = parse(dependabotText) as {
-    updates?: Array<{ "target-branch"?: string }>;
+    updates?: Array<{
+      "target-branch"?: string;
+      "open-pull-requests-limit"?: number;
+      patterns?: string[];
+      "multi-ecosystem-group"?: string;
+    }>;
   };
   const codeRabbit = parse(codeRabbitText) as {
     reviews?: { auto_review?: { base_branches?: string[] } };
@@ -96,6 +101,18 @@ test("targets pull request automation only at main", async () => {
   assert.deepEqual(
     dependabot.updates?.map((update) => update["target-branch"]),
     ["main", "main"],
+  );
+  assert.deepEqual(
+    dependabot.updates?.map((update) => update["open-pull-requests-limit"]),
+    [1, 1],
+  );
+  assert.deepEqual(
+    dependabot.updates?.map((update) => update.patterns),
+    [["*"], ["*"]],
+  );
+  assert.deepEqual(
+    dependabot.updates?.map((update) => update["multi-ecosystem-group"]),
+    ["dependencies", "dependencies"],
   );
   assert.deepEqual(codeRabbit.reviews?.auto_review?.base_branches, ["^main$"]);
 });

@@ -12,6 +12,7 @@ updates:
   - package-ecosystem: npm
     directory: /
     target-branch: main
+    open-pull-requests-limit: 1
     patterns:
       - "*"
     multi-ecosystem-group: dependencies
@@ -19,6 +20,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     target-branch: main
+    open-pull-requests-limit: 1
     patterns:
       - "*"
     multi-ecosystem-group: dependencies
