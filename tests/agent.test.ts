@@ -170,6 +170,7 @@ interface FakeQueryScenario {
   readonly readThreadId?: number;
   readonly readThreadPath?: string;
   readonly readThreadFirstOnly?: boolean;
+  readonly repeatThreadSelector?: boolean;
   readonly assertUnreadThreadAfterId?: boolean;
   readonly assertUnreadThreadRejection?: boolean;
   readonly readDiffPath?: string;
@@ -377,9 +378,11 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             for (const selector of selectors) {
               let threadDone = false;
               let threadCursor: string | undefined;
+              let repeatedSelector = false;
               while (!threadDone) {
+                const startingCursor = threadCursor;
                 const result = await threadTool.handler(
-                  threadCursor === undefined ? selector : { cursor: threadCursor },
+                  startingCursor === undefined ? selector : { cursor: startingCursor },
                 );
                 const page = JSON.parse(result.content[0]?.text ?? "{}") as {
                   readonly done?: unknown;
@@ -387,6 +390,22 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 };
                 threadDone = page.done === true;
                 threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+                if (
+                  scenario.repeatThreadSelector &&
+                  !repeatedSelector &&
+                  startingCursor === undefined &&
+                  !threadDone &&
+                  threadCursor !== undefined
+                ) {
+                  const repeated = await threadTool.handler(selector);
+                  const repeatedPage = JSON.parse(repeated.content[0]?.text ?? "{}") as {
+                    readonly reused?: unknown;
+                    readonly nextCursor?: unknown;
+                  };
+                  assert.equal(repeatedPage.reused, true);
+                  assert.equal(repeatedPage.nextCursor, threadCursor);
+                  repeatedSelector = true;
+                }
                 if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
                   const rejected = await submitTool.handler(scenario.submission);
                   assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
@@ -1486,6 +1505,7 @@ test("requires the complete prior thread before accepting a located finding", as
       assertUnreadThreadRejection: true,
       readThreadPath: "src/change.ts",
       readThreadFirstOnly: true,
+      repeatThreadSelector: true,
     }),
   );
   assert.equal(result.status, "completed");

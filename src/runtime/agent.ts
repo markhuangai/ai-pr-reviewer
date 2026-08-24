@@ -2109,6 +2109,14 @@ export async function runReviewGoal(
   }
   const queryReaders = new Map<string, QueryReaderEntry>();
   const queryReaderCompletions = new Map<string, () => void>();
+  const discussionQueryCursors = new Map<string, string>();
+  const queryReaderDiscussionKeys = new Map<string, string>();
+  const detachDiscussionQuery = (cursor: string): void => {
+    const discussionKey = queryReaderDiscussionKeys.get(cursor);
+    queryReaderDiscussionKeys.delete(cursor);
+    if (discussionKey !== undefined && discussionQueryCursors.get(discussionKey) === cursor)
+      discussionQueryCursors.delete(discussionKey);
+  };
   const discussionReadPaths = new Set<string>();
   const discussionReadThreadIds = new Set<number>();
   const discussionPathScopes = new Map<string, string>();
@@ -2120,6 +2128,7 @@ export async function runReviewGoal(
   const createQueryReader = (
     content: string,
     onComplete?: () => void,
+    discussionKey?: string,
   ): { readonly cursor: string; readonly reader: StringPageReader } => {
     while (queryReaders.size >= 32) {
       const oldest = queryReaders.keys().next().value;
@@ -2127,12 +2136,17 @@ export async function runReviewGoal(
       const evicted = queryReaders.get(oldest);
       queryReaders.delete(oldest);
       queryReaderCompletions.delete(oldest);
+      detachDiscussionQuery(oldest);
       if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
     }
     const cursor = randomUUID();
     const reader = new StringPageReader(content);
     queryReaders.set(cursor, { reader });
     if (onComplete !== undefined) queryReaderCompletions.set(cursor, onComplete);
+    if (discussionKey !== undefined) {
+      discussionQueryCursors.set(discussionKey, cursor);
+      queryReaderDiscussionKeys.set(cursor, discussionKey);
+    }
     return { cursor, reader };
   };
   const createQuerySourceReader = (
@@ -2144,6 +2158,7 @@ export async function runReviewGoal(
       const evicted = queryReaders.get(oldest);
       queryReaders.delete(oldest);
       queryReaderCompletions.delete(oldest);
+      detachDiscussionQuery(oldest);
       if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
     }
     const cursor = randomUUID();
@@ -2164,6 +2179,7 @@ export async function runReviewGoal(
     const entry = queryReaders.get(cursor);
     if (entry === undefined) return;
     queryReaders.delete(cursor);
+    detachDiscussionQuery(cursor);
     await closeQueryReader(entry);
     completeQueryReader(cursor);
   };
@@ -2331,6 +2347,19 @@ export async function runReviewGoal(
           };
         }
         const requestedPathScope = path === undefined ? undefined : discussionPathScope(path);
+        const selector = id === undefined ? { path } : { id };
+        const discussionKey =
+          id === undefined ? `path:${requestedPathScope as string}` : `id:${String(id)}`;
+        const existingCursor = discussionQueryCursors.get(discussionKey);
+        if (existingCursor !== undefined && queryReaders.has(existingCursor)) {
+          return jsonToolResult({
+            selector,
+            reused: true,
+            done: false,
+            nextCursor: existingCursor,
+          });
+        }
+        discussionQueryCursors.delete(discussionKey);
         const entries = conversation.entries.filter((entry) =>
           id === undefined
             ? entry.kind === "inline_thread" &&
@@ -2354,16 +2383,19 @@ export async function runReviewGoal(
             )
             .map((entry) => entry.path),
         );
-        const query = createQueryReader(JSON.stringify({ entries }), () => {
-          if (id !== undefined) {
-            for (const entry of entries)
-              if (entry.kind === "inline_thread") discussionReadThreadIds.add(entry.id);
-            return;
-          }
-          for (const discussionPath of discussionPaths)
-            discussionReadPaths.add(discussionPathScope(discussionPath));
-        });
-        const selector = id === undefined ? { path } : { id };
+        const query = createQueryReader(
+          JSON.stringify({ entries }),
+          () => {
+            if (id !== undefined) {
+              for (const entry of entries)
+                if (entry.kind === "inline_thread") discussionReadThreadIds.add(entry.id);
+              return;
+            }
+            for (const discussionPath of discussionPaths)
+              discussionReadPaths.add(discussionPathScope(discussionPath));
+          },
+          discussionKey,
+        );
         const pageResult = query.reader.readNext({
           selector,
           nextCursor: query.cursor,
@@ -2731,6 +2763,8 @@ export async function runReviewGoal(
     ]);
     queryReaders.clear();
     queryReaderCompletions.clear();
+    discussionQueryCursors.clear();
+    queryReaderDiscussionKeys.clear();
   }
 }
 
