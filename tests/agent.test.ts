@@ -1,8 +1,18 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -24,7 +34,11 @@ import {
 } from "../src/runtime/agent.js";
 import type { PreparedContextFile } from "../src/lib/context-files.js";
 import type { ConversationMessage, ReviewConversationSnapshot } from "../src/lib/review-context.js";
-import { RepositorySnapshot } from "../src/runtime/repository-snapshot.js";
+import { streamGitToFile } from "../src/runtime/git-stream.js";
+import {
+  RepositorySnapshot,
+  repositorySnapshotInternals,
+} from "../src/runtime/repository-snapshot.js";
 import type {
   ChangedFile,
   PullRequestContext,
@@ -456,6 +470,40 @@ test("streams a complete diff larger than the former character budget", async (t
     const artifactPath = artifact.path;
     await artifact.cleanup();
     await assert.rejects(access(artifactPath));
+  }
+});
+
+test("preserves Git stream failures and cleans conflicting outputs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-git-stream-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const output = join(root, "output");
+  await writeFile(output, "existing");
+  await assert.rejects(
+    streamGitToFile(root, ["--version"], output, "Git test"),
+    /EEXIST|already exists|Git test failed/u,
+  );
+  await assert.rejects(
+    streamGitToFile(join(root, "missing"), ["--version"], join(root, "missing-output"), "Git test"),
+    /spawn git ENOENT/u,
+  );
+  await assert.rejects(
+    streamGitToFile(root, ["not-a-command"], join(root, "bad-output"), "Git test"),
+    /Git test failed with exit code/u,
+  );
+  const fakeBin = join(root, "bin");
+  await mkdir(fakeBin);
+  const fakeGit = join(fakeBin, "git");
+  await writeFile(fakeGit, "#!/bin/sh\necho diagnostic >&2\nprintf output\n");
+  await chmod(fakeGit, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+  try {
+    const fakeOutput = join(root, "fake-output");
+    await streamGitToFile(root, ["whatever"], fakeOutput, "Git test");
+    assert.equal(await readFile(fakeOutput, "utf8"), "output");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
   }
 });
 
@@ -2498,13 +2546,20 @@ test("reads fixed changed paths at the merge base and head, including binary met
     repository.baseSha,
     files,
   );
-  assert.deepEqual(await snapshot.file("head", "new.txt"), {
-    revision: "head",
-    path: "new.txt",
-    kind: "text",
-    sizeBytes: 10,
-    content: "head-only\n",
-  });
+  const headNew = await snapshot.file("head", "new.txt");
+  assert.deepEqual(
+    { ...headNew, source: undefined },
+    {
+      revision: "head",
+      path: "new.txt",
+      kind: "text",
+      sizeBytes: 10,
+      source: undefined,
+    },
+  );
+  assert.ok(headNew.source);
+  assert.equal(await readFile(headNew.source.path, "utf8"), "head-only\n");
+  await headNew.source.cleanup();
   assert.deepEqual(await snapshot.file("base", "new.txt"), {
     revision: "base",
     path: "new.txt",
@@ -2523,7 +2578,9 @@ test("reads fixed changed paths at the merge base and head, including binary met
     kind: "binary",
     sizeBytes: 3,
   });
-  assert.match(await snapshot.diff(["new.txt"]), /head-only/u);
+  const diffSource = await snapshot.diff(["new.txt"]);
+  assert.match(await readFile(diffSource.path, "utf8"), /head-only/u);
+  await diffSource.cleanup();
   await assert.rejects(snapshot.file("head", "review.txt"), /not a changed pull-request path/u);
   await assert.rejects(snapshot.file("head", "../new.txt"), /outside the fixed checkout/u);
   await assert.rejects(snapshot.file("head", ".git/config"), /outside the fixed checkout/u);
@@ -2535,6 +2592,182 @@ test("reads fixed changed paths at the merge base and head, including binary met
     files,
   );
   await assert.rejects(unavailable.file("head", "new.txt"), /Git snapshot query failed/u);
+});
+
+test("spools repository files beyond the former Git output cap", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "large.txt"), Buffer.alloc(16 * 1024 * 1024 + 1, 0x61));
+  });
+  const files: readonly ChangedFile[] = [
+    {
+      path: "large.txt",
+      status: "added",
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    },
+  ];
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+  );
+  t.after(() => snapshot.cleanup());
+  const result = await snapshot.file("head", "large.txt");
+  assert.equal(result.kind, "text");
+  assert.equal(result.sizeBytes, 16 * 1024 * 1024 + 1);
+  assert.ok(result.source);
+  await result.source.cleanup();
+  const diffSource = await snapshot.diff(["large.txt"]);
+  assert.ok(diffSource.sizeBytes > 16 * 1024 * 1024);
+  await diffSource.cleanup();
+});
+
+test("pages spooled repository sources and rejects in-checkout query roots", async (t) => {
+  assert.equal(repositorySnapshotInternals.isWithin("/tmp/root", "/tmp/root"), true);
+  assert.equal(repositorySnapshotInternals.isWithin("/tmp/root", "/tmp/root/child"), true);
+  assert.equal(repositorySnapshotInternals.isWithin("/tmp/root", "/tmp/root/.."), false);
+  assert.equal(repositorySnapshotInternals.isWithin("/tmp/root", "/tmp/other"), false);
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "empty.txt"), "");
+    await writeFile(join(root, "controls.txt"), String.fromCharCode(1).repeat(8_000));
+  });
+  const files: readonly ChangedFile[] = [
+    {
+      path: "empty.txt",
+      status: "added",
+      additions: 0,
+      deletions: 0,
+      changes: 0,
+      addedLines: new Set(),
+    },
+    {
+      path: "controls.txt",
+      status: "added",
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    },
+  ];
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+  );
+  t.after(() => snapshot.cleanup());
+  const empty = await snapshot.file("head", "empty.txt");
+  assert.equal(empty.kind, "text");
+  assert.ok(empty.source);
+  const emptyReader = new agentInternals.RepositoryFilePageReader(
+    empty.source.path,
+    empty.source.sizeBytes,
+  );
+  assert.deepEqual(await emptyReader.readNext({ metadata: "empty" }), {
+    page: 1,
+    content: "",
+    done: true,
+  });
+  await emptyReader.close();
+  await emptyReader.close();
+  await empty.source.cleanup();
+
+  const controls = await snapshot.file("head", "controls.txt");
+  assert.ok(controls.source);
+  const controlReader = new agentInternals.RepositoryFilePageReader(
+    controls.source.path,
+    controls.source.sizeBytes,
+  );
+  let content = "";
+  while (!controlReader.complete) {
+    const page = await controlReader.readNext({ metadata: "controls", nextCursor: "cursor" });
+    content += page.content;
+    assert.equal(
+      agentInternals.jsonToolResult({
+        ...page,
+        metadata: "controls",
+        ...(page.done ? {} : { nextCursor: "cursor" }),
+      }).isError,
+      undefined,
+    );
+  }
+  assert.equal(content, String.fromCharCode(1).repeat(8_000));
+  await controlReader.close();
+  const truncatedReader = new agentInternals.RepositoryFilePageReader(
+    controls.source.path,
+    controls.source.sizeBytes + 1,
+  );
+  await assert.rejects(
+    (async () => {
+      for (let attempt = 0; attempt < 20; attempt += 1) await truncatedReader.readNext();
+    })(),
+    /ended before its recorded size/u,
+  );
+  await truncatedReader.close();
+  await controls.source.cleanup();
+  await controls.source.cleanup();
+
+  const utf8Path = join(repository.root, "utf8-query");
+  const utf8Content = `${"a".repeat(12_287)}🙂tail`;
+  await writeFile(utf8Path, utf8Content);
+  const utf8Reader = new agentInternals.RepositoryFilePageReader(
+    utf8Path,
+    Buffer.byteLength(utf8Content, "utf8"),
+  );
+  let utf8Read = "";
+  while (!utf8Reader.complete) utf8Read += (await utf8Reader.readNext()).content;
+  assert.equal(utf8Read, utf8Content);
+  assert.equal((await utf8Reader.readNext()).done, true);
+  await utf8Reader.close();
+  await assert.rejects(utf8Reader.readNext(), /closed repository query/u);
+
+  const impossiblePath = join(repository.root, "impossible-query");
+  await writeFile(impossiblePath, "a");
+  const impossibleReader = new agentInternals.RepositoryFilePageReader(impossiblePath, 1);
+  await assert.rejects(
+    impossibleReader.readNext({ metadata: "x".repeat(30_000) }),
+    /bounded result size/u,
+  );
+  await impossibleReader.close();
+
+  const signaledController = new AbortController();
+  const signaled = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+    signaledController.signal,
+  );
+  const signaledFile = await signaled.file("head", "empty.txt");
+  assert.ok(signaledFile.source);
+  await signaledFile.source.cleanup();
+  await signaled.cleanup();
+
+  const inside = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+    undefined,
+    repository.root,
+  );
+  await assert.rejects(inside.diff(["empty.txt"]), /temporary directory must be outside/u);
+
+  const invalid = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    "f".repeat(40),
+    repository.baseSha,
+    files,
+  );
+  await assert.rejects(invalid.diff(["empty.txt"]), /Git snapshot query failed with exit code/u);
 });
 
 test("exercises on-demand fixed diff/file readers and cursor validation", async (t) => {

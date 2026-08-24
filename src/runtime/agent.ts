@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { execFile } from "node:child_process";
 import { mkdtemp, open, realpath, rm, stat, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
-import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -25,11 +23,16 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-import { cancellationReason, throwIfAborted } from "../lib/bootstrap/cancellation.js";
+import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { PreparedContextFile } from "../lib/context-files.js";
 import { reviewSecretCandidates } from "../lib/input.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
-import { RepositorySnapshot, type RepositoryFileSnapshot } from "./repository-snapshot.js";
+import {
+  RepositorySnapshot,
+  type RepositoryFileSnapshot,
+  type RepositoryQuerySource,
+} from "./repository-snapshot.js";
+import { streamGitToFile } from "./git-stream.js";
 import type {
   ChangedFile,
   GoalResult,
@@ -1412,9 +1415,9 @@ interface TextPage {
   readonly done: boolean;
 }
 
-function utf8PageEnd(bytes: Buffer, start: number, proposedEnd: number): number {
+function utf8PageEnd(bytes: Buffer, start: number, proposedEnd: number, hasMore = false): number {
   let end = Math.min(proposedEnd, bytes.length);
-  if (end === bytes.length) return end;
+  if (!hasMore && end === bytes.length) return end;
   while (end > start && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
   if (end > start) return end;
   end = Math.min(start + 1, bytes.length);
@@ -1475,6 +1478,98 @@ class StringPageReader {
     if (!serializedQueryPageWithinLimit(page, extra))
       throw new Error("Repository query page exceeds the bounded result size.");
     this.offset = end;
+    this.page = page.page;
+    this.reachedEnd = page.done;
+    return page;
+  }
+}
+
+class RepositoryFilePageReader {
+  private file: FileHandle | undefined;
+  private offset = 0;
+  private page = 0;
+  private reachedEnd = false;
+  private closed = false;
+  private operation: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly path: string,
+    private readonly sizeBytes: number,
+    private readonly signal?: AbortSignal,
+  ) {}
+
+  get complete(): boolean {
+    return this.reachedEnd;
+  }
+
+  readNext(extra: Readonly<Record<string, unknown>> = {}): Promise<TextPage> {
+    const result = this.operation.then(() => this.readNextPage(extra));
+    this.operation = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async close(): Promise<void> {
+    await this.operation;
+    if (this.closed) return;
+    this.closed = true;
+    await this.file?.close();
+    this.file = undefined;
+  }
+
+  private async readNextPage(extra: Readonly<Record<string, unknown>>): Promise<TextPage> {
+    throwIfAborted(this.signal);
+    if (this.closed) throw new Error("Cannot read a closed repository query.");
+    if (this.reachedEnd) return { page: this.page, content: "", done: true };
+    this.file ??= await open(this.path, "r");
+    throwIfAborted(this.signal);
+    const start = this.offset;
+    if (this.sizeBytes === 0) {
+      const page = { page: this.page + 1, content: "", done: true };
+      if (!serializedQueryPageWithinLimit(page, extra))
+        throw new Error("Repository query page exceeds the bounded result size.");
+      this.page = page.page;
+      this.reachedEnd = true;
+      return page;
+    }
+    const requestedBytes = Math.min(REPOSITORY_PAGE_BYTES + 4, this.sizeBytes - start);
+    const buffer = Buffer.allocUnsafe(requestedBytes);
+    let bytesRead = 0;
+    while (bytesRead < requestedBytes) {
+      const result = await this.file.read(
+        buffer,
+        bytesRead,
+        requestedBytes - bytesRead,
+        start + bytesRead,
+      );
+      if (result.bytesRead === 0) break;
+      bytesRead += result.bytesRead;
+    }
+    throwIfAborted(this.signal);
+    if (bytesRead === 0) throw new Error("Repository query ended before its recorded size.");
+    const hasMore = start + bytesRead < this.sizeBytes;
+    const available = buffer.subarray(0, bytesRead);
+    let end = utf8PageEnd(available, 0, Math.min(REPOSITORY_PAGE_BYTES, bytesRead), hasMore);
+    let page: TextPage = {
+      page: this.page + 1,
+      content: available.subarray(0, end).toString("utf8"),
+      done: start + end === this.sizeBytes,
+    };
+    while (!serializedQueryPageWithinLimit(page, extra) && end > 0) {
+      const reducedEnd = utf8PageEnd(available, 0, Math.floor(end / 2), hasMore);
+      if (reducedEnd === end) break;
+      end = reducedEnd;
+      page = {
+        page: this.page + 1,
+        content: available.subarray(0, end).toString("utf8"),
+        done: start + end === this.sizeBytes,
+      };
+    }
+    if (!serializedQueryPageWithinLimit(page, extra))
+      throw new Error("Repository query page exceeds the bounded result size.");
+    this.offset = start + end;
     this.page = page.page;
     this.reachedEnd = page.done;
     return page;
@@ -1629,9 +1724,8 @@ async function streamGitDiff(
   path: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  throwIfAborted(signal);
-  const child = spawn(
-    "git",
+  await streamGitToFile(
+    cwd,
     [
       `--attr-source=${mergeBaseSha}`,
       "diff",
@@ -1643,60 +1737,10 @@ async function streamGitDiff(
       headSha,
       "--",
     ],
-    {
-      cwd,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      stdio: ["ignore", "pipe", "pipe"],
-      ...(signal === undefined ? {} : { signal }),
-    },
+    path,
+    "Git diff",
+    signal,
   );
-  const stderr: Buffer[] = [];
-  let stderrBytes = 0;
-  child.stderr.on("data", (chunk: Buffer) => {
-    if (stderrBytes >= MAX_GIT_STDERR_BYTES) return;
-    const available = MAX_GIT_STDERR_BYTES - stderrBytes;
-    const bounded = chunk.subarray(0, available);
-    stderr.push(bounded);
-    stderrBytes += bounded.length;
-  });
-  const exited = new Promise<{
-    readonly code: number | null;
-    readonly signal: NodeJS.Signals | null;
-  }>((resolveExit, rejectExit) => {
-    child.once("error", (error) => {
-      if (signal?.aborted) {
-        rejectExit(cancellationReason(signal));
-        return;
-      }
-      rejectExit(error);
-    });
-    child.once("close", (code, signal) => {
-      resolveExit({ code, signal });
-    });
-  });
-  const output = createWriteStream(path, { flags: "wx", mode: 0o600 });
-  const streamed = (
-    signal === undefined
-      ? pipeline(child.stdout, output)
-      : pipeline(child.stdout, output, { signal })
-  ).catch((error: unknown) => {
-    if (child.exitCode === null && child.signalCode === null) child.kill();
-    throw error;
-  });
-  const [streamOutcome, exitOutcome] = await Promise.allSettled([streamed, exited]);
-  throwIfAborted(signal);
-  const failures: string[] = [];
-  if (streamOutcome.status === "rejected") failures.push(errorMessage(streamOutcome.reason));
-  if (exitOutcome.status === "rejected") failures.push(errorMessage(exitOutcome.reason));
-  else if (exitOutcome.value.code !== 0) {
-    const details = Buffer.concat(stderr).toString("utf8").trim();
-    const status =
-      exitOutcome.value.signal === null
-        ? `exit code ${String(exitOutcome.value.code)}`
-        : `signal ${exitOutcome.value.signal}`;
-    failures.push(`Git diff failed with ${status}${details.length === 0 ? "." : `: ${details}`}`);
-  }
-  if (failures.length > 0) throw new Error([...new Set(failures)].join("; "));
 }
 
 async function createPullRequestDiff(
@@ -1978,7 +2022,12 @@ export async function runReviewGoal(
     files,
     signal,
   );
-  const queryReaders = new Map<string, StringPageReader>();
+  type QueryReader = StringPageReader | RepositoryFilePageReader;
+  interface QueryReaderEntry {
+    readonly reader: QueryReader;
+    readonly cleanup?: () => Promise<void>;
+  }
+  const queryReaders = new Map<string, QueryReaderEntry>();
   const queryReaderCompletions = new Map<string, () => void>();
   const discussionReadPaths = new Set<string>();
   const createQueryReader = (
@@ -1988,32 +2037,58 @@ export async function runReviewGoal(
     while (queryReaders.size >= 32) {
       const oldest = queryReaders.keys().next().value;
       if (oldest === undefined) break;
+      const evicted = queryReaders.get(oldest);
       queryReaders.delete(oldest);
       queryReaderCompletions.delete(oldest);
+      if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
     }
     const cursor = randomUUID();
     const reader = new StringPageReader(content);
-    queryReaders.set(cursor, reader);
+    queryReaders.set(cursor, { reader });
     if (onComplete !== undefined) queryReaderCompletions.set(cursor, onComplete);
     return { cursor, reader };
   };
+  const createQuerySourceReader = (
+    source: RepositoryQuerySource,
+  ): { readonly cursor: string; readonly reader: RepositoryFilePageReader } => {
+    while (queryReaders.size >= 32) {
+      const oldest = queryReaders.keys().next().value;
+      if (oldest === undefined) break;
+      const evicted = queryReaders.get(oldest);
+      queryReaders.delete(oldest);
+      queryReaderCompletions.delete(oldest);
+      if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
+    }
+    const cursor = randomUUID();
+    const reader = new RepositoryFilePageReader(source.path, source.sizeBytes, signal);
+    queryReaders.set(cursor, { reader, cleanup: source.cleanup });
+    return { cursor, reader };
+  };
+  async function closeQueryReader(entry: QueryReaderEntry): Promise<void> {
+    if (entry.reader instanceof RepositoryFilePageReader) await entry.reader.close();
+    await entry.cleanup?.();
+  }
   const completeQueryReader = (cursor: string): void => {
     const onComplete = queryReaderCompletions.get(cursor);
     queryReaderCompletions.delete(cursor);
     onComplete?.();
   };
-  const readQueryPage = (cursor: string): CallToolResult => {
-    const reader = queryReaders.get(cursor);
-    if (reader === undefined)
+  const finishQueryReader = async (cursor: string): Promise<void> => {
+    const entry = queryReaders.get(cursor);
+    if (entry === undefined) return;
+    queryReaders.delete(cursor);
+    await closeQueryReader(entry);
+    completeQueryReader(cursor);
+  };
+  const readQueryPage = async (cursor: string): Promise<CallToolResult> => {
+    const entry = queryReaders.get(cursor);
+    if (entry === undefined)
       return {
         content: [{ type: "text", text: "Unknown repository query cursor." }],
         isError: true,
       };
-    const page = reader.readNext({ nextCursor: cursor });
-    if (page.done) {
-      queryReaders.delete(cursor);
-      completeQueryReader(cursor);
-    }
+    const page = await entry.reader.readNext({ nextCursor: cursor });
+    if (page.done) await finishQueryReader(cursor);
     return jsonToolResult({ ...page, ...(page.done ? {} : { nextCursor: cursor }) });
   };
   const contextReaders = new Map(
@@ -2082,14 +2157,14 @@ export async function runReviewGoal(
           headSha: context.headSha,
         });
       }
-      const query = createQueryReader(await repositorySnapshot.diff(paths));
-      const page = query.reader.readNext({
+      const query = createQuerySourceReader(await repositorySnapshot.diff(paths));
+      const page = await query.reader.readNext({
         paths,
         mergeBaseSha: diff.mergeBaseSha,
         headSha: context.headSha,
         nextCursor: query.cursor,
       });
-      if (page.done) queryReaders.delete(query.cursor);
+      if (page.done) await finishQueryReader(query.cursor);
       return jsonToolResult({
         ...page,
         paths,
@@ -2118,15 +2193,17 @@ export async function runReviewGoal(
       if (cursor !== undefined) return readQueryPage(cursor);
       const snapshot: RepositoryFileSnapshot = await repositorySnapshot.file(revision, path);
       if (snapshot.kind !== "text") return jsonToolResult(snapshot);
-      const query = createQueryReader(snapshot.content ?? "");
-      const page = query.reader.readNext({
+      if (snapshot.source === undefined)
+        throw new Error("Text repository snapshot did not provide a query source.");
+      const query = createQuerySourceReader(snapshot.source);
+      const page = await query.reader.readNext({
         revision,
         path,
         kind: snapshot.kind,
         sizeBytes: snapshot.sizeBytes,
         nextCursor: query.cursor,
       });
-      if (page.done) queryReaders.delete(query.cursor);
+      if (page.done) await finishQueryReader(query.cursor);
       return jsonToolResult({
         revision,
         path,
@@ -2154,7 +2231,7 @@ export async function runReviewGoal(
         return Promise.resolve({
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
         });
-      return Promise.resolve().then(() => {
+      return Promise.resolve().then(async () => {
         if (cursor !== undefined) return readQueryPage(cursor);
         if ((id === undefined) === (path === undefined)) {
           return {
@@ -2192,8 +2269,7 @@ export async function runReviewGoal(
           nextCursor: query.cursor,
         });
         if (pageResult.done) {
-          queryReaders.delete(query.cursor);
-          completeQueryReader(query.cursor);
+          await finishQueryReader(query.cursor);
         }
         return jsonToolResult({
           selector,
@@ -2537,6 +2613,7 @@ export async function runReviewGoal(
     await Promise.all([
       diffReader.close(),
       ...Array.from(contextReaders.values(), ({ reader: contextReader }) => contextReader.close()),
+      repositorySnapshot.cleanup(),
     ]);
   }
 }
@@ -2635,6 +2712,7 @@ export const agentInternals = {
   PullRequestConversationReader,
   ReviewBriefingReader,
   PullRequestDiffReader,
+  RepositoryFilePageReader,
   StringPageReader,
   startReviewPrompt,
   modelUsageSnapshot,
