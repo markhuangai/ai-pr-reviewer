@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, open, realpath, rm, stat, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { join, matchesGlob, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
@@ -1007,9 +1007,17 @@ function isGitMetadataPath(candidate: string): boolean {
   return /(?:^|[\\/{,])\.git(?:$|[\\/},])/i.test(candidate);
 }
 
+function globMatchesGitMetadata(pattern: string): boolean {
+  try {
+    return pattern.split(/[\\/]/u).some((segment) => matchesGlob(".git", segment));
+  } catch {
+    return true;
+  }
+}
+
 function isSafeGlobPattern(pattern: string): boolean {
   const normalized = pattern.replace(/^!/, "");
-  if (normalized.includes("..")) return false;
+  if (normalized.includes("..") || globMatchesGitMetadata(normalized)) return false;
   let braceDepth = 0;
   for (const character of normalized) {
     if (character === "{") braceDepth += 1;
@@ -1030,7 +1038,7 @@ function isSafeGrepGlob(cwd: string, pathCandidate: unknown, pattern: string | u
   if (typeof pathCandidate === "string" && !isWithinRepository(cwd, pathCandidate)) return false;
   if (pattern === undefined) return true;
   const normalized = pattern.replace(/^!/, "");
-  if (isGitMetadataPath(normalized)) return false;
+  if (isGitMetadataPath(normalized) || globMatchesGitMetadata(normalized)) return false;
   return true;
 }
 
@@ -2401,13 +2409,11 @@ export async function runReviewGoal(
                 isError: true,
               };
             }
-            const page = await contextReader.reader.readNext();
+            const metadata = { path, sizeBytes: contextReader.file.sizeBytes };
+            const page = await contextReader.reader.readNext(metadata);
             return jsonToolResult({
-              path,
-              page: page.page,
-              sizeBytes: contextReader.file.sizeBytes,
-              content: page.content,
-              done: page.done,
+              ...metadata,
+              ...page,
             });
           },
           { alwaysLoad: true },

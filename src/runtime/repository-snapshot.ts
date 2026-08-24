@@ -8,6 +8,7 @@ import { streamGitToFile } from "./git-stream.js";
 
 const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 const PATH_PATTERN = /^(?![\\/])(?!(?:[A-Za-z]:|\\\\))[\s\S]{1,4096}$/u;
+const MAX_REPOSITORY_QUERY_STORAGE_BYTES = 256 * 1024 * 1024;
 
 function isGitMetadataPath(value: string): boolean {
   return /(?:^|[\\/])\.git(?:$|[\\/])/iu.test(value);
@@ -90,6 +91,7 @@ export class RepositorySnapshot {
   readonly mergeBaseSha: string;
   private readonly allowedPaths: ReadonlySet<string>;
   private readonly queryDirectories = new Set<string>();
+  private queryStorageBytes = 0;
 
   constructor(
     private readonly cwd: string,
@@ -99,6 +101,7 @@ export class RepositorySnapshot {
     files: readonly ChangedFile[],
     private readonly signal?: AbortSignal,
     private readonly temporaryRoot = process.env.RUNNER_TEMP?.trim() || tmpdir(),
+    private readonly maxQueryStorageBytes = MAX_REPOSITORY_QUERY_STORAGE_BYTES,
   ) {
     checkedCommit(baseSha, "Pull request base SHA");
     this.mergeBaseSha = checkedCommit(mergeBaseSha, "Pull request merge base SHA");
@@ -138,7 +141,11 @@ export class RepositorySnapshot {
       const outputPath = join(createdDirectory, "output");
       await streamGitToFile(this.cwd, args, outputPath, "Git snapshot query", this.signal);
       const { size: sizeBytes } = await stat(outputPath);
+      if (sizeBytes > this.maxQueryStorageBytes - this.queryStorageBytes) {
+        throw new Error("Repository query storage exceeds the per-goal limit.");
+      }
       this.queryDirectories.add(createdDirectory);
+      this.queryStorageBytes += sizeBytes;
       let cleaned = false;
       return {
         path: outputPath,
@@ -146,7 +153,7 @@ export class RepositorySnapshot {
         cleanup: async () => {
           if (cleaned) return;
           cleaned = true;
-          this.queryDirectories.delete(createdDirectory);
+          if (this.queryDirectories.delete(createdDirectory)) this.queryStorageBytes -= sizeBytes;
           await rm(createdDirectory, { force: true, recursive: true });
         },
       };
@@ -205,6 +212,7 @@ export class RepositorySnapshot {
   async cleanup(): Promise<void> {
     const directories = [...this.queryDirectories];
     this.queryDirectories.clear();
+    this.queryStorageBytes = 0;
     await Promise.all(
       directories.map((directory) => rm(directory, { force: true, recursive: true })),
     );
@@ -212,6 +220,7 @@ export class RepositorySnapshot {
 }
 
 export const repositorySnapshotInternals = {
+  MAX_REPOSITORY_QUERY_STORAGE_BYTES,
   validPath,
   isGitMetadataPath,
   isWithin,

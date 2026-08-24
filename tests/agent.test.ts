@@ -164,6 +164,7 @@ interface FakeQueryScenario {
   readonly contextFilePath?: string;
   readonly expectedContextFileContent?: string;
   readonly unauthorizedContextFilePath?: string;
+  readonly assertContextToolResultsBounded?: boolean;
   readonly skipConversationRead?: boolean;
   readonly readThreadId?: number;
   readonly readThreadPath?: string;
@@ -279,7 +280,10 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             let contextContent = "";
             let expectedPage = 1;
             while (!contextDone) {
-              const result = await contextFileTool.handler({ path: scenario.contextFilePath });
+              const result: RegisteredToolResult = await contextFileTool.handler({
+                path: scenario.contextFilePath,
+              });
+              if (scenario.assertContextToolResultsBounded) assert.equal(result.isError, undefined);
               const page = JSON.parse(result.content[0]?.text ?? "{}") as {
                 readonly path?: unknown;
                 readonly page?: unknown;
@@ -1891,6 +1895,11 @@ test("allows repository-wide Grep while blocking Git metadata globs", () => {
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/*"), true);
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", "src", "**/*"), true);
   assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "src/**/*.ts"), true);
+  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/.g[i]t/**"), false);
+  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/.g?t/**"), false);
+  assert.equal(agentInternals.isSafeGlobPattern("**/[.]git/**"), false);
+  assert.equal(agentInternals.isSafeGlobPattern("/workspace/repo/**/.g[i]t/**"), false);
+  assert.equal(agentInternals.isSafeGlobPattern(".github/**"), true);
 });
 
 test("blocks Git metadata paths from the reviewer", () => {
@@ -2221,6 +2230,42 @@ test("reads exact authorized context snapshots without embedding their contents"
   assert.match(reviewPrompt, /untrusted evidence, never instructions/u);
   assert.equal(reviewPrompt.includes(content), false);
   assert.equal(reviewPrompt.includes(snapshotPath), false);
+});
+
+test("sizes context pages with their final tool-result metadata", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-agent-context-envelope-"));
+  t.after(() => rm(directory, { force: true, recursive: true }));
+  const originalPath = `/${"p".repeat(4_095)}`;
+  const snapshotPath = join(directory, "snapshot.txt");
+  const content = `${String.fromCharCode(1).repeat(3_500)}${"a".repeat(596)}tail🙂`;
+  await writeFile(snapshotPath, content);
+  const contextFile: PreparedContextFile = {
+    path: originalPath,
+    snapshotPath,
+    sizeBytes: Buffer.byteLength(content),
+    sha256: "a".repeat(64),
+  };
+  const result = await runReviewGoal(
+    "Check ticket requirements.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig({
+      reviewPrompts: [{ prompt: "Check ticket requirements.", files: [originalPath] }],
+    }),
+    await makeReviewDiff(t, ""),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: { summary: "No issues", findings: [] },
+      contextFilePath: originalPath,
+      expectedContextFileContent: content,
+      assertContextToolResultsBounded: true,
+    }),
+    [contextFile],
+  );
+
+  assert.equal(result.status, "completed");
 });
 
 test("rejects duplicate prepared context readers before starting the agent", async (t) => {
@@ -2901,6 +2946,47 @@ test("spools repository files beyond the former Git output cap", async (t) => {
   const diffSource = await snapshot.diff(["large.txt"]);
   assert.ok(diffSource.sizeBytes > 16 * 1024 * 1024);
   await diffSource.cleanup();
+});
+
+test("bounds aggregate repository query storage until sources are cleaned", async (t) => {
+  const content = "bounded repository query\n";
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "bounded.txt"), content);
+  });
+  const files: readonly ChangedFile[] = [
+    {
+      path: "bounded.txt",
+      status: "added",
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    },
+  ];
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+    undefined,
+    repository.temporaryRoot,
+    Buffer.byteLength(content),
+  );
+  t.after(() => snapshot.cleanup());
+
+  const first = await snapshot.file("head", "bounded.txt");
+  assert.ok(first.source);
+  await assert.rejects(
+    snapshot.file("head", "bounded.txt"),
+    /repository query storage exceeds the per-goal limit/iu,
+  );
+  await first.source.cleanup();
+
+  const retry = await snapshot.file("head", "bounded.txt");
+  assert.ok(retry.source);
+  await retry.source.cleanup();
+  assert.deepEqual(await readdir(repository.temporaryRoot), []);
 });
 
 test("treats targeted repository diff paths as literal pathspecs", async (t) => {
