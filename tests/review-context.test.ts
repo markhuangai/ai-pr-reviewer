@@ -160,6 +160,21 @@ test("includes all reviewer comments and complete non-action inline threads", ()
       [21, "bot", "Bot-only reply"],
     ],
   );
+  const actionThread = snapshot.entries.find(
+    (entry) => entry.kind === "inline_thread" && entry.id === 10,
+  );
+  assert.equal(actionThread?.kind, "inline_thread");
+  if (actionThread?.kind !== "inline_thread") assert.fail("Expected the action thread.");
+  assert.equal(actionThread.rootAvailable, true);
+  assert.deepEqual(
+    actionThread.messages.map((message) => [message.id, message.authorRole]),
+    [
+      [10, "workflow"],
+      [11, "human"],
+      [12, "bot"],
+      [13, "workflow"],
+    ],
+  );
 });
 
 test("keeps orphaned human reply threads and produces a canonical digest", () => {

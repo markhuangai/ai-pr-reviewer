@@ -159,7 +159,7 @@ export class RepositorySnapshot {
   }
 
   async diff(paths: readonly string[] = []): Promise<RepositoryQuerySource> {
-    const selected = paths.map((path) => this.path(path));
+    const selected = paths.map((path) => `:(literal)${this.path(path)}`);
     return this.query([
       `--attr-source=${this.mergeBaseSha}`,
       "diff",

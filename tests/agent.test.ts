@@ -1549,6 +1549,74 @@ test("requires a path-scoped discussion read after an id-scoped read", async (t)
   assert.equal(result.submission?.findings[0]?.path, "src/change.ts");
 });
 
+test("matches discussion coverage across renamed paths", async (t) => {
+  const conversation: ReviewConversationSnapshot = {
+    digest: "renamed-thread-digest",
+    entries: [
+      {
+        kind: "inline_thread",
+        id: 93,
+        rootAvailable: true,
+        createdAt: "2026-08-17T00:00:00Z",
+        path: "src/old.ts",
+        line: 4,
+        messages: [
+          {
+            id: 93,
+            authorLogin: "reviewer",
+            authorRole: "human",
+            body: "This was previously reported.",
+            createdAt: "2026-08-17T00:00:00Z",
+            updatedAt: "2026-08-17T00:00:00Z",
+            path: "src/old.ts",
+            line: 4,
+          },
+        ],
+      },
+    ],
+  };
+  const result = await runReviewGoal(
+    "Check the changed behavior.",
+    0,
+    goalContext,
+    [
+      {
+        path: "src/new.ts",
+        previousPath: "src/old.ts",
+        status: "renamed",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        addedLines: new Set([4]),
+      },
+    ],
+    conversation,
+    reviewConfig(),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: {
+        summary: "One issue",
+        findings: [
+          {
+            title: "Still broken",
+            severity: "HIGH",
+            why: "The old guard no longer applies.",
+            fix: "Restore the guard.",
+            path: "src/new.ts",
+            line: 4,
+          },
+        ],
+      },
+      skipConversationRead: true,
+      assertUnreadThreadRejection: true,
+      readThreadPath: "src/new.ts",
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.equal(result.submission?.findings[0]?.path, "src/new.ts");
+});
+
 test("accepts exactly the four public finding severities", () => {
   for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const) {
     assert.equal(
@@ -2766,6 +2834,35 @@ test("spools repository files beyond the former Git output cap", async (t) => {
   const diffSource = await snapshot.diff(["large.txt"]);
   assert.ok(diffSource.sizeBytes > 16 * 1024 * 1024);
   await diffSource.cleanup();
+});
+
+test("treats targeted repository diff paths as literal pathspecs", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "foo*.ts"), "literal wildcard file\n");
+    await writeFile(join(root, "foo1.ts"), "glob match file\n");
+  });
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    [
+      {
+        path: "foo*.ts",
+        status: "added",
+        additions: 1,
+        deletions: 0,
+        changes: 1,
+        addedLines: new Set([1]),
+      },
+    ],
+  );
+  t.after(() => snapshot.cleanup());
+  const source = await snapshot.diff(["foo*.ts"]);
+  const diff = await readFile(source.path, "utf8");
+  await source.cleanup();
+  assert.match(diff, /foo\*\.ts/u);
+  assert.doesNotMatch(diff, /foo1\.ts/u);
 });
 
 test("pages spooled repository sources and rejects in-checkout query roots", async (t) => {

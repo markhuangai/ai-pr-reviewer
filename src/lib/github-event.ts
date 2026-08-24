@@ -25,7 +25,10 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
 }
 
 function optionalBody(value: unknown): string {
-  return value === null || value === undefined ? "" : stringAt(value, "pull_request.body");
+  if (value === null || value === undefined) return "";
+  if (typeof value !== "string")
+    throw new Error("GitHub event field 'pull_request.body' is missing.");
+  return value;
 }
 
 export async function readPullRequestContext(

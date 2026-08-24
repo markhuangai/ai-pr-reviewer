@@ -2102,6 +2102,12 @@ export async function runReviewGoal(
   const queryReaders = new Map<string, QueryReaderEntry>();
   const queryReaderCompletions = new Map<string, () => void>();
   const discussionReadPaths = new Set<string>();
+  const discussionPathScopes = new Map<string, string>();
+  for (const file of files) {
+    discussionPathScopes.set(file.path, file.path);
+    if (file.previousPath !== undefined) discussionPathScopes.set(file.previousPath, file.path);
+  }
+  const discussionPathScope = (path: string): string => discussionPathScopes.get(path) ?? path;
   const createQueryReader = (
     content: string,
     onComplete?: () => void,
@@ -2186,7 +2192,8 @@ export async function runReviewGoal(
       const page = conversationReader.readNext();
       if (page.done)
         for (const entry of conversation.entries)
-          if (entry.kind === "inline_thread") discussionReadPaths.add(entry.path);
+          if (entry.kind === "inline_thread")
+            discussionReadPaths.add(discussionPathScope(entry.path));
       return Promise.resolve(jsonToolResult(page));
     },
     { alwaysLoad: true },
@@ -2314,9 +2321,12 @@ export async function runReviewGoal(
             isError: true,
           };
         }
+        const requestedPathScope = path === undefined ? undefined : discussionPathScope(path);
         const entries = conversation.entries.filter((entry) =>
           id === undefined
-            ? entry.kind === "inline_thread" && entry.path === path
+            ? entry.kind === "inline_thread" &&
+              requestedPathScope !== undefined &&
+              discussionPathScope(entry.path) === requestedPathScope
             : entry.id === id,
         );
         if (entries.length === 0) {
@@ -2340,7 +2350,7 @@ export async function runReviewGoal(
           id === undefined
             ? () => {
                 for (const discussionPath of discussionPaths)
-                  discussionReadPaths.add(discussionPath);
+                  discussionReadPaths.add(discussionPathScope(discussionPath));
               }
             : undefined,
         );
@@ -2413,12 +2423,15 @@ export async function runReviewGoal(
         candidateFindings
           .map((finding) => (isRecord(finding) ? finding.path : undefined))
           .filter((path): path is string => path !== undefined)
-          .filter(
-            (path) =>
+          .filter((path) => {
+            const scope = discussionPathScope(path);
+            return (
               conversation.entries.some(
-                (entry) => entry.kind === "inline_thread" && entry.path === path,
-              ) && !discussionReadPaths.has(path),
-          ),
+                (entry) =>
+                  entry.kind === "inline_thread" && discussionPathScope(entry.path) === scope,
+              ) && !discussionReadPaths.has(scope)
+            );
+          }),
       );
       if (unreadPaths.size > 0) {
         return Promise.resolve({

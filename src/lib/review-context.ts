@@ -189,12 +189,6 @@ export function buildReviewConversation(
   );
   const threads = new Map<number, ConversationMessage[]>();
   for (const comment of reviewComments) {
-    if (
-      comment.reviewId !== undefined &&
-      actionReviewIds.has(comment.reviewId) &&
-      comment.inReplyToId === undefined
-    )
-      continue;
     const rootId = comment.inReplyToId ?? comment.id;
     const messages = threads.get(rootId) ?? [];
     messages.push(reviewCommentMessage(comment, authenticatedLogin, actionReviewIds));
