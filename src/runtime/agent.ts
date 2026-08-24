@@ -2102,6 +2102,7 @@ export async function runReviewGoal(
   const queryReaders = new Map<string, QueryReaderEntry>();
   const queryReaderCompletions = new Map<string, () => void>();
   const discussionReadPaths = new Set<string>();
+  const discussionReadThreadIds = new Set<number>();
   const discussionPathScopes = new Map<string, string>();
   for (const file of files) {
     discussionPathScopes.set(file.path, file.path);
@@ -2345,15 +2346,15 @@ export async function runReviewGoal(
             )
             .map((entry) => entry.path),
         );
-        const query = createQueryReader(
-          JSON.stringify({ entries }),
-          id === undefined
-            ? () => {
-                for (const discussionPath of discussionPaths)
-                  discussionReadPaths.add(discussionPathScope(discussionPath));
-              }
-            : undefined,
-        );
+        const query = createQueryReader(JSON.stringify({ entries }), () => {
+          if (id !== undefined) {
+            for (const entry of entries)
+              if (entry.kind === "inline_thread") discussionReadThreadIds.add(entry.id);
+            return;
+          }
+          for (const discussionPath of discussionPaths)
+            discussionReadPaths.add(discussionPathScope(discussionPath));
+        });
         const selector = id === undefined ? { path } : { id };
         const pageResult = query.reader.readNext({
           selector,
@@ -2421,17 +2422,27 @@ export async function runReviewGoal(
         isRecord(input) && Array.isArray(input.findings) ? input.findings : [];
       const unreadPaths = new Set(
         candidateFindings
-          .map((finding) => (isRecord(finding) ? finding.path : undefined))
-          .filter((path): path is string => path !== undefined)
-          .filter((path) => {
+          .filter(isRecord)
+          .filter((finding) => typeof finding.path === "string")
+          .filter((finding) => {
+            const path = finding.path as string;
             const scope = discussionPathScope(path);
-            return (
-              conversation.entries.some(
-                (entry) =>
-                  entry.kind === "inline_thread" && discussionPathScope(entry.path) === scope,
-              ) && !discussionReadPaths.has(scope)
+            if (discussionReadPaths.has(scope)) return false;
+            const matchingThreads = conversation.entries.filter(
+              (entry) =>
+                entry.kind === "inline_thread" && discussionPathScope(entry.path) === scope,
             );
-          }),
+            if (matchingThreads.length === 0) return false;
+            if (typeof finding.line !== "number") return true;
+            const matchingLocations = matchingThreads.filter(
+              (entry) => entry.kind === "inline_thread" && entry.line === finding.line,
+            );
+            return (
+              matchingLocations.length === 0 ||
+              matchingLocations.some((entry) => !discussionReadThreadIds.has(entry.id))
+            );
+          })
+          .map((finding) => finding.path as string),
       );
       if (unreadPaths.size > 0) {
         return Promise.resolve({

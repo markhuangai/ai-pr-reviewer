@@ -1481,7 +1481,7 @@ test("requires the complete prior thread before accepting a located finding", as
   assert.equal(result.submission?.findings[0]?.path, "src/change.ts");
 });
 
-test("requires a path-scoped discussion read after an id-scoped read", async (t) => {
+test("requires a path-scoped discussion read for sibling threads after an id-scoped read", async (t) => {
   const message = (id: number, body: string): ConversationMessage => ({
     id,
     authorLogin: "reviewer",
@@ -1534,7 +1534,7 @@ test("requires a path-scoped discussion read after an id-scoped read", async (t)
             why: "The old guard no longer applies.",
             fix: "Restore the guard.",
             path: "src/change.ts",
-            line: 4,
+            line: 9,
           },
         ],
       },
@@ -1547,6 +1547,73 @@ test("requires a path-scoped discussion read after an id-scoped read", async (t)
   );
   assert.equal(result.status, "completed");
   assert.equal(result.submission?.findings[0]?.path, "src/change.ts");
+});
+
+test("accepts a finding after reading its exact discussion thread by id", async (t) => {
+  const conversation: ReviewConversationSnapshot = {
+    digest: "exact-thread-digest",
+    entries: [
+      {
+        kind: "inline_thread",
+        id: 91,
+        rootAvailable: true,
+        createdAt: "2026-08-17T00:00:00Z",
+        path: "src/change.ts",
+        line: 4,
+        messages: [
+          {
+            id: 91,
+            authorLogin: "reviewer",
+            authorRole: "human",
+            body: "This was previously reported.",
+            createdAt: "2026-08-17T00:00:00Z",
+            updatedAt: "2026-08-17T00:00:00Z",
+            path: "src/change.ts",
+            line: 4,
+          },
+        ],
+      },
+      {
+        kind: "inline_thread",
+        id: 92,
+        rootAvailable: true,
+        createdAt: "2026-08-17T00:02:00Z",
+        path: "src/change.ts",
+        line: 9,
+        messages: [],
+      },
+    ],
+  };
+  const result = await runReviewGoal(
+    "Check the changed behavior.",
+    0,
+    goalContext,
+    [],
+    conversation,
+    reviewConfig(),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: {
+        summary: "One issue",
+        findings: [
+          {
+            title: "Still broken",
+            severity: "HIGH",
+            why: "The old guard no longer applies.",
+            fix: "Restore the guard.",
+            path: "src/change.ts",
+            line: 4,
+          },
+        ],
+      },
+      skipConversationRead: true,
+      assertUnreadThreadRejection: true,
+      readThreadId: 91,
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.equal(result.submission?.findings[0]?.line, 4);
 });
 
 test("matches discussion coverage across renamed paths", async (t) => {
