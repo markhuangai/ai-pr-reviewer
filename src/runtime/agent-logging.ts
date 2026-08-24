@@ -85,7 +85,7 @@ export function chunkAgentLogValue(
   if (value.length === 0) return [""];
 
   const chunks: string[] = [];
-  for (let offset = 0; offset < value.length; ) {
+  for (let offset = 0; offset < value.length;) {
     let end = Math.min(offset + maxLength, value.length);
     if (
       end < value.length &&

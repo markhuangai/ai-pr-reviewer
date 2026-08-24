@@ -179,7 +179,7 @@ export class RepositorySnapshot {
       if (directory !== undefined) await rm(directory, { force: true, recursive: true });
       throwIfAborted(this.signal);
       if (/^Git snapshot query failed/iu.test(errorMessage(error))) throw error;
-      throw new Error(`Git snapshot query failed: ${errorMessage(error)}`);
+      throw new Error(`Git snapshot query failed: ${errorMessage(error)}`, { cause: error });
     }
   }
 

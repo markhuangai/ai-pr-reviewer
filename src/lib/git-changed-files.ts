@@ -39,7 +39,7 @@ export function decodeGitPath(value: string): string {
     throw new Error("Git returned an unterminated quoted path.");
   }
   const bytes: number[] = [];
-  for (let index = 1; index < value.length - 1; ) {
+  for (let index = 1; index < value.length - 1;) {
     const character = value[index];
     if (character !== "\\") {
       if (character === undefined) throw new Error("Git returned an invalid quoted path.");
@@ -350,7 +350,7 @@ export async function readGitMetadata(
     return stdout;
   } catch (error) {
     throwIfAborted(signal);
-    throw new Error(`Git changed-file metadata failed: ${errorMessage(error)}`);
+    throw new Error(`Git changed-file metadata failed: ${errorMessage(error)}`, { cause: error });
   }
 }
 

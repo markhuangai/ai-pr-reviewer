@@ -731,6 +731,7 @@ export async function resolveCommit(
     throwIfAborted(signal);
     throw new Error(
       `${label} is not available as a commit in the checkout: ${errorMessage(error)}`,
+      { cause: error },
     );
   }
   const resolved = stdout.trim();
@@ -757,7 +758,9 @@ export async function resolveMergeBase(
     }));
   } catch (error) {
     throwIfAborted(signal);
-    throw new Error(`Could not resolve the pull request merge base: ${errorMessage(error)}`);
+    throw new Error(`Could not resolve the pull request merge base: ${errorMessage(error)}`, {
+      cause: error,
+    });
   }
   const mergeBase = stdout.trim();
   if (!COMMIT_SHA_PATTERN.test(mergeBase)) {

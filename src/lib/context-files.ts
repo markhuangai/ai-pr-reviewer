@@ -181,7 +181,9 @@ async function captureFile(
       decoder.decode();
     } catch (error) {
       if (error instanceof TypeError) {
-        throw new Error(`Context file ${JSON.stringify(path)} must contain valid UTF-8 text.`);
+        throw new Error(`Context file ${JSON.stringify(path)} must contain valid UTF-8 text.`, {
+          cause: error,
+        });
       }
       throw error;
     }

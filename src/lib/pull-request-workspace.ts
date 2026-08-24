@@ -128,7 +128,7 @@ async function git(
     return stdout.trim();
   } catch (error) {
     throwIfAborted(signal);
-    throw new Error(`Git ${args[0] ?? "command"} failed: ${errorMessage(error)}`);
+    throw new Error(`Git ${args[0] ?? "command"} failed: ${errorMessage(error)}`, { cause: error });
   }
 }
 

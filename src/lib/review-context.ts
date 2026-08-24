@@ -53,9 +53,7 @@ export interface PullRequestReviewBody {
 }
 
 export type ReviewConversationEntry =
-  | InlineConversationThread
-  | PullRequestConversationComment
-  | PullRequestReviewBody;
+  InlineConversationThread | PullRequestConversationComment | PullRequestReviewBody;
 
 export interface ReviewConversationSnapshot {
   readonly digest: string;
