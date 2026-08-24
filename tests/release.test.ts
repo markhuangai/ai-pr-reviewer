@@ -86,9 +86,17 @@ test("targets pull request automation only at main with one grouped update pull 
     on?: { pull_request?: { branches?: string[] } };
   };
   const dependabot = parse(dependabotText) as {
+    "multi-ecosystem-groups"?: Record<
+      string,
+      {
+        "target-branch"?: string;
+        "open-pull-requests-limit"?: number;
+      }
+    >;
     updates?: Array<{
       "target-branch"?: string;
       "open-pull-requests-limit"?: number;
+      cooldown?: { "default-days"?: number };
       patterns?: string[];
       "multi-ecosystem-group"?: string;
     }>;
@@ -98,14 +106,20 @@ test("targets pull request automation only at main with one grouped update pull 
   };
 
   assert.deepEqual(ci.on?.pull_request?.branches, ["main"]);
+  assert.deepEqual(dependabot["multi-ecosystem-groups"]?.dependencies?.["target-branch"], "main");
+  assert.deepEqual(
+    dependabot["multi-ecosystem-groups"]?.dependencies?.["open-pull-requests-limit"],
+    1,
+  );
   assert.deepEqual(
     dependabot.updates?.map((update) => update["target-branch"]),
-    ["main", "main"],
+    [undefined, undefined],
   );
   assert.deepEqual(
     dependabot.updates?.map((update) => update["open-pull-requests-limit"]),
-    [1, 1],
+    [undefined, undefined],
   );
+  assert.equal(dependabot.updates?.[0]?.cooldown?.["default-days"], 7);
   assert.deepEqual(
     dependabot.updates?.map((update) => update.patterns),
     [["*"], ["*"]],

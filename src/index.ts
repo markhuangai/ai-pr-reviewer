@@ -29,6 +29,7 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
+import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
 import { runReviewGoals } from "./runtime/agent.js";
 import {
   createPullRequestWorkspace,
@@ -38,6 +39,7 @@ import type {
   GoalResult,
   PullRequestContext,
   PullRequestReviewRequest,
+  ReviewBriefing,
   ReviewRunResult,
 } from "./lib/types.js";
 
@@ -275,6 +277,10 @@ export async function runAction(
     throwIfAborted(signal);
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
     const conversation = await loadConversation(api, context, authenticatedLogin);
+    const briefing =
+      typeof (api as GitHubApi & { getLinkedIssues?: unknown }).getLinkedIssues === "function"
+        ? await api.getLinkedIssues(context)
+        : emptyReviewBriefing();
     throwIfAborted(signal);
     if (config.interactWithPullRequest) {
       const marker = reviewMarker(
@@ -282,6 +288,7 @@ export async function runAction(
         config,
         conversation.snapshot.digest,
         contextFiles.identity,
+        reviewBriefingDigest(context, briefing),
       );
       if (
         conversation.reviews.some(
@@ -310,8 +317,21 @@ export async function runAction(
     const redactedConversation = mapConversationBodies(conversation.snapshot, (body) =>
       redact(body, secrets),
     );
+    const redactedContext: PullRequestContext = {
+      ...context,
+      title: redact(context.title, secrets),
+      ...(context.body === undefined ? {} : { body: redact(context.body, secrets) }),
+    };
+    const redactedBriefing: ReviewBriefing = {
+      linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
+      linkedIssues: briefing.linkedIssues.map((issue) => ({
+        ...issue,
+        title: redact(issue.title, secrets),
+        body: redact(issue.body, secrets),
+      })),
+    };
     const rawGoals = await dependencies.runGoals(
-      context,
+      redactedContext,
       files,
       redactedConversation,
       config,
@@ -319,6 +339,7 @@ export async function runAction(
       workspace,
       undefined,
       abortController,
+      redactedBriefing,
     );
     throwIfAborted(signal);
     const goals = redactGoals(rawGoals, secrets);
@@ -329,6 +350,7 @@ export async function runAction(
       goals,
       conversation.snapshot.digest,
       contextFiles.identity,
+      reviewBriefingDigest(context, briefing),
     );
     if (!config.interactWithPullRequest) {
       await assertWorkspace(context, workspace, signal);

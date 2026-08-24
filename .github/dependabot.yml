@@ -7,20 +7,21 @@ multi-ecosystem-groups:
       day: monday
       time: "09:00"
       timezone: UTC
+    target-branch: main
+    open-pull-requests-limit: 1
 
 updates:
   - package-ecosystem: npm
     directory: /
-    target-branch: main
-    open-pull-requests-limit: 1
+    # CI quarantines every locked npm package for seven days after publication.
+    cooldown:
+      default-days: 7
     patterns:
       - "*"
     multi-ecosystem-group: dependencies
 
   - package-ecosystem: github-actions
     directory: /
-    target-branch: main
-    open-pull-requests-limit: 1
     patterns:
       - "*"
     multi-ecosystem-group: dependencies

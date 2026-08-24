@@ -90,7 +90,7 @@ test("classifies people, bots, apps, and action-authored content", () => {
   assert.equal(ACTION_MARKER.test("owner explanation"), false);
 });
 
-test("includes human PR comments and review bodies plus complete replied-to inline threads", () => {
+test("includes all reviewer comments and complete non-action inline threads", () => {
   const actionBody = "<!-- ai-pr-reviewer:v3:head:digest -->\nAutomated review";
   const reviews = [
     review(1, "review-action", actionBody, "2026-08-17T00:00:01Z"),
@@ -132,25 +132,47 @@ test("includes human PR comments and review bodies plus complete replied-to inli
     snapshot.entries.map((entry) => [entry.kind, entry.id]),
     [
       ["review_body", 3],
+      ["review_body", 4],
+      ["review_body", 6],
       ["review_body", 2],
       ["inline_thread", 10],
+      ["inline_thread", 20],
+      ["inline_thread", 30],
       ["pr_comment", 40],
+      ["pr_comment", 42],
+      ["pr_comment", 43],
+      ["pr_comment", 44],
     ],
   );
-  const thread = snapshot.entries[2];
+  const thread = snapshot.entries.find(
+    (entry) => entry.kind === "inline_thread" && entry.id === 20,
+  );
   assert.equal(thread?.kind, "inline_thread");
   if (thread?.kind !== "inline_thread") assert.fail("Expected an inline thread.");
   assert.equal(thread.rootAvailable, true);
   assert.equal(thread.path, "src/change.ts");
-  assert.equal(thread.line, 10);
-  assert.equal(thread.originalLine, 9);
+  assert.equal(thread.line, 20);
+  assert.equal(thread.originalLine, 19);
   assert.deepEqual(
     thread.messages.map((message) => [message.id, message.authorRole, message.body]),
     [
-      [10, "workflow", "Automated finding"],
-      [11, "human", "The code now validates this."],
-      [12, "bot", "Bot follow-up"],
-      [13, "workflow", "Workflow follow-up"],
+      [20, "human", "Finding without owner context"],
+      [21, "bot", "Bot-only reply"],
+    ],
+  );
+  const actionThread = snapshot.entries.find(
+    (entry) => entry.kind === "inline_thread" && entry.id === 10,
+  );
+  assert.equal(actionThread?.kind, "inline_thread");
+  if (actionThread?.kind !== "inline_thread") assert.fail("Expected the action thread.");
+  assert.equal(actionThread.rootAvailable, true);
+  assert.deepEqual(
+    actionThread.messages.map((message) => [message.id, message.authorRole]),
+    [
+      [10, "workflow"],
+      [11, "human"],
+      [12, "bot"],
+      [13, "workflow"],
     ],
   );
 });
@@ -203,6 +225,18 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
     issues,
   );
   assert.notEqual(changed.digest, forward.digest);
+});
+
+test("does not let another reviewer spoof the action marker", () => {
+  const marker = "<!-- ai-pr-reviewer:v3:head:digest -->";
+  const snapshot = buildReviewConversation(
+    "review-action",
+    [review(80, "other-reviewer", marker)],
+    [reviewComment(81, 80, "other-reviewer", "Independent finding")],
+    [],
+  );
+  assert.ok(snapshot.entries.some((entry) => entry.kind === "review_body" && entry.id === 80));
+  assert.ok(snapshot.entries.some((entry) => entry.kind === "inline_thread" && entry.id === 81));
 });
 
 test("maps every exposed body without changing snapshot identity metadata", () => {

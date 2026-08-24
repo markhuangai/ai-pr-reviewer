@@ -127,6 +127,7 @@ export function reviewMarker(
   config: ReviewConfig,
   conversationDigest = EMPTY_CONVERSATION_DIGEST,
   contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
+  briefingDigest = "",
 ): string {
   const stableContextFiles = contextFiles.map((files) =>
     [...files].sort((left, right) => left.path.localeCompare(right.path)),
@@ -149,6 +150,7 @@ export function reviewMarker(
     buildId: process.env.AI_PR_REVIEWER_BUILD_ID?.trim() || "source",
     mcpServers: stableMcpShape(config.mcpServers),
     conversationDigest,
+    ...(briefingDigest.length === 0 ? {} : { briefingDigest }),
   });
   const digest = createHash("sha256").update(fingerprint).digest("hex");
   return `<!-- ai-pr-reviewer:v3:${context.headSha}:${digest} -->`;
@@ -450,8 +452,9 @@ export function aggregateReview(
   goals: readonly GoalResult[],
   conversationDigest = EMPTY_CONVERSATION_DIGEST,
   contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
+  briefingDigest = "",
 ): AggregatedReview {
-  const marker = reviewMarker(context, config, conversationDigest, contextFiles);
+  const marker = reviewMarker(context, config, conversationDigest, contextFiles, briefingDigest);
   const normalized = goals.flatMap(
     (goal, index) =>
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],

@@ -17,6 +17,7 @@ import type {
   GoalResult,
   PullRequestContext,
   PullRequestReviewRequest,
+  ReviewBriefing,
   ReviewConfig,
 } from "../src/lib/types.js";
 
@@ -164,7 +165,7 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
 });
 
 test("redacts generated AI prompts without dropping them", () => {
-  const [goal] = indexInternals.redactGoals(
+  const [goal, failedGoal] = indexInternals.redactGoals(
     [
       {
         prompt: "security",
@@ -205,6 +206,23 @@ test("redacts generated AI prompts without dropping them", () => {
           ],
         },
       },
+      {
+        prompt: "failure",
+        status: "failed",
+        error: "private-token failed",
+        tokenUsage: {
+          complete: false,
+          models: [
+            {
+              model: "private-token-model",
+              inputTokens: 0,
+              outputTokens: 0,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+            },
+          ],
+        },
+      },
     ],
     ["private-token"],
   );
@@ -220,6 +238,9 @@ test("redacts generated AI prompts without dropping them", () => {
     goal?.submission?.findings[1]?.agentPrompt,
     "Impact: The value is stale.\nRequested fix: Return the current value.",
   );
+  assert.equal(failedGoal?.error, "[REDACTED] failed");
+  assert.equal(failedGoal?.tokenUsage?.models[0]?.model, "[REDACTED]-model");
+  assert.equal(failedGoal?.submission, undefined);
 });
 
 test("workspace validation rejects ignored content", async (t) => {
@@ -379,9 +400,21 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       );
       return;
     }
+    if (request.url?.endsWith("/issues/12")) {
+      response.end(
+        JSON.stringify({
+          title: "Linked test-ai-secret",
+          body: "Linked context contains test-ai-secret.",
+          state: "open",
+          html_url: "https://github.com/target/project/issues/12",
+        }),
+      );
+      return;
+    }
     response.end(
       JSON.stringify({
-        title: "External change",
+        title: "External test-ai-secret",
+        body: "Fixes #12; PR context contains test-ai-secret.",
         changed_files: 1,
         head: { sha: headSha },
         base: { sha: baseSha, ref: "main" },
@@ -449,6 +482,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     readEventContext: () => Promise.resolve(undefined),
     createWorkspace: (context, token) => {
       assert.equal(context.repository, "target/project");
+      assert.equal(context.title, "External test-ai-secret");
       assert.equal(context.headSha, headSha);
       assert.equal(token, "test-token");
       return Promise.resolve({
@@ -459,9 +493,20 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
         },
       });
     },
-    runGoals: (context, files, conversation, _config, contextFiles, cwd) => {
+    runGoals: (
+      context,
+      files,
+      conversation,
+      _config,
+      contextFiles,
+      cwd,
+      _queryAgent,
+      _abortController,
+      briefing: ReviewBriefing | undefined,
+    ) => {
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
+      assert.equal(context.title, "External [REDACTED]");
       assert.equal(files.length, 1);
       assert.equal(files[0]?.path, "review.txt");
       assert.equal(files[0]?.additions, 1);
@@ -472,6 +517,17 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       assert.equal(entry?.kind, "pr_comment");
       if (entry?.kind !== "pr_comment") assert.fail("Expected a PR-level comment.");
       assert.equal(entry.message.body, "Owner context contains [REDACTED].");
+      assert.equal(context.body, "Fixes #12; PR context contains [REDACTED].");
+      assert.ok(briefing);
+      assert.deepEqual(briefing.linkedIssues, [
+        {
+          number: 12,
+          title: "Linked [REDACTED]",
+          body: "Linked context contains [REDACTED].",
+          state: "open",
+          htmlUrl: "https://github.com/target/project/issues/12",
+        },
+      ]);
       assert.deepEqual(contextFiles, [[]]);
       assert.equal(cwd, workspace);
       return Promise.resolve(goals);
@@ -489,7 +545,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 5);
+  assert.equal(requests.length, 6);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,
