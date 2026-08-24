@@ -80,6 +80,13 @@ test("discovers same-repository issue references while ignoring code and other r
     numbers: [12, 13, 14],
     truncated: false,
   });
+  assert.deepEqual(
+    discoverLinkedIssueNumbers({
+      ...context,
+      body: "<!-- Example: fixes #99 -->\nFixes #12",
+    }),
+    { numbers: [12], truncated: false },
+  );
 });
 
 test("handles empty briefing inputs and malformed linked issue payloads", () => {

@@ -719,8 +719,30 @@ test("pages arbitrary repository query text on UTF-8 boundaries", () => {
   assert.equal(content, "query-🙂界".repeat(5_000));
   assert.equal(content.includes("�"), false);
   assert.deepEqual(reader.readNext(), { page: pages, content: "", done: true });
+  const tiny = new agentInternals.StringPageReader("🙂", 1);
+  assert.deepEqual(tiny.readNext(), { page: 1, content: "🙂", done: true });
   const empty = new agentInternals.StringPageReader("");
   assert.deepEqual(empty.readNext(), { page: 1, content: "", done: true });
+});
+
+test("bounds each repository query page by its serialized envelope", () => {
+  const value = `${"ordinary\n".repeat(7_000)}${String.fromCharCode(1).repeat(8_000)}${"tail\n".repeat(3_000)}`;
+  const reader = new agentInternals.StringPageReader(value, 12 * 1024);
+  let content = "";
+  while (!reader.complete) {
+    const page = reader.readNext({
+      metadata: "query metadata",
+      nextCursor: "cursor",
+    });
+    content += page.content;
+    const result = agentInternals.jsonToolResult({
+      ...page,
+      metadata: "query metadata",
+      ...(page.done ? {} : { nextCursor: "cursor" }),
+    });
+    assert.equal(result.isError, undefined);
+  }
+  assert.equal(content, value);
 });
 
 test("includes deletions and renames in the fenced Git diff", async (t) => {

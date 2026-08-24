@@ -1412,10 +1412,28 @@ interface TextPage {
   readonly done: boolean;
 }
 
+function utf8PageEnd(bytes: Buffer, start: number, proposedEnd: number): number {
+  let end = Math.min(proposedEnd, bytes.length);
+  if (end === bytes.length) return end;
+  while (end > start && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  if (end > start) return end;
+  end = Math.min(start + 1, bytes.length);
+  while (end < bytes.length && ((bytes[end] ?? 0) & 0xc0) === 0x80) end += 1;
+  return end;
+}
+
+function serializedQueryPageWithinLimit(
+  page: TextPage,
+  extra: Readonly<Record<string, unknown>>,
+): boolean {
+  return (
+    toolResultSerializedBytes(JSON.stringify({ ...page, ...extra })) <= MODEL_TOOL_RESULT_BYTES
+  );
+}
+
 class StringPageReader {
   private readonly bytes: Buffer;
   private readonly pageBytes: number;
-  private readonly decoder = new StringDecoder("utf8");
   private offset = 0;
   private page = 0;
   private reachedEnd = false;
@@ -1435,16 +1453,31 @@ class StringPageReader {
     return this.reachedEnd;
   }
 
-  readNext(): TextPage {
+  readNext(extra: Readonly<Record<string, unknown>> = {}): TextPage {
     if (this.reachedEnd) return { page: this.page, content: "", done: true };
-    this.page += 1;
-    const end = Math.min(this.offset + this.pageBytes, this.bytes.length);
-    const chunk = this.bytes.subarray(this.offset, end);
+    const start = this.offset;
+    let end = utf8PageEnd(this.bytes, start, start + this.pageBytes);
+    let page: TextPage = {
+      page: this.page + 1,
+      content: this.bytes.subarray(start, end).toString("utf8"),
+      done: end === this.bytes.length,
+    };
+    while (!serializedQueryPageWithinLimit(page, extra) && end > start) {
+      const reducedEnd = utf8PageEnd(this.bytes, start, start + Math.floor((end - start) / 2));
+      if (reducedEnd === end) break;
+      end = reducedEnd;
+      page = {
+        page: this.page + 1,
+        content: this.bytes.subarray(start, end).toString("utf8"),
+        done: end === this.bytes.length,
+      };
+    }
+    if (!serializedQueryPageWithinLimit(page, extra))
+      throw new Error("Repository query page exceeds the bounded result size.");
     this.offset = end;
-    const done = this.offset === this.bytes.length;
-    const content = this.decoder.write(chunk) + (done ? this.decoder.end() : "");
-    this.reachedEnd = done;
-    return { page: this.page, content, done };
+    this.page = page.page;
+    this.reachedEnd = page.done;
+    return page;
   }
 }
 
@@ -1976,7 +2009,7 @@ export async function runReviewGoal(
         content: [{ type: "text", text: "Unknown repository query cursor." }],
         isError: true,
       };
-    const page = reader.readNext();
+    const page = reader.readNext({ nextCursor: cursor });
     if (page.done) {
       queryReaders.delete(cursor);
       completeQueryReader(cursor);
@@ -2050,7 +2083,12 @@ export async function runReviewGoal(
         });
       }
       const query = createQueryReader(await repositorySnapshot.diff(paths));
-      const page = query.reader.readNext();
+      const page = query.reader.readNext({
+        paths,
+        mergeBaseSha: diff.mergeBaseSha,
+        headSha: context.headSha,
+        nextCursor: query.cursor,
+      });
       if (page.done) queryReaders.delete(query.cursor);
       return jsonToolResult({
         ...page,
@@ -2081,7 +2119,13 @@ export async function runReviewGoal(
       const snapshot: RepositoryFileSnapshot = await repositorySnapshot.file(revision, path);
       if (snapshot.kind !== "text") return jsonToolResult(snapshot);
       const query = createQueryReader(snapshot.content ?? "");
-      const page = query.reader.readNext();
+      const page = query.reader.readNext({
+        revision,
+        path,
+        kind: snapshot.kind,
+        sizeBytes: snapshot.sizeBytes,
+        nextCursor: query.cursor,
+      });
       if (page.done) queryReaders.delete(query.cursor);
       return jsonToolResult({
         revision,
@@ -2142,13 +2186,17 @@ export async function runReviewGoal(
         const query = createQueryReader(JSON.stringify({ entries }), () => {
           for (const discussionPath of discussionPaths) discussionReadPaths.add(discussionPath);
         });
-        const pageResult = query.reader.readNext();
+        const selector = id === undefined ? { path } : { id };
+        const pageResult = query.reader.readNext({
+          selector,
+          nextCursor: query.cursor,
+        });
         if (pageResult.done) {
           queryReaders.delete(query.cursor);
           completeQueryReader(query.cursor);
         }
         return jsonToolResult({
-          selector: id === undefined ? { path } : { id },
+          selector,
           page: pageResult.page,
           content: pageResult.content,
           done: pageResult.done,
