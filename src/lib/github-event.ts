@@ -24,6 +24,10 @@ function optionalNonNegativeInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
+function optionalBody(value: unknown): string {
+  return value === null || value === undefined ? "" : stringAt(value, "pull_request.body");
+}
+
 export async function readPullRequestContext(
   eventPath: string | undefined = process.env.GITHUB_EVENT_PATH,
   repository: string | undefined = process.env.GITHUB_REPOSITORY,
@@ -72,6 +76,7 @@ export async function readPullRequestEventContext(
     baseRef: stringAt(base?.ref, "pull_request.base.ref"),
     ...(changedFiles === undefined ? {} : { changedFiles }),
     title: stringAt(pullRequest.title, "pull_request.title"),
+    body: optionalBody(pullRequest.body),
     htmlUrl: stringAt(pullRequest.html_url, "pull_request.html_url"),
   };
 }

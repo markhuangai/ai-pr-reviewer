@@ -22,6 +22,7 @@ test("reads pull request event context including the base ref", async (t) => {
       number: 7,
       pull_request: {
         title: "Change",
+        body: "Fixes #12",
         html_url: "https://github.com/owner/repository/pull/7",
         changed_files: 2,
         head: { sha: "b".repeat(40) },
@@ -40,6 +41,7 @@ test("reads pull request event context including the base ref", async (t) => {
     baseRef: "main",
     changedFiles: 2,
     title: "Change",
+    body: "Fixes #12",
     htmlUrl: "https://github.com/owner/repository/pull/7",
   });
 });
@@ -148,6 +150,10 @@ test("validates every required pull request event field", async (t) => {
     [
       { ...valid, pull_request: { ...valid.pull_request, title: "" } },
       /pull_request\.title.*missing/u,
+    ],
+    [
+      { ...valid, pull_request: { ...valid.pull_request, body: 7 } },
+      /pull_request\.body.*missing/u,
     ],
     [
       { ...valid, pull_request: { ...valid.pull_request, html_url: null } },

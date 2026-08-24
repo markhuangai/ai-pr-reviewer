@@ -17,6 +17,7 @@ import type {
   GoalResult,
   PullRequestContext,
   PullRequestReviewRequest,
+  ReviewBriefing,
   ReviewConfig,
 } from "../src/lib/types.js";
 
@@ -379,9 +380,21 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       );
       return;
     }
+    if (request.url?.endsWith("/issues/12")) {
+      response.end(
+        JSON.stringify({
+          title: "Linked issue",
+          body: "Linked context contains test-ai-secret.",
+          state: "open",
+          html_url: "https://github.com/target/project/issues/12",
+        }),
+      );
+      return;
+    }
     response.end(
       JSON.stringify({
         title: "External change",
+        body: "Fixes #12; PR context contains test-ai-secret.",
         changed_files: 1,
         head: { sha: headSha },
         base: { sha: baseSha, ref: "main" },
@@ -459,7 +472,17 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
         },
       });
     },
-    runGoals: (context, files, conversation, _config, contextFiles, cwd) => {
+    runGoals: (
+      context,
+      files,
+      conversation,
+      _config,
+      contextFiles,
+      cwd,
+      _queryAgent,
+      _abortController,
+      briefing: ReviewBriefing | undefined,
+    ) => {
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
       assert.equal(files.length, 1);
@@ -472,6 +495,17 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       assert.equal(entry?.kind, "pr_comment");
       if (entry?.kind !== "pr_comment") assert.fail("Expected a PR-level comment.");
       assert.equal(entry.message.body, "Owner context contains [REDACTED].");
+      assert.equal(context.body, "Fixes #12; PR context contains [REDACTED].");
+      assert.ok(briefing);
+      assert.deepEqual(briefing.linkedIssues, [
+        {
+          number: 12,
+          title: "Linked issue",
+          body: "Linked context contains [REDACTED].",
+          state: "open",
+          htmlUrl: "https://github.com/target/project/issues/12",
+        },
+      ]);
       assert.deepEqual(contextFiles, [[]]);
       assert.equal(cwd, workspace);
       return Promise.resolve(goals);
@@ -489,7 +523,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(summaryWrites, 1);
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
-  assert.equal(requests.length, 5);
+  assert.equal(requests.length, 6);
   assert.equal(
     requests.every((request) => request.method === "GET"),
     true,

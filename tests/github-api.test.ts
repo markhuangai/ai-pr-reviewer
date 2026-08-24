@@ -14,6 +14,11 @@ import {
   githubApiInternals,
   readPullRequestFilesFromCheckout,
 } from "../src/lib/github-api.js";
+import {
+  discoverLinkedIssueNumbers,
+  issueSnapshot,
+  reviewBriefingDigest,
+} from "../src/lib/review-evidence.js";
 import type {
   PullRequestContext,
   PullRequestLocator,
@@ -51,6 +56,68 @@ test("extracts added line numbers from a unified diff", () => {
     "@@ -10,2 +20,4 @@\n context\n-old\n+new\n+another\n context",
   );
   assert.deepEqual([...lines], [21, 22]);
+});
+
+test("discovers same-repository issue references while ignoring code and other repositories", () => {
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 10,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "Linked context",
+    body: [
+      "Fixes #12 and owner/repository#13.",
+      "See https://github.com/owner/repository/issues/14.",
+      "Ignore owner/other#15 and https://github.com/other/repository/issues/16.",
+      "```text\n#17 owner/repository#18\n``` and `#19`.",
+    ].join("\n"),
+    htmlUrl: "https://github.com/owner/repository/pull/10",
+  };
+  assert.deepEqual(discoverLinkedIssueNumbers(context), {
+    numbers: [12, 13, 14],
+    truncated: false,
+  });
+});
+
+test("handles empty briefing inputs and malformed linked issue payloads", () => {
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "No body",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+  assert.deepEqual(discoverLinkedIssueNumbers(context), { numbers: [], truncated: false });
+  const empty = { linkedIssues: [], linkedIssueReferencesTruncated: false } as const;
+  assert.equal(reviewBriefingDigest(context, empty), "");
+  assert.match(
+    reviewBriefingDigest(
+      { ...context, body: "context" },
+      {
+        linkedIssues: [],
+        linkedIssueReferencesTruncated: true,
+      },
+    ),
+    /^[0-9a-f]{64}$/u,
+  );
+  assert.throws(
+    () => issueSnapshot(2, { title: "missing body", state: "open", html_url: "" }),
+    /invalid linked issue #2/u,
+  );
+  assert.deepEqual(
+    discoverLinkedIssueNumbers({
+      ...context,
+      body: "#12 #12 #0 https://github.com/owner/repository/not-an-issue/3.",
+    }),
+    { numbers: [12], truncated: false },
+  );
 });
 
 test("does not treat file headers as added lines", () => {
@@ -640,6 +707,7 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
   const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`);
   assert.deepEqual(await api.getPullRequestContext(locator), {
     ...locator,
+    body: "",
     title: "External change",
     changedFiles: 17,
     headSha: "b".repeat(40),
@@ -652,6 +720,100 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
       path: "/repos/target/project/pulls/73",
       authorization: "Bearer test-token",
     },
+  ]);
+});
+
+test("loads linked issue bodies and excludes linked pull requests", async (t) => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? "");
+    response.setHeader("Content-Type", "application/json");
+    if (request.url?.endsWith("/issues/12")) {
+      response.end(
+        JSON.stringify({
+          title: "Issue context",
+          body: "The caller must preserve this invariant.",
+          state: "open",
+          html_url: "https://github.com/owner/repository/issues/12",
+        }),
+      );
+      return;
+    }
+    if (request.url?.endsWith("/issues/13")) {
+      response.end(
+        JSON.stringify({
+          title: "Pull request context",
+          body: "This is not an issue.",
+          state: "open",
+          html_url: "https://github.com/owner/repository/pull/13",
+          pull_request: { url: "https://api.github.com/repos/owner/repository/pulls/13" },
+        }),
+      );
+      return;
+    }
+    response.end(
+      JSON.stringify({
+        title: "Ignored context",
+        body: null,
+        state: "closed",
+        html_url: "https://github.com/owner/repository/issues/14",
+      }),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error === undefined) resolve();
+          else reject(error);
+        });
+      }),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`);
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 11,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "Linked issue context",
+    body: "Fixes #12 and #13 and #14.",
+    htmlUrl: "https://github.com/owner/repository/pull/11",
+  };
+  assert.deepEqual(await api.getLinkedIssues(context), {
+    linkedIssueReferencesTruncated: false,
+    linkedIssues: [
+      {
+        number: 12,
+        title: "Issue context",
+        body: "The caller must preserve this invariant.",
+        state: "open",
+        htmlUrl: "https://github.com/owner/repository/issues/12",
+      },
+      {
+        number: 14,
+        title: "Ignored context",
+        body: "",
+        state: "closed",
+        htmlUrl: "https://github.com/owner/repository/issues/14",
+      },
+    ],
+  });
+  assert.deepEqual(requests, [
+    "/repos/owner/repository/issues/12",
+    "/repos/owner/repository/issues/13",
+    "/repos/owner/repository/issues/14",
   ]);
 });
 

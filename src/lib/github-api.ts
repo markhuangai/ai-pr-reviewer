@@ -4,11 +4,14 @@ import { promisify } from "node:util";
 
 import type {
   ChangedFile,
+  LinkedIssueSnapshot,
   PullRequestContext,
   PullRequestLocator,
   PullRequestReviewRequest,
+  ReviewBriefing,
 } from "./types.js";
 import { cancellationReason, throwIfAborted } from "./bootstrap/cancellation.js";
+import { discoverLinkedIssueNumbers, issueSnapshot } from "./review-evidence.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_LOCAL_CHANGED_FILES = 3_000;
@@ -181,6 +184,10 @@ function readPullRequestContext(value: unknown, locator: PullRequestLocator): Pu
     baseRef,
     ...(changedFiles === undefined ? {} : { changedFiles }),
     title: value.title,
+    body:
+      value.body === null || value.body === undefined
+        ? ""
+        : requiredString(value.body, "pull request body"),
   };
 }
 
@@ -870,6 +877,23 @@ export class GitHubApi {
       `/repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}/pulls/${locator.number}`,
     );
     return readPullRequestContext(payload, locator);
+  }
+
+  async getLinkedIssues(context: PullRequestContext): Promise<ReviewBriefing> {
+    const references = discoverLinkedIssueNumbers(context);
+    const linkedIssues: LinkedIssueSnapshot[] = [];
+    for (const number of references.numbers) {
+      if (number === context.number) continue;
+      const payload = await this.request<unknown>(
+        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${number}`,
+      );
+      if (!isRecord(payload) || Object.hasOwn(payload, "pull_request")) continue;
+      linkedIssues.push(issueSnapshot(number, payload));
+    }
+    return {
+      linkedIssues,
+      linkedIssueReferencesTruncated: references.truncated,
+    };
   }
 
   async getPullRequestRefs(

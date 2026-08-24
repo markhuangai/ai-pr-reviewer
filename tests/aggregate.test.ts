@@ -506,9 +506,16 @@ test("does not include secrets in duplicate markers", () => {
   const contextualMarker = reviewMarker(context, config, "conversation-a");
   assert.notEqual(contextualMarker, marker);
   assert.notEqual(contextualMarker, reviewMarker(context, config, "conversation-b"));
+  const briefingMarker = reviewMarker(context, config, "", [], "briefing-a");
+  assert.notEqual(briefingMarker, marker);
+  assert.notEqual(briefingMarker, reviewMarker(context, config, "", [], "briefing-b"));
   assert.equal(
     aggregateReview(context, config, files, [], "conversation-a").marker,
     contextualMarker,
+  );
+  assert.equal(
+    aggregateReview(context, config, files, [], "", [], "briefing-a").marker,
+    briefingMarker,
   );
   assert.notEqual(
     marker,

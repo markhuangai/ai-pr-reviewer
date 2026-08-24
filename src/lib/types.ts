@@ -98,7 +98,21 @@ export interface PullRequestContext {
   readonly baseRef: string;
   readonly changedFiles?: number;
   readonly title: string;
+  readonly body?: string;
   readonly htmlUrl: string;
+}
+
+export interface LinkedIssueSnapshot {
+  readonly number: number;
+  readonly title: string;
+  readonly state: string;
+  readonly body: string;
+  readonly htmlUrl: string;
+}
+
+export interface ReviewBriefing {
+  readonly linkedIssues: readonly LinkedIssueSnapshot[];
+  readonly linkedIssueReferencesTruncated: boolean;
 }
 
 export interface ChangedFile {

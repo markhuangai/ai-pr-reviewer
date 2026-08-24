@@ -179,6 +179,12 @@ export function buildReviewConversation(
   );
   const threads = new Map<number, ConversationMessage[]>();
   for (const comment of reviewComments) {
+    if (
+      comment.reviewId !== undefined &&
+      actionReviewIds.has(comment.reviewId) &&
+      comment.inReplyToId === undefined
+    )
+      continue;
     const rootId = comment.inReplyToId ?? comment.id;
     const messages = threads.get(rootId) ?? [];
     messages.push(reviewCommentMessage(comment, authenticatedLogin, actionReviewIds));
@@ -189,12 +195,9 @@ export function buildReviewConversation(
   for (const [rootId, unsorted] of threads) {
     const messages = [...unsorted].sort(messageSort);
     if (
-      !messages.some(
-        (message) => message.inReplyToId !== undefined && message.authorRole === "human",
-      )
-    ) {
+      !messages.some((message) => message.authorRole !== "workflow" && message.body.trim() !== "")
+    )
       continue;
-    }
     const root = messages.find((message) => message.id === rootId);
     const location = root ?? messages[0];
     if (location === undefined || location.path === undefined) continue;
@@ -212,7 +215,7 @@ export function buildReviewConversation(
 
   for (const review of reviews) {
     const message = reviewMessage(review, authenticatedLogin);
-    if (message.authorRole !== "human" || message.body.trim().length === 0) continue;
+    if (message.authorRole === "workflow" || message.body.trim().length === 0) continue;
     entries.push({
       kind: "review_body",
       id: review.id,
@@ -225,7 +228,7 @@ export function buildReviewConversation(
 
   for (const comment of issueComments) {
     const message = issueCommentMessage(comment, authenticatedLogin);
-    if (message.authorRole !== "human" || message.body.trim().length === 0) continue;
+    if (message.authorRole === "workflow" || message.body.trim().length === 0) continue;
     entries.push({
       kind: "pr_comment",
       id: comment.id,
