@@ -383,7 +383,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     if (request.url?.endsWith("/issues/12")) {
       response.end(
         JSON.stringify({
-          title: "Linked issue",
+          title: "Linked test-ai-secret",
           body: "Linked context contains test-ai-secret.",
           state: "open",
           html_url: "https://github.com/target/project/issues/12",
@@ -393,7 +393,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     }
     response.end(
       JSON.stringify({
-        title: "External change",
+        title: "External test-ai-secret",
         body: "Fixes #12; PR context contains test-ai-secret.",
         changed_files: 1,
         head: { sha: headSha },
@@ -462,6 +462,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     readEventContext: () => Promise.resolve(undefined),
     createWorkspace: (context, token) => {
       assert.equal(context.repository, "target/project");
+      assert.equal(context.title, "External test-ai-secret");
       assert.equal(context.headSha, headSha);
       assert.equal(token, "test-token");
       return Promise.resolve({
@@ -485,6 +486,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     ) => {
       goalRuns += 1;
       assert.equal(context.repository, "target/project");
+      assert.equal(context.title, "External [REDACTED]");
       assert.equal(files.length, 1);
       assert.equal(files[0]?.path, "review.txt");
       assert.equal(files[0]?.additions, 1);
@@ -500,7 +502,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       assert.deepEqual(briefing.linkedIssues, [
         {
           number: 12,
-          title: "Linked issue",
+          title: "Linked [REDACTED]",
           body: "Linked context contains [REDACTED].",
           state: "open",
           htmlUrl: "https://github.com/target/project/issues/12",

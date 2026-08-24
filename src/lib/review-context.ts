@@ -93,7 +93,10 @@ function messageAuthor(author: GitHubCommentAuthor | undefined): { readonly auth
 }
 
 function reviewMessage(review: ExistingReview, authenticatedLogin: string): ConversationMessage {
-  const actionAuthored = ACTION_MARKER.test(review.body);
+  const actionAuthored =
+    review.author !== undefined &&
+    sameLogin(review.author.login, authenticatedLogin) &&
+    ACTION_MARKER.test(review.body);
   return {
     id: review.id,
     ...messageAuthor(review.author),
@@ -175,7 +178,14 @@ export function buildReviewConversation(
   issueComments: readonly PullRequestIssueCommentRecord[],
 ): ReviewConversationSnapshot {
   const actionReviewIds = new Set(
-    reviews.filter((review) => ACTION_MARKER.test(review.body)).map((review) => review.id),
+    reviews
+      .filter(
+        (review) =>
+          review.author !== undefined &&
+          sameLogin(review.author.login, authenticatedLogin) &&
+          ACTION_MARKER.test(review.body),
+      )
+      .map((review) => review.id),
   );
   const threads = new Map<number, ConversationMessage[]>();
   for (const comment of reviewComments) {

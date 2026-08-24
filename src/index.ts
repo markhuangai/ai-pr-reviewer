@@ -319,12 +319,14 @@ export async function runAction(
     );
     const redactedContext: PullRequestContext = {
       ...context,
+      title: redact(context.title, secrets),
       ...(context.body === undefined ? {} : { body: redact(context.body, secrets) }),
     };
     const redactedBriefing: ReviewBriefing = {
       linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
       linkedIssues: briefing.linkedIssues.map((issue) => ({
         ...issue,
+        title: redact(issue.title, secrets),
         body: redact(issue.body, secrets),
       })),
     };

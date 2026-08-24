@@ -118,6 +118,10 @@ test("handles empty briefing inputs and malformed linked issue payloads", () => 
     }),
     { numbers: [12], truncated: false },
   );
+  assert.deepEqual(discoverLinkedIssueNumbers({ ...context, body: "```\n#12\n#13" }), {
+    numbers: [],
+    truncated: false,
+  });
 });
 
 test("does not treat file headers as added lines", () => {
@@ -751,6 +755,11 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
       );
       return;
     }
+    if (request.url?.endsWith("/issues/15")) {
+      response.statusCode = 404;
+      response.end(JSON.stringify({ message: "Not Found" }));
+      return;
+    }
     response.end(
       JSON.stringify({
         title: "Ignored context",
@@ -788,7 +797,7 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
     baseSha: "a".repeat(40),
     baseRef: "main",
     title: "Linked issue context",
-    body: "Fixes #12 and #13 and #14.",
+    body: "Fixes #12 and #13 and #14 and #15.",
     htmlUrl: "https://github.com/owner/repository/pull/11",
   };
   assert.deepEqual(await api.getLinkedIssues(context), {
@@ -814,6 +823,7 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
     "/repos/owner/repository/issues/12",
     "/repos/owner/repository/issues/13",
     "/repos/owner/repository/issues/14",
+    "/repos/owner/repository/issues/15",
   ]);
 });
 

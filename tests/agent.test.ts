@@ -152,6 +152,7 @@ interface FakeQueryScenario {
   readonly unauthorizedContextFilePath?: string;
   readonly skipConversationRead?: boolean;
   readonly readThreadPath?: string;
+  readonly readThreadFirstOnly?: boolean;
   readonly assertUnreadThreadRejection?: boolean;
   readonly readDiffPath?: string;
   readonly readRepositoryFilePath?: string;
@@ -362,6 +363,10 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               };
               threadDone = page.done === true;
               threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+              if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
+                const rejected = await submitTool.handler(scenario.submission);
+                assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
+              }
             }
           }
           let diffDone = false;
@@ -672,6 +677,17 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
       Buffer.byteLength(JSON.stringify(agentInternals.jsonToolResult(page)), "utf8") <=
         agentInternals.MODEL_TOOL_RESULT_BYTES,
     );
+  }
+
+  const controlReader = new agentInternals.ReviewBriefingReader(
+    { ...context, body: String.fromCharCode(1).repeat(5_000) },
+    [],
+    emptyConversation,
+    { linkedIssues: [], linkedIssueReferencesTruncated: false },
+  );
+  while (!controlReader.complete) {
+    const page = controlReader.readNext();
+    assert.equal(agentInternals.jsonToolResult(page).isError, undefined);
   }
 });
 
@@ -1280,18 +1296,16 @@ test("contains agent logging failures without failing the review turn", () => {
 
 test("rejects review submission until the prompt and briefing are complete", () => {
   assert.equal(
-    agentInternals.reviewSubmissionRejection(false, false, false),
+    agentInternals.reviewSubmissionRejection(false),
     "Wait for the full review prompt before submitting.",
   );
-  assert.equal(agentInternals.reviewSubmissionRejection(true, false, true), undefined);
-  assert.equal(agentInternals.reviewSubmissionRejection(true, true, false), undefined);
-  assert.equal(agentInternals.reviewSubmissionRejection(true, true, true), undefined);
+  assert.equal(agentInternals.reviewSubmissionRejection(true), undefined);
   assert.match(
-    agentInternals.reviewSubmissionRejection(true, true, true, false, false) ?? "",
+    agentInternals.reviewSubmissionRejection(true, false, false) ?? "",
     /briefing until done=true/u,
   );
   assert.match(
-    agentInternals.reviewSubmissionRejection(true, true, true, true) ?? "",
+    agentInternals.reviewSubmissionRejection(true, true) ?? "",
     /already been accepted/u,
   );
 });
@@ -1312,7 +1326,7 @@ test("requires the complete prior thread before accepting a located finding", as
             id: 91,
             authorLogin: "reviewer",
             authorRole: "human",
-            body: "This was previously reported.",
+            body: `This was previously reported. ${"x".repeat(5_000)}`,
             createdAt: "2026-08-17T00:00:00Z",
             updatedAt: "2026-08-17T00:00:00Z",
             path: "src/change.ts",
@@ -1348,6 +1362,7 @@ test("requires the complete prior thread before accepting a located finding", as
       skipConversationRead: true,
       assertUnreadThreadRejection: true,
       readThreadPath: "src/change.ts",
+      readThreadFirstOnly: true,
     }),
   );
   assert.equal(result.status, "completed");
@@ -1523,12 +1538,11 @@ test("teaches the four severity definitions before review submission", () => {
   assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
   assert.match(prompt, /Set endLine only when the finding spans a contiguous range/u);
   assert.doesNotMatch(prompt, /raw replacement text|apply suggestions/u);
-  assert.match(agentInternals.repairPrompt(1, true, true), /MEDIUM and INFO are invalid/u);
-  assert.match(agentInternals.repairPrompt(1, true, true), /path, line, and endLine are optional/u);
-  assert.doesNotMatch(agentInternals.repairPrompt(1, true, true), /suggestion/u);
-  assert.match(agentInternals.repairPrompt(1, false, true), /read_pr_conversation/u);
-  assert.doesNotMatch(agentInternals.repairPrompt(1, true, false), /read_pr_diff/u);
-  assert.match(agentInternals.repairPrompt(1, true, true, false), /read_review_briefing/u);
+  assert.match(agentInternals.repairPrompt(1), /MEDIUM and INFO are invalid/u);
+  assert.match(agentInternals.repairPrompt(1), /path, line, and endLine are optional/u);
+  assert.doesNotMatch(agentInternals.repairPrompt(1), /suggestion/u);
+  assert.doesNotMatch(agentInternals.repairPrompt(1), /read_pr_conversation|read_pr_diff/u);
+  assert.match(agentInternals.repairPrompt(1, false), /read_review_briefing/u);
 });
 
 test("starts each review with a bounded Claude goal command", () => {

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ChangedFile } from "../lib/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -35,11 +36,12 @@ async function gitBytes(
       cwd,
       encoding: "buffer",
       maxBuffer: MAX_GIT_OUTPUT_BYTES,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" },
       ...(signal === undefined ? {} : { signal }),
     });
     return stdout;
   } catch (error) {
+    throwIfAborted(signal);
     throw new Error(`Git snapshot query failed: ${errorMessage(error)}`);
   }
 }
@@ -58,7 +60,6 @@ export interface RepositoryFileSnapshot {
 }
 
 export class RepositorySnapshot {
-  readonly baseSha: string;
   readonly headSha: string;
   readonly mergeBaseSha: string;
   private readonly allowedPaths: ReadonlySet<string>;
@@ -72,9 +73,8 @@ export class RepositorySnapshot {
     private readonly signal?: AbortSignal,
   ) {
     checkedCommit(baseSha, "Pull request base SHA");
-    this.baseSha = checkedCommit(mergeBaseSha, "Pull request merge base SHA");
+    this.mergeBaseSha = checkedCommit(mergeBaseSha, "Pull request merge base SHA");
     this.headSha = checkedCommit(headSha, "Pull request head SHA");
-    this.mergeBaseSha = this.baseSha;
     this.allowedPaths = new Set(
       files.flatMap((file) => [
         file.path,
@@ -91,7 +91,7 @@ export class RepositorySnapshot {
   }
 
   private sha(revision: "base" | "head"): string {
-    return revision === "base" ? this.baseSha : this.headSha;
+    return revision === "base" ? this.mergeBaseSha : this.headSha;
   }
 
   async diff(paths: readonly string[] = []): Promise<string> {

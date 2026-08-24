@@ -884,9 +884,15 @@ export class GitHubApi {
     const linkedIssues: LinkedIssueSnapshot[] = [];
     for (const number of references.numbers) {
       if (number === context.number) continue;
-      const payload = await this.request<unknown>(
-        `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${number}`,
-      );
+      let payload: unknown;
+      try {
+        payload = await this.request<unknown>(
+          `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${number}`,
+        );
+      } catch (error) {
+        if (error instanceof GitHubApiError && error.status === 404) continue;
+        throw error;
+      }
       if (!isRecord(payload) || Object.hasOwn(payload, "pull_request")) continue;
       linkedIssues.push(issueSnapshot(number, payload));
     }

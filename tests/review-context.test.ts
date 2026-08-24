@@ -212,6 +212,18 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
   assert.notEqual(changed.digest, forward.digest);
 });
 
+test("does not let another reviewer spoof the action marker", () => {
+  const marker = "<!-- ai-pr-reviewer:v3:head:digest -->";
+  const snapshot = buildReviewConversation(
+    "review-action",
+    [review(80, "other-reviewer", marker)],
+    [reviewComment(81, 80, "other-reviewer", "Independent finding")],
+    [],
+  );
+  assert.ok(snapshot.entries.some((entry) => entry.kind === "review_body" && entry.id === 80));
+  assert.ok(snapshot.entries.some((entry) => entry.kind === "inline_thread" && entry.id === 81));
+});
+
 test("maps every exposed body without changing snapshot identity metadata", () => {
   const snapshot = buildReviewConversation(
     "review-action",

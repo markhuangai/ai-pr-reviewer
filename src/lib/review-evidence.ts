@@ -13,8 +13,8 @@ function issueNumber(value: string): number | undefined {
 
 function withoutMarkdownCode(value: string): string {
   return value
-    .replace(/```[\s\S]*?```/gu, " ")
-    .replace(/~~~[\s\S]*?~~~/gu, " ")
+    .replace(/```[\s\S]*?(?:```|$)/gu, " ")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/gu, " ")
     .replace(/`[^`\n]*`/gu, " ");
 }
 

@@ -48,6 +48,7 @@ const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const DIFF_PAGE_BYTES = 4 * 1024;
 const CONVERSATION_PAGE_BYTES = 4 * 1024;
+const REPOSITORY_PAGE_BYTES = 12 * 1024;
 const BRIEFING_PAGE_BYTES = 16 * 1024;
 const BRIEFING_BODY_CHUNK_BYTES = 4 * 1024;
 const BRIEFING_MAX_AUTHORS = 32;
@@ -1265,6 +1266,34 @@ function briefingPageWithinLimits(page: ReviewBriefingPage): boolean {
   );
 }
 
+function briefingBodyRecords(
+  record: Record<string, unknown>,
+  body: string,
+): readonly Record<string, unknown>[] {
+  let chunkBytes = Math.min(
+    BRIEFING_BODY_CHUNK_BYTES,
+    Math.max(4, Buffer.byteLength(body, "utf8")),
+  );
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const chunks = splitUtf8(body, chunkBytes);
+    const records = chunks.map((chunk, part) => ({
+      ...record,
+      body: chunk,
+      bodyPart: part,
+      bodyParts: chunks.length,
+    }));
+    if (
+      records.every((chunkedRecord) =>
+        briefingPageWithinLimits({ page: 1, records: [chunkedRecord], done: false }),
+      )
+    )
+      return chunks.length === 1 ? [record] : records;
+    if (chunkBytes <= 4) throw new Error("Review briefing body cannot fit the bounded page size.");
+    chunkBytes = Math.max(4, Math.floor(chunkBytes / 2));
+  }
+  throw new Error("Review briefing body cannot fit the bounded page size.");
+}
+
 class ReviewBriefingReader {
   private readonly records: readonly Record<string, unknown>[];
   private index = 0;
@@ -1344,15 +1373,7 @@ class ReviewBriefingReader {
     }
     this.records = records.flatMap((record) => {
       const body = typeof record.body === "string" ? record.body : undefined;
-      if (body === undefined || Buffer.byteLength(body, "utf8") <= BRIEFING_BODY_CHUNK_BYTES)
-        return [record];
-      const chunks = splitUtf8(body, BRIEFING_BODY_CHUNK_BYTES);
-      return chunks.map((chunk, part) => ({
-        ...record,
-        body: chunk,
-        bodyPart: part,
-        bodyParts: chunks.length,
-      }));
+      return body === undefined ? [record] : briefingBodyRecords(record, body);
     });
     for (const record of this.records) {
       if (!briefingPageWithinLimits({ page: 1, records: [record], done: false }))
@@ -1393,16 +1414,21 @@ interface TextPage {
 
 class StringPageReader {
   private readonly bytes: Buffer;
+  private readonly pageBytes: number;
   private readonly decoder = new StringDecoder("utf8");
   private offset = 0;
   private page = 0;
   private reachedEnd = false;
 
-  constructor(
-    value: string,
-    private readonly pageBytes = DIFF_PAGE_BYTES,
-  ) {
+  constructor(value: string, pageBytes = REPOSITORY_PAGE_BYTES) {
     this.bytes = Buffer.from(value, "utf8");
+    const serializedBytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+    const expansion =
+      this.bytes.length === 0 ? 1 : Math.max(1, serializedBytes / this.bytes.length);
+    this.pageBytes = Math.min(
+      pageBytes,
+      Math.max(1_024, Math.floor((MODEL_TOOL_RESULT_BYTES - 1_024) / (expansion * 2))),
+    );
   }
 
   get complete(): boolean {
@@ -1748,30 +1774,20 @@ After reading the briefing and the relevant code and discussion, call mcp__revie
 
 function reviewSubmissionRejection(
   reviewPromptActive: boolean,
-  conversationComplete: boolean,
-  diffComplete: boolean,
   submissionAccepted = false,
   briefingComplete = true,
 ): string | undefined {
   if (!reviewPromptActive) return "Wait for the full review prompt before submitting.";
   if (!briefingComplete)
     return "Review submission rejected. Read the review briefing until done=true first.";
-  void conversationComplete;
-  void diffComplete;
   if (submissionAccepted)
     return "Review submission rejected. A review has already been accepted for this goal.";
   return undefined;
 }
 
-function repairPrompt(
-  attempt: number,
-  conversationComplete: boolean,
-  diffComplete: boolean,
-  briefingComplete = true,
-): string {
+function repairPrompt(attempt: number, briefingComplete = true): string {
   const missingReaders = [
     ...(briefingComplete ? [] : ["mcp__review_output__read_review_briefing"]),
-    ...(conversationComplete ? [] : ["mcp__review_output__read_pr_conversation"]),
   ];
   const nextAction =
     missingReaders.length === 0
@@ -1930,15 +1946,28 @@ export async function runReviewGoal(
     signal,
   );
   const queryReaders = new Map<string, StringPageReader>();
+  const queryReaderCompletions = new Map<string, () => void>();
   const discussionReadPaths = new Set<string>();
   const createQueryReader = (
     content: string,
+    onComplete?: () => void,
   ): { readonly cursor: string; readonly reader: StringPageReader } => {
-    if (queryReaders.size >= 32) throw new Error("Too many open repository query readers.");
+    while (queryReaders.size >= 32) {
+      const oldest = queryReaders.keys().next().value;
+      if (oldest === undefined) break;
+      queryReaders.delete(oldest);
+      queryReaderCompletions.delete(oldest);
+    }
     const cursor = randomUUID();
     const reader = new StringPageReader(content);
     queryReaders.set(cursor, reader);
+    if (onComplete !== undefined) queryReaderCompletions.set(cursor, onComplete);
     return { cursor, reader };
+  };
+  const completeQueryReader = (cursor: string): void => {
+    const onComplete = queryReaderCompletions.get(cursor);
+    queryReaderCompletions.delete(cursor);
+    onComplete?.();
   };
   const readQueryPage = (cursor: string): CallToolResult => {
     const reader = queryReaders.get(cursor);
@@ -1948,7 +1977,10 @@ export async function runReviewGoal(
         isError: true,
       };
     const page = reader.readNext();
-    if (page.done) queryReaders.delete(cursor);
+    if (page.done) {
+      queryReaders.delete(cursor);
+      completeQueryReader(cursor);
+    }
     return jsonToolResult({ ...page, ...(page.done ? {} : { nextCursor: cursor }) });
   };
   const contextReaders = new Map(
@@ -2099,11 +2131,22 @@ export async function runReviewGoal(
             isError: true,
           };
         }
-        for (const entry of entries)
-          if (entry.kind === "inline_thread") discussionReadPaths.add(entry.path);
-        const query = createQueryReader(JSON.stringify({ entries }));
+        const discussionPaths = new Set(
+          entries
+            .filter(
+              (entry): entry is Extract<typeof entry, { kind: "inline_thread" }> =>
+                entry.kind === "inline_thread",
+            )
+            .map((entry) => entry.path),
+        );
+        const query = createQueryReader(JSON.stringify({ entries }), () => {
+          for (const discussionPath of discussionPaths) discussionReadPaths.add(discussionPath);
+        });
         const pageResult = query.reader.readNext();
-        if (pageResult.done) queryReaders.delete(query.cursor);
+        if (pageResult.done) {
+          queryReaders.delete(query.cursor);
+          completeQueryReader(query.cursor);
+        }
         return jsonToolResult({
           selector: id === undefined ? { path } : { id },
           page: pageResult.page,
@@ -2184,8 +2227,6 @@ export async function runReviewGoal(
       }
       const rejection = reviewSubmissionRejection(
         reviewPromptActive,
-        conversationReader.complete,
-        diffReader.complete,
         submission !== undefined,
         briefingReader.complete,
       );
@@ -2377,14 +2418,7 @@ export async function runReviewGoal(
       }
       repairAttempts += 1;
       throwIfAborted(signal);
-      const repairMessage = makeUserMessage(
-        repairPrompt(
-          repairAttempts,
-          conversationReader.complete,
-          diffReader.complete,
-          briefingReader.complete,
-        ),
-      );
+      const repairMessage = makeUserMessage(repairPrompt(repairAttempts, briefingReader.complete));
       input.push(repairMessage);
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         logQueuedUserMessage(
