@@ -16,6 +16,7 @@ function withoutMarkdownCode(value: string): string {
     .replace(/<!--[\s\S]*?(?:-->|$)/gu, " ")
     .replace(/(`{3,})[\s\S]*?(?:\1|$)/gu, " ")
     .replace(/(~{3,})[\s\S]*?(?:\1|$)/gu, " ")
+    .replace(/(?<!`)(`{2,})(?!`)[\s\S]*?(?<!`)\1(?!`)/gu, " ")
     .replace(/`[^`\n]*`/gu, " ");
 }
 

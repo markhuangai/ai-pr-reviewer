@@ -165,8 +165,10 @@ interface FakeQueryScenario {
   readonly expectedContextFileContent?: string;
   readonly unauthorizedContextFilePath?: string;
   readonly skipConversationRead?: boolean;
+  readonly readThreadId?: number;
   readonly readThreadPath?: string;
   readonly readThreadFirstOnly?: boolean;
+  readonly assertUnreadThreadAfterId?: boolean;
   readonly assertUnreadThreadRejection?: boolean;
   readonly readDiffPath?: string;
   readonly readRepositoryFilePath?: string;
@@ -360,24 +362,32 @@ function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             const rejected = await submitTool.handler(scenario.submission);
             assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
           }
-          if (scenario.readThreadPath !== undefined) {
+          if (scenario.readThreadId !== undefined || scenario.readThreadPath !== undefined) {
             const threadTool = tools.read_pr_threads;
             assert.ok(threadTool);
-            let threadDone = false;
-            let threadCursor: string | undefined;
-            while (!threadDone) {
-              const result = await threadTool.handler(
-                threadCursor === undefined
-                  ? { path: scenario.readThreadPath }
-                  : { cursor: threadCursor },
-              );
-              const page = JSON.parse(result.content[0]?.text ?? "{}") as {
-                readonly done?: unknown;
-                readonly nextCursor?: unknown;
-              };
-              threadDone = page.done === true;
-              threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
-              if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
+            const selectors: readonly Readonly<Record<string, unknown>>[] = [
+              ...(scenario.readThreadId === undefined ? [] : [{ id: scenario.readThreadId }]),
+              ...(scenario.readThreadPath === undefined ? [] : [{ path: scenario.readThreadPath }]),
+            ];
+            for (const selector of selectors) {
+              let threadDone = false;
+              let threadCursor: string | undefined;
+              while (!threadDone) {
+                const result = await threadTool.handler(
+                  threadCursor === undefined ? selector : { cursor: threadCursor },
+                );
+                const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+                  readonly done?: unknown;
+                  readonly nextCursor?: unknown;
+                };
+                threadDone = page.done === true;
+                threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+                if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
+                  const rejected = await submitTool.handler(scenario.submission);
+                  assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
+                }
+              }
+              if (scenario.assertUnreadThreadAfterId && "id" in selector) {
                 const rejected = await submitTool.handler(scenario.submission);
                 assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
               }
@@ -1471,6 +1481,74 @@ test("requires the complete prior thread before accepting a located finding", as
   assert.equal(result.submission?.findings[0]?.path, "src/change.ts");
 });
 
+test("requires a path-scoped discussion read after an id-scoped read", async (t) => {
+  const message = (id: number, body: string): ConversationMessage => ({
+    id,
+    authorLogin: "reviewer",
+    authorRole: "human",
+    body,
+    createdAt: "2026-08-17T00:00:00Z",
+    updatedAt: "2026-08-17T00:00:00Z",
+    path: "src/change.ts",
+    line: 4,
+  });
+  const conversation: ReviewConversationSnapshot = {
+    digest: "thread-digest",
+    entries: [
+      {
+        kind: "inline_thread",
+        id: 91,
+        rootAvailable: true,
+        createdAt: "2026-08-17T00:00:00Z",
+        path: "src/change.ts",
+        line: 4,
+        messages: [message(91, "First prior finding")],
+      },
+      {
+        kind: "inline_thread",
+        id: 92,
+        rootAvailable: true,
+        createdAt: "2026-08-17T00:02:00Z",
+        path: "src/change.ts",
+        line: 9,
+        messages: [message(92, "Second prior finding")],
+      },
+    ],
+  };
+  const result = await runReviewGoal(
+    "Check the changed behavior.",
+    0,
+    goalContext,
+    [],
+    conversation,
+    reviewConfig(),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    fakeAgentQuery({
+      submission: {
+        summary: "One issue",
+        findings: [
+          {
+            title: "Still broken",
+            severity: "HIGH",
+            why: "The old guard no longer applies.",
+            fix: "Restore the guard.",
+            path: "src/change.ts",
+            line: 4,
+          },
+        ],
+      },
+      skipConversationRead: true,
+      assertUnreadThreadRejection: true,
+      assertUnreadThreadAfterId: true,
+      readThreadId: 91,
+      readThreadPath: "src/change.ts",
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.equal(result.submission?.findings[0]?.path, "src/change.ts");
+});
+
 test("accepts exactly the four public finding severities", () => {
   for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const) {
     assert.equal(
@@ -2531,6 +2609,28 @@ test("serializes repeated diff reads and rejects reads after close or premature 
   assert.equal((await oversized.readNext()).done, false);
   await assert.rejects(oversized.readNext(), /ended before its recorded size/u);
   await oversized.close();
+});
+
+test("bounds serialized full-diff pages before advancing the reader", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-diff-page-limit-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "diff");
+  const content = `${String.fromCharCode(1).repeat(9_000)}🙂${"界".repeat(200)}`;
+  await writeFile(path, content);
+  const reader = new agentInternals.PullRequestDiffReader(path, Buffer.byteLength(content));
+  let actual = "";
+  const extra = { mergeBaseSha: "a".repeat(40), headSha: "b".repeat(40) };
+  try {
+    while (!reader.complete) {
+      const page = await reader.readNext(extra);
+      actual += page.content;
+      const result = agentInternals.jsonToolResult({ ...page, ...extra });
+      assert.equal(result.isError, undefined);
+    }
+  } finally {
+    await reader.close();
+  }
+  assert.equal(actual, content);
 });
 
 test("reads fixed changed paths at the merge base and head, including binary metadata", async (t) => {

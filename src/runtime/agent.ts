@@ -1630,7 +1630,6 @@ class PullRequestDiffReader {
   private reachedEnd = false;
   private closed = false;
   private operation: Promise<void> = Promise.resolve();
-  private readonly decoder = new StringDecoder("utf8");
 
   constructor(
     private readonly path: string,
@@ -1642,8 +1641,8 @@ class PullRequestDiffReader {
     return this.reachedEnd;
   }
 
-  readNext(): Promise<PullRequestDiffPage> {
-    const result = this.operation.then(() => this.readNextPage());
+  readNext(extra: Readonly<Record<string, unknown>> = {}): Promise<PullRequestDiffPage> {
+    const result = this.operation.then(() => this.readNextPage(extra));
     this.operation = result.then(
       () => undefined,
       () => undefined,
@@ -1659,29 +1658,61 @@ class PullRequestDiffReader {
     this.file = undefined;
   }
 
-  private async readNextPage(): Promise<PullRequestDiffPage> {
+  private async readNextPage(
+    extra: Readonly<Record<string, unknown>>,
+  ): Promise<PullRequestDiffPage> {
     throwIfAborted(this.signal);
     if (this.closed) throw new Error("Cannot read a closed pull request diff.");
     if (this.reachedEnd) return { page: this.page, content: "", done: true };
     this.file ??= await open(this.path, "r");
     throwIfAborted(this.signal);
-    this.page += 1;
     if (this.size === 0) {
+      const page = { page: this.page + 1, content: "", done: true };
+      if (!serializedQueryPageWithinLimit(page, extra))
+        throw new Error("Pull request diff page exceeds the bounded result size.");
+      this.page = page.page;
       this.reachedEnd = true;
-      return { page: this.page, content: this.decoder.end(), done: true };
+      return page;
     }
-    const buffer = Buffer.allocUnsafe(Math.min(DIFF_PAGE_BYTES, this.size - this.offset));
-    const { bytesRead } = await this.file.read(buffer, 0, buffer.length, this.offset);
+    const start = this.offset;
+    const requestedBytes = Math.min(DIFF_PAGE_BYTES + 4, this.size - start);
+    const buffer = Buffer.allocUnsafe(requestedBytes);
+    let bytesRead = 0;
+    while (bytesRead < requestedBytes) {
+      const result = await this.file.read(
+        buffer,
+        bytesRead,
+        requestedBytes - bytesRead,
+        start + bytesRead,
+      );
+      if (result.bytesRead === 0) break;
+      bytesRead += result.bytesRead;
+    }
     throwIfAborted(this.signal);
     if (bytesRead === 0) {
       throw new Error("The pull request diff ended before its recorded size.");
     }
-    this.offset += bytesRead;
-    const done = this.offset === this.size;
-    const content =
-      this.decoder.write(buffer.subarray(0, bytesRead)) + (done ? this.decoder.end() : "");
-    this.reachedEnd = done;
-    return { page: this.page, content, done };
+    const available = buffer.subarray(0, bytesRead);
+    const hasMore = start + bytesRead < this.size;
+    let end = utf8PageEnd(available, 0, Math.min(DIFF_PAGE_BYTES, bytesRead), hasMore);
+    const makePage = (pageEnd: number): PullRequestDiffPage => ({
+      page: this.page + 1,
+      content: available.subarray(0, pageEnd).toString("utf8"),
+      done: start + pageEnd === this.size,
+    });
+    let page = makePage(end);
+    while (!serializedQueryPageWithinLimit(page, extra) && end > 0) {
+      const reducedEnd = utf8PageEnd(available, 0, Math.floor(end / 2), hasMore);
+      if (reducedEnd === end) break;
+      end = reducedEnd;
+      page = makePage(end);
+    }
+    if (!serializedQueryPageWithinLimit(page, extra))
+      throw new Error("Pull request diff page exceeds the bounded result size.");
+    this.offset = start + end;
+    this.page = page.page;
+    this.reachedEnd = page.done;
+    return page;
   }
 }
 
@@ -2191,7 +2222,10 @@ export async function runReviewGoal(
       }
       if (cursor !== undefined) return readQueryPage(cursor);
       if (paths === undefined || paths.length === 0) {
-        const page = await diffReader.readNext();
+        const page = await diffReader.readNext({
+          mergeBaseSha: diff.mergeBaseSha,
+          headSha: context.headSha,
+        });
         return jsonToolResult({
           ...page,
           mergeBaseSha: diff.mergeBaseSha,
@@ -2301,9 +2335,15 @@ export async function runReviewGoal(
             )
             .map((entry) => entry.path),
         );
-        const query = createQueryReader(JSON.stringify({ entries }), () => {
-          for (const discussionPath of discussionPaths) discussionReadPaths.add(discussionPath);
-        });
+        const query = createQueryReader(
+          JSON.stringify({ entries }),
+          id === undefined
+            ? () => {
+                for (const discussionPath of discussionPaths)
+                  discussionReadPaths.add(discussionPath);
+              }
+            : undefined,
+        );
         const selector = id === undefined ? { path } : { id };
         const pageResult = query.reader.readNext({
           selector,
