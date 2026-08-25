@@ -270,6 +270,7 @@ export interface AgentLifecycleState {
   sessionId?: string;
   turnResults: number;
   latestTurnCount: number;
+  apiRetries: number;
   goalIterations: number;
   compactionStarts: number;
   compactionSuccesses: number;
@@ -281,6 +282,7 @@ export function createAgentLifecycleState(): AgentLifecycleState {
   return {
     turnResults: 0,
     latestTurnCount: 0,
+    apiRetries: 0,
     goalIterations: 0,
     compactionStarts: 0,
     compactionSuccesses: 0,
@@ -471,6 +473,24 @@ export function logAgentLifecycleMessage(
         session_id: message.session_id,
         model: message.model,
         claude_code_version: message.claude_code_version,
+      },
+      secrets,
+      write,
+    );
+    return;
+  }
+  if (message.subtype === "api_retry") {
+    state.apiRetries += 1;
+    writeAgentLifecycleLog(
+      goalIndex,
+      "api-retry",
+      {
+        retry: state.apiRetries,
+        attempt: message.attempt,
+        max_retries: message.max_retries,
+        retry_delay_ms: message.retry_delay_ms,
+        error_status: message.error_status,
+        error: message.error,
       },
       secrets,
       write,
