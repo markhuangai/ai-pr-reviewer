@@ -539,4 +539,5 @@ test("reports the reviewed checkout as the subprocess workspace", () => {
   assert.equal(environment.ANTHROPIC_API_KEY, "ai-secret");
   assert.equal(environment.API_TIMEOUT_MS, "300000");
   assert.equal(environment.CLAUDE_STREAM_IDLE_TIMEOUT_MS, "300000");
+  assert.equal(environment.CLAUDE_CODE_MAX_RETRIES, "1");
 });

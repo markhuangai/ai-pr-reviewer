@@ -290,6 +290,16 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
       },
       ...base,
     },
+    {
+      type: "system",
+      subtype: "api_retry",
+      attempt: 1,
+      max_retries: 1,
+      retry_delay_ms: 750,
+      error_status: null,
+      error: "unknown",
+      ...base,
+    },
     { type: "system", subtype: "status", status: "compacting", ...base },
     {
       type: "system",
@@ -325,6 +335,7 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   assert.equal(state.goalIterations, 2);
   assert.equal(state.turnResults, 1);
   assert.equal(state.latestTurnCount, 4);
+  assert.equal(state.apiRetries, 1);
   assert.equal(state.compactionStarts, 1);
   assert.equal(state.compactionFailures, 1);
   assert.equal(state.compactionBoundaries, 1);
@@ -333,6 +344,10 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   const goalIteration = lines.find((line) => /session goal-iteration/u.test(line));
   assert.match(goalIteration ?? "", /payload truncated/u);
   assert.equal((goalIteration ?? "").includes("g".repeat(9_000)), false);
+  assert.match(
+    lines.join("\n"),
+    /session api-retry details:.*"attempt":1.*"max_retries":1.*"error_status":null/u,
+  );
   assert.match(lines.join("\n"), /session compaction-start/u);
   assert.match(lines.join("\n"), /session compaction-result error/u);
   assert.match(lines.join("\n"), /session compaction-boundary/u);

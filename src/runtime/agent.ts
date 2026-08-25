@@ -761,6 +761,7 @@ export async function runReviewGoal(
           prompt_gate: reviewPromptActive ? "open" : "closed",
           turn_results: lifecycle.turnResults,
           latest_turn_count: lifecycle.latestTurnCount,
+          api_retries: lifecycle.apiRetries,
           repair_attempts: repairAttempts,
           goal_iterations: lifecycle.goalIterations,
           compaction_starts: lifecycle.compactionStarts,
