@@ -59,6 +59,7 @@ const GOAL_CONDITION_PREFIX = "Complete the pull-request review goal: ";
 const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const MAX_FINDING_TITLE_LENGTH = 120;
 const MAX_FINDING_PROSE_LENGTH = 500;
+const CLAUDE_API_TIMEOUT_MS = 300_000;
 
 const SEVERITY_VALUES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
 const SEVERITY_GUIDANCE = `- CRITICAL: a credible immediate risk of compromise, irreversible data loss, or broad outage.
@@ -288,6 +289,8 @@ export function safeAgentEnvironment(
   environment.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
   environment.CLAUDE_CODE_AUTO_COMPACT = "1";
   environment.CLAUDE_AGENT_SDK_CLIENT_APP = "ai-pr-reviewer/0.1";
+  environment.API_TIMEOUT_MS = String(CLAUDE_API_TIMEOUT_MS);
+  environment.CLAUDE_STREAM_IDLE_TIMEOUT_MS = String(CLAUDE_API_TIMEOUT_MS);
   environment.GITHUB_WORKSPACE = cwd;
   return environment;
 }

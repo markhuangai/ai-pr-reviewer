@@ -537,4 +537,6 @@ test("reports the reviewed checkout as the subprocess workspace", () => {
   const environment = agentInternals.safeAgentEnvironment(config, "/tmp/reviewed-repository");
   assert.equal(environment.GITHUB_WORKSPACE, "/tmp/reviewed-repository");
   assert.equal(environment.ANTHROPIC_API_KEY, "ai-secret");
+  assert.equal(environment.API_TIMEOUT_MS, "300000");
+  assert.equal(environment.CLAUDE_STREAM_IDLE_TIMEOUT_MS, "300000");
 });

@@ -89,6 +89,8 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
 
+Every isolated goal fixes Claude Code's `API_TIMEOUT_MS` and `CLAUDE_STREAM_IDLE_TIMEOUT_MS` controls at 300000 milliseconds. These controls bound each model API request and a silent response stream, not the total goal lifetime. Claude Code may retry a timed-out request according to its retry policy.
+
 ### Custom system prompt
 
 Use `system-prompt` when the built-in reviewer instructions should be replaced for every isolated goal session:
