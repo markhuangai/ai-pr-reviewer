@@ -89,7 +89,7 @@ export interface RepositoryFileSnapshot {
 export class RepositorySnapshot {
   readonly headSha: string;
   readonly mergeBaseSha: string;
-  private readonly allowedPaths: ReadonlySet<string>;
+  private readonly changedPaths: ReadonlySet<string>;
   private readonly queryDirectories = new Set<string>();
   private queryOperation: Promise<void> = Promise.resolve();
   private queryStorageBytes = 0;
@@ -107,7 +107,7 @@ export class RepositorySnapshot {
     checkedCommit(baseSha, "Pull request base SHA");
     this.mergeBaseSha = checkedCommit(mergeBaseSha, "Pull request merge base SHA");
     this.headSha = checkedCommit(headSha, "Pull request head SHA");
-    this.allowedPaths = new Set(
+    this.changedPaths = new Set(
       files.flatMap((file) => [
         file.path,
         ...(file.previousPath === undefined ? [] : [file.previousPath]),
@@ -117,17 +117,25 @@ export class RepositorySnapshot {
 
   private path(path: string): string {
     if (!validPath(path)) throw new Error("Repository path is outside the fixed checkout.");
-    if (!this.allowedPaths.has(path))
-      throw new Error("Repository path is not a changed pull-request path.");
     return path;
+  }
+
+  private changedPath(path: string): string {
+    const selected = this.path(path);
+    if (!this.changedPaths.has(selected))
+      throw new Error("Repository path is not a changed pull-request path.");
+    return selected;
   }
 
   private sha(revision: "base" | "head"): string {
     return revision === "base" ? this.mergeBaseSha : this.headSha;
   }
 
-  private query(args: readonly string[]): Promise<RepositoryQuerySource> {
-    const result = this.queryOperation.then(() => this.runQuery(args));
+  private query(
+    args: readonly string[],
+    allowedExitCodes: readonly number[] = [0],
+  ): Promise<RepositoryQuerySource> {
+    const result = this.queryOperation.then(() => this.runQuery(args, allowedExitCodes));
     this.queryOperation = result.then(
       () => undefined,
       () => undefined,
@@ -135,7 +143,10 @@ export class RepositorySnapshot {
     return result;
   }
 
-  private async runQuery(args: readonly string[]): Promise<RepositoryQuerySource> {
+  private async runQuery(
+    args: readonly string[],
+    allowedExitCodes: readonly number[],
+  ): Promise<RepositoryQuerySource> {
     throwIfAborted(this.signal);
     let directory: string | undefined;
     try {
@@ -157,6 +168,7 @@ export class RepositorySnapshot {
         "Git snapshot query",
         this.signal,
         remainingBytes,
+        allowedExitCodes,
       );
       const { size: sizeBytes } = await stat(outputPath);
       if (sizeBytes > this.maxQueryStorageBytes - this.queryStorageBytes) {
@@ -184,7 +196,7 @@ export class RepositorySnapshot {
   }
 
   async diff(paths: readonly string[] = []): Promise<RepositoryQuerySource> {
-    const selected = paths.map((path) => `:(literal)${this.path(path)}`);
+    const selected = paths.map((path) => `:(literal)${this.changedPath(path)}`);
     return this.query([
       `--attr-source=${this.mergeBaseSha}`,
       "diff",
@@ -225,6 +237,38 @@ export class RepositorySnapshot {
     }
     await source.cleanup();
     return { revision, path: selected, kind: "binary", sizeBytes: source.sizeBytes };
+  }
+
+  list(revision: "base" | "head", path?: string): Promise<RepositoryQuerySource> {
+    const selected = path === undefined ? [] : [":(literal)" + this.path(path)];
+    return this.query(["ls-tree", "-r", "--name-only", this.sha(revision), "--", ...selected]);
+  }
+
+  search(
+    revision: "base" | "head",
+    pattern: string,
+    paths: readonly string[] = [],
+  ): Promise<RepositoryQuerySource> {
+    if (pattern.length === 0 || pattern.length > 1_000 || pattern.includes("\0")) {
+      throw new Error("Repository search pattern must contain 1 to 1000 characters.");
+    }
+    if (paths.length > 20) throw new Error("Repository search supports at most 20 paths.");
+    const selected = paths.map((path) => `:(literal)${this.path(path)}`);
+    return this.query(
+      [
+        "grep",
+        "--full-name",
+        "-n",
+        "-I",
+        "-E",
+        "-e",
+        pattern,
+        this.sha(revision),
+        "--",
+        ...selected,
+      ],
+      [0, 1],
+    );
   }
 
   async cleanup(): Promise<void> {

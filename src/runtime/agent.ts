@@ -1,13 +1,4 @@
 import { randomUUID } from "node:crypto";
-import {
-  createSdkMcpServer,
-  query as sdkQuery,
-  tool,
-  type McpServerConfig,
-  type SDKActiveGoalMessage,
-  type SDKMessage,
-  type SDKResultMessage,
-} from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
@@ -22,22 +13,13 @@ import type {
   PullRequestContext,
   ReviewBriefing,
   ReviewConfig,
-  ReviewModelUsage,
 } from "../lib/types.js";
 import {
   agentLogLine,
-  createAgentLifecycleState,
   errorMessage,
   isRecord,
   logAgentEventSafely,
-  logAgentLifecycleMessage,
-  logAgentMessageSafely,
-  logQueuedUserMessage,
-  modelUsageSnapshot,
   withTokenUsage,
-  writeCompleteAgentLog,
-  writeAgentLifecycleLog,
-  type AgentToolUse,
 } from "./agent-logging.js";
 import {
   PullRequestConversationReader,
@@ -51,18 +33,18 @@ import {
 } from "./agent-review-tools.js";
 import {
   MAX_REPAIR_ATTEMPTS,
-  PromptStream,
   REVIEW_SYSTEM_PROMPT,
-  makeOptions,
-  makeUserMessage,
+  buildReviewPrompt,
+  goalCommand,
   repairPrompt,
   reviewSubmissionRejection,
-  startReviewPrompt,
   submissionSchema,
-  toSdkMcpServer,
   toSubmission,
   type AgentQuery,
 } from "./agent-session.js";
+import type { ReviewExecutor, ReviewToolDefinition } from "./executor.js";
+import { ClaudeReviewExecutor } from "./executors/claude.js";
+import { reviewExecutor } from "./executors/index.js";
 import {
   RepositorySnapshot,
   type RepositoryFileSnapshot,
@@ -72,21 +54,30 @@ import {
 export type { AgentQuery } from "./agent-session.js";
 export { agentInternals } from "./agent-session.js";
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
+function tool<Shape extends z.ZodRawShape>(
+  name: string,
+  description: string,
+  inputSchema: Shape,
+  handler: (input: z.infer<z.ZodObject<Shape>>) => Promise<CallToolResult>,
+  options: { readonly alwaysLoad?: boolean } = {},
+): ReviewToolDefinition {
+  return {
+    name,
+    description,
+    inputSchema,
+    handler: (input) => handler(input as z.infer<z.ZodObject<Shape>>),
+    alwaysLoad: options.alwaysLoad ?? false,
+  };
 }
 
-function deferred<T>(): Deferred<T> {
-  let resolvePromise: (value: T) => void = () => undefined;
-  let rejectPromise: (error: unknown) => void = () => undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  void promise.catch(() => undefined);
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
+function selectedExecutor(
+  config: ReviewConfig,
+  executorOrClaudeQuery: ReviewExecutor | AgentQuery | undefined,
+): ReviewExecutor {
+  if (executorOrClaudeQuery === undefined) return reviewExecutor(config.executor);
+  return typeof executorOrClaudeQuery === "function"
+    ? new ClaudeReviewExecutor(executorOrClaudeQuery)
+    : executorOrClaudeQuery;
 }
 
 export async function runReviewGoal(
@@ -98,7 +89,7 @@ export async function runReviewGoal(
   config: ReviewConfig,
   diff: PullRequestDiffArtifact,
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
-  queryAgent: AgentQuery = sdkQuery,
+  executorOrClaudeQuery?: ReviewExecutor | AgentQuery,
   contextFiles: readonly PreparedContextFile[] = [],
   abortController?: AbortController,
   briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
@@ -109,8 +100,6 @@ export async function runReviewGoal(
   let reviewPromptActive = false;
   const logSecrets = reviewSecretCandidates(config);
   const effectiveSystemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT;
-  const toolUses = new Map<string, AgentToolUse>();
-  const lifecycle = createAgentLifecycleState();
   const briefingReader = new ReviewBriefingReader(context, files, conversation, briefing);
   const conversationReader = new PullRequestConversationReader(conversation);
   const diffReader = diff.createReader();
@@ -304,7 +293,7 @@ export async function runReviewGoal(
   );
   const repositoryFileTool = tool(
     "read_repository_file",
-    "Read one exact changed repository file at the immutable merge base or head. Binary blobs return metadata only; continue with the returned cursor for long text.",
+    "Read one exact tracked repository file at the immutable merge base or head. Binary blobs return metadata only; continue with the returned cursor for long text.",
     {
       revision: z.enum(["base", "head"]),
       path: z.string().min(1).max(4_096),
@@ -336,6 +325,80 @@ export async function runReviewGoal(
         path,
         kind: snapshot.kind,
         sizeBytes: snapshot.sizeBytes,
+        page: page.page,
+        content: page.content,
+        done: page.done,
+        ...(page.done ? {} : { nextCursor: query.cursor }),
+      });
+    },
+    { alwaysLoad: true },
+  );
+  const repositoryListTool = tool(
+    "list_repository_files",
+    "List tracked repository file paths at the immutable merge base or head. Optionally scope the listing to one exact repository path; continue with the returned cursor when present.",
+    {
+      revision: z.enum(["base", "head"]),
+      path: z.string().min(1).max(4_096).optional(),
+      cursor: z.string().min(1).max(100).optional(),
+    },
+    async ({ revision, path, cursor }): Promise<CallToolResult> => {
+      throwIfAborted(signal);
+      if (!reviewPromptActive) {
+        return {
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        };
+      }
+      if (cursor !== undefined) return readQueryPage(cursor);
+      const query = createQuerySourceReader(await repositorySnapshot.list(revision, path));
+      const page = await query.reader.readNext({
+        revision,
+        ...(path === undefined ? {} : { path }),
+        nextCursor: query.cursor,
+      });
+      if (page.done) await finishQueryReader(query.cursor);
+      return jsonToolResult({
+        revision,
+        ...(path === undefined ? {} : { path }),
+        page: page.page,
+        content: page.content,
+        done: page.done,
+        ...(page.done ? {} : { nextCursor: query.cursor }),
+      });
+    },
+    { alwaysLoad: true },
+  );
+  const repositorySearchTool = tool(
+    "search_repository",
+    "Search tracked text files with one extended regular expression at the immutable merge base or head. Optionally scope the search to exact repository paths; continue with the returned cursor when present.",
+    {
+      revision: z.enum(["base", "head"]),
+      pattern: z.string().min(1).max(1_000),
+      paths: z.array(z.string().min(1).max(4_096)).max(20).optional(),
+      cursor: z.string().min(1).max(100).optional(),
+    },
+    async ({ revision, pattern, paths, cursor }): Promise<CallToolResult> => {
+      throwIfAborted(signal);
+      if (!reviewPromptActive) {
+        return {
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        };
+      }
+      if (cursor !== undefined) return readQueryPage(cursor);
+      const selectedPaths = paths ?? [];
+      const query = createQuerySourceReader(
+        await repositorySnapshot.search(revision, pattern, selectedPaths),
+      );
+      const page = await query.reader.readNext({
+        revision,
+        pattern,
+        paths: selectedPaths,
+        nextCursor: query.cursor,
+      });
+      if (page.done) await finishQueryReader(query.cursor);
+      return jsonToolResult({
+        revision,
+        pattern,
+        paths: selectedPaths,
         page: page.page,
         content: page.content,
         done: page.done,
@@ -528,252 +591,110 @@ export async function runReviewGoal(
     { alwaysLoad: true },
   );
   const outputServerName = "review_output";
-  const mcpServers: Record<string, McpServerConfig> = {
-    [outputServerName]: createSdkMcpServer({
-      name: outputServerName,
-      version: "1.0.0",
-      instructions:
-        contextFileTool === undefined
-          ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before calling submit_review exactly once when the review goal is complete."
-          : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before calling submit_review exactly once when the review goal is complete.",
-      tools: [
-        briefingTool,
-        conversationTool,
-        diffTool,
-        repositoryFileTool,
-        discussionThreadTool,
-        ...(contextFileTool === undefined ? [] : [contextFileTool]),
-        outputTool,
-      ],
-      alwaysLoad: true,
-    }),
-  };
-  for (const [name, server] of Object.entries(config.mcpServers))
-    mcpServers[name] = toSdkMcpServer(server);
-
-  const input = new PromptStream();
-  let turn = deferred<SDKResultMessage>();
-  let readerFailure: Error | undefined;
-  let reader: Promise<void> | undefined;
-  const tokenUsageState: {
-    models: readonly ReviewModelUsage[];
-    latestSnapshotValid: boolean;
-  } = { models: [], latestSnapshotValid: false };
+  const tools: readonly ReviewToolDefinition[] = [
+    briefingTool,
+    conversationTool,
+    diffTool,
+    repositoryFileTool,
+    repositoryListTool,
+    repositorySearchTool,
+    discussionThreadTool,
+    ...(contextFileTool === undefined ? [] : [contextFileTool]),
+    outputTool,
+  ];
+  const outputServerInstructions =
+    contextFileTool === undefined
+      ? "Call read_review_briefing until done=true, then investigate with the fixed-revision repository tools. Read prior discussion and the diff as needed before calling submit_review exactly once when the review goal is complete."
+      : "Call read_review_briefing until done=true, then investigate with the fixed-revision repository tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before calling submit_review exactly once when the review goal is complete.";
+  const executor = selectedExecutor(config, executorOrClaudeQuery);
+  let session: Awaited<ReturnType<ReviewExecutor["createSession"]>> | undefined;
+  let result: Omit<GoalResult, "tokenUsage"> | undefined;
   let repairAttempts = 0;
-  const abortTurn = (): void => {
-    input.finish();
-    turn.reject(signal?.reason ?? new Error("The pull request review was cancelled."));
-  };
-  signal?.addEventListener("abort", abortTurn, { once: true });
-  if (signal?.aborted) abortTurn();
   try {
     throwIfAborted(signal);
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      writeAgentLifecycleLog(goalIndex, "start", { prompt_gate: "closed" }, logSecrets, write);
-      writeCompleteAgentLog(
-        goalIndex,
-        "system message",
-        "review",
-        "text",
-        effectiveSystemPrompt,
-        logSecrets,
-        write,
-      );
-    });
-    const session = queryAgent({
-      prompt: input,
-      options: makeOptions(
-        config,
-        cwd,
-        mcpServers,
-        outputServerName,
-        contextFiles.length > 0,
-        abortController,
-        effectiveSystemPrompt,
-      ),
-    });
-    const configuredMcpNames = new Set(Object.keys(config.mcpServers));
-    reader = (async () => {
-      try {
-        for await (const message of session as AsyncIterable<SDKMessage | SDKActiveGoalMessage>) {
-          if (message.type !== "active_goal")
-            logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
-          logAgentEventSafely(goalIndex, logSecrets, (write) => {
-            logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
-          });
-          if (message.type === "result") {
-            const snapshot = modelUsageSnapshot(message.modelUsage);
-            tokenUsageState.latestSnapshotValid = snapshot !== undefined;
-            if (snapshot !== undefined) tokenUsageState.models = snapshot;
-            const completedTurn = turn;
-            turn = deferred<SDKResultMessage>();
-            completedTurn.resolve(message);
-          }
-        }
-      } catch (error) {
-        readerFailure = error instanceof Error ? error : new Error(errorMessage(error));
-        turn.reject(readerFailure);
-      } finally {
-        if (signal?.aborted) turn.reject(signal.reason);
-      }
-    })();
-    throwIfAborted(signal);
-    startReviewPrompt(
-      input,
-      goal,
-      context,
-      files,
-      diff.mergeBaseSha,
-      conversation.entries.length,
-      contextFiles,
+    session = await executor.createSession({
+      config,
+      cwd,
       goalIndex,
       logSecrets,
+      systemPrompt: effectiveSystemPrompt,
+      outputServerName,
+      outputServerInstructions,
+      tools,
+      ...(abortController === undefined ? {} : { abortController }),
+    });
+    throwIfAborted(signal);
+    let turnResult = await session.runReview(
+      goalCommand(goal),
+      buildReviewPrompt(
+        goal,
+        context,
+        files,
+        diff.mergeBaseSha,
+        conversation.entries.length,
+        contextFiles,
+        cwd,
+      ),
       () => {
         reviewPromptActive = true;
       },
-      undefined,
-      cwd,
     );
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      writeAgentLifecycleLog(
-        goalIndex,
-        "prompt-gate-open",
-        { queued_messages: 2 },
-        logSecrets,
-        write,
-      );
-    });
-    for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS; turnIndex += 1) {
-      const result = await turn.promise;
+    while (result === undefined) {
       throwIfAborted(signal);
-      if (result.subtype !== "success") {
-        input.finish();
-        await reader;
-        throwIfAborted(signal);
-        return withTokenUsage(
-          {
-            prompt: goal,
-            status: "failed",
-            ...(submission === undefined ? {} : { submission }),
-            error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
-          },
-          tokenUsageState.models,
-          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-        );
+      if (!turnResult.success) {
+        result = {
+          prompt: goal,
+          status: "failed",
+          ...(submission === undefined ? {} : { submission }),
+          error: turnResult.error ?? `${executor.name} failed the review turn.`,
+        };
+        break;
       }
       if (submission !== undefined) {
-        const mcpFailures = (await session.mcpServerStatus()).filter(
-          (status) =>
-            configuredMcpNames.has(status.name) &&
-            (status.status === "failed" || status.status === "needs-auth"),
-        );
-        throwIfAborted(signal);
-        input.finish();
-        await reader;
+        const mcpFailures = await session.configuredServerFailures();
         throwIfAborted(signal);
         if (mcpFailures.length > 0) {
-          return withTokenUsage(
-            {
-              prompt: goal,
-              status: "failed",
-              submission,
-              error: `Configured MCP server failure: ${mcpFailures.map((status) => `${status.name}: ${status.error ?? status.status}`).join("; ")}`,
-            },
-            tokenUsageState.models,
-            readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-          );
-        }
-        return withTokenUsage(
-          { prompt: goal, status: "completed", submission },
-          tokenUsageState.models,
-          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-        );
-      }
-      if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
-        input.finish();
-        await reader;
-        throwIfAborted(signal);
-        return withTokenUsage(
-          {
+          result = {
             prompt: goal,
             status: "failed",
-            error: "Claude did not submit a valid review after five repair attempts.",
-          },
-          tokenUsageState.models,
-          readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-        );
+            submission,
+            error: `Configured MCP server failure: ${mcpFailures.join("; ")}`,
+          };
+        } else {
+          result = { prompt: goal, status: "completed", submission };
+        }
+        break;
+      }
+      if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
+        result = {
+          prompt: goal,
+          status: "failed",
+          error: `${executor.name === "codex" ? "Codex" : "Claude"} did not submit a valid review after five repair attempts.`,
+        };
+        break;
       }
       repairAttempts += 1;
       throwIfAborted(signal);
-      const repairMessage = makeUserMessage(repairPrompt(repairAttempts, briefingReader.complete));
-      input.push(repairMessage);
-      logAgentEventSafely(goalIndex, logSecrets, (write) => {
-        logQueuedUserMessage(
-          repairMessage,
-          `repair-${repairAttempts}`,
-          goalIndex,
-          logSecrets,
-          write,
-        );
-      });
+      turnResult = await session.runRepair(repairPrompt(repairAttempts, briefingReader.complete));
     }
-    input.finish();
-    await reader;
-    throwIfAborted(signal);
-    return withTokenUsage(
-      {
-        prompt: goal,
-        status: "failed",
-        error: "Claude did not submit a valid review after five repair attempts.",
-      },
-      tokenUsageState.models,
-      readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-    );
   } catch (error) {
-    input.finish();
-    if (reader) await reader.catch(() => undefined);
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       write(
-        agentLogLine(
-          goalIndex,
-          "session",
-          "failure",
-          "error",
-          readerFailure?.message ?? errorMessage(error),
-          logSecrets,
-        ),
+        agentLogLine(goalIndex, "session", "failure", "error", errorMessage(error), logSecrets),
       );
     });
-    return withTokenUsage(
-      { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) },
-      tokenUsageState.models,
-      false,
-    );
+    result = { prompt: goal, status: "failed", error: errorMessage(error) };
   } finally {
-    signal?.removeEventListener("abort", abortTurn);
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      writeAgentLifecycleLog(
-        goalIndex,
-        "end",
-        {
-          session_id: lifecycle.sessionId,
-          prompt_gate: reviewPromptActive ? "open" : "closed",
-          turn_results: lifecycle.turnResults,
-          latest_turn_count: lifecycle.latestTurnCount,
-          api_retries: lifecycle.apiRetries,
-          repair_attempts: repairAttempts,
-          goal_iterations: lifecycle.goalIterations,
-          compaction_starts: lifecycle.compactionStarts,
-          compaction_successes: lifecycle.compactionSuccesses,
-          compaction_failures: lifecycle.compactionFailures,
-          compaction_boundaries: lifecycle.compactionBoundaries,
-          submission_accepted: submission !== undefined,
-        },
-        logSecrets,
-        write,
-      );
-    });
+    if (session !== undefined) {
+      try {
+        await session.close();
+      } catch (error) {
+        if (!signal?.aborted) {
+          result = { prompt: goal, status: "failed", error: errorMessage(error) };
+        }
+      }
+    }
     await Promise.all([
       diffReader.close(),
       ...Array.from(contextReaders.values(), ({ reader: contextReader }) => contextReader.close()),
@@ -787,6 +708,9 @@ export async function runReviewGoal(
     discussionQueryCursors.clear();
     queryReaderDiscussionKeys.clear();
   }
+  throwIfAborted(signal);
+  const usage = session?.usage() ?? { models: [], complete: false };
+  return withTokenUsage(result, usage.models, usage.complete);
 }
 
 export async function runReviewGoals(
@@ -796,7 +720,7 @@ export async function runReviewGoals(
   config: ReviewConfig,
   contextFilesByGoal: readonly (readonly PreparedContextFile[])[],
   cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
-  queryAgent: AgentQuery = sdkQuery,
+  executorOrClaudeQuery?: ReviewExecutor | AgentQuery,
   abortController?: AbortController,
   briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
 ): Promise<readonly GoalResult[]> {
@@ -839,7 +763,7 @@ export async function runReviewGoals(
         config,
         diff,
         cwd,
-        queryAgent,
+        executorOrClaudeQuery,
         contextFilesByGoal[index] ?? [],
         abortController,
         briefing,

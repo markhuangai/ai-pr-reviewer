@@ -14,9 +14,9 @@ export const context: PullRequestContext = {
 
 export const config: ReviewConfig = {
   githubToken: "github-secret",
+  executor: "claude",
   aiBaseUrl: "https://ai.example.test",
   aiSecret: "ai-secret",
-  aiAuthMode: "api-key",
   model: "review-model",
   reviewPrompts: [
     { prompt: "correctness", files: [] },

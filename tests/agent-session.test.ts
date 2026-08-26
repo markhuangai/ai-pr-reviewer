@@ -488,43 +488,12 @@ test("recognizes only paths under the checked-out repository", () => {
   assert.equal(agentInternals.isWithinRepository("/workspace/repo", "../secret"), false);
 });
 
-test("rejects traversal and absolute alternatives in Glob braces", () => {
-  assert.equal(agentInternals.isSafeGlobPattern("src/{lib,test}/**/*.ts"), true);
-  assert.equal(agentInternals.isSafeGlobPattern("{../*,src/*}"), false);
-  assert.equal(agentInternals.isSafeGlobPattern("{/etc,src}/*"), false);
-});
-
-test("allows repository-wide Grep while blocking Git metadata globs", () => {
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", undefined), true);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", "src", undefined), true);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/*"), true);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", "src", "**/*"), true);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "src/**/*.ts"), true);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/.g[i]t/**"), false);
-  assert.equal(agentInternals.isSafeGrepGlob("/workspace/repo", ".", "**/.g?t/**"), false);
-  assert.equal(agentInternals.isSafeGlobPattern("**/[.]git/**"), false);
-  assert.equal(agentInternals.isSafeGlobPattern("/workspace/repo/**/.g[i]t/**"), false);
-  assert.equal(agentInternals.isSafeGlobPattern(".github/**"), true);
-});
-
-test("blocks Git metadata paths from the reviewer", () => {
-  assert.equal(agentInternals.isGitMetadataPath(".git/config"), true);
-  assert.equal(agentInternals.isGitMetadataPath(".GIT/config"), true);
-  assert.equal(agentInternals.isGitMetadataPath("src/.git/objects"), true);
-  assert.equal(agentInternals.isGitMetadataPath(".github/workflows/ci.yml"), false);
-  assert.equal(
-    agentInternals.isSafeResolvedPath("/workspace/repo", "/workspace/repo/.git/config"),
-    false,
-  );
-  assert.equal(agentInternals.isSafeResolvedPath("/workspace/repo", "/workspace/repo/src"), true);
-});
-
 test("reports the reviewed checkout as the subprocess workspace", () => {
   const config: ReviewConfig = {
     githubToken: "github-secret",
+    executor: "claude",
     aiBaseUrl: "https://ai.example.test",
     aiSecret: "ai-secret",
-    aiAuthMode: "api-key",
     model: "review-model",
     reviewPrompts: [{ prompt: "correctness", files: [] }],
     parallelCount: 1,

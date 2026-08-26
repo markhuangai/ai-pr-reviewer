@@ -427,7 +427,7 @@ test("does not include secrets in duplicate markers", () => {
     marker,
     reviewMarker(context, { ...config, aiBaseUrl: "https://other.example.test" }),
   );
-  assert.notEqual(marker, reviewMarker(context, { ...config, aiAuthMode: "auth-token" }));
+  assert.notEqual(marker, reviewMarker(context, { ...config, executor: "codex" }));
   assert.equal(marker, reviewMarker(context, { ...config, githubToken: "another-github-token" }));
   const highEffortMarker = reviewMarker(context, { ...config, effort: "high" });
   assert.notEqual(marker, highEffortMarker);
@@ -452,7 +452,7 @@ test("does not include secrets in duplicate markers", () => {
         security: {
           type: "http",
           url: "https://mcp.example.test",
-          tools: [{ name: "dependency_advice", permission_policy: "always_deny" }],
+          tools: [{ name: "dependency_advice", enabled: false }],
         },
       },
     }),

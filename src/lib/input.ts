@@ -3,8 +3,8 @@ import { isAbsolute, normalize } from "node:path";
 import { parseDocument } from "yaml";
 
 import type {
-  AuthMode,
   EffortLevel,
+  ExecutorName,
   HttpMcpServer,
   McpToolPolicy,
   ModelPricingConfig,
@@ -16,6 +16,8 @@ import type {
 export interface InputReader {
   get(name: string): string;
 }
+
+export type InputWarning = (message: string) => void;
 
 const MAX_PROMPTS = 50;
 const MAX_PROMPT_LENGTH = 12_000;
@@ -170,7 +172,9 @@ function jsonSecretCandidate(value: string): string {
 
 export function reviewSecretCandidates(config: ReviewConfig): readonly string[] {
   const servers = Object.values(config.mcpServers);
-  const endpoints = [config.aiBaseUrl, ...servers.map((server) => server.url)];
+  const endpoints = [config.aiBaseUrl, ...servers.map((server) => server.url)].filter(
+    (value): value is string => value !== undefined,
+  );
   const candidates = [
     config.githubToken,
     config.aiSecret,
@@ -188,18 +192,23 @@ export function reviewSecretCandidates(config: ReviewConfig): readonly string[] 
   );
 }
 
-function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy[] | undefined {
+function parseToolPolicies(
+  value: unknown,
+  path: string,
+  warn: InputWarning,
+): readonly McpToolPolicy[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error(`${path} must be a sequence.`);
   if (value.length > 100) throw new Error(`${path} has too many tool policies.`);
   return value.map((item, index) => {
     const itemPath = `${path}[${index}]`;
     if (!isRecord(item)) throw new Error(`${itemPath} must be a mapping.`);
-    const allowed = new Set(["name", "permission_policy", "org_max_permission"]);
+    const allowed = new Set(["name", "enabled", "permission_policy", "org_max_permission"]);
     for (const key of Object.keys(item)) {
       if (!allowed.has(key)) throw new Error(`${itemPath}.${key} is not supported.`);
     }
     const name = readString(item.name, `${itemPath}.name`, 200);
+    const enabled = readOptionalBoolean(item.enabled, `${itemPath}.enabled`);
     const permission = item.permission_policy;
     if (
       permission !== undefined &&
@@ -218,15 +227,34 @@ function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy
     ) {
       throw new Error(`${itemPath}.org_max_permission is invalid.`);
     }
+    if (enabled !== undefined && (permission !== undefined || orgPermission !== undefined)) {
+      throw new Error(`${itemPath}.enabled cannot be combined with deprecated permission fields.`);
+    }
+    if (permission !== undefined || orgPermission !== undefined) {
+      warn(
+        `${itemPath} uses deprecated permission_policy/org_max_permission fields; use enabled instead. Legacy ask, deny, and blocked policies are disabled in this non-interactive action.`,
+      );
+    }
+    const legacyEnabled =
+      permission === "always_ask" ||
+      permission === "always_deny" ||
+      orgPermission === "ask" ||
+      orgPermission === "blocked"
+        ? false
+        : true;
     return {
       name,
-      ...(permission === undefined ? {} : { permission_policy: permission }),
-      ...(orgPermission === undefined ? {} : { org_max_permission: orgPermission }),
+      ...(enabled === undefined && permission === undefined && orgPermission === undefined
+        ? {}
+        : { enabled: enabled ?? legacyEnabled }),
     };
   });
 }
 
-function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
+function parseMcpServers(
+  raw: string,
+  warn: InputWarning = () => undefined,
+): Readonly<Record<string, HttpMcpServer>> {
   if (raw.trim().length === 0) return {};
   const document = parseDocument(raw, { prettyErrors: true, uniqueKeys: true, version: "1.2" });
   if (document.errors.length > 0) {
@@ -258,7 +286,7 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
     }
     const url = readUrl(rawServer.url, `mcp-servers.${name}.url`, true);
     const headers = parseHeaders(rawServer.headers, `mcp-servers.${name}.headers`);
-    const tools = parseToolPolicies(rawServer.tools, `mcp-servers.${name}.tools`);
+    const tools = parseToolPolicies(rawServer.tools, `mcp-servers.${name}.tools`, warn);
     const timeout = readOptionalInteger(
       rawServer.timeout,
       `mcp-servers.${name}.timeout`,
@@ -418,10 +446,10 @@ function parseModelPricing(raw: string): ModelPricingConfig | undefined {
   return { currency: value.currency, models };
 }
 
-function readAuthMode(value: string): AuthMode {
-  const mode = value.trim().toLowerCase();
-  if (mode === "api-key" || mode === "auth-token") return mode;
-  throw new Error("Input 'ai-auth-mode' must be 'api-key' or 'auth-token'.");
+function readExecutor(value: string): ExecutorName {
+  const executor = value.trim().toLowerCase();
+  if (executor === "codex" || executor === "claude") return executor;
+  throw new Error("Input 'executor' must be 'codex' or 'claude'.");
 }
 
 function readEffort(value: string): EffortLevel | undefined {
@@ -439,29 +467,46 @@ function readEffort(value: string): EffortLevel | undefined {
   throw new Error("Input 'effort' must be 'low', 'medium', 'high', 'xhigh', or 'max'.");
 }
 
-export function readReviewConfig(reader: InputReader): ReviewConfig {
+export function readReviewConfig(
+  reader: InputReader,
+  warn: InputWarning = () => undefined,
+): ReviewConfig {
+  const executor = readExecutor(reader.get("executor") || "codex");
+  const rawBaseUrl = reader.get("ai-base-url").trim();
+  if (executor === "claude" && rawBaseUrl.length === 0) {
+    throw new Error("Input 'ai-base-url' is required when executor is 'claude'.");
+  }
+  if (reader.get("ai-auth-mode").trim().length > 0) {
+    throw new Error("Input 'ai-auth-mode' is no longer supported; API-key authentication is used.");
+  }
   const pullRequestUrl = reader.get("pull-request-url").trim();
   const modelPricing = parseModelPricing(reader.get("model-pricing"));
   const effort = readEffort(reader.get("effort"));
   const systemPrompt = reader.get("system-prompt").trim();
+  const rawMaxTurns = reader.get("max-turns").trim();
+  const maxTurns =
+    rawMaxTurns.length === 0 ? undefined : parseInteger(rawMaxTurns, "max-turns", 2, 100);
+  if (executor === "codex" && maxTurns !== undefined) {
+    warn("Input 'max-turns' applies only to the Claude executor and has no effect for Codex.");
+  }
   return {
     githubToken: required(reader.get("github-pat"), "github-pat"),
-    aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
+    executor,
+    ...(rawBaseUrl.length === 0 ? {} : { aiBaseUrl: readUrl(rawBaseUrl, "ai-base-url") }),
     aiSecret: required(reader.get("ai-secret"), "ai-secret"),
-    aiAuthMode: readAuthMode(reader.get("ai-auth-mode") || "api-key"),
     model: required(reader.get("model"), "model"),
     ...(effort === undefined ? {} : { effort }),
     ...(systemPrompt.length === 0 ? {} : { systemPrompt }),
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
-    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 100),
+    ...(maxTurns === undefined ? {} : { maxTurns }),
     autoApprove: parseBoolean(reader.get("auto-approve"), "auto-approve", false),
     interactWithPullRequest: parseBoolean(reader.get("interact-with-pr"), "interact-with-pr", true),
     ...(pullRequestUrl.length === 0
       ? {}
       : { pullRequestUrl: readUrl(pullRequestUrl, "pull-request-url") }),
-    mcpServers: parseMcpServers(reader.get("mcp-servers")),
+    mcpServers: parseMcpServers(reader.get("mcp-servers"), warn),
   };
 }
 

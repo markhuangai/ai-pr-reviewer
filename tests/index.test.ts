@@ -31,7 +31,9 @@ import {
 
 test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
-  assert.ok(secrets.includes(config.aiBaseUrl));
+  const aiBaseUrl = config.aiBaseUrl;
+  assert.ok(aiBaseUrl);
+  assert.ok(secrets.includes(aiBaseUrl));
   assert.ok(secrets.includes(config.mcpServers.security?.url ?? ""));
   assert.ok(secrets.includes("ai-url%2Fsecret"));
   assert.ok(secrets.includes("ai-url/secret"));
@@ -51,15 +53,15 @@ test("redaction secrets include configured AI and MCP endpoints", () => {
   assert.equal(secrets.includes("value"), false);
   assert.equal(
     indexInternals.redact(
-      `AI failed at ${config.aiBaseUrl}; MCP failed at ${config.mcpServers.security?.url}.`,
+      `AI failed at ${aiBaseUrl}; MCP failed at ${config.mcpServers.security?.url}.`,
       secrets,
     ),
     "AI failed at [REDACTED]; MCP failed at [REDACTED].",
   );
   assert.equal(
-    indexInternals.redact(`${config.aiBaseUrl}/mcp?signature=leaked`, [
-      config.aiBaseUrl,
-      `${config.aiBaseUrl}/mcp?signature=leaked`,
+    indexInternals.redact(`${aiBaseUrl}/mcp?signature=leaked`, [
+      aiBaseUrl,
+      `${aiBaseUrl}/mcp?signature=leaked`,
     ]),
     "[REDACTED]",
   );

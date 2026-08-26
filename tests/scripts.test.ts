@@ -203,6 +203,9 @@ async function createRuntimeFixture(root: string): Promise<void> {
   await mkdir(join(root, "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64"), {
     recursive: true,
   });
+  await mkdir(join(root, "node_modules/@openai/codex-sdk"), { recursive: true });
+  await mkdir(join(root, "node_modules/@openai/codex"), { recursive: true });
+  await mkdir(join(root, "node_modules/@openai/codex-linux-x64"), { recursive: true });
   await writeFile(join(root, "build/index.js"), "export {};\n");
   await writeFile(join(root, "build/lib/value.js"), "export const value = 1;\n");
   await writeFile(join(root, "build/runtime/index.js"), "export {};\n");
@@ -213,6 +216,18 @@ async function createRuntimeFixture(root: string): Promise<void> {
   await writeFile(
     join(root, "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json"),
     JSON.stringify({ version: "1.2.3", os: ["linux"], cpu: ["x64"], libc: ["glibc"] }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-sdk/package.json"),
+    JSON.stringify({ version: "7.8.9" }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex/package.json"),
+    JSON.stringify({ version: "7.8.9" }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-linux-x64/package.json"),
+    JSON.stringify({ version: "7.8.9-linux-x64", os: ["linux"], cpu: ["x64"] }),
   );
 }
 
@@ -241,6 +256,8 @@ test("prepares a validated runtime bundle from real files", async (t) => {
   assert.equal(manifest.stableTag, "v1.1.1");
   assert.equal(manifest.sdkVersion, "1.2.3");
   assert.equal(manifest.cliVersion, "4.5.6");
+  assert.equal(manifest.codexSdkVersion, "7.8.9");
+  assert.equal(manifest.codexCliVersion, "7.8.9");
   assert.equal(
     await readFile(join(result.bundle, "lib/value.js"), "utf8"),
     "export const value = 1;\n",
@@ -272,6 +289,24 @@ test("rejects inconsistent runtime metadata before copying a bundle", async (t) 
   await assert.rejects(
     prepareRuntime([base[0], "wrong.tar.gz", ...base.slice(2)], root),
     /does not match target/u,
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-linux-x64/package.json"),
+    JSON.stringify({ version: "7.8.8-linux-x64", os: ["linux"], cpu: ["x64"] }),
+  );
+  await assert.rejects(prepareRuntime(base, root), /Codex CLI native package does not match/u);
+  await writeFile(
+    join(root, "node_modules/@openai/codex-linux-x64/package.json"),
+    JSON.stringify({ version: "7.8.9-linux-x64", os: ["linux"], cpu: ["x64"] }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-sdk/package.json"),
+    JSON.stringify({ version: "7.8.8" }),
+  );
+  await assert.rejects(prepareRuntime(base, root), /Codex SDK and CLI.*do not match/u);
+  await writeFile(
+    join(root, "node_modules/@openai/codex-sdk/package.json"),
+    JSON.stringify({ version: "7.8.9" }),
   );
   await writeFile(
     join(root, "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json"),
