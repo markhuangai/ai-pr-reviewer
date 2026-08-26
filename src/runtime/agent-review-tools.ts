@@ -1,17 +1,16 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, open, realpath, rm, stat, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, matchesGlob, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
-import type { HookCallback, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
 import type { ChangedFile, PullRequestContext, ReviewBriefing } from "../lib/types.js";
-import { errorMessage, isRecord } from "./agent-logging.js";
+import { errorMessage } from "./agent-logging.js";
 import { streamGitToFile } from "./git-stream.js";
 
 const DIFF_PAGE_BYTES = 4 * 1024;
@@ -53,120 +52,6 @@ export function isWithinRepository(cwd: string, candidate: string): boolean {
     (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !relativePath.startsWith(sep))
   );
 }
-
-export function isGitMetadataPath(candidate: string): boolean {
-  return /(?:^|[\\/{,])\.git(?:$|[\\/},])/i.test(candidate);
-}
-
-function globMatchesGitMetadata(pattern: string): boolean {
-  try {
-    return pattern.split(/[\\/]/u).some((segment) => matchesGlob(".git", segment));
-  } catch {
-    return true;
-  }
-}
-
-export function isSafeGlobPattern(pattern: string): boolean {
-  const normalized = pattern.replace(/^!/, "");
-  if (normalized.includes("..") || globMatchesGitMetadata(normalized)) return false;
-  let braceDepth = 0;
-  for (const character of normalized) {
-    if (character === "{") braceDepth += 1;
-    if (character === "}") braceDepth -= 1;
-    if (braceDepth < 0 || braceDepth > 1) return false;
-  }
-  if (braceDepth !== 0) return false;
-  for (const match of normalized.matchAll(/\{([^{}]*)\}/g)) {
-    for (const alternative of (match[1] ?? "").split(",")) {
-      if (alternative.startsWith("/") || alternative.startsWith("\\")) return false;
-      if (/^[A-Za-z]:[\\/]/.test(alternative)) return false;
-    }
-  }
-  return true;
-}
-
-export function isSafeGrepGlob(
-  cwd: string,
-  pathCandidate: unknown,
-  pattern: string | undefined,
-): boolean {
-  if (typeof pathCandidate === "string" && !isWithinRepository(cwd, pathCandidate)) return false;
-  if (pattern === undefined) return true;
-  const normalized = pattern.replace(/^!/, "");
-  if (isGitMetadataPath(normalized) || globMatchesGitMetadata(normalized)) return false;
-  return true;
-}
-
-export function isSafeResolvedPath(cwd: string, candidate: string): boolean {
-  const root = resolve(cwd);
-  const resolved = resolve(candidate);
-  return isWithinRepository(cwd, resolved) && !isGitMetadataPath(relative(root, resolved));
-}
-
-async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boolean> {
-  if (isGitMetadataPath(candidate)) return false;
-  if (!isWithinRepository(cwd, candidate)) return false;
-  const wildcardIndex = ["*", "?", "[", "]", "{", "}", "!"]
-    .map((character) => candidate.indexOf(character))
-    .filter((index) => index >= 0)
-    .sort((left, right) => left - right)[0];
-  if (wildcardIndex !== undefined) {
-    const prefix = candidate.slice(0, wildcardIndex);
-    const separatorIndex = Math.max(prefix.lastIndexOf("/"), prefix.lastIndexOf("\\"));
-    const parent = separatorIndex < 0 ? "." : prefix.slice(0, separatorIndex) || sep;
-    try {
-      return isSafeResolvedPath(cwd, await realpath(resolve(cwd, parent)));
-    } catch {
-      return true;
-    }
-  }
-  try {
-    return isSafeResolvedPath(cwd, await realpath(resolve(cwd, candidate)));
-  } catch {
-    return true;
-  }
-}
-
-export const repositoryReadHook: HookCallback = async (input: HookInput) => {
-  if (input.hook_event_name !== "PreToolUse") return { continue: true };
-  const toolInput = isRecord(input.tool_input) ? input.tool_input : undefined;
-  if (!toolInput) return { continue: true };
-  const pathCandidate = input.tool_name === "Read" ? toolInput.file_path : toolInput.path;
-  const pathAllowed =
-    pathCandidate === undefined ||
-    (typeof pathCandidate === "string" && (await allowsRepositoryPath(input.cwd, pathCandidate)));
-  const globPattern =
-    input.tool_name === "Glob"
-      ? toolInput.pattern
-      : input.tool_name === "Grep"
-        ? toolInput.glob
-        : undefined;
-  const globPath = typeof globPattern === "string" ? globPattern.replace(/^!/, "") : globPattern;
-  const grepScopeAllowed =
-    input.tool_name !== "Grep" ||
-    isSafeGrepGlob(input.cwd, pathCandidate, typeof globPath === "string" ? globPath : undefined);
-  const patternAllowed =
-    globPattern === undefined ||
-    (typeof globPath === "string" &&
-      isSafeGlobPattern(globPath) &&
-      (await allowsRepositoryPath(input.cwd, globPath)));
-  if (
-    !pathAllowed ||
-    !grepScopeAllowed ||
-    !patternAllowed ||
-    (input.tool_name === "Glob" && typeof globPattern !== "string")
-  ) {
-    return {
-      continue: true,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse" as const,
-        permissionDecision: "deny" as const,
-        permissionDecisionReason: "Read access is limited to the checked-out repository.",
-      },
-    };
-  }
-  return { continue: true };
-};
 
 interface PullRequestConversationPage {
   readonly page: number;

@@ -10,16 +10,15 @@ export function markdownFenceLength(value: string): number {
   return Math.max(3, longestBacktickRun + 1);
 }
 
-export type AuthMode = "api-key" | "auth-token";
-
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+export type ExecutorName = "codex" | "claude";
 
 export type ReviewEvent = "APPROVE" | "COMMENT";
 
 export interface McpToolPolicy {
   readonly name: string;
-  readonly permission_policy?: "always_allow" | "always_ask" | "always_deny";
-  readonly org_max_permission?: "allow" | "ask" | "blocked";
+  readonly enabled?: boolean;
 }
 
 export interface HttpMcpServer {
@@ -64,16 +63,16 @@ export interface ReviewGoal {
 
 export interface ReviewConfig {
   readonly githubToken: string;
-  readonly aiBaseUrl: string;
+  readonly executor: ExecutorName;
+  readonly aiBaseUrl?: string;
   readonly aiSecret: string;
-  readonly aiAuthMode: AuthMode;
   readonly model: string;
   readonly effort?: EffortLevel;
   readonly systemPrompt?: string;
   readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly ReviewGoal[];
   readonly parallelCount: number;
-  readonly maxTurns: number;
+  readonly maxTurns?: number;
   readonly autoApprove: boolean;
   readonly interactWithPullRequest: boolean;
   readonly pullRequestUrl?: string;

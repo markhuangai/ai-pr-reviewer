@@ -231,7 +231,9 @@ export async function runAction(
   const { signal } = abortController;
   throwIfAborted(signal);
   registerInputSecrets(inputSecrets);
-  const config = readReviewConfig(reader);
+  const config = readReviewConfig(reader, (message) => {
+    core.warning(message);
+  });
   const secrets = reviewSecretCandidates(config);
   registerInputSecrets(secrets);
   const api = dependencies.createApi(config.githubToken, signal);
@@ -312,7 +314,7 @@ export async function runAction(
     );
     throwIfAborted(signal);
     core.info(
-      `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
+      `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated ${config.executor} goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
     );
     const redactedConversation = mapConversationBodies(conversation.snapshot, (body) =>
       redact(body, secrets),

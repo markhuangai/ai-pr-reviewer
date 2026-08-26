@@ -217,6 +217,8 @@ export interface FakeQueryScenario {
   readonly assertUnreadThreadRejection?: boolean;
   readonly readDiffPath?: string;
   readonly readRepositoryFilePath?: string;
+  readonly listRepositoryFiles?: boolean;
+  readonly searchRepositoryPattern?: string;
   readonly probeThreadErrors?: boolean;
   readonly probeUnknownCursor?: boolean;
 }
@@ -241,6 +243,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           tools.read_pr_conversation?.handler({}),
           tools.read_pr_diff?.handler({}),
           tools.read_repository_file?.handler({ revision: "head", path: "review.txt" }),
+          tools.list_repository_files?.handler({ revision: "head" }),
+          tools.search_repository?.handler({ revision: "head", pattern: "review" }),
           tools.read_pr_threads?.handler({}),
           tools.submit_review?.handler({}),
         ])
@@ -262,6 +266,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             conversationResult,
             diffResult,
             repositoryFileResult,
+            repositoryListResult,
+            repositorySearchResult,
             threadResult,
             submitResult,
           ] = await preflight;
@@ -282,6 +288,14 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             "Wait for the full review prompt before reading.",
           );
           assert.equal(
+            repositoryListResult?.content[0]?.text,
+            "Wait for the full review prompt before reading.",
+          );
+          assert.equal(
+            repositorySearchResult?.content[0]?.text,
+            "Wait for the full review prompt before reading.",
+          );
+          assert.equal(
             threadResult?.content[0]?.text,
             "Wait for the full review prompt before reading.",
           );
@@ -299,6 +313,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           const conversationTool = tools.read_pr_conversation;
           const diffTool = tools.read_pr_diff;
           const repositoryFileTool = tools.read_repository_file;
+          const repositoryListTool = tools.list_repository_files;
+          const repositorySearchTool = tools.search_repository;
           const threadTool = tools.read_pr_threads;
           const briefingTool = tools.read_review_briefing;
           const submitTool = tools.submit_review;
@@ -306,6 +322,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           if (
             diffTool === undefined ||
             repositoryFileTool === undefined ||
+            repositoryListTool === undefined ||
+            repositorySearchTool === undefined ||
             threadTool === undefined
           )
             throw new Error("The fixed repository tools were not registered.");
@@ -380,6 +398,42 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 cursor === undefined
                   ? { revision: "head", path: scenario.readRepositoryFilePath }
                   : { revision: "head", path: scenario.readRepositoryFilePath, cursor },
+              );
+              assert.equal(result.isError, undefined);
+              const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+                readonly done?: unknown;
+                readonly nextCursor?: unknown;
+              };
+              done = page.done === true;
+              cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+            }
+          }
+          if (scenario.listRepositoryFiles) {
+            let done = false;
+            let cursor: string | undefined;
+            while (!done) {
+              const result = await callRegisteredTool(
+                repositoryListTool,
+                cursor === undefined ? { revision: "head" } : { revision: "head", cursor },
+              );
+              assert.equal(result.isError, undefined);
+              const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+                readonly done?: unknown;
+                readonly nextCursor?: unknown;
+              };
+              done = page.done === true;
+              cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+            }
+          }
+          if (scenario.searchRepositoryPattern !== undefined) {
+            let done = false;
+            let cursor: string | undefined;
+            while (!done) {
+              const result = await callRegisteredTool(
+                repositorySearchTool,
+                cursor === undefined
+                  ? { revision: "head", pattern: scenario.searchRepositoryPattern }
+                  : { revision: "head", pattern: scenario.searchRepositoryPattern, cursor },
               );
               assert.equal(result.isError, undefined);
               const page = JSON.parse(result.content[0]?.text ?? "{}") as {
@@ -504,9 +558,9 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
 export function reviewConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfig {
   return {
     githubToken: "github-secret",
+    executor: "claude",
     aiBaseUrl: "https://ai.example.test",
     aiSecret: "ai-secret",
-    aiAuthMode: "api-key",
     model: "review-model",
     reviewPrompts: [{ prompt: "correctness", files: [] }],
     parallelCount: 1,

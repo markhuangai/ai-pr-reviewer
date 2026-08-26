@@ -19,6 +19,7 @@ import type {
 } from "./types.js";
 import type { ContextFileIdentityByGoal } from "./context-files.js";
 import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
+import { reviewExecutorFingerprint } from "../runtime/executors/index.js";
 
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
@@ -85,8 +86,7 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
           tools: server.tools
             ?.map((tool) => ({
               name: tool.name,
-              permission_policy: tool.permission_policy,
-              org_max_permission: tool.org_max_permission,
+              enabled: tool.enabled ?? true,
             }))
             .sort((left, right) => left.name.localeCompare(right.name)),
           timeout: server.timeout,
@@ -135,16 +135,13 @@ export function reviewMarker(
   const fingerprint = JSON.stringify({
     baseSha: context.baseSha,
     model: config.model,
-    ...(config.effort === undefined ? {} : { effort: config.effort }),
     ...(config.systemPrompt === undefined ? {} : { systemPrompt: config.systemPrompt }),
-    aiBaseUrl: config.aiBaseUrl,
-    usesAuthToken: config.aiAuthMode === "auth-token",
+    executor: reviewExecutorFingerprint(config),
     prompts: config.reviewPrompts.map((goal) => goal.prompt),
     ...(stableContextFiles.some((files) => files.length > 0)
       ? { contextFiles: stableContextFiles }
       : {}),
     parallelCount: config.parallelCount,
-    maxTurns: config.maxTurns,
     autoApprove: config.autoApprove,
     modelPricing: stableModelPricing(config.modelPricing),
     buildId: process.env.AI_PR_REVIEWER_BUILD_ID?.trim() || "source",
@@ -623,7 +620,7 @@ function accountingCallout(usage: AggregatedTokenUsage, hasUnpricedModels: boole
   return [
     `> ${accounting}`,
     ...(lowerBound === undefined ? [] : [lowerBound]),
-    "> ℹ️ Claude Agent SDK model usage only; external MCP service usage is excluded.",
+    "> ℹ️ AI executor model usage only; external MCP service usage is excluded.",
   ];
 }
 

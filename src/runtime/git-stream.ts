@@ -18,6 +18,7 @@ export async function streamGitToFile(
   failureLabel: string,
   signal?: AbortSignal,
   maxBytes?: number,
+  allowedExitCodes: readonly number[] = [0],
 ): Promise<void> {
   throwIfAborted(signal);
   const child = spawn("git", args, {
@@ -81,7 +82,7 @@ export async function streamGitToFile(
   const failures: string[] = [];
   if (streamOutcome.status === "rejected") failures.push(errorMessage(streamOutcome.reason));
   if (exitOutcome.status === "rejected") failures.push(errorMessage(exitOutcome.reason));
-  else if (exitOutcome.value.code !== 0) {
+  else if (exitOutcome.value.code === null || !allowedExitCodes.includes(exitOutcome.value.code)) {
     const details = Buffer.concat(stderr).toString("utf8").trim();
     const status =
       exitOutcome.value.signal === null

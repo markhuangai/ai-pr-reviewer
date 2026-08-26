@@ -265,6 +265,8 @@ test("downloads, verifies, extracts, and executes a runtime bundle", async (t) =
       nodeMajor: 24,
       sdkVersion: "1.2.3",
       cliVersion: "4.5.6",
+      codexSdkVersion: "7.8.9",
+      codexCliVersion: "7.8.9",
       sourceCommit,
     }),
   );

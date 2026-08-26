@@ -9,14 +9,12 @@ import {
   join,
   makeRepository,
   makeReviewDiff,
-  mkdir,
   mkdtemp,
   readdir,
   reviewConfig,
   rm,
   runReviewGoal,
   runReviewGoals,
-  symlink,
   test,
   tmpdir,
   type AgentQuery,
@@ -36,7 +34,7 @@ test("runs a complete SDK review turn through the real diff and submission tools
         type: "http",
         url: "https://mcp.example.test",
         headers: { Authorization: "Bearer external-secret" },
-        tools: [{ name: "inspect", permission_policy: "always_allow" }],
+        tools: [{ name: "inspect", enabled: true }],
         timeout: 2_000,
         alwaysLoad: true,
       },
@@ -62,7 +60,9 @@ test("runs a complete SDK review turn through the real diff and submission tools
       assert.equal(options.cwd, "/workspace/repository");
       assert.equal(options.effort, "xhigh");
       assert.equal(options.permissionMode, "dontAsk");
-      assert.deepEqual(options.tools, ["Read", "Glob", "Grep"]);
+      assert.deepEqual(options.tools, []);
+      assert.ok(options.allowedTools?.includes("mcp__review_output__list_repository_files"));
+      assert.ok(options.allowedTools?.includes("mcp__review_output__search_repository"));
       assert.ok(options.allowedTools?.includes("mcp__security__*"));
       assert.ok(options.disallowedTools?.includes("Bash"));
       assert.equal(options.env?.ANTHROPIC_API_KEY, "ai-secret");
@@ -624,41 +624,7 @@ test("stops scheduling review goals after cancellation and removes the shared di
   assert.deepEqual(await readdir(repository.temporaryRoot), []);
 });
 
-test("enforces repository paths in the SDK read hook", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-read-hook-"));
-  const outside = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-read-hook-outside-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  t.after(() => rm(outside, { recursive: true, force: true }));
-  await mkdir(join(root, "src"));
-  await writeFile(join(root, "src/index.ts"), "export {};\n");
-  await writeFile(join(outside, "secret.txt"), "secret\n");
-  await symlink(join(outside, "secret.txt"), join(root, "linked-secret"));
-  const hook = agentInternals.repositoryReadHook as unknown as (
-    input: Record<string, unknown>,
-  ) => Promise<{ readonly hookSpecificOutput?: { readonly permissionDecision?: string } }>;
-  const call = (toolName: string, toolInput: unknown, hookEventName = "PreToolUse") =>
-    hook({ hook_event_name: hookEventName, tool_name: toolName, tool_input: toolInput, cwd: root });
-
-  assert.equal((await call("Read", { file_path: "src/index.ts" })).hookSpecificOutput, undefined);
-  assert.equal(
-    (await call("Read", { file_path: "linked-secret" })).hookSpecificOutput?.permissionDecision,
-    "deny",
-  );
-  assert.equal((await call("Glob", { path: "." })).hookSpecificOutput?.permissionDecision, "deny");
-  assert.equal(
-    (await call("Glob", { path: ".", pattern: "../*" })).hookSpecificOutput?.permissionDecision,
-    "deny",
-  );
-  assert.equal((await call("Grep", { path: "." })).hookSpecificOutput, undefined);
-  assert.equal(
-    (await call("Glob", { path: "src", pattern: "missing/**/*.ts" })).hookSpecificOutput,
-    undefined,
-  );
-  assert.equal((await call("Read", null)).hookSpecificOutput, undefined);
-  assert.equal((await call("Read", {}, "PostToolUse")).hookSpecificOutput, undefined);
-});
-
-test("builds an auth-token agent environment without inherited credentials", () => {
+test("builds an API-key agent environment without inherited credentials", () => {
   const originalInput = process.env.INPUT_PRIVATE_VALUE;
   const originalGitHub = process.env.GITHUB_TOKEN;
   const originalApiKey = process.env.ANTHROPIC_API_KEY;
@@ -669,13 +635,13 @@ test("builds an auth-token agent environment without inherited credentials", () 
   process.env.CLAUDE_CODE_EFFORT_LEVEL = "low";
   try {
     const environment = agentInternals.safeAgentEnvironment(
-      reviewConfig({ aiAuthMode: "auth-token", aiSecret: "auth-secret" }),
+      reviewConfig({ aiSecret: "auth-secret" }),
       "/workspace/repository",
     );
     assert.equal(environment.INPUT_PRIVATE_VALUE, undefined);
     assert.equal(environment.GITHUB_TOKEN, undefined);
-    assert.equal(environment.ANTHROPIC_API_KEY, undefined);
-    assert.equal(environment.ANTHROPIC_AUTH_TOKEN, "auth-secret");
+    assert.equal(environment.ANTHROPIC_API_KEY, "auth-secret");
+    assert.equal(environment.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(environment.CLAUDE_CODE_EFFORT_LEVEL, undefined);
   } finally {
     if (originalInput === undefined) delete process.env.INPUT_PRIVATE_VALUE;
