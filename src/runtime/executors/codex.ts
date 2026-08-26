@@ -401,6 +401,7 @@ class CodexReviewSession implements ReviewSession {
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     let completed = false;
+    let lastStreamError: string | undefined;
     try {
       const { events } = await this.thread.runStreamed(prompt, { signal: turnController.signal });
       for await (const event of events) {
@@ -417,8 +418,9 @@ class CodexReviewSession implements ReviewSession {
           return { success: false, error: event.error.message };
         }
         if (event.type === "error") {
-          this.usageComplete = false;
-          return { success: false, error: event.message };
+          // Codex emits retry notifications as top-level errors before a terminal turn event.
+          lastStreamError = event.message;
+          continue;
         }
         if (event.type === "turn.completed") {
           completed = true;
@@ -428,7 +430,10 @@ class CodexReviewSession implements ReviewSession {
       }
       if (!completed) {
         this.usageComplete = false;
-        return { success: false, error: "Codex ended the turn without a completion event." };
+        return {
+          success: false,
+          error: lastStreamError ?? "Codex ended the turn without a completion event.",
+        };
       }
       return { success: true };
     } catch (error) {
