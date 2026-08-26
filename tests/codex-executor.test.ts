@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import { access, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -67,6 +68,35 @@ function turnEvents(usage: {
       },
     },
   ];
+}
+
+function completedResponseStream(): string {
+  const events = [
+    { type: "response.created", response: { id: "response-1" } },
+    {
+      type: "response.output_item.done",
+      item: {
+        type: "message",
+        role: "assistant",
+        id: "message-1",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    },
+    {
+      type: "response.completed",
+      response: {
+        id: "response-1",
+        usage: {
+          input_tokens: 1,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens: 1,
+          output_tokens_details: { reasoning_tokens: 0 },
+          total_tokens: 2,
+        },
+      },
+    },
+  ];
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
 function fakeClient(
@@ -152,6 +182,101 @@ test("serves authenticated review tools over real Streamable HTTP MCP", async (t
     /already registered/iu,
   );
 });
+
+test(
+  "lets the real Codex SDK fall back from WebSockets to HTTP",
+  { timeout: 30_000 },
+  async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-codex-fallback-test-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const runnerTemp = join(root, "runner-temp");
+    await mkdir(runnerTemp);
+    const previousRunnerTemp = process.env.RUNNER_TEMP;
+    process.env.RUNNER_TEMP = runnerTemp;
+    t.after(() => {
+      if (previousRunnerTemp === undefined) delete process.env.RUNNER_TEMP;
+      else process.env.RUNNER_TEMP = previousRunnerTemp;
+    });
+
+    let websocketAttempts = 0;
+    const requests: unknown[] = [];
+    const serverErrors: Error[] = [];
+    const server = createServer((request, response) => {
+      if (request.method !== "POST" || request.url !== "/v1/responses") {
+        response.writeHead(404);
+        response.end();
+        return;
+      }
+      void (async () => {
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of request) {
+          if (!(chunk instanceof Uint8Array)) {
+            throw new TypeError("Codex request body contained a non-binary chunk.");
+          }
+          chunks.push(chunk);
+        }
+        requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown);
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream",
+        });
+        response.end(completedResponseStream());
+      })().catch((error: unknown) => {
+        serverErrors.push(error instanceof Error ? error : new Error(String(error)));
+        if (!response.headersSent) response.writeHead(500);
+        response.end();
+      });
+    });
+    server.on("upgrade", (_request, socket) => {
+      websocketAttempts += 1;
+      socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    t.after(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          server.close((error) => {
+            if (error === undefined) resolve();
+            else reject(error);
+          });
+        }),
+    );
+    const address = server.address();
+    assert.ok(address !== null && typeof address !== "string");
+
+    const reviewConfig = config({
+      aiBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+      model: "auto",
+    });
+    const input = await sessionInput(root, reviewConfig);
+    const executor = new CodexReviewExecutor();
+    const session = await executor.createSession({ ...input, cwd: process.cwd() });
+    t.after(() => session.close());
+
+    assert.deepEqual(await session.runReview("ignored", "Reply with done.", () => undefined), {
+      success: true,
+    });
+    assert.ok(websocketAttempts > 1);
+    assert.equal(requests.length, 1);
+    assert.equal((requests[0] as { readonly model?: unknown }).model, "auto");
+    assert.deepEqual(serverErrors, []);
+    assert.deepEqual(session.usage(), {
+      complete: true,
+      models: [
+        {
+          model: "auto",
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      ],
+    });
+    await session.close();
+  },
+);
 
 test("passes max through Codex config and sums incremental turn usage", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-codex-test-"));
@@ -383,7 +508,13 @@ test("reports Codex terminal failures and MCP transport failures", async (t) => 
   });
 
   for (const [events, expected] of [
-    [[{ type: "turn.failed", error: { message: "provider failed" } }], /provider failed/u],
+    [
+      [
+        { type: "error", message: "Reconnecting... 2/5" },
+        { type: "turn.failed", error: { message: "provider failed" } },
+      ],
+      /provider failed/u,
+    ],
     [[{ type: "error", message: "stream failed" }], /stream failed/u],
     [[], /without a completion event/u],
   ] as const) {
