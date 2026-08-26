@@ -349,7 +349,7 @@ test("passes max through Codex config and sums incremental turn usage", async (t
     await readFile(join(home, "review-instructions.md"), "utf8"),
     reviewConfig.systemPrompt ?? "Host-owned review instructions.",
   );
-  assert.equal(codexOptions?.baseUrl, "https://api.example.test/v1");
+  assert.equal(codexOptions?.baseUrl, undefined);
   assert.equal(codexOptions?.apiKey, "ai-secret");
   assert.equal(codexOptions?.env?.INPUT_PRIVATE_VALUE, undefined);
   assert.equal(codexOptions?.env?.GITHUB_TOKEN, undefined);
@@ -358,6 +358,14 @@ test("passes max through Codex config and sums incremental turn usage", async (t
 
   const rootConfig = codexOptions?.config as Record<string, unknown>;
   assert.equal(rootConfig.model_reasoning_effort, "max");
+  assert.equal(rootConfig.model_provider, "ai_pr_reviewer");
+  assert.deepEqual((rootConfig.model_providers as Record<string, unknown>).ai_pr_reviewer, {
+    name: "AI PR Reviewer custom endpoint",
+    base_url: "https://api.example.test/v1",
+    env_key: "CODEX_API_KEY",
+    wire_api: "responses",
+    supports_websockets: true,
+  });
   assert.equal((rootConfig.features as Record<string, unknown>).shell_tool, false);
   assert.equal((rootConfig.features as Record<string, unknown>).multi_agent, false);
   assert.doesNotMatch(JSON.stringify(rootConfig), /header-secret/u);
@@ -395,6 +403,10 @@ test("passes max through Codex config and sums incremental turn usage", async (t
   assert.deepEqual(await session.configuredServerFailures(), []);
   await session.close();
   await assert.rejects(access(home), /ENOENT/u);
+});
+
+test("keeps the built-in Codex provider when no custom endpoint is configured", () => {
+  assert.deepEqual(codexExecutorInternals.codexProviderConfig(undefined), {});
 });
 
 test("fails closed on command, file, web, and unconfigured MCP events", async (t) => {

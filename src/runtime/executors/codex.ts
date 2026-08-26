@@ -33,6 +33,9 @@ interface CodexConfigObject {
   [key: string]: CodexConfigValue;
 }
 
+const CODEX_MODEL_PROVIDER_ID = "ai_pr_reviewer";
+const CODEX_API_KEY_ENVIRONMENT_VARIABLE = "CODEX_API_KEY";
+
 export interface CodexThreadLike {
   runStreamed(
     input: string,
@@ -53,6 +56,22 @@ interface CodexMcpConfiguration {
 
 function configKeySegment(value: string): string {
   return /^[A-Za-z0-9_-]+$/u.test(value) ? value : JSON.stringify(value);
+}
+
+function codexProviderConfig(baseUrl: string | undefined): CodexConfigObject {
+  if (baseUrl === undefined) return {};
+  return {
+    model_provider: CODEX_MODEL_PROVIDER_ID,
+    model_providers: {
+      [CODEX_MODEL_PROVIDER_ID]: {
+        name: "AI PR Reviewer custom endpoint",
+        base_url: baseUrl,
+        env_key: CODEX_API_KEY_ENVIRONMENT_VARIABLE,
+        wire_api: "responses",
+        supports_websockets: true,
+      },
+    },
+  };
 }
 
 function externalMcpConfiguration(
@@ -166,6 +185,7 @@ function codexConfig(
   toolNames: readonly string[],
 ): CodexConfigObject {
   return {
+    ...codexProviderConfig(config.aiBaseUrl),
     model_instructions_file: instructionsFile,
     project_doc_max_bytes: 0,
     project_doc_fallback_filenames: [],
@@ -568,7 +588,6 @@ export class CodexReviewExecutor implements ReviewExecutor {
         [server.tokenEnvironmentVariable]: server.token,
       });
       const client = this.clientFactory({
-        ...(input.config.aiBaseUrl === undefined ? {} : { baseUrl: input.config.aiBaseUrl }),
         apiKey: input.config.aiSecret,
         env: environment,
         config: codexConfig(
@@ -604,6 +623,7 @@ export class CodexReviewExecutor implements ReviewExecutor {
 export const codexExecutorInternals = {
   checkedUsage,
   codexConfig,
+  codexProviderConfig,
   configKeySegment,
   createCodexHome,
   externalMcpConfiguration,
