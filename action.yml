@@ -8,7 +8,7 @@ inputs:
   executor:
     description: AI executor to use for every review goal in this run (codex or claude).
     required: false
-    default: codex
+    default: claude
   ai-base-url:
     description: Optional API base URL for Codex; required for Claude and must be Anthropic Messages API-compatible.
     required: false

@@ -44,6 +44,14 @@ function validateStable(
   return validateReleaseRequest(version, "main", "stable", releases, tags);
 }
 
+test("defaults GitHub Action reviews to Claude", async () => {
+  const action = parse(await readFile("action.yml", "utf8")) as {
+    inputs?: Record<string, { default?: unknown }>;
+  };
+
+  assert.equal(action.inputs?.executor?.default, "claude");
+});
+
 test("keeps every release workflow upload artifact for one day", async () => {
   const workflow = parse(await readFile(".github/workflows/release.yml", "utf8")) as {
     jobs?: Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>;
