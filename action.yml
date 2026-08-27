@@ -5,21 +5,17 @@ inputs:
   github-pat:
     description: A GitHub PAT that can read the target repository and optionally create pull request reviews.
     required: true
-  executor:
-    description: AI executor to use for every review goal in this run (codex or claude).
-    required: false
-    default: claude
   ai-base-url:
-    description: Optional API base URL for Codex; required for Claude and must be Anthropic Messages API-compatible.
-    required: false
+    description: Anthropic Messages API-compatible base URL.
+    required: true
   ai-secret:
-    description: Secret for the configured AI endpoint.
+    description: API key for the configured AI endpoint.
     required: true
   model:
     description: Model identifier accepted by the configured AI endpoint.
     required: true
   effort:
-    description: "Optional reasoning effort level: low, medium, high, xhigh, or max."
+    description: "Optional Claude reasoning effort level: low, medium, high, xhigh, or max."
     required: false
   system-prompt:
     description: Optional full replacement for the built-in review system prompt; the effective prompt is written to the redacted action log.
@@ -35,8 +31,9 @@ inputs:
     required: false
     default: "5"
   max-turns:
-    description: Maximum Claude Agent SDK turns per goal session; ignored with a warning by Codex.
+    description: Maximum Claude Agent SDK turns per goal session, including /goal, conversation and diff reading, and output repair.
     required: false
+    default: "50"
   auto-approve:
     description: Approve only a complete review with no Critical, High, or Medium findings.
     required: false

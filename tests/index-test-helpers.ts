@@ -116,7 +116,6 @@ export function useWorkspace(t: TestContext, path: string): void {
 
 export const config: ReviewConfig = {
   githubToken: "github-secret",
-  executor: "claude",
   aiBaseUrl:
     "https://ai.example.test/signed?api-version=2023-06-01&token=ai-url%2Fsecret&subscription-key=subscription-secret&apiKey=camel-api-secret&accessToken=camel-access-secret",
   aiSecret: "ai-secret",

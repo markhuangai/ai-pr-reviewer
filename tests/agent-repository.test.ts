@@ -74,7 +74,7 @@ test("rejects an oversized empty full-diff page without advancing", async (t) =>
   await reader.close();
 });
 
-test("reads, lists, and searches fixed repository revisions", async (t) => {
+test("reads fixed changed paths at the merge base and head, including binary metadata", async (t) => {
   const repository = await makeRepository(
     t,
     async (root) => {
@@ -154,37 +154,9 @@ test("reads, lists, and searches fixed repository revisions", async (t) => {
   const diffSource = await snapshot.diff(["new.txt"]);
   assert.match(await readFile(diffSource.path, "utf8"), /head-only/u);
   await diffSource.cleanup();
-  await assert.rejects(snapshot.diff(["review.txt"]), /not a changed pull-request path/u);
-  const unchanged = await snapshot.file("head", "review.txt");
-  assert.equal(unchanged.kind, "text");
-  assert.ok(unchanged.source);
-  assert.equal(await readFile(unchanged.source.path, "utf8"), "base\n");
-  await unchanged.source.cleanup();
-  const listing = await snapshot.list("head");
-  assert.match(await readFile(listing.path, "utf8"), /new\.txt/u);
-  assert.match(await readFile(listing.path, "utf8"), /review\.txt/u);
-  await listing.cleanup();
-  const scopedListing = await snapshot.list("base", "review.txt");
-  assert.equal(await readFile(scopedListing.path, "utf8"), "review.txt\n");
-  await scopedListing.cleanup();
-  const matches = await snapshot.search("head", "head-only", ["new.txt"]);
-  assert.match(await readFile(matches.path, "utf8"), /new\.txt:1:head-only/u);
-  await matches.cleanup();
-  const noMatches = await snapshot.search("head", "not-present");
-  assert.equal(await readFile(noMatches.path, "utf8"), "");
-  await noMatches.cleanup();
+  await assert.rejects(snapshot.file("head", "review.txt"), /not a changed pull-request path/u);
   await assert.rejects(snapshot.file("head", "../new.txt"), /outside the fixed checkout/u);
   await assert.rejects(snapshot.file("head", ".git/config"), /outside the fixed checkout/u);
-  assert.throws(() => snapshot.search("head", ""), /1 to 1000 characters/u);
-  assert.throws(
-    () =>
-      snapshot.search(
-        "head",
-        "value",
-        Array.from({ length: 21 }, () => "new.txt"),
-      ),
-    /at most 20 paths/u,
-  );
   const unavailable = new RepositorySnapshot(
     join(repository.root, "missing-checkout"),
     repository.baseSha,
@@ -510,8 +482,6 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
         submission: { summary: "No issues", findings: [] },
         readDiffPath: "review.txt",
         readRepositoryFilePath: "review.txt",
-        listRepositoryFiles: true,
-        searchRepositoryPattern: "head change",
         probeThreadErrors: true,
         probeUnknownCursor: true,
       }),
@@ -570,4 +540,23 @@ test("rejects prepared context arrays that do not match review goals", async (t)
     ),
     /Prepared context files do not match review goal/u,
   );
+});
+
+test("rejects additional unsafe glob and hook input shapes", async (t) => {
+  assert.equal(agentInternals.isSafeGlobPattern("!src/**/*.ts"), true);
+  assert.equal(agentInternals.isSafeGlobPattern("src/{a,{b,c}}"), false);
+  assert.equal(agentInternals.isSafeGlobPattern("src/}bad{"), false);
+  assert.equal(agentInternals.isSafeGlobPattern("src/{C:\\bad,ok}"), false);
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-hook-shapes-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const hook = agentInternals.repositoryReadHook as unknown as (
+    input: Record<string, unknown>,
+  ) => Promise<{ readonly hookSpecificOutput?: { readonly permissionDecision?: string } }>;
+  const deny = async (tool_name: string, tool_input: unknown) =>
+    (await hook({ hook_event_name: "PreToolUse", tool_name, tool_input, cwd: root }))
+      .hookSpecificOutput?.permissionDecision;
+  assert.equal(await deny("Read", { file_path: 1 }), "deny");
+  assert.equal(await deny("Glob", { path: ".", pattern: 1 }), "deny");
+  assert.equal(await deny("Grep", { path: ".", glob: ".git/**" }), "deny");
+  assert.equal(await deny("Glob", { path: ".", pattern: "missing/*.ts" }), undefined);
 });
