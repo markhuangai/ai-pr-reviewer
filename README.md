@@ -2,7 +2,7 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Codex SDK or Claude Agent SDK session through a shared executor interface; Codex is the default. Both executors receive the same immutable pull-request briefing, fixed-revision repository read/list/search tools, optional exact workflow-provided context files, and explicitly configured HTTP MCP servers. Shell commands and file mutation are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Executor token usage is combined across every goal and included in a default-collapsed section in both destinations.
+Each review prompt runs one isolated Codex SDK or Claude Agent SDK session through a shared executor interface; Claude is the default. Both executors receive the same immutable pull-request briefing, fixed-revision repository read/list/search tools, optional exact workflow-provided context files, and explicitly configured HTTP MCP servers. Shell commands and file mutation are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Executor token usage is combined across every goal and included in a default-collapsed section in both destinations.
 
 ## Consumer workflow
 
@@ -34,8 +34,9 @@ jobs:
       - uses: markhuangai/ai-pr-reviewer@v1-prerelease
         with:
           github-pat: ${{ secrets.PR_REVIEW_PAT }}
+          ai-base-url: ${{ secrets.AI_BASE_URL }}
           ai-secret: ${{ secrets.AI_SECRET }}
-          model: gpt-5.6-terra
+          model: claude-sonnet-4-5
           effort: high
           review-prompts: |
             [
@@ -68,23 +69,23 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 ## Inputs
 
-| Input              | Required | Default | Notes                                                                                                          |
-| ------------------ | -------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `github-pat`       | yes      |         | Fine-grained PAT with read access to the target; pull request review write access is needed when posting.      |
-| `executor`         | no       | `codex` | `codex` or `claude`; one executor applies to every goal in the run.                                            |
-| `ai-base-url`      | no       |         | Optional Codex API base URL; required for Claude and must be Anthropic Messages API-compatible.                |
-| `ai-secret`        | yes      |         | API key for the selected executor endpoint.                                                                    |
-| `model`            | yes      |         | Model name understood by the selected endpoint.                                                                |
-| `effort`           | no       |         | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                  |
-| `system-prompt`    | no       |         | Full replacement; written to the redacted action log.                                                          |
-| `model-pricing`    | no       |         | Strict JSON with a currency prefix and per-model rates per one million tokens.                                 |
-| `review-prompts`   | yes      |         | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                 |
-| `parallel-count`   | no       | `5`     | Integer from 1 to 10; limits concurrently running goal sessions.                                               |
-| `max-turns`        | no       |         | Claude-only integer from 2 to 100; Claude defaults to 50. Explicit Codex use logs a warning and has no effect. |
-| `auto-approve`     | no       | `false` | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.         |
-| `interact-with-pr` | no       | `true`  | When `false`, do not create a review; write all findings only to the workflow run summary.                     |
-| `pull-request-url` | no       |         | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.            |
-| `mcp-servers`      | no       | empty   | Strict YAML mapping of Streamable HTTP MCP servers. Stdio and legacy SSE transports are rejected.              |
+| Input              | Required | Default  | Notes                                                                                                          |
+| ------------------ | -------- | -------- | -------------------------------------------------------------------------------------------------------------- |
+| `github-pat`       | yes      |          | Fine-grained PAT with read access to the target; pull request review write access is needed when posting.      |
+| `executor`         | no       | `claude` | `codex` or `claude`; one executor applies to every goal in the run.                                            |
+| `ai-base-url`      | no       |          | Optional Codex API base URL; required for Claude and must be Anthropic Messages API-compatible.                |
+| `ai-secret`        | yes      |          | API key for the selected executor endpoint.                                                                    |
+| `model`            | yes      |          | Model name understood by the selected endpoint.                                                                |
+| `effort`           | no       |          | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                  |
+| `system-prompt`    | no       |          | Full replacement; written to the redacted action log.                                                          |
+| `model-pricing`    | no       |          | Strict JSON with a currency prefix and per-model rates per one million tokens.                                 |
+| `review-prompts`   | yes      |          | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                 |
+| `parallel-count`   | no       | `5`      | Integer from 1 to 10; limits concurrently running goal sessions.                                               |
+| `max-turns`        | no       |          | Claude-only integer from 2 to 100; Claude defaults to 50. Explicit Codex use logs a warning and has no effect. |
+| `auto-approve`     | no       | `false`  | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.         |
+| `interact-with-pr` | no       | `true`   | When `false`, do not create a review; write all findings only to the workflow run summary.                     |
+| `pull-request-url` | no       |          | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.            |
+| `mcp-servers`      | no       | empty    | Strict YAML mapping of Streamable HTTP MCP servers. Stdio and legacy SSE transports are rejected.              |
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. Codex receives the exact value, including `max`, through its CLI configuration. The Claude subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
 
