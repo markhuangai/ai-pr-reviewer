@@ -38,8 +38,6 @@ security:
     { prompt: "second goal", files: [] },
   ]);
   assert.equal(config.aiBaseUrl, "https://ai.example.test/v1");
-  assert.equal(config.executor, "codex");
-  assert.equal(config.maxTurns, undefined);
   assert.equal(config.mcpServers.security?.type, "http");
   assert.equal(config.mcpServers.security?.headers?.Authorization, "Bearer token");
   assert.equal(config.interactWithPullRequest, true);
@@ -50,48 +48,6 @@ security:
       "server:\n  type: http\n  url: https://mcp.example.test/review?tenant=foo/",
     ).server?.url,
     "https://mcp.example.test/review?tenant=foo/",
-  );
-});
-
-test("defaults to Codex and applies executor-specific base URL and turn rules", () => {
-  const values = {
-    "github-pat": "ghp_test",
-    "ai-secret": "secret",
-    model: "model",
-    "review-prompts": JSON.stringify([{ prompt: "goal" }]),
-  };
-  const defaults = readReviewConfig(reader(values));
-  assert.equal(defaults.executor, "codex");
-  assert.equal(defaults.aiBaseUrl, undefined);
-  assert.equal(defaults.maxTurns, undefined);
-
-  const warnings: string[] = [];
-  const codex = readReviewConfig(
-    reader({ ...values, executor: "CODEX", "max-turns": "25" }),
-    (warning) => warnings.push(warning),
-  );
-  assert.equal(codex.maxTurns, 25);
-  assert.deepEqual(warnings, [
-    "Input 'max-turns' applies only to the Claude executor and has no effect for Codex.",
-  ]);
-
-  assert.throws(
-    () => readReviewConfig(reader({ ...values, executor: "claude" })),
-    /ai-base-url.*required.*claude/iu,
-  );
-  const claude = readReviewConfig(
-    reader({
-      ...values,
-      executor: " CLAUDE ",
-      "ai-base-url": "https://claude.example.test",
-      "max-turns": "25",
-    }),
-  );
-  assert.equal(claude.executor, "claude");
-  assert.equal(claude.maxTurns, 25);
-  assert.throws(
-    () => readReviewConfig(reader({ ...values, executor: "other" })),
-    /executor.*codex.*claude/u,
   );
 });
 
@@ -358,10 +314,8 @@ test("reads summary-only and pull request URL inputs", () => {
   assert.equal(config.pullRequestUrl, "https://github.com/owner/repository/pull/42");
 });
 
-test("normalizes supported and deprecated MCP policies", () => {
-  const warnings: string[] = [];
-  const servers = inputInternals.parseMcpServers(
-    `
+test("accepts every supported MCP policy and optional field", () => {
+  const servers = inputInternals.parseMcpServers(`
 security:
   type: http
   url: https://mcp.example.test/path///
@@ -380,49 +334,20 @@ security:
     - name: default
   timeout: 1000
   alwaysLoad: false
-`,
-    (warning) => warnings.push(warning),
-  );
+`);
   assert.deepEqual(servers.security, {
     type: "http",
     url: "https://mcp.example.test/path",
     headers: { "X-Test": "value" },
     tools: [
-      { name: "allow", enabled: true },
-      { name: "ask", enabled: false },
-      { name: "deny", enabled: false },
+      { name: "allow", permission_policy: "always_allow", org_max_permission: "allow" },
+      { name: "ask", permission_policy: "always_ask", org_max_permission: "ask" },
+      { name: "deny", permission_policy: "always_deny", org_max_permission: "blocked" },
       { name: "default" },
     ],
     timeout: 1000,
     alwaysLoad: false,
   });
-  assert.equal(warnings.length, 3);
-  assert.ok(warnings.every((warning) => /deprecated.*enabled/u.test(warning)));
-
-  assert.deepEqual(
-    inputInternals.parseMcpServers(`
-security:
-  type: http
-  url: https://mcp.example.test/path
-  tools:
-    - name: enabled
-      enabled: true
-    - name: disabled
-      enabled: false
-    - name: default
-`),
-    {
-      security: {
-        type: "http",
-        url: "https://mcp.example.test/path",
-        tools: [
-          { name: "enabled", enabled: true },
-          { name: "disabled", enabled: false },
-          { name: "default" },
-        ],
-      },
-    },
-  );
 });
 
 test("rejects malformed MCP maps, headers, policies, and optional values", () => {

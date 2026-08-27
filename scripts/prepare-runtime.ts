@@ -52,24 +52,11 @@ export async function prepareRuntime(
     "win32/x64/",
   ]);
   if (!supportedTargets.has(target)) throw new Error(`Unsupported runtime target: ${target}.`);
-  const claudeSdkPackage = readPackage(
+  const sdkPackage = readPackage(
     await readFile(join(cwd, "node_modules/@anthropic-ai/claude-agent-sdk/package.json"), "utf8"),
   );
-  if (typeof claudeSdkPackage.version !== "string") {
+  if (typeof sdkPackage.version !== "string") {
     throw new Error("Claude Agent SDK package metadata has no version.");
-  }
-  const codexSdkPackage = readPackage(
-    await readFile(join(cwd, "node_modules/@openai/codex-sdk/package.json"), "utf8"),
-  );
-  const codexCliPackage = readPackage(
-    await readFile(join(cwd, "node_modules/@openai/codex/package.json"), "utf8"),
-  );
-  if (
-    typeof codexSdkPackage.version !== "string" ||
-    typeof codexCliPackage.version !== "string" ||
-    codexSdkPackage.version !== codexCliPackage.version
-  ) {
-    throw new Error("Codex SDK and CLI package metadata do not match.");
   }
   const expectedAsset = `runtime-${rawTargetOs}-${rawTargetCpu}.tar.gz`;
   if (asset !== expectedAsset) {
@@ -83,7 +70,7 @@ export async function prepareRuntime(
     ),
   );
   if (
-    platformPackage.version !== claudeSdkPackage.version ||
+    platformPackage.version !== sdkPackage.version ||
     !isStringArray(platformPackage.os) ||
     !platformPackage.os.includes(rawTargetOs) ||
     !isStringArray(platformPackage.cpu) ||
@@ -93,20 +80,6 @@ export async function prepareRuntime(
   ) {
     throw new Error(
       `Claude SDK native package does not match target ${rawTargetOs}/${rawTargetCpu}.`,
-    );
-  }
-  const codexPlatformPackage = readPackage(
-    await readFile(join(cwd, `node_modules/@openai/codex-${platformSuffix}/package.json`), "utf8"),
-  );
-  if (
-    codexPlatformPackage.version !== `${codexCliPackage.version}-${rawTargetOs}-${rawTargetCpu}` ||
-    !isStringArray(codexPlatformPackage.os) ||
-    !codexPlatformPackage.os.includes(rawTargetOs) ||
-    !isStringArray(codexPlatformPackage.cpu) ||
-    !codexPlatformPackage.cpu.includes(rawTargetCpu)
-  ) {
-    throw new Error(
-      `Codex CLI native package does not match target ${rawTargetOs}/${rawTargetCpu}.`,
     );
   }
   const bundle = join(resolve(cwd, destination), "bundle");
@@ -130,10 +103,8 @@ export async function prepareRuntime(
         stableTag,
         asset,
         nodeMajor: 24,
-        sdkVersion: claudeSdkPackage.version,
-        cliVersion: claudeSdkPackage.claudeCodeVersion ?? "unknown",
-        codexSdkVersion: codexSdkPackage.version,
-        codexCliVersion: codexCliPackage.version,
+        sdkVersion: sdkPackage.version,
+        cliVersion: sdkPackage.claudeCodeVersion ?? "unknown",
         sourceCommit,
       },
       null,

@@ -44,12 +44,13 @@ function validateStable(
   return validateReleaseRequest(version, "main", "stable", releases, tags);
 }
 
-test("defaults GitHub Action reviews to Claude", async () => {
+test("exposes only API-key authentication", async () => {
   const action = parse(await readFile("action.yml", "utf8")) as {
-    inputs?: Record<string, { default?: unknown }>;
+    inputs?: Record<string, { required?: boolean }>;
   };
 
-  assert.equal(action.inputs?.executor?.default, "claude");
+  assert.equal(action.inputs?.["ai-secret"]?.required, true);
+  assert.equal(action.inputs?.["ai-auth-mode"], undefined);
 });
 
 test("keeps every release workflow upload artifact for one day", async () => {
