@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { GitHubApi, githubApiInternals } from "../src/lib/github-api.js";
 import {
@@ -25,6 +27,8 @@ const context: PullRequestContext = {
   title: "Lifecycle API",
   htmlUrl: "https://github.com/owner/repository/pull/7",
 };
+
+const execFileAsync = promisify(execFile);
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -401,18 +405,21 @@ test("validates lifecycle GraphQL records and optional fields", () => {
   assert.throws(() => pullRequestConnection(null, "reviews"), /invalid GraphQL data/u);
 });
 
-test("uses an explicitly configured GraphQL endpoint", () => {
-  const previous = process.env.GITHUB_GRAPHQL_URL;
-  process.env.GITHUB_GRAPHQL_URL = "https://ghe.example/graphql/";
-  try {
-    assert.equal(
-      githubApiInternals.graphqlUrlFor("https://api.github.com"),
-      "https://ghe.example/graphql",
-    );
-  } finally {
-    if (previous === undefined) delete process.env.GITHUB_GRAPHQL_URL;
-    else process.env.GITHUB_GRAPHQL_URL = previous;
-  }
+test("uses an explicitly configured GraphQL endpoint", async () => {
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      "import { graphqlUrlFor } from './build-test/src/lib/github-review-lifecycle.js'; process.stdout.write(graphqlUrlFor('https://api.github.com'));",
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, GITHUB_GRAPHQL_URL: "https://ghe.example/graphql/" },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(stdout, "https://ghe.example/graphql");
 });
 
 test("paginates review and thread lifecycle connections", async () => {
