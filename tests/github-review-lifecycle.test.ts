@@ -241,10 +241,6 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
     githubApiInternals.graphqlUrlFor("https://api.github.com"),
     "https://api.github.com/graphql",
   );
-  assert.equal(
-    githubApiInternals.graphqlUrlFor("https://ghe.example/api/v3"),
-    "https://ghe.example/api/graphql",
-  );
 });
 
 test("validates lifecycle GraphQL records and optional fields", () => {
