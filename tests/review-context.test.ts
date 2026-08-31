@@ -13,6 +13,22 @@ import {
   reviewContextInternals,
   type ReviewConversationEntry,
 } from "../src/lib/review-context.js";
+import {
+  actionReader,
+  cleanWorkspace,
+  emptyConversationApi,
+  readReviewConfig,
+  reviewMarker,
+  runAction,
+  useWorkspace,
+} from "./index-test-helpers.js";
+import type { GitHubApi } from "../src/lib/github-api.js";
+import type {
+  ReviewLifecycleReviewRecord,
+  ReviewLifecycleSnapshot,
+  ReviewLifecycleThreadRecord,
+} from "../src/lib/github-review-lifecycle.js";
+import { fixedReplyBody } from "../src/lib/review-lifecycle.js";
 
 const timestamp = "2026-08-17T00:00:00Z";
 
@@ -75,6 +91,454 @@ function issueComment(
     ...overrides,
   };
 }
+
+test("reconciles prepared lifecycle candidates before skipping an identical review", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const reader = actionReader();
+  const oldSha = "a".repeat(40);
+  const oldReview = {
+    id: 10,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+  };
+  const duplicateReview = {
+    id: 11,
+    author: { login: "review-action", type: "User" },
+    body: reviewMarker(context, readReviewConfig(reader)),
+    commitId: context.headSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:01:00Z",
+  };
+  const oldLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "old-review-node",
+    databaseId: oldReview.id,
+    author: oldReview.author,
+    body: oldReview.body,
+    commitId: oldReview.commitId,
+    state: oldReview.state,
+    submittedAt: oldReview.submittedAt,
+    isMinimized: false,
+  };
+  const duplicateLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "duplicate-review-node",
+    databaseId: duplicateReview.id,
+    author: duplicateReview.author,
+    body: duplicateReview.body,
+    commitId: duplicateReview.commitId,
+    state: duplicateReview.state,
+    submittedAt: duplicateReview.submittedAt,
+    isMinimized: false,
+  };
+  const rootComment = {
+    nodeId: "old-finding-node",
+    databaseId: 100,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    author: oldReview.author,
+    body: "Old finding",
+    commitId: oldSha,
+    createdAt: "2026-08-31T00:00:00Z",
+    updatedAt: "2026-08-31T00:00:00Z",
+  };
+  const oldThread: ReviewLifecycleThreadRecord = {
+    nodeId: "old-thread-node",
+    isResolved: false,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    comments: [rootComment],
+  };
+  let snapshot: ReviewLifecycleSnapshot = {
+    reviews: [oldLifecycleReview, duplicateLifecycleReview],
+    threads: [oldThread],
+  };
+  const calls: string[] = [];
+  let verifierRuns = 0;
+  let goalRuns = 0;
+  let postedReviews = 0;
+  const api = {
+    ...emptyConversationApi("review-action"),
+    listReviews: () => Promise.resolve([oldReview, duplicateReview]),
+    listReviewComments: () => Promise.resolve([]),
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
+    deleteSubmittedReview: () => Promise.resolve(),
+    addReviewThreadReply: (nodeId: string) => {
+      calls.push(`reply:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: snapshot.threads.map((item) =>
+          item.nodeId === nodeId
+            ? {
+                ...item,
+                comments: [
+                  ...item.comments,
+                  {
+                    ...rootComment,
+                    nodeId: "fixed-reply-node",
+                    databaseId: 101,
+                    replyToId: rootComment.databaseId,
+                    body: fixedReplyBody(context.headSha),
+                    commitId: context.headSha,
+                  },
+                ],
+              }
+            : item,
+        ),
+      };
+      return Promise.resolve();
+    },
+    resolveReviewThread: (nodeId: string) => {
+      calls.push(`resolve:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: snapshot.threads.map((item) =>
+          item.nodeId === nodeId ? { ...item, isResolved: true } : item,
+        ),
+      };
+      return Promise.resolve();
+    },
+    minimizeComment: () => Promise.resolve(),
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  const result = await runAction(reader, [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => {
+      throw new Error("duplicate review should skip before reading files");
+    },
+    runResolutionVerifiers: () => {
+      verifierRuns += 1;
+      return Promise.resolve([
+        { status: "completed", verdict: "fixed", confidence: "high", rationale: "gone" },
+      ]);
+    },
+    runGoals: () => {
+      goalRuns += 1;
+      return Promise.resolve([]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.deepEqual(result, { skipped: true });
+  assert.equal(verifierRuns, 1);
+  assert.equal(goalRuns, 0);
+  assert.equal(postedReviews, 0);
+  assert.deepEqual(calls, ["reply:old-thread-node", "resolve:old-thread-node"]);
+});
+
+test("finalizes resolved lifecycle reviews before skipping an identical review", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const reader = actionReader();
+  const oldSha = "a".repeat(40);
+  const oldReview = {
+    id: 30,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+  };
+  const duplicateReview = {
+    id: 31,
+    author: { login: "review-action", type: "User" },
+    body: reviewMarker(context, readReviewConfig(reader)),
+    commitId: context.headSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:01:00Z",
+  };
+  const oldLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "old-review-node-finalize",
+    databaseId: oldReview.id,
+    author: oldReview.author,
+    body: oldReview.body,
+    commitId: oldReview.commitId,
+    state: oldReview.state,
+    submittedAt: oldReview.submittedAt,
+    isMinimized: false,
+  };
+  const duplicateLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "duplicate-review-node-finalize",
+    databaseId: duplicateReview.id,
+    author: duplicateReview.author,
+    body: duplicateReview.body,
+    commitId: duplicateReview.commitId,
+    state: duplicateReview.state,
+    submittedAt: duplicateReview.submittedAt,
+    isMinimized: false,
+  };
+  const resolvedThread: ReviewLifecycleThreadRecord = {
+    nodeId: "resolved-thread-finalize",
+    isResolved: true,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    comments: [
+      {
+        nodeId: "resolved-comment-finalize",
+        databaseId: 300,
+        reviewId: oldReview.id,
+        reviewNodeId: oldLifecycleReview.nodeId,
+        author: oldReview.author,
+        body: "Old finding",
+        commitId: oldSha,
+        createdAt: "2026-08-31T00:00:00Z",
+        updatedAt: "2026-08-31T00:00:00Z",
+      },
+    ],
+  };
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [oldLifecycleReview, duplicateLifecycleReview],
+    threads: [resolvedThread],
+  };
+  const calls: string[] = [];
+  let goalRuns = 0;
+  let postedReviews = 0;
+  const api = {
+    ...emptyConversationApi("review-action"),
+    listReviews: () => Promise.resolve([oldReview, duplicateReview]),
+    listReviewComments: () => Promise.resolve([]),
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
+    deleteSubmittedReview: () => Promise.resolve(),
+    addReviewThreadReply: () => Promise.resolve(),
+    resolveReviewThread: () => Promise.resolve(),
+    minimizeComment: (nodeId: string) => {
+      calls.push(`minimize:${nodeId}`);
+      return Promise.resolve();
+    },
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  const result = await runAction(reader, [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => {
+      throw new Error("duplicate review should skip before reading files");
+    },
+    runGoals: () => {
+      goalRuns += 1;
+      return Promise.resolve([]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.deepEqual(result, { skipped: true });
+  assert.equal(goalRuns, 0);
+  assert.equal(postedReviews, 0);
+  assert.deepEqual(calls, ["minimize:old-review-node-finalize"]);
+});
+
+test("refreshes the conversation digest after lifecycle replies before duplicate detection", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const reader = actionReader();
+  const oldSha = "a".repeat(40);
+  const oldReview = {
+    id: 20,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+  };
+  const duplicateReviewBase = {
+    id: 21,
+    author: { login: "review-action", type: "User" },
+    body: "placeholder",
+    commitId: context.headSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:01:00Z",
+  };
+  const rootConversationComment = {
+    id: 200,
+    reviewId: oldReview.id,
+    author: oldReview.author,
+    body: "Old finding",
+    commitId: oldSha,
+    originalCommitId: oldSha,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    createdAt: "2026-08-31T00:00:00Z",
+    updatedAt: "2026-08-31T00:00:00Z",
+  };
+  const humanConversationReply = {
+    ...rootConversationComment,
+    id: 201,
+    inReplyToId: rootConversationComment.id,
+    author: { login: "reviewer", type: "User" },
+    body: "Please fix this finding.",
+    createdAt: "2026-08-31T00:00:01Z",
+    updatedAt: "2026-08-31T00:00:01Z",
+  };
+  const fixedConversationReply = {
+    ...rootConversationComment,
+    id: 202,
+    inReplyToId: rootConversationComment.id,
+    body: fixedReplyBody(context.headSha),
+    commitId: context.headSha,
+    createdAt: "2026-08-31T00:00:02Z",
+    updatedAt: "2026-08-31T00:00:02Z",
+  };
+  const conversationBefore = [rootConversationComment, humanConversationReply];
+  const conversationAfter = [...conversationBefore, fixedConversationReply];
+  const duplicateReview = {
+    ...duplicateReviewBase,
+    body: reviewMarker(
+      context,
+      readReviewConfig(reader),
+      buildReviewConversation(
+        "review-action",
+        [oldReview, duplicateReviewBase],
+        conversationAfter,
+        [],
+      ).digest,
+      [[]],
+    ),
+  };
+  const oldLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "old-review-node-digest",
+    databaseId: oldReview.id,
+    author: oldReview.author,
+    body: oldReview.body,
+    commitId: oldReview.commitId,
+    state: oldReview.state,
+    submittedAt: oldReview.submittedAt,
+    isMinimized: false,
+  };
+  const duplicateLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "duplicate-review-node-digest",
+    databaseId: duplicateReview.id,
+    author: duplicateReview.author,
+    body: duplicateReview.body,
+    commitId: duplicateReview.commitId,
+    state: duplicateReview.state,
+    submittedAt: duplicateReview.submittedAt,
+    isMinimized: false,
+  };
+  const rootLifecycleComment = {
+    nodeId: "old-finding-node-digest",
+    databaseId: rootConversationComment.id,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    author: oldReview.author,
+    body: rootConversationComment.body,
+    commitId: oldSha,
+    createdAt: rootConversationComment.createdAt,
+    updatedAt: rootConversationComment.updatedAt,
+  };
+  const humanLifecycleReply = {
+    ...rootLifecycleComment,
+    nodeId: "human-reply-node-digest",
+    databaseId: humanConversationReply.id,
+    replyToId: rootLifecycleComment.databaseId,
+    author: humanConversationReply.author,
+    body: humanConversationReply.body,
+    createdAt: humanConversationReply.createdAt,
+    updatedAt: humanConversationReply.updatedAt,
+  };
+  const fixedLifecycleReply = {
+    ...rootLifecycleComment,
+    nodeId: "fixed-reply-node-digest",
+    databaseId: fixedConversationReply.id,
+    replyToId: rootLifecycleComment.databaseId,
+    body: fixedConversationReply.body,
+    commitId: context.headSha,
+    createdAt: fixedConversationReply.createdAt,
+    updatedAt: fixedConversationReply.updatedAt,
+  };
+  const initialThread: ReviewLifecycleThreadRecord = {
+    nodeId: "old-thread-node-digest",
+    isResolved: false,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    comments: [rootLifecycleComment, humanLifecycleReply],
+  };
+  let snapshot: ReviewLifecycleSnapshot = {
+    reviews: [oldLifecycleReview, duplicateLifecycleReview],
+    threads: [initialThread],
+  };
+  let conversationReads = 0;
+  let goalRuns = 0;
+  const calls: string[] = [];
+  const api = {
+    ...emptyConversationApi("review-action"),
+    listReviews: () => Promise.resolve([oldReview, duplicateReview]),
+    listReviewComments: () => {
+      conversationReads += 1;
+      return Promise.resolve(conversationReads === 1 ? conversationBefore : conversationAfter);
+    },
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
+    deleteSubmittedReview: () => Promise.resolve(),
+    addReviewThreadReply: (nodeId: string) => {
+      calls.push(`reply:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: snapshot.threads.map((item) =>
+          item.nodeId === nodeId
+            ? { ...item, comments: [...item.comments, fixedLifecycleReply] }
+            : item,
+        ),
+      };
+      return Promise.resolve();
+    },
+    resolveReviewThread: (nodeId: string) => {
+      calls.push(`resolve:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: snapshot.threads.map((item) =>
+          item.nodeId === nodeId ? { ...item, isResolved: true } : item,
+        ),
+      };
+      return Promise.resolve();
+    },
+    minimizeComment: () => Promise.resolve(),
+    createReview: () => Promise.resolve(),
+  } as unknown as GitHubApi;
+  const result = await runAction(reader, [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => {
+      throw new Error("duplicate review should skip before reading files");
+    },
+    runResolutionVerifiers: () =>
+      Promise.resolve([
+        { status: "completed", verdict: "fixed", confidence: "high", rationale: "gone" },
+      ]),
+    runGoals: () => {
+      goalRuns += 1;
+      return Promise.resolve([]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.deepEqual(result, { skipped: true });
+  assert.equal(conversationReads, 2);
+  assert.equal(goalRuns, 0);
+  assert.deepEqual(calls, ["reply:old-thread-node-digest", "resolve:old-thread-node-digest"]);
+});
 
 test("classifies people, bots, apps, and action-authored content", () => {
   const { ACTION_MARKER, authorRole } = reviewContextInternals;

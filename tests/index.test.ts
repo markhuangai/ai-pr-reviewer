@@ -28,6 +28,11 @@ import {
   useWorkspace,
   writeFile,
 } from "./index-test-helpers.js";
+import type {
+  ReviewLifecycleReviewRecord,
+  ReviewLifecycleSnapshot,
+  ReviewLifecycleThreadRecord,
+} from "../src/lib/github-review-lifecycle.js";
 
 test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
@@ -815,4 +820,126 @@ test("reviews the captured event refs without querying their live state", async 
   assert.equal(result.skipped, false);
   assert.equal(refReads, 0);
   assert.equal(postedReviews, 1);
+});
+
+test("reconciles interactive lifecycle state before and after the current review", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const oldSha = "a".repeat(40);
+  const findingReview: ReviewLifecycleReviewRecord = {
+    nodeId: "finding-review-node",
+    databaseId: 22,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review\n\nSee the inline comments for details.`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+    isMinimized: false,
+  };
+  const cleanReview: ReviewLifecycleReviewRecord = {
+    nodeId: "clean-review-node",
+    databaseId: 21,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"e".repeat(64)} -->\n## ✨ Good job!\n\nNo actionable issues found.`,
+    commitId: oldSha,
+    state: "APPROVED",
+    submittedAt: "2026-08-31T00:00:00Z",
+    isMinimized: false,
+  };
+  const findingThread: ReviewLifecycleThreadRecord = {
+    nodeId: "finding-thread-node",
+    isResolved: true,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: findingReview.databaseId,
+    reviewNodeId: findingReview.nodeId,
+    comments: [
+      {
+        nodeId: "finding-comment-node",
+        databaseId: 220,
+        reviewId: findingReview.databaseId,
+        reviewNodeId: findingReview.nodeId,
+        author: { login: "review-action", type: "User" },
+        body: "Old finding",
+        commitId: oldSha,
+        createdAt: "2026-08-31T00:00:00Z",
+        updatedAt: "2026-08-31T00:00:00Z",
+      },
+    ],
+  };
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [cleanReview, findingReview],
+    threads: [findingThread],
+  };
+  const calls: string[] = [];
+  const api = {
+    ...emptyConversationApi("review-action"),
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
+    deleteSubmittedReview: (nodeId: string) => {
+      calls.push(`delete:${nodeId}`);
+      return Promise.resolve();
+    },
+    addReviewThreadReply: () => Promise.resolve(),
+    resolveReviewThread: () => Promise.resolve(),
+    minimizeComment: (nodeId: string) => {
+      calls.push(`minimize:${nodeId}`);
+      return Promise.resolve();
+    },
+    createReview: () => {
+      calls.push("create");
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  const result = await runAction(actionReader(), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.deepEqual(calls, ["delete:clean-review-node", "create", "minimize:finding-review-node"]);
+});
+
+test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  let lifecycleCalls = 0;
+  const api = {
+    ...emptyConversationApi("review-action"),
+    getReviewLifecycleSnapshot: () => {
+      lifecycleCalls += 1;
+      return Promise.reject(new Error("lifecycle must not run"));
+    },
+    deleteSubmittedReview: () => Promise.resolve(),
+    addReviewThreadReply: () => Promise.resolve(),
+    resolveReviewThread: () => Promise.resolve(),
+    minimizeComment: () => Promise.resolve(),
+  } as unknown as GitHubApi;
+  const result = await runAction(actionReader({ "interact-with-pr": "false" }), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(lifecycleCalls, 0);
 });

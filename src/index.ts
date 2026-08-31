@@ -29,8 +29,18 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
+import { redact } from "./lib/redaction.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
+import {
+  finalizeReviewLifecycle,
+  isReviewLifecycleApi,
+  logLifecycleResult,
+  prepareReviewLifecycle,
+  resolveReviewLifecycle,
+  type ReviewLifecyclePreparation,
+} from "./lib/review-lifecycle.js";
 import { runReviewGoals } from "./runtime/agent.js";
+import { runResolutionVerifiers, type ResolutionQuery } from "./runtime/resolution-session.js";
 import {
   createPullRequestWorkspace,
   type PullRequestWorkspace,
@@ -47,25 +57,6 @@ const execFileAsync = promisify(execFile);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function redactSecret(value: string, secret: string): string {
-  if (secret.length < 8 && /^[A-Za-z0-9]+$/.test(secret)) {
-    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "g");
-    return value.replace(pattern, "[REDACTED]");
-  }
-  return value.split(secret).join("[REDACTED]");
-}
-
-function redact(value: string, secrets: readonly string[]): string {
-  return secrets
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length)
-    .reduce((result, secret) => redactSecret(result, secret), value);
 }
 
 function redactGoals(
@@ -276,12 +267,46 @@ export async function runAction(
     );
     throwIfAborted(signal);
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
-    const conversation = await loadConversation(api, context, authenticatedLogin);
+    let conversation = await loadConversation(api, context, authenticatedLogin);
+    const lifecycleApi =
+      config.interactWithPullRequest && isReviewLifecycleApi(api) ? api : undefined;
+    const lifecyclePreparation: ReviewLifecyclePreparation | undefined =
+      lifecycleApi === undefined
+        ? undefined
+        : await prepareReviewLifecycle(lifecycleApi, context, authenticatedLogin);
+    if (lifecyclePreparation?.deletedCleanReviewIds.length) {
+      core.info(
+        `Removed ${lifecyclePreparation.deletedCleanReviewIds.length} stale clean AI review${lifecyclePreparation.deletedCleanReviewIds.length === 1 ? "" : "s"} before analysis.`,
+      );
+    }
     const briefing =
       typeof (api as GitHubApi & { getLinkedIssues?: unknown }).getLinkedIssues === "function"
         ? await api.getLinkedIssues(context)
         : emptyReviewBriefing();
     throwIfAborted(signal);
+    let resolvedThreadIds: readonly string[] = [];
+    if (lifecycleApi !== undefined && lifecyclePreparation !== undefined) {
+      resolvedThreadIds = await resolveReviewLifecycle(
+        lifecycleApi,
+        lifecyclePreparation,
+        context,
+        authenticatedLogin,
+        config,
+        workspace,
+        dependencies.queryAgent,
+        abortController,
+        dependencies.runResolutionVerifiers,
+      );
+      if (resolvedThreadIds.length > 0) {
+        core.info(
+          `Resolved ${resolvedThreadIds.length} stale AI review thread${resolvedThreadIds.length === 1 ? "" : "s"} before posting the current review.`,
+        );
+      }
+      if (lifecyclePreparation.candidates.length > 0) {
+        conversation = await loadConversation(api, context, authenticatedLogin);
+        throwIfAborted(signal);
+      }
+    }
     if (config.interactWithPullRequest) {
       const marker = reviewMarker(
         context,
@@ -299,6 +324,14 @@ export async function runAction(
             review.body.includes(marker),
         )
       ) {
+        if (lifecycleApi !== undefined) {
+          const minimizedReviewIds = await finalizeReviewLifecycle(
+            lifecycleApi,
+            context,
+            authenticatedLogin,
+          );
+          logLifecycleResult({ resolvedThreadIds: [], minimizedReviewIds });
+        }
         core.info("An identical review already exists for this pull request head; skipping.");
         return { skipped: true };
       }
@@ -410,6 +443,14 @@ export async function runAction(
       });
       throwIfAborted(signal);
     }
+    if (lifecycleApi !== undefined) {
+      const minimizedReviewIds = await finalizeReviewLifecycle(
+        lifecycleApi,
+        context,
+        authenticatedLogin,
+      );
+      logLifecycleResult({ resolvedThreadIds, minimizedReviewIds });
+    }
     if (review.partial)
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
     return { skipped: false, review };
@@ -425,6 +466,8 @@ interface ActionDependencies {
   readonly readFiles?: typeof readPullRequestFilesFromCheckout;
   readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
+  readonly queryAgent?: ResolutionQuery;
+  readonly runResolutionVerifiers?: typeof runResolutionVerifiers;
   readonly writeSummary: typeof writeRunSummary;
 }
 
@@ -435,6 +478,7 @@ const defaultActionDependencies: ActionDependencies = {
   createWorkspace: createPullRequestWorkspace,
   readFiles: readPullRequestFilesFromCheckout,
   runGoals: runReviewGoals,
+  runResolutionVerifiers,
   writeSummary: writeRunSummary,
 };
 

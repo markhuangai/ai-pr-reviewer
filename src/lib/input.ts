@@ -450,7 +450,7 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
     parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
-    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 100),
+    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 500),
     autoApprove: parseBoolean(reader.get("auto-approve"), "auto-approve", false),
     interactWithPullRequest: parseBoolean(reader.get("interact-with-pr"), "interact-with-pr", true),
     ...(pullRequestUrl.length === 0
