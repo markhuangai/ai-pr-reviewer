@@ -267,7 +267,7 @@ export async function runAction(
     );
     throwIfAborted(signal);
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
-    const conversation = await loadConversation(api, context, authenticatedLogin);
+    let conversation = await loadConversation(api, context, authenticatedLogin);
     const lifecycleApi =
       config.interactWithPullRequest && isReviewLifecycleApi(api) ? api : undefined;
     const lifecyclePreparation: ReviewLifecyclePreparation | undefined =
@@ -284,6 +284,29 @@ export async function runAction(
         ? await api.getLinkedIssues(context)
         : emptyReviewBriefing();
     throwIfAborted(signal);
+    let resolvedThreadIds: readonly string[] = [];
+    if (lifecycleApi !== undefined && lifecyclePreparation !== undefined) {
+      resolvedThreadIds = await resolveReviewLifecycle(
+        lifecycleApi,
+        lifecyclePreparation,
+        context,
+        authenticatedLogin,
+        config,
+        workspace,
+        dependencies.queryAgent,
+        abortController,
+        dependencies.runResolutionVerifiers,
+      );
+      if (resolvedThreadIds.length > 0) {
+        core.info(
+          `Resolved ${resolvedThreadIds.length} stale AI review thread${resolvedThreadIds.length === 1 ? "" : "s"} before posting the current review.`,
+        );
+      }
+      if (lifecyclePreparation.candidates.length > 0) {
+        conversation = await loadConversation(api, context, authenticatedLogin);
+        throwIfAborted(signal);
+      }
+    }
     if (config.interactWithPullRequest) {
       const marker = reviewMarker(
         context,
@@ -313,25 +336,6 @@ export async function runAction(
       signal,
     );
     throwIfAborted(signal);
-    let resolvedThreadIds: readonly string[] = [];
-    if (lifecycleApi !== undefined && lifecyclePreparation !== undefined) {
-      resolvedThreadIds = await resolveReviewLifecycle(
-        lifecycleApi,
-        lifecyclePreparation,
-        context,
-        authenticatedLogin,
-        config,
-        workspace,
-        dependencies.queryAgent,
-        abortController,
-        dependencies.runResolutionVerifiers,
-      );
-      if (resolvedThreadIds.length > 0) {
-        core.info(
-          `Resolved ${resolvedThreadIds.length} stale AI review thread${resolvedThreadIds.length === 1 ? "" : "s"} before posting the current review.`,
-        );
-      }
-    }
     core.info(
       `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
     );
