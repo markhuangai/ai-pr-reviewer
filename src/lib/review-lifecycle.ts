@@ -17,7 +17,8 @@ import {
 
 const ACTION_REVIEW_MARKER =
   /<!--\s*ai-pr-reviewer:v3:((?:[0-9a-f]{40}|[0-9a-f]{64})):[0-9a-f]{64}\s*-->/iu;
-const FIXED_REPLY_MARKER = /<!--\s*ai-pr-reviewer:fixed:v1:((?:[0-9a-f]{40}|[0-9a-f]{64}))\s*-->/iu;
+const FIXED_COMMENT_MARKER =
+  /^<!--\s*ai-pr-reviewer:fixed:v2:((?:[0-9a-f]{40}|[0-9a-f]{64}))\s*-->/iu;
 const STALE_REVIEW_MARKER =
   /<!--\s*ai-pr-reviewer:stale:v1:((?:[0-9a-f]{40}|[0-9a-f]{64}))\s*-->/iu;
 
@@ -48,7 +49,7 @@ export interface ReviewLifecycleApi {
   getPullRequestHeadSha(context: PullRequestContext): Promise<string>;
   updateSubmittedReview(reviewNodeId: string, body: string): Promise<void>;
   dismissSubmittedReview(reviewNodeId: string, message: string): Promise<void>;
-  addReviewThreadReply(threadNodeId: string, body: string): Promise<void>;
+  updateReviewComment(context: PullRequestContext, commentId: number, body: string): Promise<void>;
   resolveReviewThread(threadNodeId: string): Promise<void>;
   minimizeComment(subjectNodeId: string): Promise<void>;
 }
@@ -144,19 +145,8 @@ function threadRevision(thread: ReviewLifecycleThreadRecord): string {
     .digest("hex");
 }
 
-function threadRevisionWithoutOwnedFixedReplies(
-  thread: ReviewLifecycleThreadRecord,
-  headSha: string,
-  authenticatedLogin: string,
-): string {
-  const comments = thread.comments.filter(
-    (comment) =>
-      !(
-        comment.replyToId !== undefined &&
-        sameLogin(comment.author?.login, authenticatedLogin) &&
-        FIXED_REPLY_MARKER.exec(comment.body)?.[1]?.toLowerCase() === headSha.toLowerCase()
-      ),
-  );
+function threadRevisionWithoutRootEdit(thread: ReviewLifecycleThreadRecord): string {
+  const rootNodeId = threadRoot(thread)?.nodeId;
   return createHash("sha256")
     .update(
       JSON.stringify({
@@ -166,7 +156,9 @@ function threadRevisionWithoutOwnedFixedReplies(
         originalLine: thread.originalLine,
         isResolved: thread.isResolved,
         isOutdated: thread.isOutdated,
-        comments,
+        comments: thread.comments.map((comment) =>
+          comment.nodeId === rootNodeId ? { ...comment, body: "", updatedAt: "" } : comment,
+        ),
       }),
     )
     .digest("hex");
@@ -209,12 +201,27 @@ export function selectUnresolvedActionThreads(
   return candidates;
 }
 
-export function fixedReplyBody(headSha: string): string {
+function fixedCommentPrefix(headSha: string): string {
   return [
-    `Fixed in \`${headSha}\`: a fresh AI inspection found that the original failure path is no longer present at this head.`,
+    `<!-- ai-pr-reviewer:fixed:v2:${headSha} -->`,
     "",
-    `<!-- ai-pr-reviewer:fixed:v1:${headSha} -->`,
+    `✅ **Fixed in \`${headSha}\`**`,
+    "",
+    "A fresh AI inspection found that the original failure path is no longer present at this head.",
+    "",
+    "---",
   ].join("\n");
+}
+
+function originalFindingBody(body: string): string {
+  const fixedHeadSha = FIXED_COMMENT_MARKER.exec(body)?.[1];
+  if (fixedHeadSha === undefined) return body;
+  const prefix = fixedCommentPrefix(fixedHeadSha);
+  return body.startsWith(`${prefix}\n\n`) ? body.slice(prefix.length + 2) : body;
+}
+
+export function fixedCommentBody(body: string, headSha: string): string {
+  return `${fixedCommentPrefix(headSha)}\n\n${originalFindingBody(body)}`;
 }
 
 export function staleReviewBody(review: ReviewLifecycleReviewRecord, headSha: string): string {
@@ -283,44 +290,35 @@ export async function prepareReviewLifecycle(
   };
 }
 
-function hasFixedReply(
+function hasFixedComment(
   thread: ReviewLifecycleThreadRecord,
   headSha: string,
   authenticatedLogin: string,
 ): boolean {
-  return thread.comments.some((comment) => {
-    const marker = FIXED_REPLY_MARKER.exec(comment.body);
-    return (
-      marker?.[1]?.toLowerCase() === headSha.toLowerCase() &&
-      comment.replyToId !== undefined &&
-      sameLogin(comment.author?.login, authenticatedLogin)
-    );
-  });
+  const root = threadRoot(thread);
+  return (
+    root !== undefined &&
+    sameLogin(root.author?.login, authenticatedLogin) &&
+    root.body === fixedCommentBody(root.body, headSha)
+  );
 }
 
-function onlyExpectedFixedReply(
+function onlyExpectedFixedCommentUpdate(
   before: ReviewLifecycleThreadRecord,
   after: ReviewLifecycleThreadRecord,
-  headSha: string,
+  expectedBody: string,
   authenticatedLogin: string,
 ): boolean {
-  const beforeFixedReplies = before.comments.filter(
-    (comment) =>
-      comment.replyToId !== undefined &&
-      sameLogin(comment.author?.login, authenticatedLogin) &&
-      FIXED_REPLY_MARKER.exec(comment.body)?.[1]?.toLowerCase() === headSha.toLowerCase(),
-  ).length;
-  const afterFixedReplies = after.comments.filter(
-    (comment) =>
-      comment.replyToId !== undefined &&
-      sameLogin(comment.author?.login, authenticatedLogin) &&
-      FIXED_REPLY_MARKER.exec(comment.body)?.[1]?.toLowerCase() === headSha.toLowerCase(),
-  ).length;
+  const beforeRoot = threadRoot(before);
+  const afterRoot = threadRoot(after);
   return (
     !after.isResolved &&
-    afterFixedReplies === beforeFixedReplies + 1 &&
-    threadRevisionWithoutOwnedFixedReplies(before, headSha, authenticatedLogin) ===
-      threadRevisionWithoutOwnedFixedReplies(after, headSha, authenticatedLogin)
+    beforeRoot !== undefined &&
+    afterRoot !== undefined &&
+    beforeRoot.nodeId === afterRoot.nodeId &&
+    sameLogin(afterRoot.author?.login, authenticatedLogin) &&
+    afterRoot.body === expectedBody &&
+    threadRevisionWithoutRootEdit(before) === threadRevisionWithoutRootEdit(after)
   );
 }
 
@@ -382,15 +380,18 @@ export async function resolveReviewLifecycle(
     ) {
       continue;
     }
-    if (!hasFixedReply(currentThread, context.headSha, authenticatedLogin)) {
+    if (!hasFixedComment(currentThread, context.headSha, authenticatedLogin)) {
       if (!(await lifecycleHeadMatches(api, context))) {
         core.warning(
-          "The pull request head changed before adding a lifecycle reply; stopping lifecycle mutations.",
+          "The pull request head changed before updating a lifecycle comment; stopping lifecycle mutations.",
         );
         return resolvedThreadIds;
       }
-      const beforeReplyThread = currentThread;
-      await api.addReviewThreadReply(currentThread.nodeId, fixedReplyBody(context.headSha));
+      const beforeUpdateThread = currentThread;
+      const root = threadRoot(currentThread);
+      if (root === undefined) continue;
+      const updatedBody = fixedCommentBody(root.body, context.headSha);
+      await api.updateReviewComment(context, root.databaseId, updatedBody);
       latest = await api.getReviewLifecycleSnapshot(context);
       currentThread = latest.threads.find((thread) => thread.nodeId === candidate.thread.nodeId);
       currentReview = latest.reviews.find(
@@ -402,10 +403,10 @@ export async function resolveReviewLifecycle(
         currentThread.isResolved ||
         !isFindingActionReview(currentReview, context, authenticatedLogin) ||
         !threadBelongsToReview(currentThread, currentReview, authenticatedLogin) ||
-        !onlyExpectedFixedReply(
-          beforeReplyThread,
+        !onlyExpectedFixedCommentUpdate(
+          beforeUpdateThread,
           currentThread,
-          context.headSha,
+          updatedBody,
           authenticatedLogin,
         )
       ) {
@@ -516,7 +517,7 @@ export function isReviewLifecycleApi(value: GitHubApi): value is GitHubApi & Rev
     typeof (value as Partial<ReviewLifecycleApi>).getPullRequestHeadSha === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).updateSubmittedReview === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).dismissSubmittedReview === "function" &&
-    typeof (value as Partial<ReviewLifecycleApi>).addReviewThreadReply === "function" &&
+    typeof (value as Partial<ReviewLifecycleApi>).updateReviewComment === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).resolveReviewThread === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).minimizeComment === "function"
   );
@@ -537,11 +538,11 @@ export function logLifecycleResult(result: ReviewLifecycleResult): void {
 
 export const reviewLifecycleInternals = {
   ACTION_REVIEW_MARKER,
-  FIXED_REPLY_MARKER,
+  FIXED_COMMENT_MARKER,
   STALE_REVIEW_MARKER,
   isHighConfidenceFixed,
   threadRevision,
-  threadRevisionWithoutOwnedFixedReplies,
-  onlyExpectedFixedReply,
+  threadRevisionWithoutRootEdit,
+  onlyExpectedFixedCommentUpdate,
   threadRoot,
 };

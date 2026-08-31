@@ -114,14 +114,6 @@ export const DISMISS_REVIEW_MUTATION = `
   }
 `;
 
-export const REPLY_TO_THREAD_MUTATION = `
-  mutation AiPrReviewerReplyToThread($threadId: ID!, $body: String!) {
-    addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
-      comment { id databaseId }
-    }
-  }
-`;
-
 export const RESOLVE_THREAD_MUTATION = `
   mutation AiPrReviewerResolveThread($threadId: ID!) {
     resolveReviewThread(input: { threadId: $threadId }) {

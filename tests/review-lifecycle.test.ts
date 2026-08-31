@@ -10,7 +10,7 @@ import {
 } from "./index-test-helpers.js";
 import {
   finalizeReviewLifecycle,
-  fixedReplyBody,
+  fixedCommentBody,
   isActionOwnedReview,
   isCleanActionReview,
   isFindingActionReview,
@@ -127,8 +127,8 @@ function apiFor(snapshot: ReviewLifecycleSnapshot, calls: string[]): ReviewLifec
       calls.push(`dismiss:${nodeId}:${message}`);
       return Promise.resolve();
     },
-    addReviewThreadReply: (nodeId, body) => {
-      calls.push(`reply:${nodeId}:${body}`);
+    updateReviewComment: (_context, commentId, body) => {
+      calls.push(`comment:${commentId}:${body}`);
       return Promise.resolve();
     },
     resolveReviewThread: (nodeId) => {
@@ -309,8 +309,10 @@ test("skips lifecycle mutations when the live pull-request head differs", async 
   assert.deepEqual(calls, []);
 });
 
-test("adds the fixed reply before resolving an unchanged high-confidence thread", async () => {
+test("updates the root finding before resolving an unchanged high-confidence thread", async () => {
   const original = thread("thread-2", 2, false);
+  const root = original.comments[0];
+  assert.ok(root);
   const snapshot: ReviewLifecycleSnapshot = {
     reviews: [review(2, findingBody())],
     threads: [original],
@@ -326,28 +328,14 @@ test("adds the fixed reply before resolving an unchanged high-confidence thread"
   const api: ReviewLifecycleApi = {
     ...apiFor(snapshot, calls),
     getReviewLifecycleSnapshot: () => Promise.resolve(currentSnapshot),
-    addReviewThreadReply: (nodeId, body) => {
-      calls.push(`reply:${nodeId}:${body}`);
+    updateReviewComment: (_context, commentId, body) => {
+      calls.push(`comment:${commentId}:${body}`);
       currentSnapshot = {
         ...currentSnapshot,
         threads: [
           {
             ...original,
-            comments: [
-              ...original.comments,
-              {
-                nodeId: "fixed-comment",
-                databaseId: 12,
-                reviewId: 2,
-                reviewNodeId: "review-node-2",
-                replyToId: original.comments[0]?.databaseId ?? 1,
-                author: { login: "review-action", type: "User" },
-                body: fixedReplyBody(headSha),
-                commitId: headSha,
-                createdAt: "2026-08-31T00:02:00Z",
-                updatedAt: "2026-08-31T00:02:00Z",
-              },
-            ],
+            comments: [{ ...root, body, updatedAt: "2026-08-31T00:02:00Z" }],
           },
         ],
       };
@@ -370,8 +358,9 @@ test("adds the fixed reply before resolving an unchanged high-confidence thread"
   );
   assert.deepEqual(resolved, ["thread-2"]);
   assert.equal(calls.length, 2);
-  assert.match(calls[0] ?? "", /^reply:thread-2:/u);
+  assert.match(calls[0] ?? "", new RegExp(`^comment:${root.databaseId}:`));
   assert.match(calls[0] ?? "", new RegExp("Fixed in `" + headSha + "`"));
+  assert.match(calls[0] ?? "", /Original finding/u);
   assert.equal(calls[1], "resolve:thread-2");
 });
 
@@ -441,11 +430,18 @@ test("minimizes only old finding reviews whose inline threads are all resolved",
   assert.deepEqual(calls, ["minimize:review-node-2"]);
 });
 
-test("renders a deterministic fixed reply marker", () => {
-  const body = fixedReplyBody(headSha);
-  assert.match(body, new RegExp("^Fixed in `" + headSha + "`"));
-  assert.match(body, new RegExp(`ai-pr-reviewer:fixed:v1:${headSha}`));
-  assert.equal(reviewLifecycleInternals.FIXED_REPLY_MARKER.test(body), true);
+test("renders one deterministic fixed disposition while preserving the original finding", () => {
+  const body = fixedCommentBody("Original finding", headSha);
+  assert.match(body, new RegExp(`^<!-- ai-pr-reviewer:fixed:v2:${headSha} -->`));
+  assert.match(body, new RegExp("Fixed in `" + headSha + "`"));
+  assert.match(body, /Original finding/u);
+  assert.equal(reviewLifecycleInternals.FIXED_COMMENT_MARKER.test(body), true);
+
+  const newerHead = "f".repeat(40);
+  const updated = fixedCommentBody(body, newerHead);
+  assert.match(updated, new RegExp(`ai-pr-reviewer:fixed:v2:${newerHead}`));
+  assert.doesNotMatch(updated, new RegExp(`ai-pr-reviewer:fixed:v2:${headSha}`));
+  assert.equal(updated.match(/Original finding/gu)?.length, 1);
 });
 
 test("renders a stale review without losing action ownership", () => {
@@ -507,27 +503,17 @@ test("skips lifecycle verification when no candidate is available", async () => 
   assert.equal(called, false);
 });
 
-test("resolves an unchanged thread that already has the fixed reply", async () => {
+test("resolves an unchanged thread that already has the fixed root disposition", async () => {
   const original = thread("thread-fixed", 2, false);
   const root = original.comments[0];
   assert.ok(root);
-  const withReply: ReviewLifecycleThreadRecord = {
+  const withFixedRoot: ReviewLifecycleThreadRecord = {
     ...original,
-    comments: [
-      root,
-      {
-        ...root,
-        nodeId: "fixed-reply",
-        databaseId: 99,
-        replyToId: root.databaseId,
-        body: fixedReplyBody(headSha),
-        commitId: headSha,
-      },
-    ],
+    comments: [{ ...root, body: fixedCommentBody(root.body, headSha) }],
   };
   const snapshot: ReviewLifecycleSnapshot = {
     reviews: [review(2, findingBody())],
-    threads: [withReply],
+    threads: [withFixedRoot],
   };
   const calls: string[] = [];
   const preparation = await prepareReviewLifecycle(
@@ -547,7 +533,7 @@ test("resolves an unchanged thread that already has the fixed reply", async () =
     undefined,
     () =>
       Promise.resolve([
-        { status: "completed", verdict: "fixed", confidence: "high", rationale: "already replied" },
+        { status: "completed", verdict: "fixed", confidence: "high", rationale: "already marked" },
       ]),
   );
   assert.deepEqual(resolved, ["thread-fixed"]);
@@ -599,22 +585,19 @@ test("ignores failed, uncertain, and incomplete verifier results", async () => {
   assert.deepEqual(incomplete, []);
 });
 
-test("does not resolve when the reply or resolve recheck observes another change", async () => {
+test("does not resolve when the comment update or resolve recheck observes another change", async () => {
   const original = thread("thread-race", 2, false);
   const root = original.comments[0];
   assert.ok(root);
-  const changedAfterReply: ReviewLifecycleThreadRecord = {
+  const fixedRoot = {
+    ...root,
+    body: fixedCommentBody(root.body, headSha),
+    updatedAt: "2026-08-31T00:02:00Z",
+  };
+  const changedAfterUpdate: ReviewLifecycleThreadRecord = {
     ...original,
     comments: [
-      root,
-      {
-        ...root,
-        nodeId: "fixed-reply",
-        databaseId: 100,
-        replyToId: root.databaseId,
-        body: fixedReplyBody(headSha),
-        commitId: headSha,
-      },
+      fixedRoot,
       {
         ...root,
         nodeId: "human-reply",
@@ -624,19 +607,9 @@ test("does not resolve when the reply or resolve recheck observes another change
       },
     ],
   };
-  const stableWithReply: ReviewLifecycleThreadRecord = {
+  const stableWithUpdate: ReviewLifecycleThreadRecord = {
     ...original,
-    comments: [
-      root,
-      {
-        ...root,
-        nodeId: "fixed-reply",
-        databaseId: 100,
-        replyToId: root.databaseId,
-        body: fixedReplyBody(headSha),
-        commitId: headSha,
-      },
-    ],
+    comments: [fixedRoot],
   };
   const snapshot: ReviewLifecycleSnapshot = {
     reviews: [review(2, findingBody())],
@@ -647,7 +620,7 @@ test("does not resolve when the reply or resolve recheck observes another change
   const raceSnapshots: readonly ReviewLifecycleSnapshot[] = [
     snapshot,
     snapshot,
-    { reviews: snapshot.reviews, threads: [changedAfterReply] },
+    { reviews: snapshot.reviews, threads: [changedAfterUpdate] },
   ];
   const api: ReviewLifecycleApi = {
     ...apiFor(snapshot, calls),
@@ -655,6 +628,10 @@ test("does not resolve when the reply or resolve recheck observes another change
       const current = raceSnapshots[Math.min(reads++, 2)];
       assert.ok(current);
       return Promise.resolve(current);
+    },
+    updateReviewComment: (_context, commentId, body) => {
+      calls.push(`comment:${commentId}:${body}`);
+      return Promise.resolve();
     },
   };
   const preparation = await prepareReviewLifecycle(api, context, "review-action");
@@ -673,18 +650,18 @@ test("does not resolve when the reply or resolve recheck observes another change
       ]),
   );
   assert.deepEqual(firstResult, []);
-  assert.deepEqual(calls, ["reply:thread-race:" + fixedReplyBody(headSha)]);
+  assert.deepEqual(calls, [`comment:${root.databaseId}:${fixedCommentBody(root.body, headSha)}`]);
 
   const resolvedSnapshot: ReviewLifecycleSnapshot = {
     reviews: [review(2, findingBody())],
-    threads: [stableWithReply],
+    threads: [stableWithUpdate],
   };
   const resolveCalls: string[] = [];
   let resolveReads = 0;
   const resolveSnapshots: readonly ReviewLifecycleSnapshot[] = [
     resolvedSnapshot,
     resolvedSnapshot,
-    { ...resolvedSnapshot, threads: [changedAfterReply] },
+    { ...resolvedSnapshot, threads: [changedAfterUpdate] },
   ];
   const resolveApi: ReviewLifecycleApi = {
     ...apiFor(resolvedSnapshot, resolveCalls),
@@ -826,24 +803,14 @@ test("wires the injected resolution verifier through the interactive action", as
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     updateSubmittedReview: () => Promise.resolve(),
     dismissSubmittedReview: () => Promise.resolve(),
-    addReviewThreadReply: (nodeId: string, body: string) => {
-      calls.push(`reply:${nodeId}`);
+    updateReviewComment: (_context: PullRequestContext, commentId: number, body: string) => {
+      calls.push(`comment:${commentId}`);
       snapshot = {
         ...snapshot,
         threads: [
           {
             ...openThread,
-            comments: [
-              rootComment,
-              {
-                ...rootComment,
-                nodeId: "fixed-reply-node",
-                databaseId: 221,
-                replyToId: rootComment.databaseId,
-                body,
-                commitId: context.headSha,
-              },
-            ],
+            comments: [{ ...rootComment, body, updatedAt: "2026-08-31T00:02:00Z" }],
           },
         ],
       };
@@ -889,7 +856,7 @@ test("wires the injected resolution verifier through the interactive action", as
   assert.equal(result.skipped, false);
   assert.deepEqual(verifiedThreads, ["finding-thread-node"]);
   assert.deepEqual(calls, [
-    "reply:finding-thread-node",
+    "comment:220",
     "resolve:finding-thread-node",
     "create",
     "minimize:finding-review-node",

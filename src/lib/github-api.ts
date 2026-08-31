@@ -20,7 +20,6 @@ import { discoverLinkedIssueNumbers, issueSnapshot } from "./review-evidence.js"
 import {
   DISMISS_REVIEW_MUTATION,
   MINIMIZE_COMMENT_MUTATION,
-  REPLY_TO_THREAD_MUTATION,
   RESOLVE_THREAD_MUTATION,
   REVIEW_LIFECYCLE_REVIEWS_QUERY,
   REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY,
@@ -855,20 +854,6 @@ export class GitHubApi {
     ) {
       throw new Error("GitHub did not dismiss the pull request review.");
     }
-  }
-
-  async addReviewThreadReply(threadNodeId: string, body: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(REPLY_TO_THREAD_MUTATION, {
-      threadId: threadNodeId,
-      body,
-    });
-    const payload = requiredRecord(
-      requiredRecord(data, "GraphQL data").addPullRequestReviewThreadReply,
-      "thread reply payload",
-    );
-    const comment = requiredRecord(payload.comment, "thread reply comment");
-    requiredString(comment.id, "thread reply comment id");
-    positiveId(comment.databaseId, "thread reply comment databaseId");
   }
 
   async resolveReviewThread(threadNodeId: string): Promise<void> {

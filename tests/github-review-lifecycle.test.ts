@@ -204,16 +204,6 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
         );
         return;
       }
-      if (payload.query.includes("AiPrReviewerReplyToThread")) {
-        response.end(
-          JSON.stringify({
-            data: {
-              addPullRequestReviewThreadReply: { comment: { id: "reply-node", databaseId: 101 } },
-            },
-          }),
-        );
-        return;
-      }
       if (payload.query.includes("AiPrReviewerResolveThread")) {
         response.end(
           JSON.stringify({
@@ -257,11 +247,10 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
   assert.equal(snapshot.threads[0]?.comments[0]?.reviewNodeId, "review-node-42");
   await api.updateSubmittedReview("review-node-42", "stale body");
   await api.dismissSubmittedReview("review-node-42", "superseded");
-  await api.addReviewThreadReply("thread-node-1", "Fixed");
   await api.resolveReviewThread("thread-node-1");
   await api.minimizeComment("review-node-42");
   assert.equal(snapshot.threads[0]?.comments.length, 2);
-  assert.equal(requests.length, 8);
+  assert.equal(requests.length, 7);
   assert.equal(requests[0]?.variables.owner, "owner");
   assert.deepEqual(requests[3]?.variables, {
     reviewId: "review-node-42",
@@ -685,15 +674,6 @@ test("validates lifecycle mutation payloads and updates REST review comments", a
       /invalid dismiss/u,
     );
   });
-  await withFetch(
-    [jsonResponse({ data: { addPullRequestReviewThreadReply: { comment: null } } })],
-    async () => {
-      await assert.rejects(
-        new GitHubApi("token").addReviewThreadReply("thread", "reply"),
-        /invalid thread reply comment/u,
-      );
-    },
-  );
   await withFetch(
     [
       jsonResponse({

@@ -28,7 +28,7 @@ import type {
   ReviewLifecycleSnapshot,
   ReviewLifecycleThreadRecord,
 } from "../src/lib/github-review-lifecycle.js";
-import { fixedReplyBody } from "../src/lib/review-lifecycle.js";
+import { fixedCommentBody } from "../src/lib/review-lifecycle.js";
 
 const timestamp = "2026-08-17T00:00:00Z";
 
@@ -171,25 +171,19 @@ test("reconciles prepared lifecycle candidates before skipping an identical revi
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     updateSubmittedReview: () => Promise.resolve(),
     dismissSubmittedReview: () => Promise.resolve(),
-    addReviewThreadReply: (nodeId: string) => {
-      calls.push(`reply:${nodeId}`);
+    updateReviewComment: (_context: unknown, commentId: number, body: string) => {
+      calls.push(`comment:${commentId}`);
       snapshot = {
         ...snapshot,
         threads: snapshot.threads.map((item) =>
-          item.nodeId === nodeId
+          item.comments.some((comment) => comment.databaseId === commentId)
             ? {
                 ...item,
-                comments: [
-                  ...item.comments,
-                  {
-                    ...rootComment,
-                    nodeId: "fixed-reply-node",
-                    databaseId: 101,
-                    replyToId: rootComment.databaseId,
-                    body: fixedReplyBody(context.headSha),
-                    commitId: context.headSha,
-                  },
-                ],
+                comments: item.comments.map((comment) =>
+                  comment.databaseId === commentId
+                    ? { ...comment, body, updatedAt: "2026-08-31T00:02:00Z" }
+                    : comment,
+                ),
               }
             : item,
         ),
@@ -235,7 +229,7 @@ test("reconciles prepared lifecycle candidates before skipping an identical revi
   assert.equal(verifierRuns, 1);
   assert.equal(goalRuns, 0);
   assert.equal(postedReviews, 0);
-  assert.deepEqual(calls, ["reply:old-thread-node", "resolve:old-thread-node"]);
+  assert.deepEqual(calls, ["comment:100", "resolve:old-thread-node"]);
 });
 
 test("finalizes resolved lifecycle reviews before skipping an identical review", async (t) => {
@@ -317,7 +311,7 @@ test("finalizes resolved lifecycle reviews before skipping an identical review",
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     updateSubmittedReview: () => Promise.resolve(),
     dismissSubmittedReview: () => Promise.resolve(),
-    addReviewThreadReply: () => Promise.resolve(),
+    updateReviewComment: () => Promise.resolve(),
     resolveReviewThread: () => Promise.resolve(),
     minimizeComment: (nodeId: string) => {
       calls.push(`minimize:${nodeId}`);
@@ -347,7 +341,7 @@ test("finalizes resolved lifecycle reviews before skipping an identical review",
   assert.deepEqual(calls, ["minimize:old-review-node-finalize"]);
 });
 
-test("refreshes the conversation digest after lifecycle replies before duplicate detection", async (t) => {
+test("refreshes the conversation digest after lifecycle comment edits before duplicate detection", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   const reader = actionReader();
@@ -390,17 +384,13 @@ test("refreshes the conversation digest after lifecycle replies before duplicate
     createdAt: "2026-08-31T00:00:01Z",
     updatedAt: "2026-08-31T00:00:01Z",
   };
-  const fixedConversationReply = {
+  const fixedConversationRoot = {
     ...rootConversationComment,
-    id: 202,
-    inReplyToId: rootConversationComment.id,
-    body: fixedReplyBody(context.headSha),
-    commitId: context.headSha,
-    createdAt: "2026-08-31T00:00:02Z",
+    body: fixedCommentBody(rootConversationComment.body, context.headSha),
     updatedAt: "2026-08-31T00:00:02Z",
   };
   const conversationBefore = [rootConversationComment, humanConversationReply];
-  const conversationAfter = [...conversationBefore, fixedConversationReply];
+  const conversationAfter = [fixedConversationRoot, humanConversationReply];
   const duplicateReview = {
     ...duplicateReviewBase,
     body: reviewMarker(
@@ -456,15 +446,10 @@ test("refreshes the conversation digest after lifecycle replies before duplicate
     createdAt: humanConversationReply.createdAt,
     updatedAt: humanConversationReply.updatedAt,
   };
-  const fixedLifecycleReply = {
+  const fixedLifecycleRoot = {
     ...rootLifecycleComment,
-    nodeId: "fixed-reply-node-digest",
-    databaseId: fixedConversationReply.id,
-    replyToId: rootLifecycleComment.databaseId,
-    body: fixedConversationReply.body,
-    commitId: context.headSha,
-    createdAt: fixedConversationReply.createdAt,
-    updatedAt: fixedConversationReply.updatedAt,
+    body: fixedConversationRoot.body,
+    updatedAt: fixedConversationRoot.updatedAt,
   };
   const initialThread: ReviewLifecycleThreadRecord = {
     nodeId: "old-thread-node-digest",
@@ -495,13 +480,13 @@ test("refreshes the conversation digest after lifecycle replies before duplicate
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     updateSubmittedReview: () => Promise.resolve(),
     dismissSubmittedReview: () => Promise.resolve(),
-    addReviewThreadReply: (nodeId: string) => {
-      calls.push(`reply:${nodeId}`);
+    updateReviewComment: (_context: unknown, commentId: number) => {
+      calls.push(`comment:${commentId}`);
       snapshot = {
         ...snapshot,
         threads: snapshot.threads.map((item) =>
-          item.nodeId === nodeId
-            ? { ...item, comments: [...item.comments, fixedLifecycleReply] }
+          item.comments.some((comment) => comment.databaseId === commentId)
+            ? { ...item, comments: [fixedLifecycleRoot, humanLifecycleReply] }
             : item,
         ),
       };
@@ -540,7 +525,7 @@ test("refreshes the conversation digest after lifecycle replies before duplicate
   assert.deepEqual(result, { skipped: true });
   assert.equal(conversationReads, 2);
   assert.equal(goalRuns, 0);
-  assert.deepEqual(calls, ["reply:old-thread-node-digest", "resolve:old-thread-node-digest"]);
+  assert.deepEqual(calls, ["comment:200", "resolve:old-thread-node-digest"]);
 });
 
 test("classifies people, bots, apps, and action-authored content", () => {

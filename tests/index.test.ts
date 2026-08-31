@@ -887,7 +887,7 @@ test("reconciles interactive lifecycle state before and after the current review
       calls.push(`dismiss:${nodeId}:${message}`);
       return Promise.resolve();
     },
-    addReviewThreadReply: () => Promise.resolve(),
+    updateReviewComment: () => Promise.resolve(),
     resolveReviewThread: () => Promise.resolve(),
     minimizeComment: (nodeId: string) => {
       calls.push(`minimize:${nodeId}`);
@@ -933,7 +933,7 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
     },
     updateSubmittedReview: () => Promise.resolve(),
     dismissSubmittedReview: () => Promise.resolve(),
-    addReviewThreadReply: () => Promise.resolve(),
+    updateReviewComment: () => Promise.resolve(),
     resolveReviewThread: () => Promise.resolve(),
     minimizeComment: () => Promise.resolve(),
   } as unknown as GitHubApi;
