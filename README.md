@@ -6,7 +6,7 @@ Each review prompt runs one isolated Claude Agent SDK session. Sessions use auto
 
 ## Consumer workflow
 
-For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access; it needs write access only when the action may post a review.
+For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access; interactive runs also need pull-request review write access to reconcile stale reviews and threads.
 
 Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review. Workflow-generated review context belongs under `RUNNER_TEMP`, not inside `GITHUB_WORKSPACE`.
 
@@ -69,22 +69,22 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 ## Inputs
 
-| Input              | Required | Default | Notes                                                                                                               |
-| ------------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `github-pat`       | yes      |         | Fine-grained PAT with read access to the target; pull request review write access is needed when posting.           |
-| `ai-base-url`      | yes      |         | HTTP(S) Anthropic Messages API-compatible endpoint.                                                                 |
-| `ai-secret`        | yes      |         | API key for that endpoint.                                                                                          |
-| `model`            | yes      |         | Model name understood by the endpoint.                                                                              |
-| `effort`           | no       |         | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                       |
-| `system-prompt`    | no       |         | Full replacement; written to the redacted action log.                                                               |
-| `model-pricing`    | no       |         | Strict JSON with a currency prefix and per-model rates per one million tokens.                                      |
-| `review-prompts`   | yes      |         | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                      |
-| `parallel-count`   | no       | `5`     | Integer from 1 to 10; limits concurrently running goal sessions.                                                    |
-| `max-turns`        | no       | `50`    | Integer from 2 to 100 per goal session, including `/goal`, briefing and selected evidence reads, and output repair. |
-| `auto-approve`     | no       | `false` | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.              |
-| `interact-with-pr` | no       | `true`  | When `false`, do not create a review; write all findings only to the workflow run summary.                          |
-| `pull-request-url` | no       |         | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.                 |
-| `mcp-servers`      | no       | empty   | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                                     |
+| Input              | Required | Default | Notes                                                                                                                              |
+| ------------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `github-pat`       | yes      |         | Fine-grained PAT with read access to the target; interactive lifecycle reconciliation also needs pull request review write access. |
+| `ai-base-url`      | yes      |         | HTTP(S) Anthropic Messages API-compatible endpoint.                                                                                |
+| `ai-secret`        | yes      |         | API key for that endpoint.                                                                                                         |
+| `model`            | yes      |         | Model name understood by the endpoint.                                                                                             |
+| `effort`           | no       |         | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                                      |
+| `system-prompt`    | no       |         | Full replacement; written to the redacted action log.                                                                              |
+| `model-pricing`    | no       |         | Strict JSON with a currency prefix and per-model rates per one million tokens.                                                     |
+| `review-prompts`   | yes      |         | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                                     |
+| `parallel-count`   | no       | `5`     | Integer from 1 to 10; limits concurrently running goal sessions.                                                                   |
+| `max-turns`        | no       | `50`    | Integer from 2 to 100 per goal session, including `/goal`, briefing and selected evidence reads, and output repair.                |
+| `auto-approve`     | no       | `false` | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.                             |
+| `interact-with-pr` | no       | `true`  | When `false`, do not create a review; write all findings only to the workflow run summary.                                         |
+| `pull-request-url` | no       |         | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.                                |
+| `mcp-servers`      | no       | empty   | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                                                    |
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
 
@@ -301,9 +301,11 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - The briefing includes the PR body, same-repository linked issue bodies referenced by `#123`, `owner/repository#123`, or same-origin issue URLs (up to 20), changed-file metadata, and a bounded prior-discussion index. Body, issue, comment, and review text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
 - Each goal must read the briefing to completion. It can then use native `Read`, `Glob`, and repository-wide `Grep` over the pristine head checkout, plus fixed Git readers for the captured merge-base/head revision. `read_pr_diff` reads the complete diff or exact changed paths on demand; `read_repository_file` reads exact changed paths at the merge base or head, while native `Read` handles other head-checkout context. `read_pr_conversation` is optional, and `read_pr_threads` retrieves complete selected threads from the index. A located submission is rejected until prior inline discussion for that path has been read.
 - The fixed Git diff uses merge-base attributes so pull-request changes cannot hide text as binary. Pages are bounded by bytes, tool results are capped before delivery, and each goal retains at most 256 MiB across unfinished fixed Git query snapshots; a goal is not required to consume a monolithic diff or every conversation body. Bash and other write or execution tools remain unavailable.
-- The action does not reread live refs or conversation before publishing. Every review and summary describes the captured base, head, files, and conversation; a workflow consumer can use `concurrency.cancel-in-progress` when it wants newer events to supersede an active run.
+- Review analysis uses the captured base, head, files, and conversation. Interactive lifecycle mutations explicitly reread GraphQL review-thread state immediately before each stale-thread mutation; a workflow consumer can use `concurrency.cancel-in-progress` when it wants newer events to supersede an active run.
 - A first `SIGINT`, `SIGTERM`, or Windows `SIGBREAK` starts graceful cancellation across bootstrap, GitHub API/Git work, context capture, diff generation, and Claude sessions. Cancellation stops new goals and writes, and cleanup still runs. A GitHub write accepted immediately before cancellation cannot be undone.
 - The action does not add comment-event triggers. Replies affect the next pull request update, workflow rerun, or separately configured dispatch that invokes the action.
+- On an interactive rerun, stale clean reviews authored by this action are removed before analysis so an old approval cannot remain active. Finding-bearing reviews and human discussions are preserved. Unresolved inline findings from older action reviews are rechecked against the current head in bounded AI-verifier batches; only an explicit high-confidence fixed verdict receives a deterministic `Fixed in <SHA>:` reply and thread resolution.
+- After the current review is posted, an older action finding review is minimized only when every inline thread in that review is resolved and the review has no body-only findings. Lifecycle reconciliation uses the GitHub GraphQL API and is skipped entirely when `interact-with-pr: false`.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
 - A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
 - The action writes the full secret-redacted system prompt, `/goal`, review and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, goal iterations, turn results, repairs, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews. Context file tool results log an omission marker instead of page contents; hidden model reasoning is not logged.

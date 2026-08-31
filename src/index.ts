@@ -30,7 +30,16 @@ import {
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
+import {
+  finalizeReviewLifecycle,
+  isReviewLifecycleApi,
+  logLifecycleResult,
+  prepareReviewLifecycle,
+  resolveReviewLifecycle,
+  type ReviewLifecyclePreparation,
+} from "./lib/review-lifecycle.js";
 import { runReviewGoals } from "./runtime/agent.js";
+import { runResolutionVerifiers, type ResolutionQuery } from "./runtime/resolution-session.js";
 import {
   createPullRequestWorkspace,
   type PullRequestWorkspace,
@@ -277,6 +286,17 @@ export async function runAction(
     throwIfAborted(signal);
     const authenticatedLogin = await api.getAuthenticatedUserLogin();
     const conversation = await loadConversation(api, context, authenticatedLogin);
+    const lifecycleApi =
+      config.interactWithPullRequest && isReviewLifecycleApi(api) ? api : undefined;
+    const lifecyclePreparation: ReviewLifecyclePreparation | undefined =
+      lifecycleApi === undefined
+        ? undefined
+        : await prepareReviewLifecycle(lifecycleApi, context, authenticatedLogin);
+    if (lifecyclePreparation?.deletedCleanReviewIds.length) {
+      core.info(
+        `Removed ${lifecyclePreparation.deletedCleanReviewIds.length} stale clean AI review${lifecyclePreparation.deletedCleanReviewIds.length === 1 ? "" : "s"} before analysis.`,
+      );
+    }
     const briefing =
       typeof (api as GitHubApi & { getLinkedIssues?: unknown }).getLinkedIssues === "function"
         ? await api.getLinkedIssues(context)
@@ -311,6 +331,25 @@ export async function runAction(
       signal,
     );
     throwIfAborted(signal);
+    let resolvedThreadIds: readonly string[] = [];
+    if (lifecycleApi !== undefined && lifecyclePreparation !== undefined) {
+      resolvedThreadIds = await resolveReviewLifecycle(
+        lifecycleApi,
+        lifecyclePreparation,
+        context,
+        authenticatedLogin,
+        config,
+        workspace,
+        dependencies.queryAgent,
+        abortController,
+        dependencies.runResolutionVerifiers,
+      );
+      if (resolvedThreadIds.length > 0) {
+        core.info(
+          `Resolved ${resolvedThreadIds.length} stale AI review thread${resolvedThreadIds.length === 1 ? "" : "s"} before posting the current review.`,
+        );
+      }
+    }
     core.info(
       `Reviewing ${files.length} changed file${files.length === 1 ? "" : "s"} and ${conversation.snapshot.entries.length} conversation entr${conversation.snapshot.entries.length === 1 ? "y" : "ies"} with ${config.reviewPrompts.length} isolated goal session${config.reviewPrompts.length === 1 ? "" : "s"}.`,
     );
@@ -410,6 +449,14 @@ export async function runAction(
       });
       throwIfAborted(signal);
     }
+    if (lifecycleApi !== undefined) {
+      const minimizedReviewIds = await finalizeReviewLifecycle(
+        lifecycleApi,
+        context,
+        authenticatedLogin,
+      );
+      logLifecycleResult({ resolvedThreadIds, minimizedReviewIds });
+    }
     if (review.partial)
       throw new Error("The review was posted as a partial result, but one or more goals failed.");
     return { skipped: false, review };
@@ -425,6 +472,8 @@ interface ActionDependencies {
   readonly readFiles?: typeof readPullRequestFilesFromCheckout;
   readonly prepareContextFiles?: typeof prepareContextFiles;
   readonly runGoals: typeof runReviewGoals;
+  readonly queryAgent?: ResolutionQuery;
+  readonly runResolutionVerifiers?: typeof runResolutionVerifiers;
   readonly writeSummary: typeof writeRunSummary;
 }
 
@@ -435,6 +484,7 @@ const defaultActionDependencies: ActionDependencies = {
   createWorkspace: createPullRequestWorkspace,
   readFiles: readPullRequestFilesFromCheckout,
   runGoals: runReviewGoals,
+  runResolutionVerifiers,
   writeSummary: writeRunSummary,
 };
 

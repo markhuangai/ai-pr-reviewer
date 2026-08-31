@@ -1,9 +1,9 @@
 name: Goal-Driven AI PR Reviewer
-description: Conversation-aware pull request reviews with isolated AI sessions and MCP-enabled tools.
+description: Conversation-aware pull request reviews with isolated AI sessions, MCP-enabled tools, and stale-review lifecycle management.
 author: MarkHuang.ai
 inputs:
   github-pat:
-    description: A GitHub PAT that can read the target repository and optionally create pull request reviews.
+    description: A GitHub PAT that can read the target repository and, for interactive runs, create and reconcile pull request reviews and threads.
     required: true
   ai-base-url:
     description: Anthropic Messages API-compatible base URL.

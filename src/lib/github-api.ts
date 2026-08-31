@@ -17,6 +17,33 @@ import {
   readGitMetadata,
 } from "./git-changed-files.js";
 import { discoverLinkedIssueNumbers, issueSnapshot } from "./review-evidence.js";
+import {
+  DELETE_REVIEW_MUTATION,
+  MINIMIZE_COMMENT_MUTATION,
+  REPLY_TO_THREAD_MUTATION,
+  RESOLVE_THREAD_MUTATION,
+  REVIEW_LIFECYCLE_REVIEWS_QUERY,
+  REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY,
+  REVIEW_LIFECYCLE_THREADS_QUERY,
+  graphqlUrlFor,
+  pullRequestConnection,
+  requiredRecord,
+  readGraphqlComment,
+  readGraphqlConnection,
+  readGraphqlReview,
+  readGraphqlThread,
+  readGraphqlThreadComments,
+  type ReviewLifecycleSnapshot,
+  type ReviewLifecycleReviewRecord,
+  type ReviewLifecycleThreadRecord,
+} from "./github-review-lifecycle.js";
+
+export type {
+  ReviewLifecycleCommentRecord,
+  ReviewLifecycleReviewRecord,
+  ReviewLifecycleSnapshot,
+  ReviewLifecycleThreadRecord,
+} from "./github-review-lifecycle.js";
 
 export { readPullRequestFilesFromCheckout } from "./git-changed-files.js";
 
@@ -452,6 +479,7 @@ function nextPagePath(link: string | null, apiUrl: string): string | undefined {
 
 export class GitHubApi {
   private readonly apiUrl: string;
+  private readonly graphqlUrl: string;
   private readonly token: string;
   private readonly signal: AbortSignal | undefined;
 
@@ -459,8 +487,10 @@ export class GitHubApi {
     token: string,
     apiUrl = process.env.GITHUB_API_URL ?? "https://api.github.com",
     signal?: AbortSignal,
+    graphqlUrl?: string,
   ) {
     this.apiUrl = apiUrl.replace(/\/$/, "");
+    this.graphqlUrl = graphqlUrl?.replace(/\/$/, "") ?? graphqlUrlFor(this.apiUrl);
     this.token = token;
     this.signal = signal;
   }
@@ -553,6 +583,54 @@ export class GitHubApi {
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     return (await this.requestPage<T>(path, init)).payload;
+  }
+
+  private async requestGraphql<T>(
+    query: string,
+    variables: Readonly<Record<string, unknown>>,
+  ): Promise<T> {
+    const signal = this.signal;
+    throwIfAborted(signal);
+    const response = await fetch(this.graphqlUrl, {
+      method: "POST",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify({ query, variables }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const text = await response.text();
+    throwIfAborted(signal);
+    let payload: unknown = undefined;
+    if (text.length > 0) {
+      try {
+        payload = JSON.parse(text) as unknown;
+      } catch {
+        payload = undefined;
+      }
+    }
+    if (!response.ok) {
+      throw new GitHubApiError(
+        response.status,
+        `GitHub GraphQL request failed (${response.status}): ${errorDetails(payload, response.statusText)}`,
+      );
+    }
+    if (!isRecord(payload)) throw new Error("GitHub returned an invalid GraphQL response.");
+    const responsePayload = payload;
+    if (Array.isArray(responsePayload.errors) && responsePayload.errors.length > 0) {
+      const messages = responsePayload.errors.flatMap((error) => {
+        if (!isRecord(error) || typeof error.message !== "string") return [];
+        return [error.message];
+      });
+      throw new GitHubApiError(
+        200,
+        `GitHub GraphQL request returned errors: ${messages.join("; ") || "unknown error"}`,
+      );
+    }
+    return responsePayload.data as T;
   }
 
   private async listRecords<T>(
@@ -651,6 +729,159 @@ export class GitHubApi {
       { method: "POST", body: JSON.stringify(request) },
     );
   }
+
+  private async completeLifecycleThread(
+    thread: ReviewLifecycleThreadRecord,
+  ): Promise<ReviewLifecycleThreadRecord> {
+    const comments = [...thread.comments];
+    let cursor = thread.commentsCursor;
+    let pages = 0;
+    while (cursor !== undefined) {
+      pages += 1;
+      if (pages > 100)
+        throw new Error("GitHub returned more than 10,000 comments in a review thread.");
+      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY, {
+        threadId: thread.nodeId,
+        cursor,
+      });
+      const page = readGraphqlThreadComments(data, comments.length);
+      comments.push(...page.comments);
+      if (!page.hasNextPage) {
+        cursor = undefined;
+      } else if (page.endCursor === undefined || page.endCursor === cursor) {
+        throw new Error("GitHub returned a non-advancing review thread comment cursor.");
+      } else {
+        cursor = page.endCursor;
+      }
+    }
+    const { commentsCursor: ignoredCursor, ...threadWithoutCursor } = thread;
+    void ignoredCursor;
+    const root = comments.find((comment) => comment.replyToId === undefined) ?? comments[0];
+    return {
+      ...threadWithoutCursor,
+      ...(root?.reviewId === undefined ? {} : { reviewId: root.reviewId }),
+      ...(root?.reviewNodeId === undefined ? {} : { reviewNodeId: root.reviewNodeId }),
+      comments,
+    };
+  }
+
+  async getReviewLifecycleSnapshot(context: PullRequestContext): Promise<ReviewLifecycleSnapshot> {
+    const variables = {
+      owner: context.owner,
+      name: context.name,
+      number: context.number,
+    };
+    const reviews: ReviewLifecycleReviewRecord[] = [];
+    let reviewCursor: string | undefined;
+    for (;;) {
+      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_REVIEWS_QUERY, {
+        ...variables,
+        cursor: reviewCursor ?? null,
+      });
+      const connection = readGraphqlConnection(
+        pullRequestConnection(data, "reviews"),
+        "pull request reviews",
+      );
+      reviews.push(
+        ...connection.nodes.map((review, index) =>
+          readGraphqlReview(review, reviews.length + index),
+        ),
+      );
+      if (!connection.hasNextPage) break;
+      if (connection.endCursor === undefined || connection.endCursor === reviewCursor) {
+        throw new Error("GitHub returned a non-advancing pull request review cursor.");
+      }
+      reviewCursor = connection.endCursor;
+    }
+
+    const threads: ReviewLifecycleThreadRecord[] = [];
+    let threadCursor: string | undefined;
+    for (;;) {
+      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_THREADS_QUERY, {
+        ...variables,
+        cursor: threadCursor ?? null,
+      });
+      const connection = readGraphqlConnection(
+        pullRequestConnection(data, "reviewThreads"),
+        "pull request review threads",
+      );
+      for (const [index, value] of connection.nodes.entries()) {
+        threads.push(
+          await this.completeLifecycleThread(readGraphqlThread(value, threads.length + index)),
+        );
+      }
+      if (!connection.hasNextPage) break;
+      if (connection.endCursor === undefined || connection.endCursor === threadCursor) {
+        throw new Error("GitHub returned a non-advancing pull request review thread cursor.");
+      }
+      threadCursor = connection.endCursor;
+    }
+    return { reviews, threads };
+  }
+
+  async deleteSubmittedReview(reviewNodeId: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(DELETE_REVIEW_MUTATION, {
+      reviewId: reviewNodeId,
+    });
+    requiredRecord(
+      requiredRecord(data, "GraphQL data").deletePullRequestReview,
+      "delete review payload",
+    );
+  }
+
+  async addReviewThreadReply(threadNodeId: string, body: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(REPLY_TO_THREAD_MUTATION, {
+      threadId: threadNodeId,
+      body,
+    });
+    const payload = requiredRecord(
+      requiredRecord(data, "GraphQL data").addPullRequestReviewThreadReply,
+      "thread reply payload",
+    );
+    const comment = requiredRecord(payload.comment, "thread reply comment");
+    requiredString(comment.id, "thread reply comment id");
+    positiveId(comment.databaseId, "thread reply comment databaseId");
+  }
+
+  async resolveReviewThread(threadNodeId: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(RESOLVE_THREAD_MUTATION, {
+      threadId: threadNodeId,
+    });
+    const payload = requiredRecord(
+      requiredRecord(data, "GraphQL data").resolveReviewThread,
+      "resolve thread payload",
+    );
+    const thread = requiredRecord(payload.thread, "resolved thread");
+    if (thread.isResolved !== true) {
+      throw new Error("GitHub did not resolve the pull request review thread.");
+    }
+  }
+
+  async minimizeComment(subjectNodeId: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(MINIMIZE_COMMENT_MUTATION, {
+      subjectId: subjectNodeId,
+      classifier: "OUTDATED",
+    });
+    const payload = requiredRecord(
+      requiredRecord(data, "GraphQL data").minimizeComment,
+      "minimize comment payload",
+    );
+    const comment = requiredRecord(payload.minimizedComment, "minimized comment");
+    if (comment.isMinimized !== true) {
+      throw new Error("GitHub did not minimize the pull request review.");
+    }
+  }
+
+  async updateReviewComment(
+    context: PullRequestContext,
+    commentId: number,
+    body: string,
+  ): Promise<void> {
+    await this.request<unknown>(
+      `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/comments/${commentId}`,
+      { method: "PATCH", body: JSON.stringify({ body }) },
+    );
+  }
 }
 
 export const githubApiInternals = {
@@ -675,4 +906,9 @@ export const githubApiInternals = {
   readReviewCommentPayload,
   readReviewPayload,
   readUser,
+  graphqlUrlFor,
+  readGraphqlConnection,
+  readGraphqlReview,
+  readGraphqlComment,
+  readGraphqlThread,
 };
