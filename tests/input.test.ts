@@ -280,6 +280,10 @@ test("rejects invalid numeric and boolean inputs", () => {
     "parallel-count": "0",
   };
   assert.throws(() => readReviewConfig(reader(values)), /parallel-count.*between 1 and 10/);
+  assert.equal(
+    readReviewConfig(reader({ ...values, "parallel-count": "1", "max-turns": "500" })).maxTurns,
+    500,
+  );
   assert.throws(
     () =>
       readReviewConfig(reader({ ...values, "parallel-count": "1", "auto-approve": "sometimes" })),
@@ -287,7 +291,7 @@ test("rejects invalid numeric and boolean inputs", () => {
   );
   assert.throws(
     () => readReviewConfig(reader({ ...values, "parallel-count": "1", "max-turns": "1" })),
-    /max-turns.*between 2 and 100/,
+    /max-turns.*between 2 and 500/,
   );
   assert.throws(
     () =>
@@ -521,8 +525,8 @@ test("rejects malformed URLs, prompts, required values, and removed auth modes",
     /parallel-count.*integer/u,
   );
   assert.throws(
-    () => readReviewConfig(reader({ ...base, "max-turns": "101" })),
-    /max-turns.*between 2 and 100/u,
+    () => readReviewConfig(reader({ ...base, "max-turns": "501" })),
+    /max-turns.*between 2 and 500/u,
   );
 });
 

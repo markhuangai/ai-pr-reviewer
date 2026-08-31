@@ -80,7 +80,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `model-pricing`    | no       |         | Strict JSON with a currency prefix and per-model rates per one million tokens.                                                     |
 | `review-prompts`   | yes      |         | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                                     |
 | `parallel-count`   | no       | `5`     | Integer from 1 to 10; limits concurrently running goal sessions.                                                                   |
-| `max-turns`        | no       | `50`    | Integer from 2 to 100 per goal session, including `/goal`, briefing and selected evidence reads, and output repair.                |
+| `max-turns`        | no       | `50`    | Integer from 2 to 500 per goal session, including `/goal`, briefing and selected evidence reads, and output repair.                |
 | `auto-approve`     | no       | `false` | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.                             |
 | `interact-with-pr` | no       | `true`  | When `false`, do not create a review; write all findings only to the workflow run summary.                                         |
 | `pull-request-url` | no       |         | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.                                |

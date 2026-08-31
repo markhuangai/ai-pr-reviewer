@@ -31,7 +31,7 @@ inputs:
     required: false
     default: "5"
   max-turns:
-    description: Maximum Claude Agent SDK turns per goal session, including /goal, conversation and diff reading, and output repair.
+    description: Maximum Claude Agent SDK turns per goal session (2-500), including /goal, conversation and diff reading, and output repair.
     required: false
     default: "50"
   auto-approve:
