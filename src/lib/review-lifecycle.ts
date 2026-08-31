@@ -43,6 +43,7 @@ export interface ReviewLifecycleResult {
 
 export interface ReviewLifecycleApi {
   getReviewLifecycleSnapshot(context: PullRequestContext): Promise<ReviewLifecycleSnapshot>;
+  getPullRequestHeadSha(context: PullRequestContext): Promise<string>;
   deleteSubmittedReview(reviewNodeId: string): Promise<void>;
   addReviewThreadReply(threadNodeId: string, body: string): Promise<void>;
   resolveReviewThread(threadNodeId: string): Promise<void>;
@@ -51,6 +52,14 @@ export interface ReviewLifecycleApi {
 
 function sameLogin(left: string | undefined, right: string): boolean {
   return left !== undefined && left.toLowerCase() === right.toLowerCase();
+}
+
+async function lifecycleHeadMatches(
+  api: ReviewLifecycleApi,
+  context: PullRequestContext,
+): Promise<boolean> {
+  const liveHeadSha = await api.getPullRequestHeadSha(context);
+  return liveHeadSha.toLowerCase() === context.headSha.toLowerCase();
 }
 
 export function parseActionReviewIdentity(body: string): ActionReviewIdentity | undefined {
@@ -211,14 +220,34 @@ export async function prepareReviewLifecycle(
   authenticatedLogin: string,
 ): Promise<ReviewLifecyclePreparation> {
   const snapshot = await api.getReviewLifecycleSnapshot(context);
+  if (!(await lifecycleHeadMatches(api, context))) {
+    core.warning(
+      "The pull request head changed before lifecycle preparation; skipping lifecycle mutations.",
+    );
+    return { snapshot, candidates: [], deletedCleanReviewIds: [] };
+  }
   const staleCleanReviews = snapshot.reviews.filter((review) =>
     isCleanActionReview(review, context, authenticatedLogin),
   );
-  for (const review of staleCleanReviews) await api.deleteSubmittedReview(review.nodeId);
+  const deletedCleanReviewIds: number[] = [];
+  for (const review of staleCleanReviews) {
+    if (!(await lifecycleHeadMatches(api, context))) {
+      core.warning(
+        "The pull request head changed during lifecycle preparation; stopping lifecycle mutations.",
+      );
+      return {
+        snapshot,
+        candidates: [],
+        deletedCleanReviewIds,
+      };
+    }
+    await api.deleteSubmittedReview(review.nodeId);
+    deletedCleanReviewIds.push(review.databaseId);
+  }
   return {
     snapshot,
     candidates: selectUnresolvedActionThreads(snapshot, context, authenticatedLogin),
-    deletedCleanReviewIds: staleCleanReviews.map((review) => review.databaseId),
+    deletedCleanReviewIds,
   };
 }
 
@@ -275,6 +304,12 @@ export async function resolveReviewLifecycle(
   verify = runResolutionVerifiers,
 ): Promise<readonly string[]> {
   if (preparation.candidates.length === 0) return [];
+  if (!(await lifecycleHeadMatches(api, context))) {
+    core.warning(
+      "The pull request head changed before lifecycle verification; skipping lifecycle mutations.",
+    );
+    return [];
+  }
   const verifications = await verify(
     context,
     preparation.candidates.map((candidate) => candidate.thread),
@@ -294,6 +329,12 @@ export async function resolveReviewLifecycle(
     ) {
       continue;
     }
+    if (!(await lifecycleHeadMatches(api, context))) {
+      core.warning(
+        "The pull request head changed during lifecycle verification; stopping lifecycle mutations.",
+      );
+      return resolvedThreadIds;
+    }
     let latest = await api.getReviewLifecycleSnapshot(context);
     let currentThread = latest.threads.find((thread) => thread.nodeId === candidate.thread.nodeId);
     let currentReview = latest.reviews.find(
@@ -310,6 +351,12 @@ export async function resolveReviewLifecycle(
       continue;
     }
     if (!hasFixedReply(currentThread, context.headSha, authenticatedLogin)) {
+      if (!(await lifecycleHeadMatches(api, context))) {
+        core.warning(
+          "The pull request head changed before adding a lifecycle reply; stopping lifecycle mutations.",
+        );
+        return resolvedThreadIds;
+      }
       const beforeReplyThread = currentThread;
       await api.addReviewThreadReply(currentThread.nodeId, fixedReplyBody(context.headSha));
       latest = await api.getReviewLifecycleSnapshot(context);
@@ -333,6 +380,12 @@ export async function resolveReviewLifecycle(
         continue;
       }
     }
+    if (!(await lifecycleHeadMatches(api, context))) {
+      core.warning(
+        "The pull request head changed before resolving a lifecycle thread; stopping lifecycle mutations.",
+      );
+      return resolvedThreadIds;
+    }
     const beforeResolve = await api.getReviewLifecycleSnapshot(context);
     const resolveThread = beforeResolve.threads.find(
       (thread) => thread.nodeId === candidate.thread.nodeId,
@@ -349,6 +402,12 @@ export async function resolveReviewLifecycle(
       !threadBelongsToReview(resolveThread, resolveReview, authenticatedLogin)
     ) {
       continue;
+    }
+    if (!(await lifecycleHeadMatches(api, context))) {
+      core.warning(
+        "The pull request head changed before resolving a lifecycle thread; stopping lifecycle mutations.",
+      );
+      return resolvedThreadIds;
     }
     await api.resolveReviewThread(resolveThread.nodeId);
     resolvedThreadIds.push(resolveThread.nodeId);
@@ -369,7 +428,19 @@ export async function finalizeReviewLifecycle(
   context: PullRequestContext,
   authenticatedLogin: string,
 ): Promise<readonly number[]> {
+  if (!(await lifecycleHeadMatches(api, context))) {
+    core.warning(
+      "The pull request head changed before lifecycle finalization; skipping lifecycle mutations.",
+    );
+    return [];
+  }
   const snapshot = await api.getReviewLifecycleSnapshot(context);
+  if (!(await lifecycleHeadMatches(api, context))) {
+    core.warning(
+      "The pull request head changed during lifecycle finalization; stopping lifecycle mutations.",
+    );
+    return [];
+  }
   const minimized: number[] = [];
   for (const review of snapshot.reviews) {
     if (
@@ -381,6 +452,12 @@ export async function finalizeReviewLifecycle(
     }
     const threads = snapshot.threads.filter((thread) => thread.reviewId === review.databaseId);
     if (threads.length === 0 || threads.some((thread) => !thread.isResolved)) continue;
+    if (!(await lifecycleHeadMatches(api, context))) {
+      core.warning(
+        "The pull request head changed before minimizing a lifecycle review; stopping lifecycle mutations.",
+      );
+      return minimized;
+    }
     await api.minimizeComment(review.nodeId);
     minimized.push(review.databaseId);
   }
@@ -390,6 +467,7 @@ export async function finalizeReviewLifecycle(
 export function isReviewLifecycleApi(value: GitHubApi): value is GitHubApi & ReviewLifecycleApi {
   return (
     typeof (value as Partial<ReviewLifecycleApi>).getReviewLifecycleSnapshot === "function" &&
+    typeof (value as Partial<ReviewLifecycleApi>).getPullRequestHeadSha === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).deleteSubmittedReview === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).addReviewThreadReply === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).resolveReviewThread === "function" &&

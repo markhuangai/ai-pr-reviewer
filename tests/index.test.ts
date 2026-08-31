@@ -877,6 +877,7 @@ test("reconciles interactive lifecycle state before and after the current review
   const api = {
     ...emptyConversationApi("review-action"),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     deleteSubmittedReview: (nodeId: string) => {
       calls.push(`delete:${nodeId}`);
       return Promise.resolve();

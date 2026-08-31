@@ -117,6 +117,7 @@ function thread(
 function apiFor(snapshot: ReviewLifecycleSnapshot, calls: string[]): ReviewLifecycleApi {
   return {
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     deleteSubmittedReview: (nodeId) => {
       calls.push(`delete:${nodeId}`);
       return Promise.resolve();
@@ -194,6 +195,47 @@ test("deletes stale clean reviews and selects only unresolved owned finding thre
     ["thread-2"],
   );
   assert.equal(selectUnresolvedActionThreads(snapshot, context, "review-action").length, 1);
+});
+
+test("skips lifecycle mutations when the live pull-request head differs", async () => {
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [review(2, findingBody())],
+    threads: [thread("thread-head-race", 2, false)],
+  };
+  const calls: string[] = [];
+  const api: ReviewLifecycleApi = {
+    ...apiFor(snapshot, calls),
+    getPullRequestHeadSha: () => Promise.resolve("f".repeat(40)),
+  };
+  const preparation = await prepareReviewLifecycle(api, context, "review-action");
+  assert.deepEqual(preparation.candidates, []);
+  assert.deepEqual(calls, []);
+
+  let headReads = 0;
+  const raceApi: ReviewLifecycleApi = {
+    ...apiFor(snapshot, calls),
+    getPullRequestHeadSha: () => {
+      headReads += 1;
+      return Promise.resolve(headReads < 3 ? context.headSha : "f".repeat(40));
+    },
+  };
+  const racePreparation = await prepareReviewLifecycle(raceApi, context, "review-action");
+  const resolved = await resolveReviewLifecycle(
+    raceApi,
+    racePreparation,
+    context,
+    "review-action",
+    config,
+    "/workspace",
+    undefined,
+    undefined,
+    () =>
+      Promise.resolve([
+        { status: "completed", verdict: "fixed", confidence: "high", rationale: "gone" },
+      ]),
+  );
+  assert.deepEqual(resolved, []);
+  assert.deepEqual(calls, []);
 });
 
 test("adds the fixed reply before resolving an unchanged high-confidence thread", async () => {
@@ -678,6 +720,7 @@ test("wires the injected resolution verifier through the interactive action", as
   const api = {
     ...emptyConversationApi("review-action"),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     deleteSubmittedReview: (nodeId: string) => {
       calls.push(`delete:${nodeId}`);
       return Promise.resolve();
