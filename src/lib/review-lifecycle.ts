@@ -452,6 +452,20 @@ export async function finalizeReviewLifecycle(
     }
     const threads = snapshot.threads.filter((thread) => thread.reviewId === review.databaseId);
     if (threads.length === 0 || threads.some((thread) => !thread.isResolved)) continue;
+    const latest = await api.getReviewLifecycleSnapshot(context);
+    const currentReview = latest.reviews.find((item) => item.databaseId === review.databaseId);
+    const currentThreads = latest.threads.filter((thread) => thread.reviewId === review.databaseId);
+    if (
+      currentReview === undefined ||
+      currentReview.nodeId !== review.nodeId ||
+      currentReview.isMinimized ||
+      !isFindingActionReview(currentReview, context, authenticatedLogin) ||
+      currentReview.body.includes("### Findings") ||
+      currentThreads.length === 0 ||
+      currentThreads.some((thread) => !thread.isResolved)
+    ) {
+      continue;
+    }
     if (!(await lifecycleHeadMatches(api, context))) {
       core.warning(
         "The pull request head changed before minimizing a lifecycle review; stopping lifecycle mutations.",

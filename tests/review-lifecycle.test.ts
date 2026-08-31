@@ -665,6 +665,29 @@ test("guards minimization against current, minimized, unrelated, and threadless 
   assert.deepEqual(calls, ["minimize:review-node-2"]);
 });
 
+test("does not minimize a review after a thread reopens during the finalization read", async () => {
+  const resolvedThread = thread("thread-reopened", 2, true);
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [review(2, findingBody())],
+    threads: [resolvedThread],
+  };
+  const reopenedSnapshot: ReviewLifecycleSnapshot = {
+    ...snapshot,
+    threads: [{ ...resolvedThread, isResolved: false }],
+  };
+  const calls: string[] = [];
+  let reads = 0;
+  const api: ReviewLifecycleApi = {
+    ...apiFor(snapshot, calls),
+    getReviewLifecycleSnapshot: () => {
+      const current = reads++ === 0 ? snapshot : reopenedSnapshot;
+      return Promise.resolve(current);
+    },
+  };
+  assert.deepEqual(await finalizeReviewLifecycle(api, context, "review-action"), []);
+  assert.deepEqual(calls, []);
+});
+
 test("identifies complete lifecycle APIs and logs non-empty results", () => {
   assert.equal(
     isReviewLifecycleApi(apiFor({ reviews: [], threads: [] }, []) as unknown as GitHubApi),
