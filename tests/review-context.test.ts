@@ -237,6 +237,114 @@ test("reconciles prepared lifecycle candidates before skipping an identical revi
   assert.deepEqual(calls, ["reply:old-thread-node", "resolve:old-thread-node"]);
 });
 
+test("finalizes resolved lifecycle reviews before skipping an identical review", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const reader = actionReader();
+  const oldSha = "a".repeat(40);
+  const oldReview = {
+    id: 30,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+  };
+  const duplicateReview = {
+    id: 31,
+    author: { login: "review-action", type: "User" },
+    body: reviewMarker(context, readReviewConfig(reader)),
+    commitId: context.headSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:01:00Z",
+  };
+  const oldLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "old-review-node-finalize",
+    databaseId: oldReview.id,
+    author: oldReview.author,
+    body: oldReview.body,
+    commitId: oldReview.commitId,
+    state: oldReview.state,
+    submittedAt: oldReview.submittedAt,
+    isMinimized: false,
+  };
+  const duplicateLifecycleReview: ReviewLifecycleReviewRecord = {
+    nodeId: "duplicate-review-node-finalize",
+    databaseId: duplicateReview.id,
+    author: duplicateReview.author,
+    body: duplicateReview.body,
+    commitId: duplicateReview.commitId,
+    state: duplicateReview.state,
+    submittedAt: duplicateReview.submittedAt,
+    isMinimized: false,
+  };
+  const resolvedThread: ReviewLifecycleThreadRecord = {
+    nodeId: "resolved-thread-finalize",
+    isResolved: true,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: oldReview.id,
+    reviewNodeId: oldLifecycleReview.nodeId,
+    comments: [
+      {
+        nodeId: "resolved-comment-finalize",
+        databaseId: 300,
+        reviewId: oldReview.id,
+        reviewNodeId: oldLifecycleReview.nodeId,
+        author: oldReview.author,
+        body: "Old finding",
+        commitId: oldSha,
+        createdAt: "2026-08-31T00:00:00Z",
+        updatedAt: "2026-08-31T00:00:00Z",
+      },
+    ],
+  };
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [oldLifecycleReview, duplicateLifecycleReview],
+    threads: [resolvedThread],
+  };
+  const calls: string[] = [];
+  let goalRuns = 0;
+  let postedReviews = 0;
+  const api = {
+    ...emptyConversationApi("review-action"),
+    listReviews: () => Promise.resolve([oldReview, duplicateReview]),
+    listReviewComments: () => Promise.resolve([]),
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    getPullRequestHeadSha: () => Promise.resolve(context.headSha),
+    deleteSubmittedReview: () => Promise.resolve(),
+    addReviewThreadReply: () => Promise.resolve(),
+    resolveReviewThread: () => Promise.resolve(),
+    minimizeComment: (nodeId: string) => {
+      calls.push(`minimize:${nodeId}`);
+      return Promise.resolve();
+    },
+    createReview: () => {
+      postedReviews += 1;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  const result = await runAction(reader, [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => {
+      throw new Error("duplicate review should skip before reading files");
+    },
+    runGoals: () => {
+      goalRuns += 1;
+      return Promise.resolve([]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.deepEqual(result, { skipped: true });
+  assert.equal(goalRuns, 0);
+  assert.equal(postedReviews, 0);
+  assert.deepEqual(calls, ["minimize:old-review-node-finalize"]);
+});
+
 test("refreshes the conversation digest after lifecycle replies before duplicate detection", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);

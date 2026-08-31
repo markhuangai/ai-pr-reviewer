@@ -324,6 +324,14 @@ export async function runAction(
             review.body.includes(marker),
         )
       ) {
+        if (lifecycleApi !== undefined) {
+          const minimizedReviewIds = await finalizeReviewLifecycle(
+            lifecycleApi,
+            context,
+            authenticatedLogin,
+          );
+          logLifecycleResult({ resolvedThreadIds: [], minimizedReviewIds });
+        }
         core.info("An identical review already exists for this pull request head; skipping.");
         return { skipped: true };
       }
