@@ -1,7 +1,10 @@
+import { resolve } from "node:path";
+
 import {
   createSdkMcpServer,
   query as sdkQuery,
   tool,
+  type HookCallback,
   type McpServerConfig,
   type Options,
   type SDKActiveGoalMessage,
@@ -13,6 +16,8 @@ import { z } from "zod";
 
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewLifecycleThreadRecord } from "../lib/github-review-lifecycle.js";
+import { reviewSecretCandidates } from "../lib/input.js";
+import { redact } from "../lib/redaction.js";
 import type { PullRequestContext, ReviewConfig } from "../lib/types.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
 import { repositoryReadHook } from "./agent-review-tools.js";
@@ -83,6 +88,36 @@ function resolutionRepairPrompt(attempt: number): string {
   return `The previous turn did not produce an accepted resolution. This is repair attempt ${attempt} of ${MAX_RESOLUTION_REPAIR_ATTEMPTS}. Inspect the cited current file if needed, then call mcp__resolution_output__submit_resolution with a schema-valid verdict, confidence, and concise rationale. Use fixed only when confidence is high.`;
 }
 
+function redactedThread(
+  thread: ReviewLifecycleThreadRecord,
+  secrets: readonly string[],
+): ReviewLifecycleThreadRecord {
+  return {
+    ...thread,
+    comments: thread.comments.map((comment) => ({
+      ...comment,
+      body: redact(comment.body, secrets),
+    })),
+  };
+}
+
+function resolutionReadEvidenceHook(targetPath: string, evidence: { read: boolean }): HookCallback {
+  return (input) => {
+    if (input.hook_event_name !== "PostToolUse" || input.tool_name !== "Read") {
+      return Promise.resolve({ continue: true });
+    }
+    const toolInput = isRecord(input.tool_input) ? input.tool_input : undefined;
+    const filePath = toolInput?.file_path;
+    if (
+      typeof filePath === "string" &&
+      resolve(input.cwd, filePath) === resolve(input.cwd, targetPath)
+    ) {
+      evidence.read = true;
+    }
+    return Promise.resolve({ continue: true });
+  };
+}
+
 interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
@@ -105,6 +140,7 @@ function optionsForResolution(
   cwd: string,
   abortController: AbortController | undefined,
   outputServer: McpServerConfig,
+  readEvidenceHook?: HookCallback,
 ): Options {
   return {
     cwd,
@@ -134,6 +170,9 @@ function optionsForResolution(
     mcpServers: { resolution_output: outputServer },
     hooks: {
       PreToolUse: [{ matcher: "^(Read|Glob|Grep)$", hooks: [repositoryReadHook] }],
+      ...(readEvidenceHook === undefined
+        ? {}
+        : { PostToolUse: [{ matcher: "^Read$", hooks: [readEvidenceHook] }] }),
     },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
@@ -152,6 +191,8 @@ export async function verifyResolution(
   const signal = abortController?.signal;
   throwIfAborted(signal);
   let resolution: ResolutionInput | undefined;
+  const readEvidence = { read: false };
+  const safeThread = redactedThread(thread, reviewSecretCandidates(config));
   const outputTool = tool(
     "submit_resolution",
     "Submit exactly one evidence-based resolution verdict for the supplied stale inline finding.",
@@ -185,6 +226,17 @@ export async function verifyResolution(
           isError: true,
         });
       }
+      if (parsed.data.verdict === "fixed" && !readEvidence.read) {
+        return Promise.resolve({
+          content: [
+            {
+              type: "text",
+              text: "Resolution submission rejected. A successful Read of the cited file is required before a fixed verdict.",
+            },
+          ],
+          isError: true,
+        });
+      }
       resolution = parsed.data;
       return Promise.resolve({ content: [{ type: "text", text: "Resolution accepted." }] });
     },
@@ -205,7 +257,13 @@ export async function verifyResolution(
   try {
     const session = queryAgent({
       prompt: input,
-      options: optionsForResolution(config, cwd, abortController, outputServer),
+      options: optionsForResolution(
+        config,
+        cwd,
+        abortController,
+        outputServer,
+        resolutionReadEvidenceHook(safeThread.path, readEvidence),
+      ),
     });
     reader = (async () => {
       try {
@@ -219,9 +277,13 @@ export async function verifyResolution(
       } catch (error) {
         readerFailure = error instanceof Error ? error : new Error(errorMessage(error));
         resultTurn.reject(readerFailure);
+      } finally {
+        if (readerFailure === undefined) {
+          resultTurn.reject(new Error("The verifier session ended before returning a result."));
+        }
       }
     })();
-    const initial = makeUserMessage(resolutionPrompt(context, thread));
+    const initial = makeUserMessage(resolutionPrompt(context, safeThread));
     input.push(initial);
     for (let attempt = 0; attempt <= MAX_RESOLUTION_REPAIR_ATTEMPTS; attempt += 1) {
       const result = await resultTurn.promise;

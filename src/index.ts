@@ -29,6 +29,7 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
+import { redact } from "./lib/redaction.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
 import {
   finalizeReviewLifecycle,
@@ -56,25 +57,6 @@ const execFileAsync = promisify(execFile);
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function redactSecret(value: string, secret: string): string {
-  if (secret.length < 8 && /^[A-Za-z0-9]+$/.test(secret)) {
-    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "g");
-    return value.replace(pattern, "[REDACTED]");
-  }
-  return value.split(secret).join("[REDACTED]");
-}
-
-function redact(value: string, secrets: readonly string[]): string {
-  return secrets
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length)
-    .reduce((result, secret) => redactSecret(result, secret), value);
 }
 
 function redactGoals(

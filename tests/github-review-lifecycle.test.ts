@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { GitHubApi, githubApiInternals } from "../src/lib/github-api.js";
+import { GitHubApi } from "../src/lib/github-api.js";
 import {
   pullRequestConnection,
   readGraphqlComment,
@@ -237,10 +237,6 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
   assert.equal(snapshot.threads[0]?.comments.length, 2);
   assert.equal(requests.length, 7);
   assert.equal(requests[0]?.variables.owner, "owner");
-  assert.equal(
-    githubApiInternals.graphqlUrlFor("https://api.github.com"),
-    "https://api.github.com/graphql",
-  );
 });
 
 test("validates lifecycle GraphQL records and optional fields", () => {

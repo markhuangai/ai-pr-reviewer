@@ -89,6 +89,7 @@ function fakeQuery(
         const content = message.value.message.content;
         const contentText = typeof content === "string" ? content : JSON.stringify(content);
         assert.ok(contentText.includes(context.headSha));
+        await markReadEvidence(input.options);
         await inputHandler(submit);
         yield {
           type: "result",
@@ -112,6 +113,7 @@ interface ScriptedTurn {
   readonly hasSubmission?: boolean;
   readonly submission?: unknown;
   readonly duplicateSubmission?: unknown;
+  readonly readBeforeSubmit?: boolean;
   readonly subtype?: string;
   readonly errors?: readonly string[];
   readonly failure?: Error;
@@ -121,6 +123,7 @@ function scriptedQuery(
   turns: readonly ScriptedTurn[],
   onSubmission?: (result: { readonly content: readonly { readonly text?: string }[] }) => void,
   onQuery?: () => void,
+  onPrompt?: (message: SDKUserMessage) => void,
 ): ResolutionQuery {
   return ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => {
     onQuery?.();
@@ -144,8 +147,10 @@ function scriptedQuery(
         for (const turn of turns) {
           const message = await iterator.next();
           assert.equal(message.done, false);
+          onPrompt?.(message.value);
           if (turn.failure !== undefined) throw turn.failure;
           if (turn.hasSubmission === true) {
+            if (turn.readBeforeSubmit !== false) await markReadEvidence(input.options);
             const result = await submit.handler(turn.submission as Record<string, unknown>);
             onSubmission?.(result);
             if (turn.duplicateSubmission !== undefined) {
@@ -172,6 +177,24 @@ function scriptedQuery(
       mcpServerStatus: () => Promise.resolve([]),
     };
   }) as unknown as ResolutionQuery;
+}
+
+async function markReadEvidence(options: Options): Promise<void> {
+  const hooks = options.hooks as unknown as {
+    readonly PostToolUse?: readonly {
+      readonly hooks: readonly ((input: unknown) => Promise<unknown>)[];
+    }[];
+  };
+  const callback = hooks.PostToolUse?.[0]?.hooks[0];
+  if (callback === undefined) throw new Error("resolution read evidence hook is missing");
+  await callback({
+    hook_event_name: "PostToolUse",
+    tool_name: "Read",
+    tool_input: { file_path: thread.path },
+    tool_response: "current file contents",
+    tool_use_id: "read-tool",
+    cwd: "/workspace",
+  });
 }
 
 test("resolution verifier accepts an explicit high-confidence fixed verdict", async () => {
@@ -247,6 +270,52 @@ test("repairs invalid verifier submissions before accepting a valid result", asy
     "Resolution submission rejected. Input must be an object.",
     "Resolution accepted.",
   ]);
+});
+
+test("redacts untrusted thread bodies and rejects a fixed verdict without a current-file read", async () => {
+  const secret = "thread-only-secret-value";
+  const originalComment = thread.comments[0];
+  assert.ok(originalComment);
+  const secretThread: ReviewLifecycleThreadRecord = {
+    ...thread,
+    comments: [{ ...originalComment, body: `Credential: ${secret}` }],
+  };
+  let prompt = "";
+  const prompts: string[] = [];
+  const toolResults: string[] = [];
+  const result = await verifyResolution(
+    context,
+    secretThread,
+    { ...config, githubToken: secret },
+    "/workspace",
+    scriptedQuery(
+      [
+        {
+          hasSubmission: true,
+          readBeforeSubmit: false,
+          submission: { verdict: "fixed", confidence: "high", rationale: "premature" },
+        },
+        {
+          hasSubmission: true,
+          submission: { verdict: "not_fixed", confidence: "high", rationale: "still present" },
+        },
+      ],
+      (response) => toolResults.push(response.content[0]?.text ?? ""),
+      undefined,
+      (message) => {
+        const content = message.message.content;
+        prompt = typeof content === "string" ? content : JSON.stringify(content);
+        prompts.push(prompt);
+      },
+    ),
+  );
+  assert.equal(result.verdict, "not_fixed");
+  assert.doesNotMatch(prompts[0] ?? "", new RegExp(secret, "u"));
+  assert.match(prompts[0] ?? "", /\[REDACTED\]/u);
+  assert.equal(
+    toolResults[0],
+    "Resolution submission rejected. A successful Read of the cited file is required before a fixed verdict.",
+  );
 });
 
 test("rejects duplicate submissions and reports non-success or missing verdicts", async () => {
@@ -347,6 +416,18 @@ test("contains provider and reader failures while preserving cancellation", asyn
     scriptedQuery([{ failure: new Error("reader failed") }]),
   );
   assert.deepEqual(readerFailure, { status: "failed", error: "reader failed" });
+
+  const exhausted = await verifyResolution(
+    context,
+    thread,
+    config,
+    "/workspace",
+    scriptedQuery([]),
+  );
+  assert.deepEqual(exhausted, {
+    status: "failed",
+    error: "The verifier session ended before returning a result.",
+  });
 
   const controller = new AbortController();
   const cancellation = new CancellationError("SIGTERM");

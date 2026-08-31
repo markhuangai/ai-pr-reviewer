@@ -805,9 +805,10 @@ export class GitHubApi {
         pullRequestConnection(data, "reviewThreads"),
         "pull request review threads",
       );
+      const pageOffset = threads.length;
       for (const [index, value] of connection.nodes.entries()) {
         threads.push(
-          await this.completeLifecycleThread(readGraphqlThread(value, threads.length + index)),
+          await this.completeLifecycleThread(readGraphqlThread(value, pageOffset + index)),
         );
       }
       if (!connection.hasNextPage) break;

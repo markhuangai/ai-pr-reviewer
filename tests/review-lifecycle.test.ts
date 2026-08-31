@@ -1,4 +1,13 @@
-import { assert, test, type PullRequestContext } from "./index-test-helpers.js";
+import {
+  actionReader,
+  assert,
+  cleanWorkspace,
+  emptyConversationApi,
+  runAction,
+  test,
+  useWorkspace,
+  type PullRequestContext,
+} from "./index-test-helpers.js";
 import {
   finalizeReviewLifecycle,
   fixedReplyBody,
@@ -622,4 +631,123 @@ test("identifies complete lifecycle APIs and logs non-empty results", () => {
   assert.equal(isReviewLifecycleApi({} as GitHubApi), false);
   logLifecycleResult({ resolvedThreadIds: ["thread"], minimizedReviewIds: [1] });
   logLifecycleResult({ resolvedThreadIds: [], minimizedReviewIds: [] });
+});
+
+test("wires the injected resolution verifier through the interactive action", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const oldSha = "a".repeat(40);
+  const findingReview: ReviewLifecycleReviewRecord = {
+    nodeId: "finding-review-node",
+    databaseId: 22,
+    author: { login: "review-action", type: "User" },
+    body: `<!-- ai-pr-reviewer:v3:${oldSha}:${"d".repeat(64)} -->\n## 🔎 AI review\n\nSee the inline comments for details.`,
+    commitId: oldSha,
+    state: "COMMENTED",
+    submittedAt: "2026-08-31T00:00:00Z",
+    isMinimized: false,
+  };
+  const rootComment = {
+    nodeId: "finding-comment-node",
+    databaseId: 220,
+    reviewId: findingReview.databaseId,
+    reviewNodeId: findingReview.nodeId,
+    author: { login: "review-action", type: "User" },
+    body: "Old finding",
+    commitId: oldSha,
+    createdAt: "2026-08-31T00:00:00Z",
+    updatedAt: "2026-08-31T00:00:00Z",
+  };
+  const openThread: ReviewLifecycleThreadRecord = {
+    nodeId: "finding-thread-node",
+    isResolved: false,
+    isOutdated: true,
+    path: "review.txt",
+    line: 1,
+    originalLine: 1,
+    reviewId: findingReview.databaseId,
+    reviewNodeId: findingReview.nodeId,
+    comments: [rootComment],
+  };
+  let snapshot: ReviewLifecycleSnapshot = {
+    reviews: [findingReview],
+    threads: [openThread],
+  };
+  const calls: string[] = [];
+  let verifiedThreads: readonly string[] = [];
+  const api = {
+    ...emptyConversationApi("review-action"),
+    getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
+    deleteSubmittedReview: (nodeId: string) => {
+      calls.push(`delete:${nodeId}`);
+      return Promise.resolve();
+    },
+    addReviewThreadReply: (nodeId: string, body: string) => {
+      calls.push(`reply:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: [
+          {
+            ...openThread,
+            comments: [
+              rootComment,
+              {
+                ...rootComment,
+                nodeId: "fixed-reply-node",
+                databaseId: 221,
+                replyToId: rootComment.databaseId,
+                body,
+                commitId: context.headSha,
+              },
+            ],
+          },
+        ],
+      };
+      return Promise.resolve();
+    },
+    resolveReviewThread: (nodeId: string) => {
+      calls.push(`resolve:${nodeId}`);
+      snapshot = {
+        ...snapshot,
+        threads: snapshot.threads.map((item) => ({ ...item, isResolved: true })),
+      };
+      return Promise.resolve();
+    },
+    minimizeComment: (nodeId: string) => {
+      calls.push(`minimize:${nodeId}`);
+      return Promise.resolve();
+    },
+    createReview: () => {
+      calls.push("create");
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+  const result = await runAction(actionReader(), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: { summary: "clean", findings: [] },
+        },
+      ]),
+    runResolutionVerifiers: (_context, threads) => {
+      verifiedThreads = threads.map((item) => item.nodeId);
+      return Promise.resolve([
+        { status: "completed", verdict: "fixed", confidence: "high", rationale: "gone" },
+      ]);
+    },
+    writeSummary: () => Promise.resolve(),
+  });
+  assert.equal(result.skipped, false);
+  assert.deepEqual(verifiedThreads, ["finding-thread-node"]);
+  assert.deepEqual(calls, [
+    "reply:finding-thread-node",
+    "resolve:finding-thread-node",
+    "create",
+    "minimize:finding-review-node",
+  ]);
 });
