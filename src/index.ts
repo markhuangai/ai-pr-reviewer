@@ -274,9 +274,9 @@ export async function runAction(
       lifecycleApi === undefined
         ? undefined
         : await prepareReviewLifecycle(lifecycleApi, context, authenticatedLogin);
-    if (lifecyclePreparation?.deletedCleanReviewIds.length) {
+    if (lifecyclePreparation?.reconciledCleanReviewIds.length) {
       core.info(
-        `Removed ${lifecyclePreparation.deletedCleanReviewIds.length} stale clean AI review${lifecyclePreparation.deletedCleanReviewIds.length === 1 ? "" : "s"} before analysis.`,
+        `Reconciled ${lifecyclePreparation.reconciledCleanReviewIds.length} stale clean AI review${lifecyclePreparation.reconciledCleanReviewIds.length === 1 ? "" : "s"} before analysis.`,
       );
     }
     const briefing =

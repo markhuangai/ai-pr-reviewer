@@ -169,7 +169,8 @@ test("reconciles prepared lifecycle candidates before skipping an identical revi
     listReviewComments: () => Promise.resolve([]),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: () => Promise.resolve(),
+    updateSubmittedReview: () => Promise.resolve(),
+    dismissSubmittedReview: () => Promise.resolve(),
     addReviewThreadReply: (nodeId: string) => {
       calls.push(`reply:${nodeId}`);
       snapshot = {
@@ -314,7 +315,8 @@ test("finalizes resolved lifecycle reviews before skipping an identical review",
     listReviewComments: () => Promise.resolve([]),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: () => Promise.resolve(),
+    updateSubmittedReview: () => Promise.resolve(),
+    dismissSubmittedReview: () => Promise.resolve(),
     addReviewThreadReply: () => Promise.resolve(),
     resolveReviewThread: () => Promise.resolve(),
     minimizeComment: (nodeId: string) => {
@@ -491,7 +493,8 @@ test("refreshes the conversation digest after lifecycle replies before duplicate
     },
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: () => Promise.resolve(),
+    updateSubmittedReview: () => Promise.resolve(),
+    dismissSubmittedReview: () => Promise.resolve(),
     addReviewThreadReply: (nodeId: string) => {
       calls.push(`reply:${nodeId}`);
       snapshot = {

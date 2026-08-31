@@ -18,7 +18,7 @@ import {
 } from "./git-changed-files.js";
 import { discoverLinkedIssueNumbers, issueSnapshot } from "./review-evidence.js";
 import {
-  DELETE_REVIEW_MUTATION,
+  DISMISS_REVIEW_MUTATION,
   MINIMIZE_COMMENT_MUTATION,
   REPLY_TO_THREAD_MUTATION,
   RESOLVE_THREAD_MUTATION,
@@ -33,6 +33,7 @@ import {
   readGraphqlReview,
   readGraphqlThread,
   readGraphqlThreadComments,
+  UPDATE_REVIEW_MUTATION,
   type ReviewLifecycleSnapshot,
   type ReviewLifecycleReviewRecord,
   type ReviewLifecycleThreadRecord,
@@ -820,14 +821,40 @@ export class GitHubApi {
     return { reviews, threads };
   }
 
-  async deleteSubmittedReview(reviewNodeId: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(DELETE_REVIEW_MUTATION, {
+  async updateSubmittedReview(reviewNodeId: string, body: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(UPDATE_REVIEW_MUTATION, {
       reviewId: reviewNodeId,
+      body,
     });
-    requiredRecord(
-      requiredRecord(data, "GraphQL data").deletePullRequestReview,
-      "delete review payload",
+    const payload = requiredRecord(
+      requiredRecord(data, "GraphQL data").updatePullRequestReview,
+      "update review payload",
     );
+    const review = requiredRecord(payload.pullRequestReview, "updated review");
+    if (
+      requiredString(review.id, "updated review id") !== reviewNodeId ||
+      requiredString(review.body, "updated review body") !== body
+    ) {
+      throw new Error("GitHub did not update the pull request review.");
+    }
+  }
+
+  async dismissSubmittedReview(reviewNodeId: string, message: string): Promise<void> {
+    const data = await this.requestGraphql<unknown>(DISMISS_REVIEW_MUTATION, {
+      reviewId: reviewNodeId,
+      message,
+    });
+    const payload = requiredRecord(
+      requiredRecord(data, "GraphQL data").dismissPullRequestReview,
+      "dismiss review payload",
+    );
+    const review = requiredRecord(payload.pullRequestReview, "dismissed review");
+    if (
+      requiredString(review.id, "dismissed review id") !== reviewNodeId ||
+      requiredString(review.state, "dismissed review state") !== "DISMISSED"
+    ) {
+      throw new Error("GitHub did not dismiss the pull request review.");
+    }
   }
 
   async addReviewThreadReply(threadNodeId: string, body: string): Promise<void> {

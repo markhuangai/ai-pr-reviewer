@@ -18,6 +18,8 @@ import {
 const ACTION_REVIEW_MARKER =
   /<!--\s*ai-pr-reviewer:v3:((?:[0-9a-f]{40}|[0-9a-f]{64})):[0-9a-f]{64}\s*-->/iu;
 const FIXED_REPLY_MARKER = /<!--\s*ai-pr-reviewer:fixed:v1:((?:[0-9a-f]{40}|[0-9a-f]{64}))\s*-->/iu;
+const STALE_REVIEW_MARKER =
+  /<!--\s*ai-pr-reviewer:stale:v1:((?:[0-9a-f]{40}|[0-9a-f]{64}))\s*-->/iu;
 
 export interface ActionReviewIdentity {
   readonly headSha: string;
@@ -33,7 +35,7 @@ export interface ReviewLifecycleCandidate {
 export interface ReviewLifecyclePreparation {
   readonly snapshot: ReviewLifecycleSnapshot;
   readonly candidates: readonly ReviewLifecycleCandidate[];
-  readonly deletedCleanReviewIds: readonly number[];
+  readonly reconciledCleanReviewIds: readonly number[];
 }
 
 export interface ReviewLifecycleResult {
@@ -44,7 +46,8 @@ export interface ReviewLifecycleResult {
 export interface ReviewLifecycleApi {
   getReviewLifecycleSnapshot(context: PullRequestContext): Promise<ReviewLifecycleSnapshot>;
   getPullRequestHeadSha(context: PullRequestContext): Promise<string>;
-  deleteSubmittedReview(reviewNodeId: string): Promise<void>;
+  updateSubmittedReview(reviewNodeId: string, body: string): Promise<void>;
+  dismissSubmittedReview(reviewNodeId: string, message: string): Promise<void>;
   addReviewThreadReply(threadNodeId: string, body: string): Promise<void>;
   resolveReviewThread(threadNodeId: string): Promise<void>;
   minimizeComment(subjectNodeId: string): Promise<void>;
@@ -86,11 +89,11 @@ export function isCleanActionReview(
   return (
     identity !== undefined &&
     isActionOwnedReview(review, authenticatedLogin) &&
-    (review.state === "COMMENTED" || review.state === "APPROVED") &&
+    (review.state === "COMMENTED" || review.state === "APPROVED" || review.state === "DISMISSED") &&
     review.commitId !== null &&
     review.commitId.toLowerCase() === identity.headSha.toLowerCase() &&
     identity.headSha.toLowerCase() !== context.headSha.toLowerCase() &&
-    review.body.includes("## ✨ Good job!") &&
+    (review.body.includes("## ✨ Good job!") || STALE_REVIEW_MARKER.test(review.body)) &&
     !review.body.includes("### Findings")
   );
 }
@@ -214,6 +217,25 @@ export function fixedReplyBody(headSha: string): string {
   ].join("\n");
 }
 
+export function staleReviewBody(review: ReviewLifecycleReviewRecord, headSha: string): string {
+  const marker = ACTION_REVIEW_MARKER.exec(review.body)?.[0];
+  const identity = parseActionReviewIdentity(review.body);
+  if (marker === undefined || identity === undefined) {
+    throw new Error("Cannot mark an unowned pull request review as stale.");
+  }
+  return [
+    marker,
+    `<!-- ai-pr-reviewer:stale:v1:${headSha} -->`,
+    "## ⚠️ Stale AI review",
+    "",
+    `This review covered \`${identity.headSha}\`. New changes were pushed in \`${headSha}\`, so this result is no longer current.`,
+  ].join("\n");
+}
+
+function staleReviewDismissalMessage(headSha: string): string {
+  return `Superseded by new changes at ${headSha}; this automated approval is no longer current.`;
+}
+
 export async function prepareReviewLifecycle(
   api: ReviewLifecycleApi,
   context: PullRequestContext,
@@ -224,30 +246,40 @@ export async function prepareReviewLifecycle(
     core.warning(
       "The pull request head changed before lifecycle preparation; skipping lifecycle mutations.",
     );
-    return { snapshot, candidates: [], deletedCleanReviewIds: [] };
+    return { snapshot, candidates: [], reconciledCleanReviewIds: [] };
   }
   const staleCleanReviews = snapshot.reviews.filter((review) =>
     isCleanActionReview(review, context, authenticatedLogin),
   );
-  const deletedCleanReviewIds: number[] = [];
+  const reconciledCleanReviewIds: number[] = [];
   for (const review of staleCleanReviews) {
-    if (!(await lifecycleHeadMatches(api, context))) {
-      core.warning(
-        "The pull request head changed during lifecycle preparation; stopping lifecycle mutations.",
-      );
-      return {
-        snapshot,
-        candidates: [],
-        deletedCleanReviewIds,
-      };
+    if (review.state === "APPROVED") {
+      if (!(await lifecycleHeadMatches(api, context))) {
+        core.warning(
+          "The pull request head changed during lifecycle preparation; stopping lifecycle mutations.",
+        );
+        return { snapshot, candidates: [], reconciledCleanReviewIds };
+      }
+      await api.dismissSubmittedReview(review.nodeId, staleReviewDismissalMessage(context.headSha));
+      reconciledCleanReviewIds.push(review.databaseId);
     }
-    await api.deleteSubmittedReview(review.nodeId);
-    deletedCleanReviewIds.push(review.databaseId);
+    if (!STALE_REVIEW_MARKER.test(review.body)) {
+      if (!(await lifecycleHeadMatches(api, context))) {
+        core.warning(
+          "The pull request head changed during lifecycle preparation; stopping lifecycle mutations.",
+        );
+        return { snapshot, candidates: [], reconciledCleanReviewIds };
+      }
+      await api.updateSubmittedReview(review.nodeId, staleReviewBody(review, context.headSha));
+      if (!reconciledCleanReviewIds.includes(review.databaseId)) {
+        reconciledCleanReviewIds.push(review.databaseId);
+      }
+    }
   }
   return {
     snapshot,
     candidates: selectUnresolvedActionThreads(snapshot, context, authenticatedLogin),
-    deletedCleanReviewIds,
+    reconciledCleanReviewIds,
   };
 }
 
@@ -482,7 +514,8 @@ export function isReviewLifecycleApi(value: GitHubApi): value is GitHubApi & Rev
   return (
     typeof (value as Partial<ReviewLifecycleApi>).getReviewLifecycleSnapshot === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).getPullRequestHeadSha === "function" &&
-    typeof (value as Partial<ReviewLifecycleApi>).deleteSubmittedReview === "function" &&
+    typeof (value as Partial<ReviewLifecycleApi>).updateSubmittedReview === "function" &&
+    typeof (value as Partial<ReviewLifecycleApi>).dismissSubmittedReview === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).addReviewThreadReply === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).resolveReviewThread === "function" &&
     typeof (value as Partial<ReviewLifecycleApi>).minimizeComment === "function"
@@ -505,6 +538,7 @@ export function logLifecycleResult(result: ReviewLifecycleResult): void {
 export const reviewLifecycleInternals = {
   ACTION_REVIEW_MARKER,
   FIXED_REPLY_MARKER,
+  STALE_REVIEW_MARKER,
   isHighConfidenceFixed,
   threadRevision,
   threadRevisionWithoutOwnedFixedReplies,

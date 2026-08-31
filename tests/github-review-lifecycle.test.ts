@@ -173,9 +173,34 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
         );
         return;
       }
-      if (payload.query.includes("AiPrReviewerDeleteReview")) {
+      if (payload.query.includes("AiPrReviewerUpdateReview")) {
         response.end(
-          JSON.stringify({ data: { deletePullRequestReview: { clientMutationId: null } } }),
+          JSON.stringify({
+            data: {
+              updatePullRequestReview: {
+                pullRequestReview: {
+                  id: payload.variables.reviewId,
+                  body: payload.variables.body,
+                  state: "COMMENTED",
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.query.includes("AiPrReviewerDismissReview")) {
+        response.end(
+          JSON.stringify({
+            data: {
+              dismissPullRequestReview: {
+                pullRequestReview: {
+                  id: payload.variables.reviewId,
+                  state: "DISMISSED",
+                },
+              },
+            },
+          }),
         );
         return;
       }
@@ -230,13 +255,22 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
   const snapshot = await api.getReviewLifecycleSnapshot(context);
   assert.equal(snapshot.reviews[0]?.databaseId, 42);
   assert.equal(snapshot.threads[0]?.comments[0]?.reviewNodeId, "review-node-42");
-  await api.deleteSubmittedReview("review-node-42");
+  await api.updateSubmittedReview("review-node-42", "stale body");
+  await api.dismissSubmittedReview("review-node-42", "superseded");
   await api.addReviewThreadReply("thread-node-1", "Fixed");
   await api.resolveReviewThread("thread-node-1");
   await api.minimizeComment("review-node-42");
   assert.equal(snapshot.threads[0]?.comments.length, 2);
-  assert.equal(requests.length, 7);
+  assert.equal(requests.length, 8);
   assert.equal(requests[0]?.variables.owner, "owner");
+  assert.deepEqual(requests[3]?.variables, {
+    reviewId: "review-node-42",
+    body: "stale body",
+  });
+  assert.deepEqual(requests[4]?.variables, {
+    reviewId: "review-node-42",
+    message: "superseded",
+  });
 });
 
 test("validates lifecycle GraphQL records and optional fields", () => {
@@ -605,8 +639,51 @@ test("fails closed on malformed GraphQL responses and non-advancing cursors", as
 });
 
 test("validates lifecycle mutation payloads and updates REST review comments", async () => {
-  await withFetch([jsonResponse({ data: { deletePullRequestReview: null } })], async () => {
-    await assert.rejects(new GitHubApi("token").deleteSubmittedReview("review"), /invalid delete/u);
+  await withFetch([jsonResponse({ data: { updatePullRequestReview: null } })], async () => {
+    await assert.rejects(
+      new GitHubApi("token").updateSubmittedReview("review", "stale"),
+      /invalid update/u,
+    );
+  });
+  await withFetch(
+    [
+      jsonResponse({
+        data: {
+          dismissPullRequestReview: {
+            pullRequestReview: { id: "review", state: "APPROVED" },
+          },
+        },
+      }),
+    ],
+    async () => {
+      await assert.rejects(
+        new GitHubApi("token").dismissSubmittedReview("review", "superseded"),
+        /did not dismiss/u,
+      );
+    },
+  );
+  await withFetch(
+    [
+      jsonResponse({
+        data: {
+          updatePullRequestReview: {
+            pullRequestReview: { id: "review", body: "different" },
+          },
+        },
+      }),
+    ],
+    async () => {
+      await assert.rejects(
+        new GitHubApi("token").updateSubmittedReview("review", "stale"),
+        /did not update/u,
+      );
+    },
+  );
+  await withFetch([jsonResponse({ data: { dismissPullRequestReview: null } })], async () => {
+    await assert.rejects(
+      new GitHubApi("token").dismissSubmittedReview("review", "superseded"),
+      /invalid dismiss/u,
+    );
   });
   await withFetch(
     [jsonResponse({ data: { addPullRequestReviewThreadReply: { comment: null } } })],

@@ -21,6 +21,7 @@ import {
   resolveReviewLifecycle,
   reviewLifecycleInternals,
   selectUnresolvedActionThreads,
+  staleReviewBody,
   type ReviewLifecycleApi,
 } from "../src/lib/review-lifecycle.js";
 import type {
@@ -118,8 +119,12 @@ function apiFor(snapshot: ReviewLifecycleSnapshot, calls: string[]): ReviewLifec
   return {
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: (nodeId) => {
-      calls.push(`delete:${nodeId}`);
+    updateSubmittedReview: (nodeId, body) => {
+      calls.push(`update:${nodeId}:${body}`);
+      return Promise.resolve();
+    },
+    dismissSubmittedReview: (nodeId, message) => {
+      calls.push(`dismiss:${nodeId}:${message}`);
       return Promise.resolve();
     },
     addReviewThreadReply: (nodeId, body) => {
@@ -160,9 +165,17 @@ test("recognizes only stale, marker-owned clean reviews", () => {
     ),
     false,
   );
+  assert.equal(
+    isCleanActionReview(
+      { ...stale, body: staleReviewBody(stale, headSha), state: "DISMISSED" },
+      context,
+      "review-action",
+    ),
+    true,
+  );
 });
 
-test("deletes stale clean reviews and selects only unresolved owned finding threads", async () => {
+test("marks stale clean reviews and selects only unresolved owned finding threads", async () => {
   const otherThread = thread("thread-other", 2, false);
   const otherRoot = otherThread.comments[0];
   assert.ok(otherRoot);
@@ -188,13 +201,71 @@ test("deletes stale clean reviews and selects only unresolved owned finding thre
     context,
     "review-action",
   );
-  assert.deepEqual(calls, ["delete:review-node-1"]);
-  assert.deepEqual(preparation.deletedCleanReviewIds, [1]);
+  const cleanReview = snapshot.reviews[0];
+  assert.ok(cleanReview);
+  assert.deepEqual(calls, [`update:review-node-1:${staleReviewBody(cleanReview, headSha)}`]);
+  assert.deepEqual(preparation.reconciledCleanReviewIds, [1]);
   assert.deepEqual(
     preparation.candidates.map((candidate) => candidate.thread.nodeId),
     ["thread-2"],
   );
   assert.equal(selectUnresolvedActionThreads(snapshot, context, "review-action").length, 1);
+});
+
+test("dismisses stale approvals and resumes interrupted reconciliation", async () => {
+  const approved = { ...review(3, cleanBody()), state: "APPROVED" };
+  const dismissed = { ...review(4, cleanBody()), state: "DISMISSED" };
+  const alreadyStale = review(5, staleReviewBody(review(5, cleanBody()), headSha));
+  const snapshot: ReviewLifecycleSnapshot = {
+    reviews: [approved, dismissed, alreadyStale],
+    threads: [],
+  };
+  const calls: string[] = [];
+  const preparation = await prepareReviewLifecycle(
+    apiFor(snapshot, calls),
+    context,
+    "review-action",
+  );
+  assert.deepEqual(calls, [
+    `dismiss:review-node-3:Superseded by new changes at ${headSha}; this automated approval is no longer current.`,
+    `update:review-node-3:${staleReviewBody(approved, headSha)}`,
+    `update:review-node-4:${staleReviewBody(dismissed, headSha)}`,
+  ]);
+  assert.deepEqual(preparation.reconciledCleanReviewIds, [3, 4]);
+
+  calls.length = 0;
+  const staleApproval = {
+    ...approved,
+    body: staleReviewBody(approved, headSha),
+  };
+  const retry = await prepareReviewLifecycle(
+    apiFor({ reviews: [staleApproval], threads: [] }, calls),
+    context,
+    "review-action",
+  );
+  assert.deepEqual(calls, [
+    `dismiss:review-node-3:Superseded by new changes at ${headSha}; this automated approval is no longer current.`,
+  ]);
+  assert.deepEqual(retry.reconciledCleanReviewIds, [3]);
+});
+
+test("stops between approval dismissal and body update when the head changes", async () => {
+  const approved = { ...review(3, cleanBody()), state: "APPROVED" };
+  const calls: string[] = [];
+  let headReads = 0;
+  const api: ReviewLifecycleApi = {
+    ...apiFor({ reviews: [approved], threads: [] }, calls),
+    getPullRequestHeadSha: () => {
+      headReads += 1;
+      return Promise.resolve(headReads < 3 ? headSha : "f".repeat(40));
+    },
+  };
+  const preparation = await prepareReviewLifecycle(api, context, "review-action");
+  assert.deepEqual(calls, [
+    `dismiss:review-node-3:Superseded by new changes at ${headSha}; this automated approval is no longer current.`,
+  ]);
+  assert.deepEqual(preparation.reconciledCleanReviewIds, [3]);
+  assert.deepEqual(preparation.candidates, []);
 });
 
 test("skips lifecycle mutations when the live pull-request head differs", async () => {
@@ -377,6 +448,15 @@ test("renders a deterministic fixed reply marker", () => {
   assert.equal(reviewLifecycleInternals.FIXED_REPLY_MARKER.test(body), true);
 });
 
+test("renders a stale review without losing action ownership", () => {
+  const original = review(1, cleanBody());
+  const body = staleReviewBody(original, headSha);
+  assert.deepEqual(parseActionReviewIdentity(body), { headSha: oldSha });
+  assert.equal(reviewLifecycleInternals.STALE_REVIEW_MARKER.test(body), true);
+  assert.match(body, new RegExp(headSha));
+  assert.doesNotMatch(body, /Good job/u);
+});
+
 test("binds lifecycle ownership and finding identity to the authenticated action", () => {
   const clean = review(1, cleanBody());
   const finding = review(2, findingBody());
@@ -411,7 +491,7 @@ test("skips lifecycle verification when no candidate is available", async () => 
   let called = false;
   const result = await resolveReviewLifecycle(
     apiFor({ reviews: [], threads: [] }, []),
-    { snapshot: { reviews: [], threads: [] }, candidates: [], deletedCleanReviewIds: [] },
+    { snapshot: { reviews: [], threads: [] }, candidates: [], reconciledCleanReviewIds: [] },
     context,
     "review-action",
     config,
@@ -744,10 +824,8 @@ test("wires the injected resolution verifier through the interactive action", as
     ...emptyConversationApi("review-action"),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: (nodeId: string) => {
-      calls.push(`delete:${nodeId}`);
-      return Promise.resolve();
-    },
+    updateSubmittedReview: () => Promise.resolve(),
+    dismissSubmittedReview: () => Promise.resolve(),
     addReviewThreadReply: (nodeId: string, body: string) => {
       calls.push(`reply:${nodeId}`);
       snapshot = {

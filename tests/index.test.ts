@@ -33,6 +33,7 @@ import type {
   ReviewLifecycleSnapshot,
   ReviewLifecycleThreadRecord,
 } from "../src/lib/github-review-lifecycle.js";
+import { staleReviewBody } from "../src/lib/review-lifecycle.js";
 
 test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
@@ -878,8 +879,12 @@ test("reconciles interactive lifecycle state before and after the current review
     ...emptyConversationApi("review-action"),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
-    deleteSubmittedReview: (nodeId: string) => {
-      calls.push(`delete:${nodeId}`);
+    updateSubmittedReview: (nodeId: string, body: string) => {
+      calls.push(`update:${nodeId}:${body}`);
+      return Promise.resolve();
+    },
+    dismissSubmittedReview: (nodeId: string, message: string) => {
+      calls.push(`dismiss:${nodeId}:${message}`);
       return Promise.resolve();
     },
     addReviewThreadReply: () => Promise.resolve(),
@@ -908,7 +913,12 @@ test("reconciles interactive lifecycle state before and after the current review
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
-  assert.deepEqual(calls, ["delete:clean-review-node", "create", "minimize:finding-review-node"]);
+  assert.deepEqual(calls, [
+    `dismiss:clean-review-node:Superseded by new changes at ${context.headSha}; this automated approval is no longer current.`,
+    `update:clean-review-node:${staleReviewBody(cleanReview, context.headSha)}`,
+    "create",
+    "minimize:finding-review-node",
+  ]);
 });
 
 test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
@@ -921,7 +931,8 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
       lifecycleCalls += 1;
       return Promise.reject(new Error("lifecycle must not run"));
     },
-    deleteSubmittedReview: () => Promise.resolve(),
+    updateSubmittedReview: () => Promise.resolve(),
+    dismissSubmittedReview: () => Promise.resolve(),
     addReviewThreadReply: () => Promise.resolve(),
     resolveReviewThread: () => Promise.resolve(),
     minimizeComment: () => Promise.resolve(),

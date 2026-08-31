@@ -98,10 +98,18 @@ export const REVIEW_LIFECYCLE_THREADS_QUERY = `
   }
 `;
 
-export const DELETE_REVIEW_MUTATION = `
-  mutation AiPrReviewerDeleteReview($reviewId: ID!) {
-    deletePullRequestReview(input: { pullRequestReviewId: $reviewId }) {
-      clientMutationId
+export const UPDATE_REVIEW_MUTATION = `
+  mutation AiPrReviewerUpdateReview($reviewId: ID!, $body: String!) {
+    updatePullRequestReview(input: { pullRequestReviewId: $reviewId, body: $body }) {
+      pullRequestReview { id body state }
+    }
+  }
+`;
+
+export const DISMISS_REVIEW_MUTATION = `
+  mutation AiPrReviewerDismissReview($reviewId: ID!, $message: String!) {
+    dismissPullRequestReview(input: { pullRequestReviewId: $reviewId, message: $message }) {
+      pullRequestReview { id state }
     }
   }
 `;
