@@ -606,7 +606,7 @@ export async function runAction(
       );
       if (config.interactWithPullRequest && review.omittedFindings.length > 0) {
         core.warning(
-          `Published the 25 highest-priority inline findings and omitted ${review.omittedFindings.length} additional finding${review.omittedFindings.length === 1 ? "" : "s"} from the pull request review; the workflow summary retains every finding.`,
+          `Published ${review.inlineFindings.length} verified inline finding${review.inlineFindings.length === 1 ? "" : "s"} and omitted ${review.omittedFindings.length} additional finding${review.omittedFindings.length === 1 ? "" : "s"} from the pull request review; the workflow summary retains every finding.`,
         );
       }
       if (!config.interactWithPullRequest) {
@@ -701,6 +701,17 @@ export async function runAction(
           };
         }
       }
+      if (review.omittedFindings.length > 0) {
+        await diagnostics.withSpan(
+          actionDescriptor(
+            "publication",
+            "action.summary.write-overflow",
+            "write findings omitted from the interactive review to the workflow summary",
+          ),
+          () => dependencies.writeSummary(context, review, goals),
+        );
+        throwIfAborted(signal);
+      }
       try {
         await diagnostics.withSpan(
           actionDescriptor(
@@ -749,17 +760,6 @@ export async function runAction(
           () => finalizeReviewLifecycle(lifecycleApi, context, authenticatedLogin),
         );
         logLifecycleResult({ resolvedThreadIds, minimizedReviewIds });
-      }
-      if (review.omittedFindings.length > 0) {
-        await diagnostics.withSpan(
-          actionDescriptor(
-            "publication",
-            "action.summary.write-overflow",
-            "write findings omitted from the interactive review to the workflow summary",
-          ),
-          () => dependencies.writeSummary(context, review, goals),
-        );
-        throwIfAborted(signal);
       }
       if (review.partial)
         throw new Error("The review was posted as a partial result, but one or more goals failed.");

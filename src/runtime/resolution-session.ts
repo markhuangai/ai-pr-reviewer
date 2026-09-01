@@ -28,6 +28,7 @@ import {
 import { repositoryReadHook } from "./agent-review-tools.js";
 import {
   PromptStream,
+  SDK_SESSION_STALL_MS,
   SdkSessionMonitor,
   makeUserMessage,
   safeAgentEnvironment,
@@ -455,7 +456,7 @@ export async function verifyResolution(
         sessionPhase = "waiting-for-continuation-result";
         input.push(
           makeUserMessage(
-            "The previous turn was interrupted after 300000 ms without an SDK message. Continue the same resolution verification from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+            `The previous turn was interrupted after ${SDK_SESSION_STALL_MS} ms without an SDK message. Continue the same resolution verification from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.`,
           ),
         );
         writeMonitorEvent("continuation-queued", {

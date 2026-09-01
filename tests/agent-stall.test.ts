@@ -180,6 +180,7 @@ test("finalizes an accepted submission when the SDK stops yielding messages", as
   const closed = manualSignal<undefined>();
   let interrupts = 0;
   let closes = 0;
+  let mcpStatusChecks = 0;
   const query = ((input: {
     readonly prompt: AsyncIterable<SDKUserMessage>;
     readonly options: Options;
@@ -197,7 +198,10 @@ test("finalizes an accepted submission when the SDK stops yielding messages", as
       await closed.promise;
       yield* [] as SDKResultMessage[];
     },
-    mcpServerStatus: () => Promise.resolve([]),
+    mcpServerStatus: () => {
+      mcpStatusChecks += 1;
+      return Promise.resolve([]);
+    },
     interrupt: () => {
       interrupts += 1;
       return Promise.resolve(undefined);
@@ -228,9 +232,11 @@ test("finalizes an accepted submission when the SDK stops yielding messages", as
   assert.deepEqual(result.tokenUsage, { models: [], complete: false });
   assert.equal(interrupts, 1);
   assert.equal(closes, 1);
+  assert.equal(mcpStatusChecks, 1);
   const logs = output.join("");
   assert.match(logs, /session heartbeat.*"submission_accepted":true/u);
   assert.match(logs, /session stall-detected.*"elapsed_since_sdk_message_ms":300000/u);
+  assert.match(logs, /session submission-finalized.*"mcp_status_checked":true/u);
   assert.match(logs, /session submission-finalized.*"token_accounting_complete":false/u);
 });
 
@@ -241,6 +247,7 @@ test("lets an accepted submission win an interrupted turn boundary", async (t) =
   let interrupts = 0;
   let closes = 0;
   let extraPrompt = false;
+  let mcpStatusChecks = 0;
   const query = ((input: {
     readonly prompt: AsyncIterable<SDKUserMessage>;
     readonly options: Options;
@@ -260,7 +267,10 @@ test("lets an accepted submission win an interrupted turn boundary", async (t) =
       const next = await messages.next();
       extraPrompt = !next.done;
     },
-    mcpServerStatus: () => Promise.resolve([]),
+    mcpServerStatus: () => {
+      mcpStatusChecks += 1;
+      return Promise.resolve([]);
+    },
     interrupt: () => {
       interrupts += 1;
       boundary.resolve(undefined);
@@ -292,6 +302,7 @@ test("lets an accepted submission win an interrupted turn boundary", async (t) =
   assert.equal(extraPrompt, false);
   assert.equal(interrupts, 1);
   assert.equal(closes, 1);
+  assert.equal(mcpStatusChecks, 1);
 });
 
 test("continues unfinished turns across repeated SDK stalls", async (t) => {

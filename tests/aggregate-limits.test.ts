@@ -246,9 +246,13 @@ test("omits unverified findings from the review body while retaining them in the
   ];
   const review = aggregateReview(context, config, files, goals);
   const body = buildReviewBody(review, goals);
+  const summary = buildRunSummary(context, review, goals);
 
   assert.doesNotMatch(body, /Unverified finding|### Findings/u);
-  assert.match(buildRunSummary(context, review, goals), /Unverified finding/u);
+  assert.match(summary, /Unverified finding/u);
+  assert.doesNotMatch(summary.slice(0, summary.indexOf("#### Details")), /src\/other\.ts:1/u);
+  assert.match(summary, /location could not be verified against an added line/u);
+  assert.doesNotMatch(summary, /after the 25 inline-comment limit/u);
   assert.doesNotMatch(body, /PRIVATE OVERSIZED GOAL|PRIVATE OVERSIZED SUMMARY|### Goals/u);
 });
 
@@ -429,6 +433,48 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
     if (hasDetails) included += 1;
   }
   assert.ok(included > 0 && included < goals.length);
+});
+
+test("caps the finding index when it alone exceeds the run-summary byte limit", () => {
+  const summaryConfig = { ...config, interactWithPullRequest: false };
+  const largeFiles = Array.from({ length: 3_000 }, (_, index) => ({
+    path: `src/${"p".repeat(480)}-${String(index).padStart(4, "0")}.ts`,
+    status: "modified" as const,
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    addedLines: new Set([1]),
+  }));
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "large index",
+      status: "completed",
+      submission: {
+        summary: "large index",
+        findings: largeFiles.map((file, index) => {
+          const identifier = String(index).padStart(4, "0");
+          return {
+            title: `Finding ${identifier} ${"x".repeat(100)}`,
+            severity: "LOW" as const,
+            body: `BEGIN-${identifier}:evidence:END-${identifier}`,
+            path: file.path,
+            line: 1,
+          };
+        }),
+      },
+    },
+  ];
+  const review = aggregateReview(context, summaryConfig, largeFiles, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
+  assert.match(
+    summary,
+    /additional findings? (?:was|were) omitted because the run summary reached its size limit/u,
+  );
+  assert.match(summary, /Finding 0000/u);
+  assert.doesNotMatch(summary, /Finding 2999/u);
+  assert.match(summary, /BEGIN-0000:evidence:END-0000/u);
 });
 
 test("renders the maximum supported finding count with linear byte accounting", () => {

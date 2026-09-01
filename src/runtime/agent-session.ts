@@ -404,7 +404,7 @@ export interface ReviewSessionRecoveryMonitorOptions {
   readonly markBoundaryPending: () => void;
   readonly interrupt: () => Promise<unknown>;
   readonly closeAcceptedSession: () => void;
-  readonly finalizeAcceptedSubmission: () => void;
+  readonly finalizeAcceptedSubmission: () => void | Promise<void>;
 }
 
 export function createReviewSessionRecoveryMonitor(
@@ -442,8 +442,17 @@ export function createReviewSessionRecoveryMonitor(
           });
         });
       if (!submissionAccepted) return;
-      options.closeAcceptedSession();
-      options.finalizeAcceptedSubmission();
+      void Promise.resolve()
+        .then(() => options.finalizeAcceptedSubmission())
+        .catch((error: unknown) => {
+          options.write("submission-finalization-failed", {
+            recovery: stall.recovery,
+            error: errorMessage(error),
+          });
+        })
+        .finally(() => {
+          options.closeAcceptedSession();
+        });
     },
   });
 }

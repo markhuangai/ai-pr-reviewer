@@ -52,9 +52,16 @@ import {
   jsonToolResult,
 } from "./agent-review-tools.js";
 import {
+  acceptedSubmissionDetails,
+  readAcceptedSubmissionMcpFailures,
+  acceptedSubmissionResult,
+  readAcceptedSubmissionMcpStatus,
+} from "./accepted-submission.js";
+import {
   MAX_REPAIR_ATTEMPTS,
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
+  SDK_SESSION_STALL_MS,
   createReviewSessionRecoveryMonitor,
   interactiveSubmissionSchema,
   invalidInteractiveFindingLocations,
@@ -76,9 +83,7 @@ import {
   type RepositoryFileSnapshot,
   type RepositoryQuerySource,
 } from "./repository-snapshot.js";
-
-export type { AgentQuery } from "./agent-session.js";
-export { agentInternals } from "./agent-session.js";
+export { agentInternals, type AgentQuery } from "./agent-session.js";
 interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
@@ -637,6 +642,10 @@ export async function runReviewGoal(
     });
     const activeSession = session;
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
+    const readMcpFailures = (): Promise<readonly string[]> =>
+      readAcceptedSubmissionMcpFailures(() => activeSession.mcpServerStatus(), configuredMcpNames);
+    let stalledMcpStatus = { checked: false, failures: "" };
+    let stalledSubmissionFinalization: Promise<void> | undefined;
     const activeMonitor = createReviewSessionRecoveryMonitor({
       snapshot: () =>
         reviewSessionSnapshot(
@@ -664,7 +673,13 @@ export async function runReviewGoal(
       interrupt: () => activeSession.interrupt(),
       closeAcceptedSession: closeSession,
       finalizeAcceptedSubmission: () => {
-        stalledSubmission.resolve(undefined);
+        if (stalledSubmissionFinalization !== undefined) return stalledSubmissionFinalization;
+        stalledSubmissionFinalization = (async () => {
+          stalledMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
+          closeSession();
+          stalledSubmission.resolve(undefined);
+        })();
+        return stalledSubmissionFinalization;
       },
     });
     monitor = activeMonitor;
@@ -739,21 +754,25 @@ export async function runReviewGoal(
         if (acceptedSubmission === undefined) {
           throw new Error("The SDK session closed for stall recovery without an accepted review.");
         }
+        activeMonitor.stop();
         sessionPhase = "finalizing-stalled-submission";
         await reader;
         writeAgentMonitorEvent(
           goalIndex,
           "submission-finalized",
-          {
-            recovery: activeMonitor.recoveryCount,
-            terminal_sdk_result: false,
-            mcp_status_checked: false,
-            token_accounting_complete: false,
-          },
+          acceptedSubmissionDetails(
+            activeMonitor.recoveryCount,
+            false,
+            undefined,
+            stalledMcpStatus,
+            false,
+          ),
           logSecrets,
         );
-        return withTokenUsage(
-          { prompt: goal, status: "completed", submission: acceptedSubmission },
+        return acceptedSubmissionResult(
+          goal,
+          acceptedSubmission,
+          stalledMcpStatus,
           tokenUsageState.models,
           false,
         );
@@ -774,6 +793,9 @@ export async function runReviewGoal(
         if (submission !== undefined) {
           const acceptedSubmission = submission;
           sessionPhase = "finalizing-interrupted-submission";
+          activeMonitor.stop();
+          const interruptedMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
+          throwIfAborted(signal);
           sessionState.expectedSessionClose = true;
           input.finish();
           closeSession();
@@ -781,25 +803,26 @@ export async function runReviewGoal(
           writeAgentMonitorEvent(
             goalIndex,
             "submission-finalized",
-            {
-              recovery: activeMonitor.recoveryCount,
-              terminal_sdk_result: true,
-              terminal_sdk_result_subtype: result.subtype,
-              mcp_status_checked: false,
-              token_accounting_complete:
-                readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-            },
+            acceptedSubmissionDetails(
+              activeMonitor.recoveryCount,
+              true,
+              result.subtype,
+              interruptedMcpStatus,
+              readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+            ),
             logSecrets,
           );
-          return withTokenUsage(
-            { prompt: goal, status: "completed", submission: acceptedSubmission },
+          return acceptedSubmissionResult(
+            goal,
+            acceptedSubmission,
+            interruptedMcpStatus,
             tokenUsageState.models,
             readerFailure === undefined && tokenUsageState.latestSnapshotValid,
           );
         }
         sessionPhase = "waiting-for-continuation-result";
         const continuation = makeUserMessage(
-          "The previous turn was interrupted after 300000 ms without an SDK message. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+          `The previous turn was interrupted after ${SDK_SESSION_STALL_MS} ms without an SDK message. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.`,
         );
         input.push(continuation);
         writeAgentMonitorEvent(
@@ -842,11 +865,7 @@ export async function runReviewGoal(
       }
       if (submission !== undefined) {
         sessionPhase = "checking-mcp-status";
-        const mcpFailures = (await activeSession.mcpServerStatus()).filter(
-          (status) =>
-            configuredMcpNames.has(status.name) &&
-            (status.status === "failed" || status.status === "needs-auth"),
-        );
+        const mcpFailures = await readMcpFailures();
         throwIfAborted(signal);
         sessionState.expectedSessionClose = true;
         input.finish();
@@ -858,7 +877,7 @@ export async function runReviewGoal(
               prompt: goal,
               status: "failed",
               submission,
-              error: `Configured MCP server failure: ${mcpFailures.map((status) => `${status.name}: ${status.error ?? status.status}`).join("; ")}`,
+              error: `Configured MCP server failure: ${mcpFailures.join("; ")}`,
             },
             tokenUsageState.models,
             readerFailure === undefined && tokenUsageState.latestSnapshotValid,

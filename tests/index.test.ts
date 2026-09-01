@@ -1115,9 +1115,11 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
   let request: PullRequestReviewRequest | undefined;
   let summary = "";
   let summaryWrites = 0;
+  const publicationOrder: string[] = [];
   const api = {
     ...emptyConversationApi("review-action"),
     createReview: (_context: PullRequestContext, reviewRequest: PullRequestReviewRequest) => {
+      publicationOrder.push("review");
       request = reviewRequest;
       return Promise.resolve();
     },
@@ -1146,6 +1148,7 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
         },
       ]),
     writeSummary: (summaryContext, review, goals) => {
+      publicationOrder.push("summary");
       summaryWrites += 1;
       summary = buildRunSummary(summaryContext, review, goals);
       return Promise.resolve();
@@ -1157,5 +1160,6 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
   assert.equal(request?.comments.length, 25);
   assert.doesNotMatch(request?.body ?? "", /Finding 25|### Findings/u);
   assert.equal(summaryWrites, 1);
+  assert.deepEqual(publicationOrder, ["summary", "review"]);
   assert.match(summary, /Finding 25/u);
 });
