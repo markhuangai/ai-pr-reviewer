@@ -6,7 +6,7 @@ Each review prompt runs one isolated Claude Agent SDK session. Sessions use auto
 
 ## Consumer workflow
 
-For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access; interactive runs also need pull-request review write access to reconcile stale reviews and threads.
+For event-based reviews, the action expects a pull request event and a full-history checkout so the reviewer can inspect the repository and its history. A PAT is required for target-repository API and Git access. For a fine-grained PAT, summary-only runs need `Contents: Read-only` and `Pull requests: Read-only`; interactive runs need both permissions set to `Read and write` because GitHub gates `resolveReviewThread` on Contents write as well as Pull requests write.
 
 Run the action against a pristine checkout containing no tracked modifications, untracked files, or ignored files and directories. Run it before setup or build steps, or remove every artifact those steps create before starting the review. Workflow-generated review context belongs under `RUNNER_TEMP`, not inside `GITHUB_WORKSPACE`.
 
@@ -46,6 +46,8 @@ jobs:
             ]
 ```
 
+The workflow-level `permissions` block configures only `GITHUB_TOKEN`. Configure the PAT supplied through `github-pat` separately; changing the block does not change the PAT's grants. If the organization requires approval for fine-grained PATs, an organization owner must approve a new token or permission change before the grants take effect.
+
 The workflow owns whether a newer event cancels an older review. For example, a pull-request workflow can keep only the newest run for each target:
 
 ```yaml
@@ -71,7 +73,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 | Input              | Required | Default | Notes                                                                                                                              |
 | ------------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `github-pat`       | yes      |         | Fine-grained PAT with read access to the target; interactive lifecycle reconciliation also needs pull request review write access. |
+| `github-pat`       | yes      |         | Fine-grained PAT for each target: Contents and Pull requests read-only for summaries; both Read and write for interactive reviews. |
 | `ai-base-url`      | yes      |         | HTTP(S) Anthropic Messages API-compatible endpoint.                                                                                |
 | `ai-secret`        | yes      |         | API key for that endpoint.                                                                                                         |
 | `model`            | yes      |         | Model name understood by the endpoint.                                                                                             |
@@ -266,7 +268,7 @@ jobs:
           interact-with-pr: false
 ```
 
-The PAT must cover the target repository. For summary-only review, grant target contents and pull request metadata read access. If `interact-with-pr` is `true`, also grant pull request review write access.
+The PAT must cover the target repository. For a fine-grained PAT, summary-only review needs Contents and Pull requests set to Read-only. If `interact-with-pr` is `true`, both must be set to Read and write; GitHub requires Contents write to resolve review threads.
 
 ## HTTP MCP configuration
 

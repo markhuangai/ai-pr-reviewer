@@ -46,11 +46,24 @@ function validateStable(
 
 test("exposes only API-key authentication", async () => {
   const action = parse(await readFile("action.yml", "utf8")) as {
-    inputs?: Record<string, { required?: boolean }>;
+    inputs?: Record<string, { description?: string; required?: boolean }>;
   };
 
   assert.equal(action.inputs?.["ai-secret"]?.required, true);
   assert.equal(action.inputs?.["ai-auth-mode"], undefined);
+});
+
+test("documents the GitHub PAT permissions required for interactive reconciliation", async () => {
+  const action = parse(await readFile("action.yml", "utf8")) as {
+    inputs?: Record<string, { description?: string }>;
+  };
+
+  assert.equal(
+    action.inputs?.["github-pat"]?.description,
+    "A GitHub PAT scoped to the target repository. Summary-only runs need Contents " +
+      "and Pull requests read access; interactive runs need both set to Read and " +
+      "write because lifecycle reconciliation resolves review threads.",
+  );
 });
 
 test("keeps every release workflow upload artifact for one day", async () => {

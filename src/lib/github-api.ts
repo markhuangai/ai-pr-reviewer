@@ -1369,7 +1369,7 @@ export class GitHubApi {
       "AiPrReviewerResolveThread",
       "resolve a verified fixed action review thread",
       "POST",
-      "pull_requests:write",
+      "contents:write + pull_requests:write",
     );
     const data = await this.requestGraphql(
       RESOLVE_THREAD_MUTATION,

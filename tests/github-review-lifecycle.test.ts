@@ -5,6 +5,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { GitHubApi } from "../src/lib/github-api.js";
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
 import {
   pullRequestConnection,
   readGraphqlComment,
@@ -705,4 +706,54 @@ test("validates lifecycle mutation payloads and updates REST review comments", a
     assert.equal(request.init?.method, "PATCH");
     assert.equal(request.init?.body, JSON.stringify({ body: "updated body" }));
   });
+});
+
+test("reports both permissions when review thread resolution is forbidden", async () => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  await withFetch(
+    [
+      new Response(
+        JSON.stringify({
+          errors: [
+            {
+              type: "FORBIDDEN",
+              message: "Resource not accessible by personal access token",
+              path: ["resolveReviewThread"],
+            },
+          ],
+        }),
+        { status: 200, headers: { "x-github-request-id": "resolve-forbidden" } },
+      ),
+    ],
+    async () => {
+      const api = new GitHubApi(
+        "token",
+        "https://api.github.com",
+        undefined,
+        "https://api.github.com/graphql",
+        diagnostics,
+      );
+      await assert.rejects(
+        api.resolveReviewThread("thread"),
+        /Resource not accessible by personal access token/u,
+      );
+    },
+  );
+
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find(
+    (record) =>
+      record.event === "operation.finished" && record.operation === "AiPrReviewerResolveThread",
+  );
+  assert.ok(terminal);
+  const details = terminal.details as Record<string, unknown>;
+  const error = details.error as Record<string, unknown>;
+  assert.equal(details.required_permission, "contents:write + pull_requests:write");
+  assert.equal(error.requiredPermission, "contents:write + pull_requests:write");
 });
