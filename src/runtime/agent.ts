@@ -34,6 +34,11 @@ import {
   logAgentMessageSafely,
   logQueuedUserMessage,
   modelUsageSnapshot,
+  acceptedSubmissionDetails,
+  acceptedSubmissionResult,
+  readAcceptedSubmissionMcpFailures,
+  readAcceptedSubmissionMcpStatus,
+  runAgentCleanup,
   sdkSessionActivity,
   withTokenUsage,
   writeCompleteAgentLog,
@@ -51,12 +56,6 @@ import {
   StringPageReader,
   jsonToolResult,
 } from "./agent-review-tools.js";
-import {
-  acceptedSubmissionDetails,
-  readAcceptedSubmissionMcpFailures,
-  acceptedSubmissionResult,
-  readAcceptedSubmissionMcpStatus,
-} from "./accepted-submission.js";
 import {
   MAX_REPAIR_ATTEMPTS,
   PromptStream,
@@ -89,7 +88,6 @@ interface Deferred<T> {
   resolve(value: T): void;
   reject(error: unknown): void;
 }
-
 function deferred<T>(): Deferred<T> {
   let resolvePromise: (value: T) => void = () => undefined;
   let rejectPromise: (error: unknown) => void = () => undefined;
@@ -100,7 +98,6 @@ function deferred<T>(): Deferred<T> {
   void promise.catch(() => undefined);
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
-
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -674,10 +671,10 @@ export async function runReviewGoal(
       closeAcceptedSession: closeSession,
       finalizeAcceptedSubmission: () => {
         if (stalledSubmissionFinalization !== undefined) return stalledSubmissionFinalization;
+        stalledSubmission.resolve(undefined);
         stalledSubmissionFinalization = (async () => {
           stalledMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
           closeSession();
-          stalledSubmission.resolve(undefined);
         })();
         return stalledSubmissionFinalization;
       },
@@ -756,6 +753,7 @@ export async function runReviewGoal(
         }
         activeMonitor.stop();
         sessionPhase = "finalizing-stalled-submission";
+        if (stalledSubmissionFinalization !== undefined) await stalledSubmissionFinalization;
         await reader;
         writeAgentMonitorEvent(
           goalIndex,
@@ -960,18 +958,20 @@ export async function runReviewGoal(
       monitor?.recoveryCount ?? 0,
       logSecrets,
     );
-    await Promise.all([
-      diffReader.close(),
-      ...Array.from(contextReaders.values(), ({ reader: contextReader }) => contextReader.close()),
-      ...Array.from(queryReaders.values(), (entry) =>
-        closeQueryReader(entry).catch(() => undefined),
-      ),
-      repositorySnapshot.cleanup(),
-    ]);
-    queryReaders.clear();
-    queryReaderCompletions.clear();
-    discussionQueryCursors.clear();
-    queryReaderDiscussionKeys.clear();
+    await runAgentCleanup(
+      [
+        diffReader.close(),
+        ...Array.from(contextReaders.values(), ({ reader: contextReader }) =>
+          contextReader.close(),
+        ),
+        ...Array.from(queryReaders.values(), (entry) =>
+          closeQueryReader(entry).catch(() => undefined),
+        ),
+        repositorySnapshot.cleanup(),
+      ],
+      goalIndex,
+      logSecrets,
+    );
   }
 }
 export function runReviewGoals(

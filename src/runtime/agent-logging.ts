@@ -5,16 +5,113 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import type { GoalResult, ReviewModelUsage } from "../lib/types.js";
+import type { GoalResult, GoalSubmission, ReviewModelUsage } from "../lib/types.js";
 
 const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
 const MAX_AGENT_LOG_CHUNK_LENGTH = 8_000;
 const MAX_AGENT_LOG_PROJECTION_CHARACTERS = 1_024;
 const MAX_AGENT_LOG_PROJECTION_NODES = 100;
 const MAX_AGENT_LOG_PROJECTION_DEPTH = 8;
+const ACCEPTED_SUBMISSION_STATUS_TIMEOUT_MS = 30_000;
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface McpServerStatusRecord {
+  readonly name: string;
+  readonly status: string;
+  readonly error?: string;
+}
+
+export interface AcceptedSubmissionMcpStatus {
+  readonly checked: boolean;
+  readonly failures: string;
+  readonly error?: string;
+}
+
+export async function readAcceptedSubmissionMcpFailures(
+  mcpServerStatus: () => Promise<readonly McpServerStatusRecord[]>,
+  configuredMcpNames: ReadonlySet<string>,
+): Promise<readonly string[]> {
+  return (await mcpServerStatus())
+    .filter(
+      (status) =>
+        configuredMcpNames.has(status.name) &&
+        (status.status === "failed" || status.status === "needs-auth"),
+    )
+    .map((status) => `${status.name}: ${status.error ?? status.status}`);
+}
+
+export async function readAcceptedSubmissionMcpStatus(
+  readFailures: () => Promise<readonly string[]>,
+  timeoutMs = ACCEPTED_SUBMISSION_STATUS_TIMEOUT_MS,
+): Promise<AcceptedSubmissionMcpStatus> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const failures = await Promise.race([
+      readFailures(),
+      new Promise<readonly string[]>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`MCP status check timed out after ${timeoutMs} ms.`));
+        }, timeoutMs);
+      }),
+    ]);
+    return { checked: true, failures: failures.join("; ") };
+  } catch (error) {
+    return {
+      checked: false,
+      failures: "",
+      error: errorMessage(error),
+    };
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+export function acceptedSubmissionResult(
+  goal: string,
+  submission: GoalSubmission,
+  status: AcceptedSubmissionMcpStatus,
+  models: readonly ReviewModelUsage[],
+  tokenAccountingComplete: boolean,
+): GoalResult {
+  const error =
+    status.error === undefined
+      ? status.failures.length === 0
+        ? undefined
+        : `Configured MCP server failure: ${status.failures}`
+      : `Configured MCP server status check failed: ${status.error}`;
+  return withTokenUsage(
+    {
+      prompt: goal,
+      status: error === undefined ? "completed" : "failed",
+      submission,
+      ...(error === undefined ? {} : { error }),
+    },
+    models,
+    tokenAccountingComplete,
+  );
+}
+
+export function acceptedSubmissionDetails(
+  recovery: number,
+  terminalSdkResult: boolean,
+  terminalSdkResultSubtype: string | undefined,
+  status: AcceptedSubmissionMcpStatus,
+  tokenAccountingComplete: boolean,
+): Readonly<Record<string, unknown>> {
+  return {
+    recovery,
+    terminal_sdk_result: terminalSdkResult,
+    ...(terminalSdkResultSubtype === undefined
+      ? {}
+      : { terminal_sdk_result_subtype: terminalSdkResultSubtype }),
+    mcp_status_checked: status.checked,
+    ...(status.failures.length === 0 ? {} : { mcp_failures: status.failures }),
+    ...(status.error === undefined ? {} : { mcp_status_error: status.error }),
+    token_accounting_complete: tokenAccountingComplete,
+  };
 }
 
 function redactAgentLogSecret(value: string, secret: string): string {
@@ -398,6 +495,27 @@ export function writeAgentMonitorEvent(
       writeAgentLifecycleLog(goalIndex, event, details, secrets, safeWrite);
     },
     write,
+  );
+}
+
+export async function runAgentCleanup(
+  operations: readonly Promise<unknown>[],
+  goalIndex: number,
+  secrets: readonly string[],
+): Promise<void> {
+  await Promise.all(operations).then(
+    () => {
+      writeAgentMonitorEvent(goalIndex, "cleanup", { outcome: "success" }, secrets);
+    },
+    (error: unknown) => {
+      writeAgentMonitorEvent(
+        goalIndex,
+        "cleanup",
+        { outcome: "failed", error: errorMessage(error) },
+        secrets,
+      );
+      throw error;
+    },
   );
 }
 

@@ -421,8 +421,32 @@ export function createReviewSessionRecoveryMonitor(
         elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs,
         submission_accepted: submissionAccepted,
       });
-      if (submissionAccepted) options.finishAcceptedInput();
-      else options.markBoundaryPending();
+      if (submissionAccepted) {
+        options.finishAcceptedInput();
+        let finalization: void | Promise<void>;
+        try {
+          finalization = options.finalizeAcceptedSubmission();
+        } catch (error) {
+          options.write("submission-finalization-failed", {
+            recovery: stall.recovery,
+            error: errorMessage(error),
+          });
+          options.closeAcceptedSession();
+          finalization = undefined;
+        }
+        if (finalization !== undefined) {
+          void Promise.resolve(finalization)
+            .catch((error: unknown) => {
+              options.write("submission-finalization-failed", {
+                recovery: stall.recovery,
+                error: errorMessage(error),
+              });
+            })
+            .finally(() => {
+              options.closeAcceptedSession();
+            });
+        }
+      } else options.markBoundaryPending();
       void options
         .interrupt()
         .then((receipt) => {
@@ -442,17 +466,6 @@ export function createReviewSessionRecoveryMonitor(
           });
         });
       if (!submissionAccepted) return;
-      void Promise.resolve()
-        .then(() => options.finalizeAcceptedSubmission())
-        .catch((error: unknown) => {
-          options.write("submission-finalization-failed", {
-            recovery: stall.recovery,
-            error: errorMessage(error),
-          });
-        })
-        .finally(() => {
-          options.closeAcceptedSession();
-        });
     },
   });
 }

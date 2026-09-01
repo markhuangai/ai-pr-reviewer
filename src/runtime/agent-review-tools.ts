@@ -381,6 +381,7 @@ export class ReviewBriefingReader {
         ...(entry.kind === "inline_thread"
           ? {
               path: entry.path,
+              ...(entry.reviewId === undefined ? {} : { reviewId: entry.reviewId }),
               ...(entry.line === undefined ? {} : { line: entry.line }),
               messageCount: entry.messages.length,
               isResolved: entry.isResolved,

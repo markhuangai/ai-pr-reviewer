@@ -282,6 +282,30 @@ test("resolution verifier accepts an explicit high-confidence fixed verdict", as
   });
 });
 
+test("logs resolution failures and cleanup", async (t) => {
+  const output: string[] = [];
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+  const result = await verifyResolution(
+    context,
+    thread,
+    config,
+    "/workspace",
+    scriptedQuery([
+      {
+        subtype: "error_during_execution",
+        errors: ["verifier stopped"],
+      },
+    ]),
+  );
+
+  assert.deepEqual(result, { status: "failed", error: "verifier stopped" });
+  assert.match(output.join(""), /session failure.*verifier stopped/u);
+  assert.match(output.join(""), /session cleanup.*"outcome":"success"/u);
+});
+
 test("resolution verifier preserves non-high confidence verdicts for the lifecycle guard", async () => {
   const result = await verifyResolution(
     context,

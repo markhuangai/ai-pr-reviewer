@@ -872,6 +872,46 @@ test("keeps duplicate identity stable for workflow-only lifecycle changes", () =
   assert.notEqual(externallyDiscussed.digest, original.digest);
 });
 
+test("keeps duplicate identity stable for external minimization and outdated changes", () => {
+  const reviewRecord: ReviewLifecycleReviewRecord = {
+    ...review(110, "reviewer", "Human review"),
+    nodeId: "review-node-human-lifecycle",
+    databaseId: 110,
+    commitId: null,
+    isMinimized: false,
+  };
+  const comment = {
+    ...reviewComment(111, reviewRecord.databaseId, "reviewer", "Finding"),
+    nodeId: "comment-node-human-lifecycle",
+    databaseId: 111,
+    reviewNodeId: reviewRecord.nodeId,
+  };
+  const thread: ReviewLifecycleThreadRecord = {
+    nodeId: "thread-node-human-lifecycle",
+    isResolved: false,
+    isOutdated: false,
+    path: "src/change.ts",
+    line: 10,
+    reviewId: reviewRecord.databaseId,
+    reviewNodeId: reviewRecord.nodeId,
+    comments: [comment],
+  };
+  const original = buildReviewConversation(
+    "review-action",
+    { reviews: [reviewRecord], threads: [thread] },
+    [],
+  );
+  const lifecycleChanged = buildReviewConversation(
+    "review-action",
+    {
+      reviews: [{ ...reviewRecord, isMinimized: true, minimizedReason: "OUTDATED" }],
+      threads: [{ ...thread, isOutdated: true }],
+    },
+    [],
+  );
+  assert.equal(lifecycleChanged.digest, original.digest);
+});
+
 test("does not let another reviewer spoof the action marker", () => {
   const marker = "<!-- ai-pr-reviewer:v3:head:digest -->";
   const snapshot = buildConversation(

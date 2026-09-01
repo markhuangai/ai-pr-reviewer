@@ -238,6 +238,76 @@ test("finalizes an accepted submission when the SDK stops yielding messages", as
   assert.match(logs, /session stall-detected.*"elapsed_since_sdk_message_ms":300000/u);
   assert.match(logs, /session submission-finalized.*"mcp_status_checked":true/u);
   assert.match(logs, /session submission-finalized.*"token_accounting_complete":false/u);
+  assert.match(logs, /session cleanup.*"outcome":"success"/u);
+});
+
+test("accepted stalled submissions win an interruption result while MCP status is pending", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+  const ready = manualSignal<undefined>();
+  const mcpStarted = manualSignal<undefined>();
+  const resultYielded = manualSignal<undefined>();
+  const closed = manualSignal<undefined>();
+  let interrupts = 0;
+  let closes = 0;
+  let mcpStatusChecks = 0;
+  const query = ((input: {
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: Options;
+  }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+      const messages = input.prompt[Symbol.asyncIterator]();
+      assert.equal((await messages.next()).done, false);
+      assert.equal((await messages.next()).done, false);
+      await completeReviewBriefing(input.options);
+      const submit = reviewOutputTools(input.options).submit_review;
+      assert.ok(submit);
+      const accepted = await submit.handler({ summary: "No issues", findings: [] });
+      assert.equal(accepted.content[0]?.text, "Review submission accepted.");
+      ready.resolve(undefined);
+      resultYielded.resolve(undefined);
+      yield resultMessage(1, "error_during_execution");
+      await closed.promise;
+    },
+    mcpServerStatus: () => {
+      mcpStatusChecks += 1;
+      mcpStarted.resolve(undefined);
+      return new Promise<readonly never[]>(() => undefined);
+    },
+    interrupt: () => {
+      interrupts += 1;
+      return Promise.resolve(undefined);
+    },
+    close: () => {
+      closes += 1;
+      closed.resolve(undefined);
+    },
+  })) as unknown as AgentQuery;
+
+  const running = runReviewGoal(
+    "Check accepted stall precedence.",
+    0,
+    goalContext,
+    [],
+    emptyConversation,
+    reviewConfig({ mcpServers: { security: { type: "http", url: "https://mcp.example.test" } } }),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    query,
+  );
+  await ready.promise;
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  await mcpStarted.promise;
+  await resultYielded.promise;
+  await Promise.resolve();
+  t.mock.timers.tick(30_000);
+  const result = await running;
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.submission, { summary: "No issues", findings: [] });
+  assert.match(result.error ?? "", /MCP status check timed out after 30000 ms/u);
+  assert.equal(mcpStatusChecks, 1);
+  assert.equal(interrupts, 1);
+  assert.equal(closes, 1);
 });
 
 test("lets an accepted submission win an interrupted turn boundary", async (t) => {

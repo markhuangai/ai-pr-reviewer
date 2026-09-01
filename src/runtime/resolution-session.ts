@@ -467,6 +467,11 @@ export async function verifyResolution(
         continue;
       }
       if (result.subtype !== "success") {
+        writeMonitorEvent("failure", {
+          phase: sessionPhase,
+          result_subtype: result.subtype,
+          error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
+        });
         return {
           status: "failed",
           error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
@@ -481,6 +486,10 @@ export async function verifyResolution(
         };
       }
       if (repairAttempts >= MAX_RESOLUTION_REPAIR_ATTEMPTS) {
+        writeMonitorEvent("failure", {
+          phase: sessionPhase,
+          error: "The verifier did not submit a resolution verdict.",
+        });
         return { status: "failed", error: "The verifier did not submit a resolution verdict." };
       }
       repairAttempts += 1;
@@ -489,6 +498,10 @@ export async function verifyResolution(
     }
   } catch (error) {
     throwIfAborted(signal);
+    writeMonitorEvent("failure", {
+      phase: sessionPhase,
+      error: readerFailure?.message ?? errorMessage(error),
+    });
     return {
       status: "failed",
       error: readerFailure?.message ?? errorMessage(error),
@@ -499,6 +512,7 @@ export async function verifyResolution(
     input.finish();
     closeSession();
     if (reader !== undefined) await reader.catch(() => undefined);
+    writeMonitorEvent("cleanup", { outcome: "success" });
     writeMonitorEvent("end", {
       phase: sessionPhase,
       session_id: sessionId,

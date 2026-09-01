@@ -230,6 +230,7 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
       {
         kind: "inline_thread",
         id: 4,
+        reviewId: 10,
         rootAvailable: true,
         createdAt: "2026-08-17T00:01:00Z",
         path: "src/change.ts",
@@ -292,6 +293,7 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
     .flatMap((page) => page.records)
     .find((record) => record.kind === "discussion_index" && record.id === 4);
   assert.ok(discussion);
+  assert.equal(discussion.reviewId, 10);
   assert.equal(discussion.isResolved, true);
   assert.equal(discussion.isOutdated, true);
   assert.equal(discussion.resolvedByLogin, "pr-owner");

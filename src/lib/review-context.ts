@@ -184,9 +184,13 @@ function conversationIdentityEntry(
   entry: ReviewConversationEntry,
   authenticatedLogin: string,
 ): unknown {
-  if (entry.kind !== "inline_thread") return entry;
-  const root = entry.messages.find((message) => message.id === entry.id);
-  const actionOwned = root?.authorRole === "workflow";
+  if (entry.kind !== "inline_thread") {
+    return {
+      kind: entry.kind,
+      id: entry.id,
+      message: entry.message,
+    };
+  }
   const externalMessages = entry.messages.filter((message) => message.authorRole !== "workflow");
   const externallyResolved =
     entry.resolvedByLogin !== undefined && !sameLogin(entry.resolvedByLogin, authenticatedLogin);
@@ -201,20 +205,12 @@ function conversationIdentityEntry(
     line: entry.line,
     originalLine: entry.originalLine,
     messages: externalMessages,
-    ...(actionOwned
-      ? externallyResolved
-        ? {
-            isResolved: entry.isResolved,
-            resolvedByLogin: entry.resolvedByLogin,
-          }
-        : {}
-      : {
+    ...(externallyResolved
+      ? {
           isResolved: entry.isResolved,
-          isOutdated: entry.isOutdated,
           resolvedByLogin: entry.resolvedByLogin,
-          reviewIsMinimized: entry.reviewIsMinimized,
-          reviewMinimizedReason: entry.reviewMinimizedReason,
-        }),
+        }
+      : {}),
   };
 }
 
