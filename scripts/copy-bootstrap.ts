@@ -11,6 +11,7 @@ export async function copyBootstrap(source = "build", destination = "dist"): Pro
     join(source, "lib/bootstrap/cancellation.js"),
     join(destination, "lib/bootstrap/cancellation.js"),
   );
+  await cp(join(source, "lib/diagnostics.js"), join(destination, "lib/diagnostics.js"));
   await cp(join(source, "lib/bootstrap/version.js"), join(destination, "lib/bootstrap/version.js"));
 }
 

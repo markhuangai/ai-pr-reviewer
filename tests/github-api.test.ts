@@ -1,9 +1,12 @@
+/* eslint-disable max-lines, @typescript-eslint/require-await, @typescript-eslint/prefer-promise-reject-errors, @typescript-eslint/only-throw-error */
+
 import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import test from "node:test";
 
 import { CancellationError } from "../src/lib/bootstrap/cancellation.js";
 import { GitHubApi, GitHubApiError, githubApiInternals } from "../src/lib/github-api.js";
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
 import {
   discoverLinkedIssueNumbers,
   issueSnapshot,
@@ -311,6 +314,487 @@ test("retrieves complete pull request metadata through the GitHub HTTP client", 
   ]);
 });
 
+test("logs REST response metadata without recording response bodies", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    secrets: ["body-secret"],
+    write: (line) => lines.push(line),
+    id: (() => {
+      let index = 0;
+      return () => `rest-${++index}`;
+    })(),
+  });
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({ message: "body-secret", errors: [{ message: "permission detail" }] }),
+      {
+        status: 403,
+        statusText: "Forbidden",
+        headers: {
+          "content-type": "application/json",
+          "x-github-request-id": "request-403",
+          "x-accepted-github-permissions": "metadata=read",
+          "x-ratelimit-remaining": "0",
+        },
+      },
+    );
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const api = new GitHubApi("token", "https://api.github.com", undefined, undefined, diagnostics);
+  await assert.rejects(api.getAuthenticatedUserLogin(), /body-secret/u);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  assert.equal(terminal.operation, "rest.user.current");
+  assert.equal(terminal.outcome, "failure");
+  const details = terminal.details as Record<string, unknown>;
+  assert.equal(details.status, 403);
+  assert.equal(details.request_id, "request-403");
+  assert.equal(details.required_permission, "metadata:read");
+  assert.deepEqual(details.error, {
+    name: "GitHubApiError",
+    message: "GitHub API request failed (403).",
+    diagnosticMessage: "GitHub API request failed (403).",
+    operation: "rest.user.current",
+    status: 403,
+    requestId: "request-403",
+    requiredPermission: "metadata:read",
+  });
+  assert.equal(JSON.stringify(records).includes("body-secret"), false);
+  assert.equal(JSON.stringify(records).includes("permission detail"), false);
+});
+
+test("logs GraphQL authorization errors with bounded metadata", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        errors: [
+          {
+            type: "FORBIDDEN",
+            message: "Resource not accessible by integration",
+            path: ["repository", "pullRequest", "reviewThreads"],
+            locations: [{ line: 3, column: 5, secret: "must-not-appear" }],
+            extensions: { code: "FORBIDDEN", secret: "must-not-appear" },
+          },
+        ],
+      }),
+      { status: 200, headers: { "x-github-request-id": "graphql-403" } },
+    );
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 7,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "GraphQL authorization",
+    htmlUrl: "https://github.com/owner/repository/pull/7",
+  };
+  const api = new GitHubApi(
+    "token",
+    "https://api.github.com",
+    undefined,
+    "https://api.github.com/graphql",
+    diagnostics,
+  );
+  await assert.rejects(api.getReviewLifecycleSnapshot(context), /Resource not accessible/u);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  assert.equal(terminal.operation, "AiPrReviewerReviews");
+  const details = terminal.details as Record<string, unknown>;
+  const errorDetails = details.error as Record<string, unknown>;
+  assert.equal(errorDetails.name, "GitHubApiError");
+  assert.equal(errorDetails.message, "GitHub API request failed (200).");
+  assert.equal(errorDetails.diagnosticMessage, "GitHub API request failed (200).");
+  assert.equal(errorDetails.operation, "AiPrReviewerReviews");
+  assert.equal(errorDetails.status, 200);
+  assert.equal(errorDetails.requestId, "graphql-403");
+  assert.equal(errorDetails.requiredPermission, "pull_requests:read");
+  assert.equal(
+    ((errorDetails.graphqlErrors as Array<Record<string, unknown>>)[0] as Record<string, unknown>)
+      .message,
+    "Resource not accessible by integration",
+  );
+  assert.deepEqual((details.graphql_errors as Array<Record<string, unknown>>)[0], {
+    type: "FORBIDDEN",
+    message: "Resource not accessible by integration",
+    path: ["repository", "pullRequest", "reviewThreads"],
+    locations: [{ line: 3, column: 5 }],
+    code: "FORBIDDEN",
+  });
+  assert.equal(JSON.stringify(records).includes("must-not-appear"), false);
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        message: "forbidden",
+        errors: [
+          {
+            type: "FORBIDDEN",
+            message: "Resource not accessible by integration",
+            path: ["repository"],
+          },
+        ],
+      }),
+      { status: 403, headers: { "x-github-request-id": "graphql-403-http" } },
+    );
+  await assert.rejects(api.getReviewLifecycleSnapshot(context), /forbidden/u);
+  const httpRecords = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const httpTerminal = httpRecords.find(
+    (record) =>
+      record.operation === "AiPrReviewerReviews" &&
+      record.event === "operation.finished" &&
+      (record.details as Record<string, unknown> | undefined)?.request_id === "graphql-403-http",
+  );
+  assert.ok(httpTerminal);
+  assert.deepEqual(
+    (
+      (httpTerminal.details as Record<string, unknown>).graphql_errors as Array<
+        Record<string, unknown>
+      >
+    )[0],
+    { type: "FORBIDDEN", message: "Resource not accessible by integration", path: ["repository"] },
+  );
+
+  const largeMessage = `graphql-large-${"x".repeat(2_048)}`;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        errors: Array.from({ length: 20 }, () => ({
+          type: "FORBIDDEN",
+          message: largeMessage,
+          path: ["repository", "pullRequest", "reviewThreads"],
+          locations: [{ line: 3, column: 5 }],
+          extensions: { code: "FORBIDDEN" },
+        })),
+      }),
+      { status: 200, headers: { "x-github-request-id": "graphql-large" } },
+    );
+  await assert.rejects(api.getReviewLifecycleSnapshot(context), /graphql-large/u);
+  const largeRecords = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const largeTerminal = largeRecords.find(
+    (record) =>
+      record.operation === "AiPrReviewerReviews" &&
+      record.event === "operation.finished" &&
+      (record.details as Record<string, unknown> | undefined)?.request_id === "graphql-large",
+  );
+  assert.ok(largeTerminal);
+  assert.equal(JSON.stringify(largeTerminal).length <= 8_000, true);
+  const largeDetails = largeTerminal.details as Record<string, unknown>;
+  assert.equal(largeDetails.status, 200);
+  assert.equal(largeDetails.request_id, "graphql-large");
+  assert.equal(largeDetails.required_permission, "pull_requests:read");
+  assert.equal(largeDetails.graphql_errors, "[TRUNCATED]");
+});
+
+test("logs network failures and strips signed URL query parameters", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new TypeError("fetch failed for https://api.example.test/user?signature=private");
+  };
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  await assert.rejects(
+    new GitHubApi(
+      "token",
+      "https://api.example.test",
+      undefined,
+      undefined,
+      diagnostics,
+    ).getAuthenticatedUserLogin(),
+    /fetch failed/u,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  assert.equal(terminal.outcome, "failure");
+  assert.equal(JSON.stringify(records).includes("signature="), false);
+  const errorDetails = (terminal.details as Record<string, unknown>).error as Record<
+    string,
+    unknown
+  >;
+  assert.equal(typeof errorDetails.message, "string");
+  assert.equal((errorDetails.message as string).endsWith("/user"), true);
+});
+
+test("records header-construction failures without leaking newline-containing tokens", async () => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const token = "token\nwith-newline";
+  await assert.rejects(
+    new GitHubApi(
+      token,
+      "https://api.example.test",
+      undefined,
+      undefined,
+      diagnostics,
+    ).getAuthenticatedUserLogin(),
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const started = records.find(
+    (record) => record.operation === "rest.user.current" && record.event === "operation.started",
+  );
+  const terminal = records.find(
+    (record) => record.operation === "rest.user.current" && record.event === "operation.finished",
+  );
+  assert.ok(started);
+  assert.ok(terminal);
+  assert.equal(started.operation_id, terminal.operation_id);
+  assert.equal(terminal.outcome, "failure");
+  assert.equal(JSON.stringify(records).includes(token), false);
+});
+
+test("preserves pre-aborted cancellation before malformed header construction", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const previous = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests += 1;
+    throw new Error("request should not be sent");
+  };
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGTERM");
+  controller.abort(reason);
+  await assert.rejects(
+    new GitHubApi(
+      "token\nwith-newline",
+      "https://api.example.test",
+      controller.signal,
+      undefined,
+      diagnostics,
+    ).getAuthenticatedUserLogin(),
+    (error: unknown) => error === reason,
+  );
+  assert.equal(requests, 0);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const started = records.find(
+    (record) => record.operation === "rest.user.current" && record.event === "operation.started",
+  );
+  const terminal = records.find(
+    (record) => record.operation === "rest.user.current" && record.event === "operation.cancelled",
+  );
+  assert.ok(started);
+  assert.ok(terminal);
+  assert.equal(started.operation_id, terminal.operation_id);
+});
+
+test("retains REST response metadata when the response body read fails", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const previous = globalThis.fetch;
+  const bodyError = Object.freeze(new Error("rest-body-read-sentinel"));
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 502,
+      headers: new Headers({ "x-github-request-id": "rest-body-read" }),
+      text: async () => {
+        throw bodyError;
+      },
+    }) as unknown as Response;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  await assert.rejects(
+    new GitHubApi(
+      "token",
+      "https://api.example.test",
+      undefined,
+      undefined,
+      diagnostics,
+    ).getAuthenticatedUserLogin(),
+    (error: unknown) => error === bodyError,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  const details = terminal.details as Record<string, unknown>;
+  assert.equal(details.status, 502);
+  assert.equal(details.request_id, "rest-body-read");
+  assert.equal(details.required_permission, "metadata:read");
+  assert.equal(
+    (details.error as Record<string, unknown>).message,
+    "GitHub REST response body read failed.",
+  );
+  assert.equal(JSON.stringify(records).includes("rest-body-read-sentinel"), false);
+
+  const primitiveBodyError = "rest-primitive-body-read-sentinel";
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 502,
+      headers: new Headers({ "x-github-request-id": "rest-primitive-body-read" }),
+      text: async () => Promise.reject(primitiveBodyError),
+    }) as unknown as Response;
+  await assert.rejects(
+    new GitHubApi(
+      "token",
+      "https://api.example.test",
+      undefined,
+      undefined,
+      diagnostics,
+    ).getAuthenticatedUserLogin(),
+    (error: unknown) => error === primitiveBodyError,
+  );
+  const primitiveRecords = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const primitiveTerminal = primitiveRecords.find(
+    (record) =>
+      record.event === "operation.finished" &&
+      (record.details as Record<string, unknown> | undefined)?.request_id ===
+        "rest-primitive-body-read",
+  );
+  assert.ok(primitiveTerminal);
+  assert.equal(
+    ((primitiveTerminal.details as Record<string, unknown>).error as Record<string, unknown>)
+      .message,
+    "GitHub REST response body read failed.",
+  );
+  assert.equal(JSON.stringify(primitiveRecords).includes(primitiveBodyError), false);
+});
+
+test("retains GraphQL response metadata when the response body read fails", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
+  const previous = globalThis.fetch;
+  const bodyError = Object.freeze(new Error("graphql-body-read-sentinel"));
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 502,
+      headers: new Headers({ "x-github-request-id": "graphql-body-read" }),
+      text: async () => {
+        throw bodyError;
+      },
+    }) as unknown as Response;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 7,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "GraphQL body read",
+    htmlUrl: "https://github.com/owner/repository/pull/7",
+  };
+  await assert.rejects(
+    new GitHubApi(
+      "token",
+      "https://api.example.test",
+      undefined,
+      "https://api.example.test/graphql",
+      diagnostics,
+    ).getReviewLifecycleSnapshot(context),
+    (error: unknown) => error === bodyError,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  const details = terminal.details as Record<string, unknown>;
+  assert.equal(details.status, 502);
+  assert.equal(details.request_id, "graphql-body-read");
+  assert.equal(details.required_permission, "pull_requests:read");
+  assert.equal(
+    (details.error as Record<string, unknown>).message,
+    "GitHub GraphQL response body read failed.",
+  );
+  assert.equal(JSON.stringify(records).includes("graphql-body-read-sentinel"), false);
+
+  const primitiveBodyError = "graphql-primitive-body-read-sentinel";
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 502,
+      headers: new Headers({ "x-github-request-id": "graphql-primitive-body-read" }),
+      text: async () => Promise.reject(primitiveBodyError),
+    }) as unknown as Response;
+  await assert.rejects(
+    new GitHubApi(
+      "token",
+      "https://api.example.test",
+      undefined,
+      "https://api.example.test/graphql",
+      diagnostics,
+    ).getReviewLifecycleSnapshot(context),
+    (error: unknown) => error === primitiveBodyError,
+  );
+  const primitiveRecords = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const primitiveTerminal = primitiveRecords.find(
+    (record) =>
+      record.event === "operation.finished" &&
+      (record.details as Record<string, unknown> | undefined)?.request_id ===
+        "graphql-primitive-body-read",
+  );
+  assert.ok(primitiveTerminal);
+  assert.equal(
+    ((primitiveTerminal.details as Record<string, unknown>).error as Record<string, unknown>)
+      .message,
+    "GitHub GraphQL response body read failed.",
+  );
+  assert.equal(JSON.stringify(primitiveRecords).includes(primitiveBodyError), false);
+});
+
 test("loads linked issue bodies and excludes linked pull requests", async (t) => {
   const requests: string[] = [];
   const server = createServer((request, response) => {
@@ -412,6 +896,11 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
 });
 
 test("aborts in-flight GitHub requests and blocks later writes", async (t) => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => lines.push(line),
+  });
   let requests = 0;
   let markStarted: (() => void) | undefined;
   const started = new Promise<void>((resolve) => {
@@ -435,7 +924,13 @@ test("aborts in-flight GitHub requests and blocks later writes", async (t) => {
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
   const controller = new AbortController();
-  const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`, controller.signal);
+  const api = new GitHubApi(
+    "test-token",
+    `http://127.0.0.1:${address.port}`,
+    controller.signal,
+    undefined,
+    diagnostics,
+  );
   const pending = api.getAuthenticatedUserLogin();
   await started;
   const reason = new CancellationError("SIGTERM");
@@ -463,9 +958,30 @@ test("aborts in-flight GitHub requests and blocks later writes", async (t) => {
     (error: unknown) => error === reason,
   );
   assert.equal(requests, 1);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some(
+      (record) => record.operation === "rest.user.current" && record.outcome === "cancelled",
+    ),
+    true,
+  );
+  assert.equal(
+    records.some(
+      (record) =>
+        record.operation === "rest.pull-request.create-review" && record.outcome === "cancelled",
+    ),
+    true,
+  );
 });
 
 test("paginates files and conversation records and creates a review", async (t) => {
+  const diagnosticLines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "github",
+    write: (line) => diagnosticLines.push(line),
+  });
   const requests: Array<{
     readonly method: string | undefined;
     readonly url: string | undefined;
@@ -635,7 +1151,13 @@ test("paginates files and conversation records and creates a review", async (t) 
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
   serverOrigin = `http://127.0.0.1:${address.port}`;
-  const api = new GitHubApi("test-token", `${serverOrigin}/api/`);
+  const api = new GitHubApi(
+    "test-token",
+    `${serverOrigin}/api/`,
+    undefined,
+    undefined,
+    diagnostics,
+  );
   const context: PullRequestContext = {
     repository: "owner/repository",
     owner: "owner",
@@ -659,6 +1181,17 @@ test("paginates files and conversation records and creates a review", async (t) 
   assert.equal(files.length, 101);
   assert.equal(files[0]?.previousPath, "src/old.ts");
   assert.deepEqual([...(files[100]?.addedLines ?? [])], [1]);
+  const filePages = diagnosticLines
+    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>)
+    .filter(
+      (record) =>
+        record.event === "operation.started" && record.operation === "rest.pull-request.files",
+    )
+    .map(
+      (record) =>
+        ((record.details as Record<string, unknown>).request as Record<string, unknown>).page,
+    );
+  assert.deepEqual(filePages, [1, 2]);
   assert.deepEqual(await api.listReviews(context), [
     {
       id: 1,

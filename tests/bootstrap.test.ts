@@ -1,3 +1,5 @@
+/* eslint-disable max-lines, @typescript-eslint/require-await, @typescript-eslint/prefer-promise-reject-errors, @typescript-eslint/only-throw-error */
+
 import { strict as assert } from "node:assert";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -23,6 +25,7 @@ import {
   parseActionReleaseTag,
 } from "../src/lib/bootstrap/version.js";
 import { bootstrapInternals, bootstrapRuntime, resolveActionRelease } from "../src/bootstrap.js";
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -244,6 +247,12 @@ test("matches runtime manifests to exact action releases", () => {
 });
 
 test("downloads, verifies, extracts, and executes a runtime bundle", async (t) => {
+  const diagnosticLines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    secrets: ["signed-secret"],
+    write: (line) => diagnosticLines.push(line),
+  });
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-bootstrap-runtime-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const bundle = join(root, "source");
@@ -273,11 +282,11 @@ test("downloads, verifies, extracts, and executes a runtime bundle", async (t) =
   const digest = bootstrapInternals.sha256(bytes);
 
   const server = createServer((request, response) => {
-    if (request.url === "/runtime.sha256") {
+    if (request.url?.includes(".sha256")) {
       response.end(`${digest}  ${assetName}\n`);
       return;
     }
-    if (request.url === "/runtime") {
+    if (request.url?.startsWith("/runtime")) {
       response.setHeader("content-length", String(bytes.byteLength));
       response.end(bytes);
       return;
@@ -288,7 +297,7 @@ test("downloads, verifies, extracts, and executes a runtime bundle", async (t) =
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => closeServer(server));
   const { port } = server.address() as AddressInfo;
-  const assetUrl = `http://127.0.0.1:${port}/runtime`;
+  const assetUrl = `http://127.0.0.1:${port}/runtime?signature=signed-secret`;
   const code = await bootstrapRuntime({
     releaseRef: "v1.1.1-rc.0",
     temporaryRoot: root,
@@ -305,10 +314,28 @@ test("downloads, verifies, extracts, and executes a runtime bundle", async (t) =
           },
         ],
       } as T),
+    diagnostics,
   });
 
   assert.equal(code, 0);
   assert.equal(await readFile(output, "utf8"), sourceCommit);
+  const records = diagnosticLines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some((record) => record.operation === "github.asset.download"),
+    true,
+  );
+  assert.equal(
+    records.some((record) => record.operation === "archive.verify"),
+    true,
+  );
+  assert.equal(
+    records.some((record) => record.operation === "runtime.cleanup"),
+    true,
+  );
+  assert.equal(JSON.stringify(records).includes("signed-secret"), false);
+  assert.equal(JSON.stringify(records).includes("signature="), false);
 });
 
 test("validates bootstrap asset metadata, headers, checksums, and HTTP failures", async (t) => {
@@ -440,6 +467,450 @@ test("validates bootstrap asset metadata, headers, checksums, and HTTP failures"
   assert.equal(await readFile(join(root, "small.bin"), "utf8"), "small payload");
 });
 
+test("checks bootstrap HTTP status before consuming non-success bodies", async (t) => {
+  const previous = globalThis.fetch;
+  let consumed = 0;
+  globalThis.fetch = async () =>
+    ({
+      ok: false,
+      status: 503,
+      headers: new Headers({ "content-length": "11", "x-github-request-id": "bootstrap-503" }),
+      text: async () => {
+        consumed += 1;
+        throw new Error("body should not be consumed");
+      },
+    }) as unknown as Response;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => lines.push(line),
+  });
+  await assert.rejects(
+    bootstrapInternals.fetchJson("https://api.example.test/release", undefined, diagnostics),
+    /lookup failed \(503\)/u,
+  );
+  assert.equal(consumed, 0);
+
+  globalThis.fetch = async () =>
+    ({
+      ok: false,
+      status: 404,
+      headers: new Headers(),
+      text: async () => {
+        consumed += 1;
+        throw new Error("checksum body should not be consumed");
+      },
+    }) as unknown as Response;
+  assert.equal(
+    await bootstrapInternals.readChecksum(
+      "https://api.example.test/checksum",
+      undefined,
+      diagnostics,
+    ),
+    undefined,
+  );
+  assert.equal(consumed, 0);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some((record) => record.operation === "github.request" && record.outcome === "failure"),
+    true,
+  );
+  const failed = records.find(
+    (record) => record.operation === "github.request" && record.outcome === "failure",
+  );
+  assert.ok(failed);
+  assert.equal((failed.details as Record<string, unknown>).request_id, "bootstrap-503");
+  assert.equal((failed.details as Record<string, unknown>).required_permission, "contents:read");
+  assert.equal(
+    records.some(
+      (record) => record.operation === "github.asset.checksum" && record.outcome === "skipped",
+    ),
+    true,
+  );
+});
+
+test("sanitizes malformed successful bootstrap JSON diagnostics", async (t) => {
+  const previous = globalThis.fetch;
+  const sentinel = "malformed-bootstrap-response-sentinel";
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "application/json" }),
+      text: async () => `{"release":"${sentinel}`,
+    }) as unknown as Response;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => lines.push(line),
+  });
+  await assert.rejects(
+    bootstrapInternals.fetchJson("https://api.example.test/malformed", undefined, diagnostics),
+    (error: unknown) => error instanceof SyntaxError,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(JSON.stringify(records).includes(sentinel), false);
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  assert.equal(
+    ((terminal.details as Record<string, unknown>).error as Record<string, unknown>).message,
+    "GitHub release metadata JSON parsing failed.",
+  );
+});
+
+test("retains bootstrap response metadata when the response body read fails", async (t) => {
+  const previous = globalThis.fetch;
+  const bodyError = new Error("bootstrap-body-read-sentinel");
+  globalThis.fetch = async () =>
+    ({
+      ok: true,
+      status: 502,
+      headers: new Headers({ "x-github-request-id": "bootstrap-body-read" }),
+      text: async () => {
+        throw bodyError;
+      },
+    }) as unknown as Response;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => lines.push(line),
+  });
+  await assert.rejects(
+    bootstrapInternals.fetchJson("https://api.example.test/body-read", undefined, diagnostics),
+    (error: unknown) => error === bodyError,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.finished");
+  assert.ok(terminal);
+  const details = terminal.details as Record<string, unknown>;
+  assert.equal(details.status, 502);
+  assert.equal(details.request_id, "bootstrap-body-read");
+  assert.equal(details.required_permission, "contents:read");
+  assert.equal(
+    (details.error as Record<string, unknown>).message,
+    "GitHub release response body read failed.",
+  );
+  assert.equal(JSON.stringify(records).includes("bootstrap-body-read-sentinel"), false);
+});
+
+test("sanitizes immutable and primitive bootstrap body-read rejections", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const failures: readonly [string, unknown][] = [
+    ["bootstrap-frozen-body-sentinel", Object.freeze(new Error("bootstrap-frozen-body-sentinel"))],
+    ["bootstrap-primitive-body-sentinel", "bootstrap-primitive-body-sentinel"],
+  ];
+  for (const [index, [sentinel, bodyError]] of failures.entries()) {
+    const requestId = `bootstrap-immutable-${index}`;
+    globalThis.fetch = async () =>
+      ({
+        ok: true,
+        status: 502,
+        headers: new Headers({ "x-github-request-id": requestId }),
+        text: async () => Promise.reject(bodyError),
+      }) as unknown as Response;
+    const lines: string[] = [];
+    const diagnostics = new DiagnosticLogger({
+      component: "bootstrap",
+      write: (line) => lines.push(line),
+    });
+    await assert.rejects(
+      bootstrapInternals.fetchJson(
+        `https://api.example.test/body-read/${String(index)}`,
+        undefined,
+        diagnostics,
+      ),
+      (error: unknown) => error === bodyError,
+    );
+    const records = lines.map(
+      (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+    );
+    const terminal = records.find((record) => record.event === "operation.finished");
+    assert.ok(terminal);
+    assert.equal(
+      ((terminal.details as Record<string, unknown>).error as Record<string, unknown>).message,
+      "GitHub release response body read failed.",
+    );
+    assert.equal(JSON.stringify(records).includes(sentinel), false);
+  }
+});
+
+test("keeps immutable body-read failures redacted through bootstrap lifecycle spans", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const failures: readonly [string, unknown][] = [
+    [
+      "bootstrap-lifecycle-frozen-sentinel",
+      Object.freeze(new Error("bootstrap-lifecycle-frozen-sentinel")),
+    ],
+    ["bootstrap-lifecycle-primitive-sentinel", "bootstrap-lifecycle-primitive-sentinel"],
+  ];
+  for (const [index, [sentinel, bodyError]] of failures.entries()) {
+    globalThis.fetch = async () =>
+      ({
+        ok: true,
+        status: 502,
+        headers: new Headers({ "x-github-request-id": `bootstrap-lifecycle-${index}` }),
+        text: async () => Promise.reject(bodyError),
+      }) as unknown as Response;
+    const lines: string[] = [];
+    const diagnostics = new DiagnosticLogger({
+      component: "bootstrap",
+      write: (line) => lines.push(line),
+    });
+    await assert.rejects(
+      bootstrapRuntime({ releaseRef: "v1.1.1-rc.0", diagnostics }),
+      (error: unknown) => error === bodyError,
+    );
+    const records = lines.map(
+      (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+    );
+    const terminal = records.find(
+      (record) => record.operation === "runtime.bootstrap" && record.event === "operation.finished",
+    );
+    assert.ok(terminal);
+    assert.equal(
+      ((terminal.details as Record<string, unknown>).error as Record<string, unknown>).message,
+      "GitHub release response body read failed.",
+    );
+    assert.equal(JSON.stringify(records).includes(sentinel), false);
+  }
+});
+
+test("does not suppress colliding bootstrap body-read failures", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const scenarios: readonly {
+    readonly operation: string;
+    readonly error: Error;
+    readonly invoke: (diagnostics: DiagnosticLogger) => Promise<unknown>;
+    readonly response: () => Response;
+  }[] = [
+    {
+      operation: "github.request",
+      error: new Error("Runtime release lookup failed (503): release-body-sentinel"),
+      invoke: (diagnostics) =>
+        bootstrapInternals.fetchJson(
+          "https://api.example.test/release-body",
+          undefined,
+          diagnostics,
+        ),
+      response: () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "x-github-request-id": "bootstrap-colliding-release" }),
+          text: async () => Promise.reject(scenarios[0]?.error),
+        }) as unknown as Response,
+    },
+    {
+      operation: "github.asset.download",
+      error: new Error("Runtime asset download failed (503): asset-body-sentinel"),
+      invoke: (diagnostics) =>
+        bootstrapInternals.download(
+          "https://api.example.test/asset-body",
+          join(tmpdir(), "bootstrap-colliding-asset"),
+          undefined,
+          diagnostics,
+        ),
+      response: () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "x-github-request-id": "bootstrap-colliding-asset" }),
+          arrayBuffer: async () => Promise.reject(scenarios[1]?.error),
+        }) as unknown as Response,
+    },
+    {
+      operation: "github.asset.checksum",
+      error: new Error("Runtime checksum download failed (503): checksum-body-sentinel"),
+      invoke: (diagnostics) =>
+        bootstrapInternals.readChecksum(
+          "https://api.example.test/checksum-body",
+          undefined,
+          diagnostics,
+        ),
+      response: () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: new Headers({ "x-github-request-id": "bootstrap-colliding-checksum" }),
+          text: async () => Promise.reject(scenarios[2]?.error),
+        }) as unknown as Response,
+    },
+  ];
+  for (const scenario of scenarios) {
+    globalThis.fetch = async () => scenario.response();
+    const lines: string[] = [];
+    const diagnostics = new DiagnosticLogger({
+      component: "bootstrap",
+      write: (line) => lines.push(line),
+    });
+    await assert.rejects(
+      scenario.invoke(diagnostics),
+      (error: unknown) => error === scenario.error,
+    );
+    const records = lines.map(
+      (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+    );
+    const terminal = records.find(
+      (record) => record.operation === scenario.operation && record.event === "operation.finished",
+    );
+    assert.ok(terminal);
+    assert.equal(
+      ((terminal.details as Record<string, unknown>).error as Record<string, unknown>).message,
+      scenario.operation === "github.request"
+        ? "GitHub release response body read failed."
+        : scenario.operation === "github.asset.download"
+          ? "Runtime asset response body read failed."
+          : "Runtime checksum response body read failed.",
+    );
+    assert.equal(JSON.stringify(records).includes(scenario.error.message), false);
+  }
+});
+
+test("retains bootstrap response metadata when cancellation interrupts a body read", async (t) => {
+  const previous = globalThis.fetch;
+  const entered = new Promise<void>((resolve) => {
+    globalThis.fetch = async (_input, init) => {
+      resolve();
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "x-github-request-id": "bootstrap-cancelled" }),
+        text: async () => {
+          await new Promise<void>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal?.aborted) {
+              reject(signal.reason);
+              return;
+            }
+            signal?.addEventListener(
+              "abort",
+              () => {
+                reject(signal.reason);
+              },
+              { once: true },
+            );
+          });
+          return "";
+        },
+      } as unknown as Response;
+    };
+  });
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => lines.push(line),
+  });
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGTERM");
+  const pending = bootstrapInternals.fetchJson(
+    "https://api.example.test/cancelled",
+    controller.signal,
+    diagnostics,
+  );
+  await entered;
+  controller.abort(reason);
+  await assert.rejects(pending, (error: unknown) => error === reason);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find((record) => record.event === "operation.cancelled");
+  assert.ok(terminal);
+  const details = terminal.details as Record<string, unknown>;
+  assert.equal(details.status, 200);
+  assert.equal(details.request_id, "bootstrap-cancelled");
+  assert.equal(details.required_permission, "contents:read");
+});
+
+test("redacts the bootstrap PAT in default diagnostics", async (t) => {
+  const previousToken = process.env["INPUT_GITHUB-PAT"];
+  process.env["INPUT_GITHUB-PAT"] = "bootstrap-secret-token";
+  t.after(() => {
+    if (previousToken === undefined) delete process.env["INPUT_GITHUB-PAT"];
+    else process.env["INPUT_GITHUB-PAT"] = previousToken;
+  });
+  const output: string[] = [];
+  t.mock.method(console, "log", (line: unknown) => {
+    output.push(String(line));
+  });
+  await assert.rejects(
+    bootstrapRuntime({
+      releaseRef: "v1",
+      getJson: async () => {
+        throw new Error("bootstrap-secret-token was rejected");
+      },
+    }),
+    /bootstrap-secret-token/u,
+  );
+  const rendered = output.join("\n");
+  assert.equal(rendered.includes("bootstrap-secret-token"), false);
+  assert.equal(rendered.includes("[REDACTED]"), true);
+});
+
+test("preserves undefined bootstrap failures and records a terminal failure", async () => {
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => lines.push(line),
+  });
+  let threw = false;
+  let rejection: unknown;
+  let returned: number | undefined;
+  try {
+    returned = await bootstrapRuntime({
+      releaseRef: "v1.1.1-rc.0",
+      getJson: async () => {
+        throw undefined;
+      },
+      diagnostics,
+    });
+  } catch (error) {
+    threw = true;
+    rejection = error;
+  }
+  assert.equal(threw, true);
+  assert.equal(rejection, undefined);
+  assert.equal(returned, undefined);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const terminal = records.find(
+    (record) => record.operation === "runtime.bootstrap" && record.event === "operation.finished",
+  );
+  assert.ok(terminal);
+  assert.equal(terminal.outcome, "failure");
+  assert.deepEqual((terminal.details as Record<string, unknown>).error, {
+    name: "undefined",
+    message: "undefined",
+  });
+});
+
 test("rejects unsafe archives and reports runtime process outcomes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-bootstrap-safety-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -550,15 +1021,34 @@ test("propagates bootstrap cancellation to the runtime child over IPC", async (t
     `,
   );
   const controller = new AbortController();
-  const running = bootstrapInternals.runRuntime(root, "source", controller.signal);
+  const diagnosticLines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => diagnosticLines.push(line),
+  });
+  const running = bootstrapInternals.runRuntime(root, "source", controller.signal, diagnostics);
   await waitForPath(ready);
   controller.abort(new CancellationError("SIGTERM"));
 
   assert.equal(await running, 0);
   assert.match(await readFile(cleaned, "utf8"), /SIGTERM/u);
+  const records = diagnosticLines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some(
+      (record) => record.operation === "runtime.launch" && record.outcome === "cancelled",
+    ),
+    true,
+  );
 });
 
 test("rejects release and manifest mismatches before runtime execution", async (t) => {
+  const diagnosticLines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "bootstrap",
+    write: (line) => diagnosticLines.push(line),
+  });
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-bootstrap-invalid-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const assetName = bootstrapInternals.platformAssetName();
@@ -566,6 +1056,7 @@ test("rejects release and manifest mismatches before runtime execution", async (
     bootstrapRuntime({
       releaseRef: "v1.1.1-rc.0",
       temporaryRoot: root,
+      diagnostics,
       getJson: <T>(): Promise<T> => Promise.resolve(value as T),
     });
   await assert.rejects(
@@ -595,5 +1086,20 @@ test("rejects release and manifest mismatches before runtime execution", async (
       ],
     }),
     /larger than the safety limit/u,
+  );
+  const records = diagnosticLines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some(
+      (record) => record.operation === "release.validate" && record.outcome === "failure",
+    ),
+    true,
+  );
+  assert.equal(
+    records.some(
+      (record) => record.operation === "release.asset.select" && record.outcome === "failure",
+    ),
+    true,
   );
 });

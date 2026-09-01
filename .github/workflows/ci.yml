@@ -40,10 +40,21 @@ jobs:
       - name: Verify reproducible compiled runtime
         run: npm run security:repro
       - name: Ensure generated bootstrap is present and stable
-        run: >-
-          git diff --exit-code -- dist/bootstrap.js
-          dist/lib/bootstrap/archive.js dist/lib/bootstrap/cancellation.js
-          dist/lib/bootstrap/version.js
+        run: |
+          set -euo pipefail
+          generated=(
+            dist/bootstrap.js
+            dist/lib/diagnostics.js
+            dist/lib/bootstrap/archive.js
+            dist/lib/bootstrap/cancellation.js
+            dist/lib/bootstrap/version.js
+          )
+          for path in "${generated[@]}"; do
+            test -f "${path}"
+            git ls-files --error-unmatch "${path}" >/dev/null
+          done
+          git diff --exit-code -- "${generated[@]}"
+          test -z "$(git status --porcelain --untracked-files=all -- "${generated[@]}")"
 
   codeql:
     name: CodeQL
