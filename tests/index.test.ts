@@ -1,3 +1,5 @@
+/* eslint-disable max-lines */
+
 import {
   GitHubApi,
   GitHubApiError,
@@ -34,6 +36,60 @@ import type {
   ReviewLifecycleThreadRecord,
 } from "../src/lib/github-review-lifecycle.js";
 import { staleReviewBody } from "../src/lib/review-lifecycle.js";
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
+
+test("correlates action phases and cleanup outcomes in diagnostics", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "action",
+    write: (line) => lines.push(line),
+    id: (() => {
+      let index = 0;
+      return () => `action-${++index}`;
+    })(),
+  });
+  const api = {
+    ...emptyConversationApi("review-owner"),
+    getPullRequestFiles: () => Promise.resolve([]),
+  } as unknown as GitHubApi;
+  const result = await runAction(
+    actionReader({ "interact-with-pr": "false" }),
+    [],
+    {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      readFiles: () => Promise.resolve([]),
+      runGoals: () =>
+        Promise.resolve([
+          {
+            prompt: "correctness",
+            status: "completed",
+            submission: { summary: "clean", findings: [] },
+          },
+        ]),
+      writeSummary: () => Promise.resolve(),
+    },
+    new AbortController(),
+    diagnostics,
+  );
+  assert.equal(result.skipped, false);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const operations = new Set(records.map((record) => record.operation));
+  assert.equal(operations.has("action.run"), true);
+  assert.equal(operations.has("action.config.read"), true);
+  assert.equal(operations.has("action.event.read"), true);
+  assert.equal(operations.has("action.diff.capture"), true);
+  assert.equal(operations.has("action.goals.run"), true);
+  assert.equal(operations.has("action.review.aggregate"), true);
+  assert.equal(operations.has("action.summary.write"), true);
+  assert.equal(operations.has("action.context.cleanup"), true);
+  assert.equal(records.at(-1)?.outcome, "success");
+});
 
 test("redaction secrets include configured AI and MCP endpoints", () => {
   const secrets = indexInternals.reviewSecrets(config);
@@ -209,15 +265,32 @@ test("attempts workspace cleanup when context cleanup fails", async (t) => {
   const temporaryWorkspace = join(root, "workspace");
   await mkdir(temporaryWorkspace);
   t.after(() => rm(root, { force: true, recursive: true }));
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "action",
+    write: (line) => lines.push(line),
+  });
 
   await assert.rejects(
     indexInternals.cleanupReviewArtifacts(
       { cleanup: () => Promise.reject(new Error("context cleanup failed")) },
       { cleanup: () => rm(temporaryWorkspace, { force: true, recursive: true }) },
+      diagnostics,
     ),
     /context cleanup failed/u,
   );
   await assert.rejects(access(temporaryWorkspace));
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const cleanupFailure = records.find(
+    (record) => record.operation === "action.context.cleanup" && record.outcome === "failure",
+  );
+  assert.ok(cleanupFailure);
+  assert.equal(
+    ((cleanupFailure.details as Record<string, unknown>).error as Record<string, unknown>).message,
+    "context cleanup failed",
+  );
 });
 
 test("summary-only URL reviews make GET requests and write one run summary", async (t) => {
@@ -516,20 +589,38 @@ test("skips an identical current-head review by the authenticated user", async (
         },
       ]),
   } as unknown as GitHubApi;
-
-  const result = await runAction(reader, [], {
-    createApi: () => api,
-    readEventContext: () => Promise.resolve(context),
-    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-    runGoals: () => {
-      goalRuns += 1;
-      return Promise.resolve([]);
-    },
-    writeSummary: () => Promise.resolve(),
+  const diagnosticLines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "action",
+    write: (line) => diagnosticLines.push(line),
   });
+
+  const result = await runAction(
+    reader,
+    [],
+    {
+      createApi: () => api,
+      readEventContext: () => Promise.resolve(context),
+      createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+      runGoals: () => {
+        goalRuns += 1;
+        return Promise.resolve([]);
+      },
+      writeSummary: () => Promise.resolve(),
+    },
+    new AbortController(),
+    diagnostics,
+  );
 
   assert.deepEqual(result, { skipped: true });
   assert.equal(goalRuns, 0);
+  const records = diagnosticLines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(
+    records.some((record) => record.operation === "action.run" && record.outcome === "skipped"),
+    true,
+  );
 });
 
 test("passes immutable context snapshots to goals and cleans them after the run", async (t) => {

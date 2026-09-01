@@ -21,11 +21,13 @@ import {
   type ActionReleaseReference,
   type ActionReleaseVersion,
 } from "./lib/bootstrap/version.js";
+import { DiagnosticLogger, type DiagnosticDescriptor } from "./lib/diagnostics.js";
 
 const RELEASE_REPOSITORY = "markhuangai/ai-pr-reviewer";
 const MAX_ARCHIVE_BYTES = 600 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 10_000;
+const BOOTSTRAP_GITHUB_PERMISSION = "contents:read";
 
 interface ReleaseAsset {
   readonly name?: unknown;
@@ -43,6 +45,30 @@ interface ReleasePayload {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function withDiagnosticMessage(error: unknown, message: string): unknown {
+  if (error instanceof Error) {
+    try {
+      Object.defineProperty(error, "diagnosticMessage", {
+        configurable: true,
+        enumerable: false,
+        value: message,
+        writable: true,
+      });
+    } catch {
+      // Preserve the original parser error when its properties cannot be changed.
+    }
+  }
+  return error;
+}
+
+function parseJson(text: string, diagnosticMessage: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    throw withDiagnosticMessage(error, diagnosticMessage);
+  }
 }
 
 function platformAssetName(): string {
@@ -70,17 +96,114 @@ function apiRequestHeaders(): Headers {
   return headers;
 }
 
-async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  throwIfAborted(signal);
-  const response = await fetch(url, {
-    headers: apiRequestHeaders(),
-    ...(signal === undefined ? {} : { signal }),
-  });
-  if (!response.ok) throw new Error(`Runtime release lookup failed (${response.status}).`);
-  return (await response.json()) as T;
+function bootstrapDescriptor(operation: string, purpose: string): DiagnosticDescriptor {
+  return { component: "bootstrap", phase: "bootstrap", operation, purpose };
 }
 
-type JsonFetcher = <T>(url: string, signal?: AbortSignal) => Promise<T>;
+function bootstrapRequestDetails(url: string): Readonly<Record<string, unknown>> {
+  return { method: "GET", url, required_permission: BOOTSTRAP_GITHUB_PERMISSION };
+}
+
+function responseStatusText(response: Response): string | undefined {
+  const value = (response as Response & { readonly statusText?: unknown }).statusText;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function bootstrapResponseDetails(
+  response: Response,
+  responseBytes?: number,
+): Readonly<Record<string, unknown>> {
+  const requestId = response.headers.get("x-github-request-id");
+  const statusText = responseStatusText(response);
+  return {
+    status: response.status,
+    ...(statusText === undefined ? {} : { status_text: statusText }),
+    ...(responseBytes === undefined ? {} : { response_bytes: responseBytes }),
+    ...(requestId === null ? {} : { request_id: requestId }),
+    required_permission: BOOTSTRAP_GITHUB_PERMISSION,
+    response_headers: Object.fromEntries(response.headers.entries()),
+  };
+}
+
+type DiagnosticJsonFetcher = <T>(
+  url: string,
+  signal?: AbortSignal,
+  diagnostics?: DiagnosticLogger,
+  descriptor?: DiagnosticDescriptor,
+) => Promise<T>;
+
+async function fetchJson<T>(
+  url: string,
+  signal?: AbortSignal,
+  diagnostics = new DiagnosticLogger({ component: "bootstrap" }),
+  descriptor = bootstrapDescriptor("github.request", "read GitHub release metadata"),
+): Promise<T> {
+  const span = diagnostics.start(descriptor, bootstrapRequestDetails(url));
+  let responseMetadata: Readonly<Record<string, unknown>> | undefined;
+  let bodyReadAttempted = false;
+  let bodyRead = false;
+  try {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+      headers: apiRequestHeaders(),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    responseMetadata = bootstrapResponseDetails(response);
+    if (!response.ok) {
+      const error = new Error(`Runtime release lookup failed (${response.status}).`);
+      span.failure(error, {
+        ...responseMetadata,
+        content_length: response.headers.get("content-length") ?? undefined,
+      });
+      throw error;
+    }
+    bodyReadAttempted = true;
+    const text = await response.text();
+    bodyRead = true;
+    let payload: T;
+    try {
+      payload = parseJson(text, "GitHub release metadata JSON parsing failed.") as T;
+    } catch (error) {
+      span.failure(error, {
+        ...responseMetadata,
+        response_bytes: Buffer.byteLength(text),
+      });
+      throw error;
+    }
+    span.success({ ...responseMetadata, response_bytes: Buffer.byteLength(text) });
+    return payload;
+  } catch (error) {
+    const bodyReadFailure = responseMetadata !== undefined && bodyReadAttempted && !bodyRead;
+    if (bodyReadFailure)
+      diagnostics.registerSafeDiagnosticError(error, "GitHub release response body read failed.");
+    const diagnosticError = bodyReadFailure
+      ? new Error("GitHub release response body read failed.")
+      : error;
+    if (signal?.aborted) span.cancelled(diagnosticError, responseMetadata);
+    else {
+      span.failure(diagnosticError, responseMetadata);
+    }
+    throw error;
+  }
+}
+
+type JsonFetcher = DiagnosticJsonFetcher;
+
+async function getJsonWithDiagnostics<T>(
+  getJson: JsonFetcher,
+  url: string,
+  signal: AbortSignal | undefined,
+  diagnostics: DiagnosticLogger | undefined,
+  descriptor: DiagnosticDescriptor,
+): Promise<T> {
+  if (diagnostics === undefined) return getJson<T>(url, signal);
+  if (getJson === fetchJson) return getJson<T>(url, signal, diagnostics, descriptor);
+  return diagnostics.withSpan(
+    descriptor,
+    () => getJson<T>(url, signal, diagnostics, descriptor),
+    bootstrapRequestDetails(url),
+  );
+}
 
 function gitObject(value: unknown, expectedType: "commit" | "tag"): string | undefined {
   if (!isRecord(value) || !isRecord(value.object)) return undefined;
@@ -96,16 +219,23 @@ async function resolveAlias(
   alias: ActionReleaseAlias,
   getJson: JsonFetcher,
   signal?: AbortSignal,
+  diagnostics?: DiagnosticLogger,
 ): Promise<ActionReleaseVersion> {
-  const ref = await getJson<unknown>(
+  const ref = await getJsonWithDiagnostics<unknown>(
+    getJson,
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(alias.tag)}`,
     signal,
+    diagnostics,
+    bootstrapDescriptor("github.release.alias-ref", "resolve the requested runtime release alias"),
   );
   const tagObjectSha = gitObject(ref, "tag");
   if (!tagObjectSha) throw new Error("The action release alias is not an annotated Git tag.");
-  const tagObject = await getJson<unknown>(
+  const tagObject = await getJsonWithDiagnostics<unknown>(
+    getJson,
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/tags/${tagObjectSha}`,
     signal,
+    diagnostics,
+    bootstrapDescriptor("github.release.alias-tag", "read the annotated runtime release alias"),
   );
   if (
     !isRecord(tagObject) ||
@@ -119,9 +249,12 @@ async function resolveAlias(
   if (!release || !commitSha || !aliasAcceptsRelease(alias, release)) {
     throw new Error("The action release alias targets an incompatible exact version.");
   }
-  const exactRef = await getJson<unknown>(
+  const exactRef = await getJsonWithDiagnostics<unknown>(
+    getJson,
     `https://api.github.com/repos/${RELEASE_REPOSITORY}/git/ref/tags/${encodeURIComponent(release.tag)}`,
     signal,
+    diagnostics,
+    bootstrapDescriptor("github.release.exact-ref", "verify the exact runtime release commit"),
   );
   if (gitObject(exactRef, "commit") !== commitSha) {
     throw new Error("The action release alias and exact version resolve to different commits.");
@@ -133,6 +266,7 @@ export async function resolveActionRelease(
   value: string | undefined,
   getJson: JsonFetcher = fetchJson,
   signal?: AbortSignal,
+  diagnostics?: DiagnosticLogger,
 ): Promise<ActionReleaseVersion> {
   throwIfAborted(signal);
   const reference: ActionReleaseReference | undefined = parseActionReleaseReference(value);
@@ -141,7 +275,9 @@ export async function resolveActionRelease(
       "This action must be referenced by vN, vN-prerelease, or an exact tag such as v1.0.0 or v1.0.0-rc.0.",
     );
   }
-  return "stableTag" in reference ? reference : resolveAlias(reference, getJson, signal);
+  return "stableTag" in reference
+    ? reference
+    : resolveAlias(reference, getJson, signal, diagnostics);
 }
 
 function readAsset(value: unknown): ReleaseAsset {
@@ -168,22 +304,73 @@ async function download(
   url: string,
   destination: string,
   signal?: AbortSignal,
+  diagnostics = new DiagnosticLogger({ component: "bootstrap" }),
 ): Promise<Uint8Array> {
-  throwIfAborted(signal);
-  const response = await fetch(url, {
-    headers: requestHeaders(),
-    ...(signal === undefined ? {} : { signal }),
-  });
-  if (!response.ok) throw new Error(`Runtime asset download failed (${response.status}).`);
-  const contentLength = Number(response.headers.get("content-length") ?? "0");
-  if (contentLength > MAX_ARCHIVE_BYTES)
-    throw new Error("Runtime asset is larger than the safety limit.");
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_ARCHIVE_BYTES)
-    throw new Error("Runtime asset is larger than the safety limit.");
-  await mkdir(dirname(destination), { recursive: true });
-  await writeFile(destination, bytes, { signal });
-  return bytes;
+  const span = diagnostics.start(
+    bootstrapDescriptor("github.asset.download", "download the verified runtime archive"),
+    { ...bootstrapRequestDetails(url), destination },
+  );
+  let responseMetadata: Readonly<Record<string, unknown>> | undefined;
+  let bodyReadAttempted = false;
+  let bodyRead = false;
+  try {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+      headers: requestHeaders(),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    const contentLength = Number(response.headers.get("content-length") ?? "0");
+    const responseHeaders = Object.fromEntries(response.headers.entries());
+    responseMetadata = {
+      ...bootstrapResponseDetails(response),
+      content_length: Number.isFinite(contentLength) ? contentLength : undefined,
+    };
+    if (!response.ok) {
+      const error = new Error(`Runtime asset download failed (${response.status}).`);
+      span.failure(error, {
+        ...responseMetadata,
+      });
+      throw error;
+    }
+    if (contentLength > MAX_ARCHIVE_BYTES) {
+      const error = new Error("Runtime asset is larger than the safety limit.");
+      span.failure(error, {
+        ...responseMetadata,
+      });
+      throw error;
+    }
+    bodyReadAttempted = true;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    bodyRead = true;
+    if (bytes.byteLength > MAX_ARCHIVE_BYTES) {
+      const error = new Error("Runtime asset is larger than the safety limit.");
+      span.failure(error, {
+        ...responseMetadata,
+        response_bytes: bytes.byteLength,
+      });
+      throw error;
+    }
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, bytes, { signal });
+    span.success({
+      ...responseMetadata,
+      response_bytes: bytes.byteLength,
+      response_headers: responseHeaders,
+    });
+    return bytes;
+  } catch (error) {
+    const bodyReadFailure = responseMetadata !== undefined && bodyReadAttempted && !bodyRead;
+    if (bodyReadFailure)
+      diagnostics.registerSafeDiagnosticError(error, "Runtime asset response body read failed.");
+    const diagnosticError = bodyReadFailure
+      ? new Error("Runtime asset response body read failed.")
+      : error;
+    if (signal?.aborted) span.cancelled(diagnosticError, responseMetadata);
+    else {
+      span.failure(diagnosticError, responseMetadata);
+    }
+    throw error;
+  }
 }
 
 function expectedDigest(asset: ReleaseAsset, checksumText: string | undefined): string {
@@ -194,15 +381,64 @@ function expectedDigest(asset: ReleaseAsset, checksumText: string | undefined): 
   return match[1].toLowerCase();
 }
 
-async function readChecksum(url: string, signal?: AbortSignal): Promise<string | undefined> {
-  throwIfAborted(signal);
-  const response = await fetch(url, {
-    headers: requestHeaders(),
-    ...(signal === undefined ? {} : { signal }),
-  });
-  if (response.status === 404) return undefined;
-  if (!response.ok) throw new Error(`Runtime checksum download failed (${response.status}).`);
-  return response.text();
+async function readChecksum(
+  url: string,
+  signal?: AbortSignal,
+  diagnostics = new DiagnosticLogger({ component: "bootstrap" }),
+): Promise<string | undefined> {
+  const span = diagnostics.start(
+    bootstrapDescriptor("github.asset.checksum", "read the optional runtime archive checksum"),
+    bootstrapRequestDetails(url),
+  );
+  let responseMetadata: Readonly<Record<string, unknown>> | undefined;
+  let bodyReadAttempted = false;
+  let bodyRead = false;
+  try {
+    throwIfAborted(signal);
+    const response = await fetch(url, {
+      headers: requestHeaders(),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    responseMetadata = bootstrapResponseDetails(response);
+    if (response.status === 404) {
+      span.skipped({
+        ...responseMetadata,
+        reason: "optional checksum is absent",
+        content_length: response.headers.get("content-length") ?? undefined,
+      });
+      return undefined;
+    }
+    if (!response.ok) {
+      const error = new Error(`Runtime checksum download failed (${response.status}).`);
+      span.failure(error, {
+        ...responseMetadata,
+        content_length: response.headers.get("content-length") ?? undefined,
+      });
+      throw error;
+    }
+    bodyReadAttempted = true;
+    const text = await response.text();
+    bodyRead = true;
+    const responseHeaders = Object.fromEntries(response.headers.entries());
+    span.success({
+      ...responseMetadata,
+      response_bytes: Buffer.byteLength(text),
+      response_headers: responseHeaders,
+    });
+    return text;
+  } catch (error) {
+    const bodyReadFailure = responseMetadata !== undefined && bodyReadAttempted && !bodyRead;
+    if (bodyReadFailure)
+      diagnostics.registerSafeDiagnosticError(error, "Runtime checksum response body read failed.");
+    const diagnosticError = bodyReadFailure
+      ? new Error("Runtime checksum response body read failed.")
+      : error;
+    if (signal?.aborted) span.cancelled(diagnosticError, responseMetadata);
+    else {
+      span.failure(diagnosticError, responseMetadata);
+    }
+    throw error;
+  }
 }
 
 async function extract(archive: string, destination: string, signal?: AbortSignal): Promise<void> {
@@ -319,42 +555,57 @@ async function runRuntime(
   runtimeDirectory: string,
   buildId = process.env.AI_PR_REVIEWER_BUILD_ID ?? "source",
   signal?: AbortSignal,
+  diagnostics = new DiagnosticLogger({ component: "bootstrap" }),
 ): Promise<number> {
-  throwIfAborted(signal);
-  const entry = join(runtimeDirectory, "runtime", "index.js");
-  const entryStats = await stat(entry).catch(() => undefined);
-  if (!entryStats?.isFile()) throw new Error("Runtime bundle is missing runtime/index.js.");
-  const child = spawn(process.execPath, [entry], {
-    stdio: ["inherit", "inherit", "inherit", "ipc"],
-    env: {
-      ...process.env,
-      AI_PR_REVIEWER_BUILD_ID: buildId,
-    },
-    windowsHide: false,
-  });
-  return new Promise<number>((resolve, reject) => {
-    const cancelRuntime = (): void => {
-      if (!child.connected) return;
-      child.send(cancellationInternals.cancellationMessage(signal?.reason), () => undefined);
-    };
-    const cleanup = (): void => {
-      signal?.removeEventListener("abort", cancelRuntime);
-    };
-    signal?.addEventListener("abort", cancelRuntime, { once: true });
-    if (signal?.aborted) cancelRuntime();
-    child.once("error", (error) => {
-      cleanup();
-      if (signal?.aborted) {
-        reject(cancellationReason(signal));
-        return;
-      }
-      reject(error);
+  const span = diagnostics.start(
+    bootstrapDescriptor("runtime.launch", "launch the verified runtime bundle"),
+    { build_id: buildId },
+  );
+  try {
+    throwIfAborted(signal);
+    const entry = join(runtimeDirectory, "runtime", "index.js");
+    const entryStats = await stat(entry).catch(() => undefined);
+    if (!entryStats?.isFile()) throw new Error("Runtime bundle is missing runtime/index.js.");
+    const child = spawn(process.execPath, [entry], {
+      stdio: ["inherit", "inherit", "inherit", "ipc"],
+      env: {
+        ...process.env,
+        AI_PR_REVIEWER_BUILD_ID: buildId,
+      },
+      windowsHide: false,
     });
-    child.once("exit", (code, signal) => {
-      cleanup();
-      resolve(code ?? (signal ? 1 : 0));
+    const code = await new Promise<number>((resolve, reject) => {
+      const cancelRuntime = (): void => {
+        if (!child.connected) return;
+        child.send(cancellationInternals.cancellationMessage(signal?.reason), () => undefined);
+      };
+      const cleanup = (): void => {
+        signal?.removeEventListener("abort", cancelRuntime);
+      };
+      signal?.addEventListener("abort", cancelRuntime, { once: true });
+      if (signal?.aborted) cancelRuntime();
+      child.once("error", (error) => {
+        cleanup();
+        if (signal?.aborted) {
+          reject(cancellationReason(signal));
+          return;
+        }
+        reject(error);
+      });
+      child.once("exit", (exitCode, childSignal) => {
+        cleanup();
+        resolve(exitCode ?? (childSignal ? 1 : 0));
+      });
     });
-  });
+    if (signal?.aborted) span.cancelled(cancellationReason(signal), { exit_code: code });
+    else if (code === 0) span.success({ exit_code: code });
+    else span.failure(new Error(`Runtime exited with code ${code}.`), { exit_code: code });
+    return code;
+  } catch (error) {
+    if (signal?.aborted) span.cancelled(error);
+    else span.failure(error);
+    throw error;
+  }
 }
 
 export interface BootstrapRuntimeOptions {
@@ -362,71 +613,172 @@ export interface BootstrapRuntimeOptions {
   readonly temporaryRoot?: string;
   readonly getJson?: JsonFetcher;
   readonly signal?: AbortSignal;
+  readonly diagnostics?: DiagnosticLogger;
 }
 
 export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): Promise<number> {
   const { signal } = options;
-  throwIfAborted(signal);
+  const bootstrapToken = process.env["INPUT_GITHUB-PAT"]?.trim();
+  const diagnostics =
+    options.diagnostics ??
+    new DiagnosticLogger({
+      component: "bootstrap",
+      context: {
+        action_ref: process.env.GITHUB_ACTION_REF ?? "unknown",
+        build_id: process.env.AI_PR_REVIEWER_BUILD_ID ?? "source",
+      },
+    });
+  if (bootstrapToken !== undefined && bootstrapToken.length > 0)
+    diagnostics.addSecrets([bootstrapToken]);
+  const runSpan = diagnostics.start(
+    bootstrapDescriptor("runtime.bootstrap", "bootstrap and execute the verified runtime"),
+  );
   const releaseRef = options.releaseRef ?? process.env.GITHUB_ACTION_REF;
   const getJson = options.getJson ?? fetchJson;
-  const requestedRelease = await resolveActionRelease(releaseRef, getJson, signal);
-  const assetName = platformAssetName();
-  const release = await getJson<ReleasePayload>(
-    `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
-    signal,
-  );
-  if (
-    release.tag_name !== requestedRelease.tag ||
-    release.draft !== false ||
-    release.prerelease !== requestedRelease.prerelease ||
-    !Array.isArray(release.assets)
-  ) {
-    throw new Error("The runtime release does not match the requested action version.");
-  }
-  const assets = release.assets.map(readAsset);
-  const asset = assets.find((candidate) => candidate.name === assetName);
-  if (!asset || typeof asset.browser_download_url !== "string")
-    throw new Error(`Runtime release has no asset for ${assetName}.`);
-  if (typeof asset.size === "number" && asset.size > MAX_ARCHIVE_BYTES)
-    throw new Error("Runtime asset is larger than the safety limit.");
-  const checksum = await readChecksum(`${asset.browser_download_url}.sha256`, signal);
-  const cacheRoot = join(
-    options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(),
-    "ai-pr-reviewer-runtime",
-    requestedRelease.tag,
-    assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
-  );
-  const archive = join(cacheRoot, assetName);
-  const bytes = await download(asset.browser_download_url, archive, signal);
-  const actualDigest = sha256(bytes);
-  if (actualDigest !== expectedDigest(asset, checksum))
-    throw new Error("Runtime asset SHA-256 verification failed.");
-  const extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
+  let extracted: string | undefined;
+  let primaryError: unknown;
+  let failed = false;
+  let runtimeCode: number | undefined;
   try {
-    await extract(archive, extracted, signal);
-    const manifestPath = join(extracted, "runtime", "manifest.json");
-    const manifest = JSON.parse(
-      await readFile(manifestPath, { encoding: "utf8", signal }),
-    ) as unknown;
-    if (
-      !isRecord(manifest) ||
-      !isCompatibleRuntimeManifest(requestedRelease, manifest.artifactTag, manifest.stableTag) ||
-      manifest.asset !== assetName ||
-      manifest.nodeMajor !== 24 ||
-      typeof manifest.sdkVersion !== "string" ||
-      typeof manifest.cliVersion !== "string" ||
-      typeof manifest.sourceCommit !== "string" ||
-      manifest.sourceCommit.length === 0
-    ) {
+    throwIfAborted(signal);
+    const requestedRelease = await diagnostics.withSpan(
+      bootstrapDescriptor("release.resolve", "resolve the requested action release"),
+      () => resolveActionRelease(releaseRef, getJson, signal, diagnostics),
+      { release_ref: releaseRef ?? "unset" },
+    );
+    const assetName = platformAssetName();
+    const release = await getJsonWithDiagnostics<ReleasePayload>(
+      getJson,
+      `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${encodeURIComponent(requestedRelease.tag)}`,
+      signal,
+      diagnostics,
+      bootstrapDescriptor("github.release.metadata", "read the exact runtime release metadata"),
+    );
+    const assets = await diagnostics.withSpan(
+      bootstrapDescriptor("release.validate", "validate the requested runtime release metadata"),
+      () => {
+        const releaseAssets = release.assets;
+        if (
+          release.tag_name !== requestedRelease.tag ||
+          release.draft !== false ||
+          release.prerelease !== requestedRelease.prerelease ||
+          !Array.isArray(releaseAssets)
+        ) {
+          throw new Error("The runtime release does not match the requested action version.");
+        }
+        return releaseAssets.map(readAsset);
+      },
+      { release_tag: requestedRelease.tag, asset: assetName },
+    );
+    const asset = await diagnostics.withSpan(
+      bootstrapDescriptor("release.asset.select", "select and validate the platform runtime asset"),
+      () => {
+        const candidate = assets.find((item) => item.name === assetName);
+        if (!candidate || typeof candidate.browser_download_url !== "string")
+          throw new Error(`Runtime release has no asset for ${assetName}.`);
+        if (typeof candidate.size === "number" && candidate.size > MAX_ARCHIVE_BYTES)
+          throw new Error("Runtime asset is larger than the safety limit.");
+        return candidate as ReleaseAsset & { readonly browser_download_url: string };
+      },
+      { asset: assetName },
+    );
+    const checksum = await readChecksum(
+      `${asset.browser_download_url}.sha256`,
+      signal,
+      diagnostics,
+    );
+    const cacheRoot = join(
+      options.temporaryRoot ?? process.env.RUNNER_TEMP ?? tmpdir(),
+      "ai-pr-reviewer-runtime",
+      requestedRelease.tag,
+      assetName.replace(/[^A-Za-z0-9_.-]/g, "_"),
+    );
+    const archive = join(cacheRoot, assetName);
+    const bytes = await download(asset.browser_download_url, archive, signal, diagnostics);
+    const actualDigest = sha256(bytes);
+    await diagnostics.withSpan(
+      bootstrapDescriptor("archive.verify", "verify the downloaded runtime archive checksum"),
+      () => {
+        const expected = expectedDigest(asset, checksum);
+        if (actualDigest !== expected)
+          throw new Error("Runtime asset SHA-256 verification failed.");
+      },
+      { asset: assetName, actual_digest: actualDigest },
+    );
+    extracted = await mkdtemp(join(cacheRoot, `bundle-${actualDigest}-`));
+    const extractedDirectory = extracted;
+    await diagnostics.withSpan(
+      bootstrapDescriptor("archive.extract", "extract and validate the runtime archive"),
+      () => extract(archive, extractedDirectory, signal),
+      { asset: assetName, archive_bytes: bytes.byteLength },
+    );
+    const manifestPath = join(extractedDirectory, "runtime", "manifest.json");
+    const manifest = await diagnostics.withSpan(
+      bootstrapDescriptor("manifest.verify", "verify the runtime bundle manifest"),
+      async () =>
+        parseJson(
+          await readFile(manifestPath, { encoding: "utf8", signal }),
+          "Runtime bundle manifest JSON parsing failed.",
+        ),
+    );
+    await diagnostics.withSpan(
+      bootstrapDescriptor("manifest.validate", "validate runtime bundle compatibility metadata"),
+      () => {
+        if (
+          !isRecord(manifest) ||
+          !isCompatibleRuntimeManifest(
+            requestedRelease,
+            manifest.artifactTag,
+            manifest.stableTag,
+          ) ||
+          manifest.asset !== assetName ||
+          manifest.nodeMajor !== 24 ||
+          typeof manifest.sdkVersion !== "string" ||
+          typeof manifest.cliVersion !== "string" ||
+          typeof manifest.sourceCommit !== "string" ||
+          manifest.sourceCommit.length === 0
+        ) {
+          throw new Error("Runtime bundle manifest verification failed.");
+        }
+      },
+      { release_tag: requestedRelease.tag, asset: assetName },
+    );
+    if (!isRecord(manifest) || typeof manifest.sourceCommit !== "string") {
       throw new Error("Runtime bundle manifest verification failed.");
     }
     const sourceCommit = manifest.sourceCommit;
-    const code = await runRuntime(extracted, sourceCommit, signal);
+    runtimeCode = await runRuntime(extracted, sourceCommit, signal, diagnostics);
     throwIfAborted(signal);
-    return code;
-  } finally {
-    await rm(extracted, { recursive: true, force: true });
+  } catch (error) {
+    failed = true;
+    primaryError = error;
   }
+  if (extracted !== undefined) {
+    const cleanupSpan = diagnostics.start(
+      bootstrapDescriptor("runtime.cleanup", "remove the temporary runtime bundle"),
+    );
+    try {
+      await rm(extracted, { recursive: true, force: true });
+      cleanupSpan.success();
+    } catch (error) {
+      cleanupSpan.failure(error);
+      failed = true;
+      primaryError = error;
+    }
+  }
+  if (failed) {
+    if (signal?.aborted) runSpan.cancelled(primaryError);
+    else runSpan.failure(primaryError);
+    throw primaryError;
+  }
+  if (runtimeCode !== undefined && runtimeCode !== 0) {
+    runSpan.failure(new Error(`Runtime exited with code ${runtimeCode}.`), {
+      exit_code: runtimeCode,
+    });
+    return runtimeCode;
+  }
+  runSpan.success({ exit_code: runtimeCode ?? 0 });
+  return runtimeCode ?? 0;
 }
 
 async function main(): Promise<void> {

@@ -1,3 +1,5 @@
+/* eslint-disable max-lines */
+
 import type {
   ChangedFile,
   LinkedIssueSnapshot,
@@ -37,6 +39,7 @@ import {
   type ReviewLifecycleReviewRecord,
   type ReviewLifecycleThreadRecord,
 } from "./github-review-lifecycle.js";
+import { DiagnosticLogger, type DiagnosticDescriptor } from "./diagnostics.js";
 
 export type {
   ReviewLifecycleCommentRecord,
@@ -92,12 +95,67 @@ interface IssueCommentPayload {
 
 export class GitHubApiError extends Error {
   readonly status: number;
+  readonly operation?: string;
+  readonly requestId?: string;
+  readonly requiredPermission?: string;
+  readonly graphqlErrors?: readonly unknown[];
+  readonly diagnosticMessage: string;
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    metadata: {
+      readonly operation?: string;
+      readonly requestId?: string;
+      readonly requiredPermission?: string;
+      readonly graphqlErrors?: readonly unknown[];
+    } = {},
+  ) {
     super(message);
     this.name = "GitHubApiError";
     this.status = status;
+    if (metadata.operation !== undefined) this.operation = metadata.operation;
+    if (metadata.requestId !== undefined) this.requestId = metadata.requestId;
+    if (metadata.requiredPermission !== undefined)
+      this.requiredPermission = metadata.requiredPermission;
+    if (metadata.graphqlErrors !== undefined) this.graphqlErrors = metadata.graphqlErrors;
+    this.diagnosticMessage = `GitHub API request failed (${status}).`;
   }
+}
+
+interface GitHubOperation extends DiagnosticDescriptor {
+  readonly method: string;
+  readonly requiredPermission?: string;
+  readonly expectedStatuses?: readonly number[];
+}
+
+function githubOperation(
+  phase: string,
+  operation: string,
+  purpose: string,
+  method = "GET",
+  requiredPermission?: string,
+  expectedStatuses?: readonly number[],
+): GitHubOperation {
+  return {
+    component: "github",
+    phase,
+    operation,
+    purpose,
+    method,
+    ...(requiredPermission === undefined ? {} : { requiredPermission }),
+    ...(expectedStatuses === undefined ? {} : { expectedStatuses }),
+  };
+}
+
+function decodeOperation(operation: GitHubOperation, purpose: string): GitHubOperation {
+  return githubOperation(
+    `${operation.phase}.decode`,
+    `${operation.operation}.decode`,
+    purpose,
+    operation.method,
+    operation.requiredPermission,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -149,6 +207,57 @@ function errorDetails(payload: unknown, statusText: string): string {
     }
   }
   return details.join("; ") || statusText;
+}
+
+function responseStatusText(response: Response): string {
+  const value = (response as Response & { readonly statusText?: unknown }).statusText;
+  return typeof value === "string" ? value : "";
+}
+
+function responseRequestId(response: Response): string | undefined {
+  const value = response.headers.get("x-github-request-id");
+  return value === null ? undefined : value;
+}
+
+function responseDetails(
+  response: Response,
+  bodyLength?: number,
+): Readonly<Record<string, unknown>> {
+  const requestId = response.headers.get("x-github-request-id");
+  const statusText = responseStatusText(response);
+  return {
+    status: response.status,
+    ...(statusText.length === 0 ? {} : { status_text: statusText }),
+    ...(bodyLength === undefined ? {} : { response_bytes: bodyLength }),
+    ...(requestId === null ? {} : { request_id: requestId }),
+    response_headers: Object.fromEntries(response.headers.entries()),
+  };
+}
+
+function graphqlErrorMetadata(value: unknown): readonly Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 20).map((entry) => {
+    if (!isRecord(entry)) return { type: typeof entry };
+    const metadata: Record<string, unknown> = {};
+    if (typeof entry.message === "string") metadata.message = entry.message;
+    if (typeof entry.type === "string") metadata.type = entry.type;
+    if (Array.isArray(entry.path))
+      metadata.path = entry.path
+        .slice(0, 20)
+        .filter(
+          (part): part is string | number => typeof part === "string" || typeof part === "number",
+        );
+    if (Array.isArray(entry.locations))
+      metadata.locations = entry.locations.slice(0, 20).flatMap((location) => {
+        if (!isRecord(location)) return [];
+        const line = typeof location.line === "number" ? location.line : undefined;
+        const column = typeof location.column === "number" ? location.column : undefined;
+        return line === undefined && column === undefined ? [] : [{ line, column }];
+      });
+    if (isRecord(entry.extensions) && typeof entry.extensions.code === "string")
+      metadata.code = entry.extensions.code;
+    return metadata;
+  });
 }
 
 function readHeadSha(value: unknown): string | undefined {
@@ -482,30 +591,74 @@ export class GitHubApi {
   private readonly graphqlUrl: string;
   private readonly token: string;
   private readonly signal: AbortSignal | undefined;
+  private readonly diagnostics: DiagnosticLogger;
 
   constructor(
     token: string,
     apiUrl = process.env.GITHUB_API_URL ?? "https://api.github.com",
     signal?: AbortSignal,
     graphqlUrl?: string,
+    diagnostics = new DiagnosticLogger({ component: "github" }),
   ) {
     this.apiUrl = apiUrl.replace(/\/$/, "");
     this.graphqlUrl = graphqlUrl?.replace(/\/$/, "") ?? graphqlUrlFor(this.apiUrl);
     this.token = token;
     this.signal = signal;
+    this.diagnostics = diagnostics;
+    this.diagnostics.addSecrets([token]);
+  }
+
+  private decode<T>(operation: GitHubOperation, action: () => T, details?: unknown): T {
+    const span = this.diagnostics.start(
+      decodeOperation(operation, "validate the GitHub response shape"),
+      details,
+    );
+    try {
+      const result = action();
+      span.success();
+      return result;
+    } catch (error) {
+      span.failure(error);
+      throw error;
+    }
   }
 
   async getAuthenticatedUserLogin(): Promise<string> {
-    const login = readLogin(await this.request<unknown>("/user"));
-    if (login === undefined) throw new Error("GitHub returned no authenticated user login.");
-    return login;
+    const operation = githubOperation(
+      "identity.capture",
+      "rest.user.current",
+      "identify the GitHub account that owns lifecycle content",
+      "GET",
+      "metadata:read",
+    );
+    const payload = await this.request<unknown>("/user", operation);
+    return this.decode(
+      operation,
+      () => {
+        const login = readLogin(payload);
+        if (login === undefined) throw new Error("GitHub returned no authenticated user login.");
+        return login;
+      },
+      { stage: "login" },
+    );
   }
 
   async getPullRequestContext(locator: PullRequestLocator): Promise<PullRequestContext> {
+    const operation = githubOperation(
+      "target.capture",
+      "rest.pull-request.context",
+      "capture immutable pull request metadata and refs",
+      "GET",
+      "pull_requests:read",
+    );
     const payload = await this.request<unknown>(
       `/repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}/pulls/${locator.number}`,
+      operation,
     );
-    return readPullRequestContext(payload, locator);
+    return this.decode(operation, () => readPullRequestContext(payload, locator), {
+      repository: locator.repository,
+      pull_request: locator.number,
+    });
   }
 
   async getLinkedIssues(context: PullRequestContext): Promise<ReviewBriefing> {
@@ -513,17 +666,30 @@ export class GitHubApi {
     const linkedIssues: LinkedIssueSnapshot[] = [];
     for (const number of references.numbers) {
       if (number === context.number) continue;
+      const operation = githubOperation(
+        "briefing.linked-issues",
+        "rest.issue.lookup",
+        "load a same-repository issue referenced by the pull request",
+        "GET",
+        "issues:read",
+        [404],
+      );
       let payload: unknown;
       try {
         payload = await this.request<unknown>(
           `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${number}`,
+          operation,
+          {},
+          { issue_number: number },
         );
       } catch (error) {
         if (error instanceof GitHubApiError && error.status === 404) continue;
         throw error;
       }
       if (!isRecord(payload) || Object.hasOwn(payload, "pull_request")) continue;
-      linkedIssues.push(issueSnapshot(number, payload));
+      linkedIssues.push(
+        this.decode(operation, () => issueSnapshot(number, payload), { issue_number: number }),
+      );
     }
     return {
       linkedIssues,
@@ -534,122 +700,295 @@ export class GitHubApi {
   async getPullRequestRefs(
     context: PullRequestContext,
   ): Promise<{ readonly headSha: string; readonly baseSha: string }> {
+    const operation = githubOperation(
+      "publication.head-fence",
+      "rest.pull-request.refs",
+      "verify the live pull request refs before a write",
+      "GET",
+      "pull_requests:read",
+    );
     const payload = await this.request<unknown>(
       `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}`,
+      operation,
     );
-    const headSha = readHeadSha(payload);
-    const baseSha = readBaseSha(payload);
-    if (headSha === undefined || baseSha === undefined) {
-      throw new Error("GitHub returned incomplete pull request ref metadata.");
-    }
-    return { headSha, baseSha };
+    return this.decode(
+      operation,
+      () => {
+        const headSha = readHeadSha(payload);
+        const baseSha = readBaseSha(payload);
+        if (headSha === undefined || baseSha === undefined) {
+          throw new Error("GitHub returned incomplete pull request ref metadata.");
+        }
+        return { headSha, baseSha };
+      },
+      { stage: "refs" },
+    );
   }
 
   async getPullRequestHeadSha(context: PullRequestContext): Promise<string> {
     return (await this.getPullRequestRefs(context)).headSha;
   }
 
-  private async requestPage<T>(path: string, init: RequestInit = {}): Promise<RequestPage<T>> {
+  private async requestPage<T>(
+    path: string,
+    operation: GitHubOperation,
+    init: RequestInit = {},
+    details?: unknown,
+  ): Promise<RequestPage<T>> {
     const signal = init.signal ?? this.signal;
-    throwIfAborted(signal ?? undefined);
-    const headers = new Headers(init.headers);
-    headers.set("Accept", "application/vnd.github+json");
-    headers.set("Authorization", `Bearer ${this.token}`);
-    headers.set("X-GitHub-Api-Version", "2022-11-28");
-    if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    const response = await fetch(`${this.apiUrl}${path}`, {
-      ...init,
-      headers,
-      ...(signal === undefined ? {} : { signal }),
+    const span = this.diagnostics.start(operation, {
+      method: init.method ?? operation.method,
+      route: path,
+      ...(operation.requiredPermission === undefined
+        ? {}
+        : { required_permission: operation.requiredPermission }),
+      ...(details === undefined ? {} : { request: details }),
     });
-    const text = await response.text();
-    throwIfAborted(signal ?? undefined);
-    let payload: unknown = undefined;
-    if (text.length > 0) {
-      try {
-        payload = JSON.parse(text) as unknown;
-      } catch {
-        payload = undefined;
+    let responseMetadata: Readonly<Record<string, unknown>> | undefined;
+    let bodyRead = false;
+    try {
+      throwIfAborted(signal ?? undefined);
+      const headers = new Headers(init.headers);
+      headers.set("Accept", "application/vnd.github+json");
+      headers.set("Authorization", `Bearer ${this.token}`);
+      headers.set("X-GitHub-Api-Version", "2022-11-28");
+      if (init.body !== undefined) headers.set("Content-Type", "application/json");
+      const response = await fetch(`${this.apiUrl}${path}`, {
+        ...init,
+        headers,
+        ...(signal === undefined ? {} : { signal }),
+      });
+      responseMetadata = {
+        ...responseDetails(response),
+        ...(operation.requiredPermission === undefined
+          ? {}
+          : { required_permission: operation.requiredPermission }),
+      };
+      const text = await response.text();
+      bodyRead = true;
+      throwIfAborted(signal ?? undefined);
+      let payload: unknown = undefined;
+      if (text.length > 0) {
+        try {
+          payload = JSON.parse(text) as unknown;
+        } catch {
+          payload = undefined;
+        }
       }
+      responseMetadata = {
+        ...responseMetadata,
+        response_bytes: Buffer.byteLength(text),
+      };
+      if (!response.ok) {
+        const requestId = responseRequestId(response);
+        const error = new GitHubApiError(
+          response.status,
+          `GitHub API request failed (${response.status}): ${errorDetails(payload, responseStatusText(response))}`,
+          {
+            operation: operation.operation,
+            ...(requestId === undefined ? {} : { requestId }),
+            ...(operation.requiredPermission === undefined
+              ? {}
+              : { requiredPermission: operation.requiredPermission }),
+          },
+        );
+        if (operation.expectedStatuses?.includes(response.status))
+          span.skipped({ ...responseMetadata, reason: "expected non-success response" });
+        else span.failure(error, responseMetadata);
+        throw error;
+      }
+      span.success(responseMetadata);
+      return { payload: payload as T, headers: response.headers };
+    } catch (error) {
+      const bodyReadFailure = responseMetadata !== undefined && !bodyRead;
+      if (bodyReadFailure)
+        this.diagnostics.registerSafeDiagnosticError(
+          error,
+          "GitHub REST response body read failed.",
+        );
+      const diagnosticError = bodyReadFailure
+        ? new Error("GitHub REST response body read failed.")
+        : error;
+      if (signal?.aborted) span.cancelled(diagnosticError, responseMetadata);
+      else if (error instanceof GitHubApiError && error.operation === operation.operation) {
+        // The HTTP failure was already recorded with response metadata above.
+      } else {
+        span.failure(diagnosticError, responseMetadata);
+      }
+      throw error;
     }
-    if (!response.ok) {
-      throw new GitHubApiError(
-        response.status,
-        `GitHub API request failed (${response.status}): ${errorDetails(payload, response.statusText)}`,
-      );
-    }
-    return { payload: payload as T, headers: response.headers };
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    return (await this.requestPage<T>(path, init)).payload;
+  private async request<T>(
+    path: string,
+    operation: GitHubOperation,
+    init: RequestInit = {},
+    details?: unknown,
+  ): Promise<T> {
+    return (await this.requestPage<T>(path, operation, init, details)).payload;
   }
 
   private async requestGraphql<T>(
     query: string,
     variables: Readonly<Record<string, unknown>>,
+    operation: GitHubOperation,
+    details?: unknown,
   ): Promise<T> {
     const signal = this.signal;
-    throwIfAborted(signal);
-    const response = await fetch(this.graphqlUrl, {
+    const span = this.diagnostics.start(operation, {
       method: "POST",
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-      body: JSON.stringify({ query, variables }),
-      ...(signal === undefined ? {} : { signal }),
+      route: this.graphqlUrl,
+      ...(operation.requiredPermission === undefined
+        ? {}
+        : { required_permission: operation.requiredPermission }),
+      ...(details === undefined ? {} : { request: details }),
     });
-    const text = await response.text();
-    throwIfAborted(signal);
-    let payload: unknown = undefined;
-    if (text.length > 0) {
-      try {
-        payload = JSON.parse(text) as unknown;
-      } catch {
-        payload = undefined;
-      }
-    }
-    if (!response.ok) {
-      throw new GitHubApiError(
-        response.status,
-        `GitHub GraphQL request failed (${response.status}): ${errorDetails(payload, response.statusText)}`,
-      );
-    }
-    if (!isRecord(payload)) throw new Error("GitHub returned an invalid GraphQL response.");
-    const responsePayload = payload;
-    if (Array.isArray(responsePayload.errors) && responsePayload.errors.length > 0) {
-      const messages = responsePayload.errors.flatMap((error) => {
-        if (!isRecord(error) || typeof error.message !== "string") return [];
-        return [error.message];
+    let responseMetadata: Readonly<Record<string, unknown>> | undefined;
+    let bodyRead = false;
+    try {
+      throwIfAborted(signal);
+      const response = await fetch(this.graphqlUrl, {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({ query, variables }),
+        ...(signal === undefined ? {} : { signal }),
       });
-      throw new GitHubApiError(
-        200,
-        `GitHub GraphQL request returned errors: ${messages.join("; ") || "unknown error"}`,
-      );
+      responseMetadata = {
+        ...responseDetails(response),
+        ...(operation.requiredPermission === undefined
+          ? {}
+          : { required_permission: operation.requiredPermission }),
+      };
+      const text = await response.text();
+      bodyRead = true;
+      throwIfAborted(signal);
+      let payload: unknown = undefined;
+      if (text.length > 0) {
+        try {
+          payload = JSON.parse(text) as unknown;
+        } catch {
+          payload = undefined;
+        }
+      }
+      responseMetadata = {
+        ...responseMetadata,
+        response_bytes: Buffer.byteLength(text),
+      };
+      if (!response.ok) {
+        const requestId = responseRequestId(response);
+        const graphqlErrors = isRecord(payload)
+          ? graphqlErrorMetadata(payload.errors)
+          : ([] as readonly Record<string, unknown>[]);
+        const error = new GitHubApiError(
+          response.status,
+          `GitHub GraphQL request failed (${response.status}): ${errorDetails(payload, responseStatusText(response))}`,
+          {
+            operation: operation.operation,
+            ...(requestId === undefined ? {} : { requestId }),
+            ...(operation.requiredPermission === undefined
+              ? {}
+              : { requiredPermission: operation.requiredPermission }),
+            graphqlErrors,
+          },
+        );
+        span.failure(error, {
+          ...responseMetadata,
+          ...(graphqlErrors.length === 0 ? {} : { graphql_errors: graphqlErrors }),
+        });
+        throw error;
+      }
+      if (!isRecord(payload)) {
+        const error = new Error("GitHub returned an invalid GraphQL response.");
+        span.failure(error, responseMetadata);
+        throw error;
+      }
+      const responsePayload = payload;
+      if (Array.isArray(responsePayload.errors) && responsePayload.errors.length > 0) {
+        const requestId = responseRequestId(response);
+        const errors = graphqlErrorMetadata(responsePayload.errors);
+        const messages = errors.flatMap((error) => {
+          if (!isRecord(error) || typeof error.message !== "string") return [];
+          return [error.message];
+        });
+        const error = new GitHubApiError(
+          200,
+          `GitHub GraphQL request returned errors: ${messages.join("; ") || "unknown error"}`,
+          {
+            operation: operation.operation,
+            ...(requestId === undefined ? {} : { requestId }),
+            ...(operation.requiredPermission === undefined
+              ? {}
+              : { requiredPermission: operation.requiredPermission }),
+            graphqlErrors: errors,
+          },
+        );
+        span.failure(error, {
+          ...responseMetadata,
+          graphql_errors: errors,
+        });
+        throw error;
+      }
+      span.success(responseMetadata);
+      return responsePayload.data as T;
+    } catch (error) {
+      const bodyReadFailure = responseMetadata !== undefined && !bodyRead;
+      if (bodyReadFailure)
+        this.diagnostics.registerSafeDiagnosticError(
+          error,
+          "GitHub GraphQL response body read failed.",
+        );
+      const diagnosticError = bodyReadFailure
+        ? new Error("GitHub GraphQL response body read failed.")
+        : error;
+      if (signal?.aborted) span.cancelled(diagnosticError, responseMetadata);
+      else if (error instanceof GitHubApiError && error.operation === operation.operation) {
+        // The GitHub response failure was already recorded with response metadata above.
+      } else {
+        span.failure(diagnosticError, responseMetadata);
+      }
+      throw error;
     }
-    return responsePayload.data as T;
   }
 
   private async listRecords<T>(
     pathForPage: (page: number) => string,
     responseName: string,
     read: (value: unknown, index: number) => T,
+    operation: GitHubOperation,
   ): Promise<readonly T[]> {
     const records: T[] = [];
     let page = 1;
     let path = pathForPage(page);
     let hasNext = true;
     while (hasNext) {
-      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
-      if (!Array.isArray(response.payload)) {
-        throw new Error(`GitHub returned an invalid ${responseName} response.`);
-      }
-      records.push(...response.payload.map((item, index) => read(item, records.length + index)));
-      const nextPath = nextPagePath(response.headers.get("link"), this.apiUrl);
-      hasNext = nextPath !== undefined || response.payload.length === 100;
+      const response: RequestPage<unknown> = await this.requestPage<unknown>(
+        path,
+        operation,
+        {},
+        { page },
+      );
+      const pageRecords = this.decode(
+        operation,
+        () => {
+          if (!Array.isArray(response.payload)) {
+            throw new Error(`GitHub returned an invalid ${responseName} response.`);
+          }
+          return response.payload.map((item, index) => read(item, records.length + index));
+        },
+        { page, record_type: responseName },
+      );
+      records.push(...pageRecords);
+      const nextPath = this.decode(
+        operation,
+        () => nextPagePath(response.headers.get("link"), this.apiUrl),
+        { page, stage: "pagination" },
+      );
+      hasNext = nextPath !== undefined || pageRecords.length === 100;
       if (!hasNext) continue;
       page += 1;
       path = nextPath ?? pathForPage(page);
@@ -659,33 +998,66 @@ export class GitHubApi {
 
   async getPullRequestFiles(context: PullRequestContext): Promise<readonly ChangedFile[]> {
     const files: ChangedFile[] = [];
+    const operation = githubOperation(
+      "diff.metadata",
+      "rest.pull-request.files",
+      "load changed-file metadata and patch boundaries",
+      "GET",
+      "pull_requests:read",
+    );
     let page = 1;
     let path = `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`;
     let hasNext = true;
     while (hasNext) {
-      const response: RequestPage<unknown> = await this.requestPage<unknown>(path);
-      const payload = response.payload;
-      if (!Array.isArray(payload))
-        throw new Error("GitHub returned an invalid pull request files response.");
-      files.push(...payload.map((item, index) => readFilePayload(item, files.length + index)));
-      if (files.length > 3_000) {
-        throw new Error("GitHub returned more than the pull request file API limit.");
-      }
-      if (context.changedFiles !== undefined && files.length > context.changedFiles) {
-        throw new Error("GitHub returned more files than the pull request metadata reports.");
-      }
+      const response: RequestPage<unknown> = await this.requestPage<unknown>(
+        path,
+        operation,
+        {},
+        { page },
+      );
+      const payload = this.decode(
+        operation,
+        () => {
+          if (!Array.isArray(response.payload))
+            throw new Error("GitHub returned an invalid pull request files response.");
+          const pageFiles = response.payload.map((item, index) =>
+            readFilePayload(item, files.length + index),
+          );
+          if (files.length + pageFiles.length > 3_000) {
+            throw new Error("GitHub returned more than the pull request file API limit.");
+          }
+          if (
+            context.changedFiles !== undefined &&
+            files.length + pageFiles.length > context.changedFiles
+          ) {
+            throw new Error("GitHub returned more files than the pull request metadata reports.");
+          }
+          return pageFiles;
+        },
+        { page, record_type: "pull request files" },
+      );
+      files.push(...payload);
       if (payload.length < 100) {
         hasNext = false;
         continue;
       }
       page += 1;
       path =
-        nextPagePath(response.headers.get("link"), this.apiUrl) ??
+        this.decode(operation, () => nextPagePath(response.headers.get("link"), this.apiUrl), {
+          page,
+          stage: "pagination",
+        }) ??
         `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/files?per_page=100&page=${page}`;
     }
-    if (context.changedFiles !== undefined && context.changedFiles > files.length) {
-      throw new Error("GitHub returned an incomplete pull request file list.");
-    }
+    this.decode(
+      operation,
+      () => {
+        if (context.changedFiles !== undefined && context.changedFiles > files.length) {
+          throw new Error("GitHub returned an incomplete pull request file list.");
+        }
+      },
+      { stage: "complete" },
+    );
     return files;
   }
 
@@ -695,6 +1067,13 @@ export class GitHubApi {
         `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews?per_page=100&page=${page}`,
       "pull request reviews",
       readReviewPayload,
+      githubOperation(
+        "conversation.capture",
+        "rest.pull-request.reviews",
+        "load pull request review summaries and bodies",
+        "GET",
+        "pull_requests:read",
+      ),
     );
   }
 
@@ -706,6 +1085,13 @@ export class GitHubApi {
         `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/comments?per_page=100&page=${page}`,
       "pull request review comments",
       readReviewCommentPayload,
+      githubOperation(
+        "conversation.capture",
+        "rest.pull-request.review-comments",
+        "load inline review comments and replies",
+        "GET",
+        "pull_requests:read",
+      ),
     );
   }
 
@@ -717,6 +1103,13 @@ export class GitHubApi {
         `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/issues/${context.number}/comments?per_page=100&page=${page}`,
       "pull request conversation comments",
       readIssueCommentPayload,
+      githubOperation(
+        "conversation.capture",
+        "rest.pull-request.issue-comments",
+        "load pull request conversation comments",
+        "GET",
+        "issues:read",
+      ),
     );
   }
 
@@ -726,7 +1119,19 @@ export class GitHubApi {
   ): Promise<void> {
     await this.request<unknown>(
       `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/${context.number}/reviews`,
+      githubOperation(
+        "publication.review",
+        "rest.pull-request.create-review",
+        "publish the completed pull request review",
+        "POST",
+        "pull_requests:write",
+      ),
       { method: "POST", body: JSON.stringify(request) },
+      {
+        event: request.event,
+        comment_count: request.comments.length,
+        commit_present: request.commit_id.length > 0,
+      },
     );
   }
 
@@ -734,22 +1139,47 @@ export class GitHubApi {
     thread: ReviewLifecycleThreadRecord,
   ): Promise<ReviewLifecycleThreadRecord> {
     const comments = [...thread.comments];
+    const operation = githubOperation(
+      "lifecycle.snapshot",
+      "AiPrReviewerThreadComments",
+      "load the next page of comments for a lifecycle review thread",
+      "POST",
+      "pull_requests:read",
+    );
     let cursor = thread.commentsCursor;
     let pages = 0;
     while (cursor !== undefined) {
       pages += 1;
-      if (pages > 100)
-        throw new Error("GitHub returned more than 10,000 comments in a review thread.");
-      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY, {
-        threadId: thread.nodeId,
-        cursor,
+      if (pages > 100) {
+        this.decode(
+          operation,
+          () => {
+            throw new Error("GitHub returned more than 10,000 comments in a review thread.");
+          },
+          { page: pages, stage: "pagination" },
+        );
+      }
+      const data = await this.requestGraphql<unknown>(
+        REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY,
+        { threadId: thread.nodeId, cursor },
+        operation,
+        { page: pages, cursor_present: true },
+      );
+      const page = this.decode(operation, () => readGraphqlThreadComments(data, comments.length), {
+        page: pages,
+        cursor_present: true,
       });
-      const page = readGraphqlThreadComments(data, comments.length);
       comments.push(...page.comments);
       if (!page.hasNextPage) {
         cursor = undefined;
       } else if (page.endCursor === undefined || page.endCursor === cursor) {
-        throw new Error("GitHub returned a non-advancing review thread comment cursor.");
+        this.decode(
+          operation,
+          () => {
+            throw new Error("GitHub returned a non-advancing review thread comment cursor.");
+          },
+          { page: pages, stage: "pagination" },
+        );
       } else {
         cursor = page.endCursor;
       }
@@ -773,116 +1203,224 @@ export class GitHubApi {
     };
     const reviews: ReviewLifecycleReviewRecord[] = [];
     let reviewCursor: string | undefined;
+    let reviewPage = 0;
     for (;;) {
-      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_REVIEWS_QUERY, {
-        ...variables,
-        cursor: reviewCursor ?? null,
-      });
-      const connection = readGraphqlConnection(
-        pullRequestConnection(data, "reviews"),
-        "pull request reviews",
+      reviewPage += 1;
+      const operation = githubOperation(
+        "lifecycle.prepare",
+        "AiPrReviewerReviews",
+        "load pull request reviews for lifecycle reconciliation",
+        "POST",
+        "pull_requests:read",
       );
-      reviews.push(
-        ...connection.nodes.map((review, index) =>
-          readGraphqlReview(review, reviews.length + index),
-        ),
+      const data = await this.requestGraphql<unknown>(
+        REVIEW_LIFECYCLE_REVIEWS_QUERY,
+        { ...variables, cursor: reviewCursor ?? null },
+        operation,
+        { page: reviewPage, cursor_present: reviewCursor !== undefined },
       );
+      const connection = this.decode(
+        operation,
+        () => readGraphqlConnection(pullRequestConnection(data, "reviews"), "pull request reviews"),
+        { page: reviewPage, record_type: "pull request reviews" },
+      );
+      const pageReviews = this.decode(
+        operation,
+        () =>
+          connection.nodes.map((review, index) =>
+            readGraphqlReview(review, reviews.length + index),
+          ),
+        { page: reviewPage, record_type: "review" },
+      );
+      reviews.push(...pageReviews);
       if (!connection.hasNextPage) break;
-      if (connection.endCursor === undefined || connection.endCursor === reviewCursor) {
-        throw new Error("GitHub returned a non-advancing pull request review cursor.");
-      }
+      this.decode(
+        operation,
+        () => {
+          if (connection.endCursor === undefined || connection.endCursor === reviewCursor) {
+            throw new Error("GitHub returned a non-advancing pull request review cursor.");
+          }
+        },
+        { page: reviewPage, stage: "pagination" },
+      );
       reviewCursor = connection.endCursor;
     }
 
     const threads: ReviewLifecycleThreadRecord[] = [];
     let threadCursor: string | undefined;
+    let threadPage = 0;
     for (;;) {
-      const data = await this.requestGraphql<unknown>(REVIEW_LIFECYCLE_THREADS_QUERY, {
-        ...variables,
-        cursor: threadCursor ?? null,
-      });
-      const connection = readGraphqlConnection(
-        pullRequestConnection(data, "reviewThreads"),
-        "pull request review threads",
+      threadPage += 1;
+      const operation = githubOperation(
+        "lifecycle.prepare",
+        "AiPrReviewerThreads",
+        "load pull request review threads for lifecycle reconciliation",
+        "POST",
+        "pull_requests:read",
+      );
+      const data = await this.requestGraphql<unknown>(
+        REVIEW_LIFECYCLE_THREADS_QUERY,
+        { ...variables, cursor: threadCursor ?? null },
+        operation,
+        { page: threadPage, cursor_present: threadCursor !== undefined },
+      );
+      const connection = this.decode(
+        operation,
+        () =>
+          readGraphqlConnection(
+            pullRequestConnection(data, "reviewThreads"),
+            "pull request review threads",
+          ),
+        { page: threadPage, record_type: "pull request review threads" },
       );
       const pageOffset = threads.length;
       for (const [index, value] of connection.nodes.entries()) {
-        threads.push(
-          await this.completeLifecycleThread(readGraphqlThread(value, pageOffset + index)),
-        );
+        const thread = this.decode(operation, () => readGraphqlThread(value, pageOffset + index), {
+          page: threadPage,
+          record_type: "review thread",
+          index: pageOffset + index,
+        });
+        threads.push(await this.completeLifecycleThread(thread));
       }
       if (!connection.hasNextPage) break;
-      if (connection.endCursor === undefined || connection.endCursor === threadCursor) {
-        throw new Error("GitHub returned a non-advancing pull request review thread cursor.");
-      }
+      this.decode(
+        operation,
+        () => {
+          if (connection.endCursor === undefined || connection.endCursor === threadCursor) {
+            throw new Error("GitHub returned a non-advancing pull request review thread cursor.");
+          }
+        },
+        { page: threadPage, stage: "pagination" },
+      );
       threadCursor = connection.endCursor;
     }
     return { reviews, threads };
   }
 
   async updateSubmittedReview(reviewNodeId: string, body: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(UPDATE_REVIEW_MUTATION, {
-      reviewId: reviewNodeId,
-      body,
-    });
-    const payload = requiredRecord(
-      requiredRecord(data, "GraphQL data").updatePullRequestReview,
-      "update review payload",
+    const operation = githubOperation(
+      "lifecycle.prepare",
+      "AiPrReviewerUpdateReview",
+      "mark a stale clean action review with the current head",
+      "POST",
+      "pull_requests:write",
     );
-    const review = requiredRecord(payload.pullRequestReview, "updated review");
-    if (
-      requiredString(review.id, "updated review id") !== reviewNodeId ||
-      requiredString(review.body, "updated review body") !== body
-    ) {
-      throw new Error("GitHub did not update the pull request review.");
-    }
+    const data = await this.requestGraphql<unknown>(
+      UPDATE_REVIEW_MUTATION,
+      { reviewId: reviewNodeId, body },
+      operation,
+      { review_id: reviewNodeId },
+    );
+    this.decode(
+      operation,
+      () => {
+        const payload = requiredRecord(
+          requiredRecord(data, "GraphQL data").updatePullRequestReview,
+          "updated review payload",
+        );
+        const review = requiredRecord(payload.pullRequestReview, "updated review");
+        if (
+          requiredString(review.id, "updated review id") !== reviewNodeId ||
+          requiredString(review.body, "updated review body") !== body
+        ) {
+          throw new Error("GitHub did not update the pull request review.");
+        }
+      },
+      { review_id: reviewNodeId },
+    );
   }
 
   async dismissSubmittedReview(reviewNodeId: string, message: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(DISMISS_REVIEW_MUTATION, {
-      reviewId: reviewNodeId,
-      message,
-    });
-    const payload = requiredRecord(
-      requiredRecord(data, "GraphQL data").dismissPullRequestReview,
-      "dismiss review payload",
+    const operation = githubOperation(
+      "lifecycle.prepare",
+      "AiPrReviewerDismissReview",
+      "dismiss a stale action approval before newer-head analysis",
+      "POST",
+      "pull_requests:write",
     );
-    const review = requiredRecord(payload.pullRequestReview, "dismissed review");
-    if (
-      requiredString(review.id, "dismissed review id") !== reviewNodeId ||
-      requiredString(review.state, "dismissed review state") !== "DISMISSED"
-    ) {
-      throw new Error("GitHub did not dismiss the pull request review.");
-    }
+    const data = await this.requestGraphql(
+      DISMISS_REVIEW_MUTATION,
+      { reviewId: reviewNodeId, message },
+      operation,
+      { review_id: reviewNodeId },
+    );
+    this.decode(
+      operation,
+      () => {
+        const payload = requiredRecord(
+          requiredRecord(data, "GraphQL data").dismissPullRequestReview,
+          "dismiss review payload",
+        );
+        const review = requiredRecord(payload.pullRequestReview, "dismissed review");
+        if (
+          requiredString(review.id, "dismissed review id") !== reviewNodeId ||
+          requiredString(review.state, "dismissed review state") !== "DISMISSED"
+        ) {
+          throw new Error("GitHub did not dismiss the pull request review.");
+        }
+      },
+      { review_id: reviewNodeId },
+    );
   }
 
   async resolveReviewThread(threadNodeId: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(RESOLVE_THREAD_MUTATION, {
-      threadId: threadNodeId,
-    });
-    const payload = requiredRecord(
-      requiredRecord(data, "GraphQL data").resolveReviewThread,
-      "resolve thread payload",
+    const operation = githubOperation(
+      "lifecycle.resolve",
+      "AiPrReviewerResolveThread",
+      "resolve a verified fixed action review thread",
+      "POST",
+      "pull_requests:write",
     );
-    const thread = requiredRecord(payload.thread, "resolved thread");
-    if (thread.isResolved !== true) {
-      throw new Error("GitHub did not resolve the pull request review thread.");
-    }
+    const data = await this.requestGraphql(
+      RESOLVE_THREAD_MUTATION,
+      { threadId: threadNodeId },
+      operation,
+      { thread_id: threadNodeId },
+    );
+    this.decode(
+      operation,
+      () => {
+        const payload = requiredRecord(
+          requiredRecord(data, "GraphQL data").resolveReviewThread,
+          "resolve thread payload",
+        );
+        const thread = requiredRecord(payload.thread, "resolved thread");
+        if (thread.isResolved !== true) {
+          throw new Error("GitHub did not resolve the pull request review thread.");
+        }
+      },
+      { thread_id: threadNodeId },
+    );
   }
 
   async minimizeComment(subjectNodeId: string): Promise<void> {
-    const data = await this.requestGraphql<unknown>(MINIMIZE_COMMENT_MUTATION, {
-      subjectId: subjectNodeId,
-      classifier: "OUTDATED",
-    });
-    const payload = requiredRecord(
-      requiredRecord(data, "GraphQL data").minimizeComment,
-      "minimize comment payload",
+    const operation = githubOperation(
+      "lifecycle.finalize",
+      "AiPrReviewerMinimizeComment",
+      "minimize a superseded action review after all threads resolve",
+      "POST",
+      "pull_requests:write",
     );
-    const comment = requiredRecord(payload.minimizedComment, "minimized comment");
-    if (comment.isMinimized !== true) {
-      throw new Error("GitHub did not minimize the pull request review.");
-    }
+    const data = await this.requestGraphql(
+      MINIMIZE_COMMENT_MUTATION,
+      { subjectId: subjectNodeId, classifier: "OUTDATED" },
+      operation,
+      { subject_id: subjectNodeId },
+    );
+    this.decode(
+      operation,
+      () => {
+        const payload = requiredRecord(
+          requiredRecord(data, "GraphQL data").minimizeComment,
+          "minimized comment payload",
+        );
+        const comment = requiredRecord(payload.minimizedComment, "minimized comment");
+        if (comment.isMinimized !== true) {
+          throw new Error("GitHub did not minimize the pull request review.");
+        }
+      },
+      { subject_id: subjectNodeId },
+    );
   }
 
   async updateReviewComment(
@@ -892,7 +1430,15 @@ export class GitHubApi {
   ): Promise<void> {
     await this.request<unknown>(
       `/repos/${encodeURIComponent(context.owner)}/${encodeURIComponent(context.name)}/pulls/comments/${commentId}`,
+      githubOperation(
+        "lifecycle.resolve",
+        "rest.pull-request.update-comment",
+        "rewrite an action-owned root finding comment with its fixed disposition",
+        "PATCH",
+        "pull_requests:write",
+      ),
       { method: "PATCH", body: JSON.stringify({ body }) },
+      { comment_id: commentId },
     );
   }
 }
@@ -924,4 +1470,5 @@ export const githubApiInternals = {
   readGraphqlReview,
   readGraphqlComment,
   readGraphqlThread,
+  graphqlErrorMetadata,
 };

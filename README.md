@@ -319,6 +319,31 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - If GitHub rejects an approval, the action retries once as a comment review.
 - Review bodies are capped at approximately 60 KB. No report artifact is uploaded.
 
+### Diagnostics and troubleshooting
+
+The action emits one-line, secret-redacted JSON diagnostics with the readable prefix
+`[ai-pr-reviewer][component]`. Every operation has a `schema_version`, `timestamp`,
+`event`, `component`, `phase`, `operation`, `purpose`, `operation_id`, and `outcome`;
+terminal events also include `elapsed_ms`. The `operation_id` pairs
+`operation.started` with `operation.succeeded`, `operation.finished`,
+`operation.cancelled`, or `operation.skipped`, so a failed step can be located in the
+action phase and correlated with its direct API call.
+
+GitHub request diagnostics record the HTTP method, route or endpoint, expected
+permission, status, response byte count, GitHub request ID, rate-limit and accepted
+scope headers, pagination cursor/page metadata, and bounded GraphQL error metadata.
+Bootstrap diagnostics record release/tag resolution, asset selection, checksum and
+manifest verification, archive extraction, runtime launch, and cleanup. Response
+bodies, request bodies, GraphQL documents, variables, authorization headers, prompt
+content, and signed URL query parameters are never emitted. Error records include a
+bounded stack and cause chain, with truncation markers when a diagnostic exceeds its
+size limits. Logging failures are swallowed and cannot change the action result.
+
+For a failed run, search the workflow log for the matching `operation.finished` or
+`operation.cancelled` event, then use its `operation`, `purpose`, `status`,
+`request_id`, and `required_permission` fields to distinguish an API authorization,
+rate-limit, response-shape, network, cancellation, or local validation failure.
+
 ## Security and release model
 
 The action is compiled TypeScript and runs on Node 24 or newer. It does not use Docker. Reference the action with an exact stable or release-candidate tag such as `v1.0.0` or `v1.0.1-rc.0` for reproducible behavior, or use a major alias such as `v1` or `v1-prerelease` to receive the latest stable or prerelease release in that major line. Branches and commit SHAs are not supported. Major aliases are annotated, moving Git tags with no GitHub Release of their own; the bootstrap resolves each alias to its exact compatible release before downloading and verifying the platform runtime. Supported bundles are Linux glibc x64/arm64, Windows x64/arm64, and macOS x64/arm64.

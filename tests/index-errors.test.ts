@@ -1,6 +1,9 @@
+/* eslint-disable @typescript-eslint/require-await, @typescript-eslint/prefer-promise-reject-errors */
+
 import {
   CancellationError,
-  type GitHubApi,
+  GitHubApiError,
+  GitHubApi,
   actionReader,
   assert,
   buildRunSummary,
@@ -18,6 +21,323 @@ import {
   type PullRequestContext,
   useWorkspace,
 } from "./index-test-helpers.js";
+import { DiagnosticLogger, diagnosticsInternals } from "../src/lib/diagnostics.js";
+import type { ContextFileArtifact } from "../src/lib/context-files.js";
+
+test("diagnostic logger emits correlated, redacted operation records", () => {
+  const lines: string[] = [];
+  let nextId = 0;
+  let now = new Date("2026-09-01T00:00:00.000Z");
+  const logger = new DiagnosticLogger({
+    component: "github",
+    context: { run_id: "42" },
+    secrets: ["gh-secret", "short"],
+    write: (line) => lines.push(line),
+    now: () => now,
+    id: () => `operation-${++nextId}`,
+  });
+  const descriptor = {
+    phase: "conversation",
+    operation: "rest.pull-request.context",
+    purpose: "capture pull request metadata",
+  } as const;
+  const started = logger.start(descriptor, {
+    url: "https://api.example.test/repos/owner/repo?signature=gh-secret",
+    authorization: "gh-secret",
+    request_body: "private body",
+    response_headers: {
+      "x-github-request-id": "request-1",
+      "x-ratelimit-remaining": "4999",
+      "set-cookie": "private-cookie",
+    },
+  });
+  now = new Date("2026-09-01T00:00:00.125Z");
+  started.success({ status: 200, token: "gh-secret", reason: "short" });
+  const skipped = logger.start({ ...descriptor, operation: "rest.issue.lookup" });
+  skipped.skipped({ status: 404, reason: "optional issue is absent" });
+  const cancelled = logger.start({ ...descriptor, operation: "rest.cancelled" });
+  cancelled.cancelled(new CancellationError("SIGTERM"));
+  const failed = logger.start({ ...descriptor, operation: "rest.failed" });
+  const cause = new Error("upstream short failure");
+  failed.failure(new Error("request failed", { cause }), { status: 503 });
+
+  assert.equal(lines.length, 8);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const first = records[0];
+  assert.ok(first);
+  assert.equal(first.schema_version, 1);
+  assert.equal(first.event, "operation.started");
+  assert.equal(first.operation_id, "operation-1");
+  assert.equal(first.run_id, "42");
+  assert.equal(
+    (first.details as Record<string, unknown>).url,
+    "https://api.example.test/repos/owner/repo",
+  );
+  assert.equal((first.details as Record<string, unknown>).authorization, "[OMITTED]");
+  assert.equal((first.details as Record<string, unknown>).request_body, "[OMITTED]");
+  assert.deepEqual((first.details as Record<string, unknown>).response_headers, {
+    "x-github-request-id": "request-1",
+    "x-ratelimit-remaining": "4999",
+  });
+  assert.equal((records[1]?.details as Record<string, unknown>).token, "[OMITTED]");
+  assert.equal(records[3]?.event, "operation.skipped");
+  assert.equal(records[3]?.outcome, "skipped");
+  assert.equal(records[5]?.event, "operation.cancelled");
+  assert.equal(records[5]?.outcome, "cancelled");
+  assert.equal(records[7]?.outcome, "failure");
+  assert.equal(JSON.stringify(records).includes("gh-secret"), false);
+  assert.equal(JSON.stringify(records).includes("private body"), false);
+  assert.equal(JSON.stringify(records).includes("signature="), false);
+});
+
+test("diagnostic serialization bounds complex values and preserves causes", () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  const deep: Record<string, unknown> = {};
+  let current = deep;
+  for (let index = 0; index < 8; index += 1) {
+    const child: Record<string, unknown> = {};
+    current.child = child;
+    current = child;
+  }
+  const projected = JSON.parse(
+    diagnosticsInternals.serialized(
+      {
+        secret: "hidden",
+        query: "private query",
+        body: "private body",
+        headers: { authorization: "hidden-header" },
+        status_text: "Forbidden",
+        content_length: 12,
+        response_headers: "not a header map",
+        circular,
+        deep,
+        values: ["visible", 1n, () => undefined, Symbol("value")],
+      },
+      ["hidden"],
+    ),
+  ) as Record<string, unknown>;
+  assert.equal(projected.secret, "[OMITTED]");
+  assert.equal(projected.query, "[OMITTED]");
+  assert.equal(projected.body, "[OMITTED]");
+  assert.equal(projected.headers, "[OMITTED]");
+  assert.equal(projected.status_text, "Forbidden");
+  assert.equal(projected.content_length, 12);
+  assert.equal(projected.response_headers, "[OMITTED]");
+  assert.equal((projected.circular as Record<string, unknown>).self, "[CIRCULAR]");
+  assert.equal((projected.deep as Record<string, unknown>).child !== undefined, true);
+  assert.deepEqual(projected.values, [
+    "visible",
+    "[BIGINT]",
+    "[UNSERIALIZABLE]",
+    "[UNSERIALIZABLE]",
+  ]);
+
+  let error: Error = new Error("level-0");
+  for (let index = 1; index <= 7; index += 1) error = new Error(`level-${index}`, { cause: error });
+  const errorRecord = diagnosticsInternals.errorRecord(error, []);
+  assert.equal(typeof errorRecord, "object");
+  assert.equal(JSON.stringify(errorRecord).includes("CAUSE_DEPTH_EXCEEDED"), true);
+  const diagnosticError = new Error("response body must not be logged");
+  Object.assign(diagnosticError, { diagnosticMessage: "safe status" });
+  const safeRecord = diagnosticsInternals.errorRecord(diagnosticError, []);
+  assert.equal((safeRecord as Record<string, unknown>).message, "safe status");
+  assert.equal(JSON.stringify(safeRecord).includes("response body must not be logged"), false);
+  const apiError = new GitHubApiError(403, "response body must not be logged", {
+    operation: "rest.user.current",
+    requestId: "request-1",
+  });
+  const apiRecord = diagnosticsInternals.errorRecord(apiError, []);
+  assert.equal((apiRecord as Record<string, unknown>).message, "GitHub API request failed (403).");
+  assert.equal(JSON.stringify(apiRecord).includes("response body must not be logged"), false);
+  const multilineApiError = new GitHubApiError(403, "safe line\nsecret body", {
+    operation: "rest.user.current",
+  });
+  const multilineRecord = diagnosticsInternals.errorRecord(multilineApiError, []);
+  assert.equal(JSON.stringify(multilineRecord).includes("secret body"), false);
+
+  const many: Record<string, string> = {};
+  for (let index = 0; index < 200; index += 1) many[`field-${index}`] = "x".repeat(2_048);
+  const bounded = JSON.parse(diagnosticsInternals.serialized(many, [])) as Record<string, unknown>;
+  assert.equal(JSON.stringify(bounded).length <= 8_000, true);
+  assert.equal(
+    bounded.event === "diagnostic.truncated" ||
+      (bounded.details as Record<string, unknown> | undefined)?.truncated === true,
+    true,
+  );
+  assert.equal(
+    diagnosticsInternals.stripUrlQuery("https://example.test/path?token=hidden"),
+    "https://example.test/path",
+  );
+  assert.equal(
+    diagnosticsInternals.stripEmbeddedUrlQueries(
+      "fetch https://example.test/path?token=hidden now",
+    ),
+    "fetch https://example.test/path now",
+  );
+  const boundary = JSON.parse(
+    diagnosticsInternals.serialized(
+      { value: `${"x".repeat(2_040)}boundary-secret${"y".repeat(32)}` },
+      ["boundary-secret"],
+    ),
+  ) as Record<string, unknown>;
+  assert.equal(JSON.stringify(boundary).includes("boundary-secret"), false);
+  assert.equal(diagnosticsInternals.isCancellation(new Error("request aborted")), true);
+  assert.equal(diagnosticsInternals.isCancellation(new Error("other")), false);
+});
+
+test("diagnostic writer failures cannot change the action result", () => {
+  const logger = new DiagnosticLogger({
+    component: "action",
+    write: () => {
+      throw new Error("writer unavailable");
+    },
+  });
+  assert.doesNotThrow(() => {
+    const span = logger.start({ phase: "action", operation: "run", purpose: "run action" });
+    span.failure(new Error("failure"));
+  });
+});
+
+test("diagnostic metadata failures cannot change the action result", async () => {
+  const lines: string[] = [];
+  const context = {} as Record<string, unknown>;
+  Object.defineProperty(context, "run_id", {
+    enumerable: true,
+    get: () => {
+      throw new Error("context unavailable");
+    },
+  });
+  let executed = false;
+  const logger = new DiagnosticLogger({
+    component: "action",
+    context,
+    write: (line) => lines.push(line),
+  });
+  await assert.doesNotReject(
+    logger.withSpan({ phase: "action", operation: "run", purpose: "run action" }, () => {
+      executed = true;
+    }),
+  );
+  assert.equal(executed, true);
+  assert.equal(lines.length, 0);
+});
+
+test("diagnostic id failures cannot change the operation result", async () => {
+  const lines: string[] = [];
+  let executed = false;
+  const logger = new DiagnosticLogger({
+    component: "action",
+    id: () => {
+      throw new Error("id provider unavailable");
+    },
+    write: (line) => lines.push(line),
+  });
+  await assert.doesNotReject(
+    logger.withSpan({ phase: "action", operation: "run", purpose: "run action" }, () => {
+      executed = true;
+    }),
+  );
+  assert.equal(executed, true);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const started = records.find((record) => record.event === "operation.started");
+  const terminal = records.find((record) => record.event === "operation.succeeded");
+  assert.ok(started);
+  assert.ok(terminal);
+  assert.equal(started.operation_id, terminal.operation_id);
+  assert.match(String(started.operation_id), /^fallback-\d+$/u);
+});
+
+test("keeps immutable body-read failures redacted through action lifecycle spans", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const failures: readonly [string, unknown][] = [
+    [
+      "action-lifecycle-frozen-sentinel",
+      Object.freeze(new Error("action-lifecycle-frozen-sentinel")),
+    ],
+    ["action-lifecycle-primitive-sentinel", "action-lifecycle-primitive-sentinel"],
+  ];
+  for (const [index, [sentinel, bodyError]] of failures.entries()) {
+    globalThis.fetch = async () =>
+      ({
+        ok: true,
+        status: 502,
+        headers: new Headers({ "x-github-request-id": `action-lifecycle-${index}` }),
+        text: async () => Promise.reject(bodyError),
+      }) as unknown as Response;
+    const lines: string[] = [];
+    const diagnostics = new DiagnosticLogger({
+      component: "action",
+      write: (line) => lines.push(line),
+    });
+    const api = new GitHubApi(
+      "test-token",
+      "https://api.example.test",
+      undefined,
+      undefined,
+      diagnostics,
+    );
+    await assert.rejects(
+      runAction(
+        actionReader(),
+        [],
+        {
+          createApi: () => api,
+          readEventContext: () => Promise.resolve(context),
+          createWorkspace: () => Promise.reject(new Error("workspace should not be created")),
+          prepareContextFiles: () =>
+            Promise.resolve({
+              filesByGoal: [[]],
+              identity: [],
+              cleanup: () => Promise.resolve(),
+            } as unknown as ContextFileArtifact),
+          readFiles: () => Promise.resolve([]),
+          runGoals: () => Promise.resolve([]),
+          writeSummary: () => Promise.resolve(),
+        },
+        new AbortController(),
+        diagnostics,
+      ),
+      (error: unknown) => error === bodyError,
+    );
+    const records = lines.map(
+      (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+    );
+    const terminal = records.find(
+      (record) => record.operation === "action.run" && record.event === "operation.finished",
+    );
+    assert.ok(terminal);
+    assert.equal(
+      ((terminal.details as Record<string, unknown>).error as Record<string, unknown>).message,
+      "GitHub REST response body read failed.",
+    );
+    assert.equal(JSON.stringify(records).includes(sentinel), false);
+  }
+});
+
+test("diagnostic spans preserve non-coercible rejected values", async () => {
+  const lines: string[] = [];
+  const logger = new DiagnosticLogger({ component: "action", write: (line) => lines.push(line) });
+  const reason = Object.create(null) as object;
+  await assert.rejects(
+    logger.withSpan(
+      { phase: "action", operation: "non-coercible", purpose: "preserve a rejection" },
+      () => Promise.reject(reason),
+    ),
+    (error: unknown) => error === reason,
+  );
+  assert.equal(lines.length, 2);
+  assert.equal(JSON.stringify(lines).includes("UNSERIALIZABLE"), true);
+});
 
 test("cancellation prevents new summaries and pull request writes", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
@@ -26,6 +346,12 @@ test("cancellation prevents new summaries and pull request writes", async (t) =>
   for (const interactWithPullRequest of [true, false]) {
     const controller = new AbortController();
     const reason = new CancellationError("SIGTERM");
+    const lines: string[] = [];
+    const diagnostics = new DiagnosticLogger({
+      component: "action",
+      context: { run_id: `cancel-${String(interactWithPullRequest)}` },
+      write: (line) => lines.push(line),
+    });
     let summaries = 0;
     let reviews = 0;
     const api = {
@@ -70,12 +396,82 @@ test("cancellation prevents new summaries and pull request writes", async (t) =>
           },
         },
         controller,
+        diagnostics,
       ),
       (error: unknown) => error === reason,
     );
     assert.equal(summaries, 0);
     assert.equal(reviews, 0);
+    const records = lines.map(
+      (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+    );
+    const terminal = records.find(
+      (record) => record.operation === "action.run" && record.outcome === "cancelled",
+    );
+    assert.ok(terminal);
+    assert.equal(terminal.run_id, `cancel-${String(interactWithPullRequest)}`);
   }
+});
+
+test("correlates full action cleanup failures with the parent failure", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "action",
+    context: { run_id: "cleanup-failure" },
+    write: (line) => lines.push(line),
+  });
+  const api = {
+    ...emptyConversationApi(),
+    getPullRequestFiles: () => Promise.resolve([]),
+  } as unknown as GitHubApi;
+  await assert.rejects(
+    runAction(
+      actionReader({ "interact-with-pr": "false" }),
+      [],
+      {
+        createApi: () => api,
+        readEventContext: () => Promise.resolve(context),
+        createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+        readFiles: () => Promise.resolve([]),
+        prepareContextFiles: () =>
+          Promise.resolve({
+            filesByGoal: [[]],
+            identity: [],
+            cleanup: () => Promise.reject(new Error("context cleanup failed")),
+          } as unknown as ContextFileArtifact),
+        runGoals: () =>
+          Promise.resolve([
+            {
+              prompt: "correctness",
+              status: "completed",
+              submission: { summary: "clean", findings: [] },
+            },
+          ]),
+        writeSummary: () => Promise.resolve(),
+      },
+      new AbortController(),
+      diagnostics,
+    ),
+    /context cleanup failed/u,
+  );
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const cleanup = records.find(
+    (record) => record.operation === "action.context.cleanup" && record.outcome === "failure",
+  );
+  const parent = records.find(
+    (record) => record.operation === "action.run" && record.outcome === "failure",
+  );
+  assert.ok(cleanup);
+  assert.ok(parent);
+  assert.equal(cleanup.run_id, parent.run_id);
+  assert.equal(
+    ((parent.details as Record<string, unknown>).error as Record<string, unknown>).message,
+    "context cleanup failed",
+  );
 });
 
 test("rejects mismatched event URL targets", async (t) => {
