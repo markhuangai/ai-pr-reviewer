@@ -383,6 +383,17 @@ export class ReviewBriefingReader {
               path: entry.path,
               ...(entry.line === undefined ? {} : { line: entry.line }),
               messageCount: entry.messages.length,
+              isResolved: entry.isResolved,
+              isOutdated: entry.isOutdated,
+              ...(entry.resolvedByLogin === undefined
+                ? {}
+                : { resolvedByLogin: entry.resolvedByLogin }),
+              ...(entry.reviewIsMinimized === undefined
+                ? {}
+                : { reviewIsMinimized: entry.reviewIsMinimized }),
+              ...(entry.reviewMinimizedReason === undefined
+                ? {}
+                : { reviewMinimizedReason: entry.reviewMinimizedReason }),
             }
           : {}),
         authors: authors.slice(0, BRIEFING_MAX_AUTHORS),

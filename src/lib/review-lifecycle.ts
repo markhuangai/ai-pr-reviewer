@@ -247,8 +247,9 @@ export async function prepareReviewLifecycle(
   api: ReviewLifecycleApi,
   context: PullRequestContext,
   authenticatedLogin: string,
+  initialSnapshot?: ReviewLifecycleSnapshot,
 ): Promise<ReviewLifecyclePreparation> {
-  const snapshot = await api.getReviewLifecycleSnapshot(context);
+  const snapshot = initialSnapshot ?? (await api.getReviewLifecycleSnapshot(context));
   if (!(await lifecycleHeadMatches(api, context))) {
     core.warning(
       "The pull request head changed before lifecycle preparation; skipping lifecycle mutations.",
@@ -476,15 +477,11 @@ export async function finalizeReviewLifecycle(
   }
   const minimized: number[] = [];
   for (const review of snapshot.reviews) {
-    if (
-      review.isMinimized ||
-      !isFindingActionReview(review, context, authenticatedLogin) ||
-      review.body.includes("### Findings")
-    ) {
+    if (review.isMinimized || !isFindingActionReview(review, context, authenticatedLogin)) {
       continue;
     }
     const threads = snapshot.threads.filter((thread) => thread.reviewId === review.databaseId);
-    if (threads.length === 0 || threads.some((thread) => !thread.isResolved)) continue;
+    if (threads.some((thread) => !thread.isResolved)) continue;
     const latest = await api.getReviewLifecycleSnapshot(context);
     const currentReview = latest.reviews.find((item) => item.databaseId === review.databaseId);
     const currentThreads = latest.threads.filter((thread) => thread.reviewId === review.databaseId);
@@ -493,8 +490,6 @@ export async function finalizeReviewLifecycle(
       currentReview.nodeId !== review.nodeId ||
       currentReview.isMinimized ||
       !isFindingActionReview(currentReview, context, authenticatedLogin) ||
-      currentReview.body.includes("### Findings") ||
-      currentThreads.length === 0 ||
       currentThreads.some((thread) => !thread.isResolved)
     ) {
       continue;

@@ -34,8 +34,11 @@ import {
   logAgentMessageSafely,
   logQueuedUserMessage,
   modelUsageSnapshot,
+  sdkSessionActivity,
   withTokenUsage,
   writeCompleteAgentLog,
+  writeAgentMonitorEvent,
+  writeAgentSessionEndLog,
   writeAgentLifecycleLog,
   type AgentToolUse,
 } from "./agent-logging.js";
@@ -46,22 +49,27 @@ import {
   RepositoryFilePageReader,
   ReviewBriefingReader,
   StringPageReader,
-  createPullRequestDiff,
   jsonToolResult,
 } from "./agent-review-tools.js";
 import {
   MAX_REPAIR_ATTEMPTS,
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
+  createReviewSessionRecoveryMonitor,
+  interactiveSubmissionSchema,
+  invalidInteractiveFindingLocations,
   makeOptions,
   makeUserMessage,
   repairPrompt,
+  reviewSessionSnapshot,
   reviewSubmissionRejection,
   startReviewPrompt,
   submissionSchema,
   toSdkMcpServer,
   toSubmission,
   type AgentQuery,
+  type SdkSessionMonitor,
+  runReviewGoalsWithRunner,
 } from "./agent-session.js";
 import {
   RepositorySnapshot,
@@ -71,7 +79,6 @@ import {
 
 export type { AgentQuery } from "./agent-session.js";
 export { agentInternals } from "./agent-session.js";
-
 interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
@@ -473,7 +480,7 @@ export async function runReviewGoal(
   const outputTool = tool(
     "submit_review",
     "Submit concise validated findings for this isolated review goal.",
-    submissionSchema.shape,
+    (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
     (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
       const candidateFindings =
@@ -522,7 +529,33 @@ export async function runReviewGoal(
           content: [{ type: "text", text: rejection }],
         });
       }
-      submission = toSubmission(input);
+      const candidate = toSubmission(submissionSchema.parse(input));
+      logAgentEventSafely(goalIndex, logSecrets, (write) => {
+        writeCompleteAgentLog(
+          goalIndex,
+          "review submission",
+          "submit_review",
+          "candidate",
+          candidate,
+          logSecrets,
+          write,
+        );
+      });
+      if (config.interactWithPullRequest) {
+        const invalidLocations = invalidInteractiveFindingLocations(candidate, files);
+        if (invalidLocations.length > 0) {
+          return Promise.resolve({
+            content: [
+              {
+                type: "text",
+                text: `Review submission rejected. Every interactive finding must cite a participating added line in a changed file. Correct or remove these findings, then resubmit the complete review:\n${invalidLocations.join("\n")}`,
+              },
+            ],
+            isError: true,
+          });
+        }
+      }
+      submission = candidate;
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
     { alwaysLoad: true },
@@ -550,11 +583,21 @@ export async function runReviewGoal(
   };
   for (const [name, server] of Object.entries(config.mcpServers))
     mcpServers[name] = toSdkMcpServer(server);
-
   const input = new PromptStream();
   let turn = deferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
+  let session: ReturnType<AgentQuery> | undefined;
+  let monitor: SdkSessionMonitor | undefined;
+  let sessionPhase = "starting";
+  const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
+  let sessionClosed = false;
+  const stalledSubmission = deferred<undefined>();
+  const closeSession = (): void => {
+    if (session === undefined || sessionClosed) return;
+    sessionClosed = true;
+    session.close();
+  };
   const tokenUsageState: {
     models: readonly ReviewModelUsage[];
     latestSnapshotValid: boolean;
@@ -580,7 +623,7 @@ export async function runReviewGoal(
         write,
       );
     });
-    const session = queryAgent({
+    session = queryAgent({
       prompt: input,
       options: makeOptions(
         config,
@@ -592,10 +635,47 @@ export async function runReviewGoal(
         effectiveSystemPrompt,
       ),
     });
+    const activeSession = session;
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
+    const activeMonitor = createReviewSessionRecoveryMonitor({
+      snapshot: () =>
+        reviewSessionSnapshot(
+          sessionPhase,
+          lifecycle,
+          repairAttempts,
+          submission !== undefined,
+          sessionState.stallBoundaryPending,
+        ),
+      write: (event, details) => {
+        writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
+      },
+      hasAcceptedSubmission: () => submission !== undefined,
+      setPhase: (phase) => {
+        sessionPhase = phase;
+      },
+      finishAcceptedInput: () => {
+        sessionState.expectedSessionClose = true;
+        input.finish();
+      },
+      markBoundaryPending: () => {
+        sessionState.stallBoundaryPending = true;
+        sessionPhase = "waiting-for-interrupted-turn-boundary";
+      },
+      interrupt: () => activeSession.interrupt(),
+      closeAcceptedSession: closeSession,
+      finalizeAcceptedSubmission: () => {
+        stalledSubmission.resolve(undefined);
+      },
+    });
+    monitor = activeMonitor;
+    activeMonitor.start();
+    sessionPhase = "waiting-for-sdk-message";
     reader = (async () => {
       try {
-        for await (const message of session as AsyncIterable<SDKMessage | SDKActiveGoalMessage>) {
+        for await (const message of activeSession as AsyncIterable<
+          SDKMessage | SDKActiveGoalMessage
+        >) {
+          activeMonitor.observe(sdkSessionActivity(message, toolUses));
           if (message.type !== "active_goal")
             logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
           logAgentEventSafely(goalIndex, logSecrets, (write) => {
@@ -615,6 +695,9 @@ export async function runReviewGoal(
         turn.reject(readerFailure);
       } finally {
         if (signal?.aborted) turn.reject(signal.reason);
+        else if (!sessionState.expectedSessionClose && readerFailure === undefined) {
+          turn.reject(new Error("The Claude SDK message stream ended before a terminal result."));
+        }
       }
     })();
     throwIfAborted(signal);
@@ -633,6 +716,7 @@ export async function runReviewGoal(
       },
       undefined,
       cwd,
+      config.interactWithPullRequest,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -643,10 +727,105 @@ export async function runReviewGoal(
         write,
       );
     });
-    for (let turnIndex = 0; turnIndex <= MAX_REPAIR_ATTEMPTS; turnIndex += 1) {
-      const result = await turn.promise;
+    sessionPhase = "waiting-for-turn-result";
+    for (;;) {
+      const outcome = await Promise.race([
+        turn.promise.then((result) => ({ kind: "result" as const, result })),
+        stalledSubmission.promise.then(() => ({ kind: "stalled-submission" as const })),
+      ]);
       throwIfAborted(signal);
+      if (outcome.kind === "stalled-submission") {
+        const acceptedSubmission = submission;
+        if (acceptedSubmission === undefined) {
+          throw new Error("The SDK session closed for stall recovery without an accepted review.");
+        }
+        sessionPhase = "finalizing-stalled-submission";
+        await reader;
+        writeAgentMonitorEvent(
+          goalIndex,
+          "submission-finalized",
+          {
+            recovery: activeMonitor.recoveryCount,
+            terminal_sdk_result: false,
+            mcp_status_checked: false,
+            token_accounting_complete: false,
+          },
+          logSecrets,
+        );
+        return withTokenUsage(
+          { prompt: goal, status: "completed", submission: acceptedSubmission },
+          tokenUsageState.models,
+          false,
+        );
+      }
+      const { result } = outcome;
+      if (sessionState.stallBoundaryPending) {
+        sessionState.stallBoundaryPending = false;
+        writeAgentMonitorEvent(
+          goalIndex,
+          "interrupted-turn-boundary",
+          {
+            recovery: activeMonitor.recoveryCount,
+            result_subtype: result.subtype,
+            submission_accepted: submission !== undefined,
+          },
+          logSecrets,
+        );
+        if (submission !== undefined) {
+          const acceptedSubmission = submission;
+          sessionPhase = "finalizing-interrupted-submission";
+          sessionState.expectedSessionClose = true;
+          input.finish();
+          closeSession();
+          await reader;
+          writeAgentMonitorEvent(
+            goalIndex,
+            "submission-finalized",
+            {
+              recovery: activeMonitor.recoveryCount,
+              terminal_sdk_result: true,
+              terminal_sdk_result_subtype: result.subtype,
+              mcp_status_checked: false,
+              token_accounting_complete:
+                readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+            },
+            logSecrets,
+          );
+          return withTokenUsage(
+            { prompt: goal, status: "completed", submission: acceptedSubmission },
+            tokenUsageState.models,
+            readerFailure === undefined && tokenUsageState.latestSnapshotValid,
+          );
+        }
+        sessionPhase = "waiting-for-continuation-result";
+        const continuation = makeUserMessage(
+          "The previous turn was interrupted after 300000 ms without an SDK message. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+        );
+        input.push(continuation);
+        writeAgentMonitorEvent(
+          goalIndex,
+          "continuation-queued",
+          {
+            recovery: activeMonitor.recoveryCount,
+            interrupted_result_subtype: result.subtype,
+            repair_attempts: repairAttempts,
+          },
+          logSecrets,
+        );
+        logAgentEventSafely(goalIndex, logSecrets, (write) => {
+          logQueuedUserMessage(
+            continuation,
+            `stall-continuation-${activeMonitor.recoveryCount}`,
+            goalIndex,
+            logSecrets,
+            write,
+          );
+        });
+        continue;
+      }
       if (result.subtype !== "success") {
+        sessionPhase = "finalizing-failed-turn";
+        sessionState.expectedSessionClose = true;
         input.finish();
         await reader;
         throwIfAborted(signal);
@@ -662,12 +841,14 @@ export async function runReviewGoal(
         );
       }
       if (submission !== undefined) {
-        const mcpFailures = (await session.mcpServerStatus()).filter(
+        sessionPhase = "checking-mcp-status";
+        const mcpFailures = (await activeSession.mcpServerStatus()).filter(
           (status) =>
             configuredMcpNames.has(status.name) &&
             (status.status === "failed" || status.status === "needs-auth"),
         );
         throwIfAborted(signal);
+        sessionState.expectedSessionClose = true;
         input.finish();
         await reader;
         throwIfAborted(signal);
@@ -690,6 +871,8 @@ export async function runReviewGoal(
         );
       }
       if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
+        sessionPhase = "repair-exhausted";
+        sessionState.expectedSessionClose = true;
         input.finish();
         await reader;
         throwIfAborted(signal);
@@ -705,7 +888,10 @@ export async function runReviewGoal(
       }
       repairAttempts += 1;
       throwIfAborted(signal);
-      const repairMessage = makeUserMessage(repairPrompt(repairAttempts, briefingReader.complete));
+      sessionPhase = "waiting-for-repair-result";
+      const repairMessage = makeUserMessage(
+        repairPrompt(repairAttempts, briefingReader.complete, config.interactWithPullRequest),
+      );
       input.push(repairMessage);
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         logQueuedUserMessage(
@@ -717,20 +903,12 @@ export async function runReviewGoal(
         );
       });
     }
-    input.finish();
-    await reader;
-    throwIfAborted(signal);
-    return withTokenUsage(
-      {
-        prompt: goal,
-        status: "failed",
-        error: "Claude did not submit a valid review after five repair attempts.",
-      },
-      tokenUsageState.models,
-      readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-    );
   } catch (error) {
+    sessionPhase = "failed";
+    sessionState.expectedSessionClose = true;
     input.finish();
+    monitor?.stop();
+    closeSession();
     if (reader) await reader.catch(() => undefined);
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
@@ -751,29 +929,18 @@ export async function runReviewGoal(
       false,
     );
   } finally {
+    monitor?.stop();
+    closeSession();
     signal?.removeEventListener("abort", abortTurn);
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      writeAgentLifecycleLog(
-        goalIndex,
-        "end",
-        {
-          session_id: lifecycle.sessionId,
-          prompt_gate: reviewPromptActive ? "open" : "closed",
-          turn_results: lifecycle.turnResults,
-          latest_turn_count: lifecycle.latestTurnCount,
-          api_retries: lifecycle.apiRetries,
-          repair_attempts: repairAttempts,
-          goal_iterations: lifecycle.goalIterations,
-          compaction_starts: lifecycle.compactionStarts,
-          compaction_successes: lifecycle.compactionSuccesses,
-          compaction_failures: lifecycle.compactionFailures,
-          compaction_boundaries: lifecycle.compactionBoundaries,
-          submission_accepted: submission !== undefined,
-        },
-        logSecrets,
-        write,
-      );
-    });
+    writeAgentSessionEndLog(
+      goalIndex,
+      lifecycle,
+      reviewPromptActive,
+      repairAttempts,
+      submission !== undefined,
+      monitor?.recoveryCount ?? 0,
+      logSecrets,
+    );
     await Promise.all([
       diffReader.close(),
       ...Array.from(contextReaders.values(), ({ reader: contextReader }) => contextReader.close()),
@@ -788,8 +955,7 @@ export async function runReviewGoal(
     queryReaderDiscussionKeys.clear();
   }
 }
-
-export async function runReviewGoals(
+export function runReviewGoals(
   context: PullRequestContext,
   files: readonly ChangedFile[],
   conversation: ReviewConversationSnapshot,
@@ -800,69 +966,16 @@ export async function runReviewGoals(
   abortController?: AbortController,
   briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
 ): Promise<readonly GoalResult[]> {
-  const signal = abortController?.signal;
-  throwIfAborted(signal);
-  if (contextFilesByGoal.length !== config.reviewPrompts.length) {
-    throw new Error("Prepared context files must match the configured review goals.");
-  }
-  for (let index = 0; index < config.reviewPrompts.length; index += 1) {
-    const goal = config.reviewPrompts[index];
-    if (goal === undefined) continue;
-    const prepared = contextFilesByGoal[index] ?? [];
-    if (
-      prepared.length !== goal.files.length ||
-      prepared.some((file, fileIndex) => file.path !== goal.files[fileIndex])
-    ) {
-      throw new Error(`Prepared context files do not match review goal ${index + 1}.`);
-    }
-  }
-  const diff = await createPullRequestDiff(context, cwd, undefined, signal);
-  const results: Array<GoalResult | undefined> = Array.from(
-    { length: config.reviewPrompts.length },
-    () => undefined,
+  return runReviewGoalsWithRunner(
+    runReviewGoal,
+    context,
+    files,
+    conversation,
+    config,
+    contextFilesByGoal,
+    cwd,
+    queryAgent,
+    abortController,
+    briefing,
   );
-  let cursor = 0;
-  const worker = async (): Promise<void> => {
-    while (cursor < config.reviewPrompts.length) {
-      throwIfAborted(signal);
-      const index = cursor;
-      cursor += 1;
-      const goal = config.reviewPrompts[index];
-      if (goal === undefined) return;
-      throwIfAborted(signal);
-      results[index] = await runReviewGoal(
-        goal.prompt,
-        index,
-        context,
-        files,
-        conversation,
-        config,
-        diff,
-        cwd,
-        queryAgent,
-        contextFilesByGoal[index] ?? [],
-        abortController,
-        briefing,
-      );
-    }
-  };
-  try {
-    const workerCount = Math.min(config.parallelCount, config.reviewPrompts.length);
-    const outcomes = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
-    const failure = outcomes.find(
-      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
-    );
-    if (failure !== undefined) throw failure.reason;
-    throwIfAborted(signal);
-    return results.map(
-      (result, index) =>
-        result ?? {
-          prompt: config.reviewPrompts[index]?.prompt ?? "",
-          status: "failed",
-          error: "Worker did not return a result.",
-        },
-    );
-  } finally {
-    await diff.cleanup();
-  }
 }

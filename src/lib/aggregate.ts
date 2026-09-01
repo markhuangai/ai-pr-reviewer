@@ -436,6 +436,14 @@ function findingSummary(findings: readonly AggregatedFinding[]): string {
   return `Found **${count} actionable issue${count === 1 ? "" : "s"}** — ${severitySummary(findings)}.`;
 }
 
+function findingIndexLine(finding: AggregatedFinding, index: number): string {
+  const location =
+    finding.path === undefined
+      ? ""
+      : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
+  return `${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}`;
+}
+
 function formatFinding(finding: AggregatedFinding, index: number): string {
   const location =
     finding.locationVerified && finding.path && finding.line
@@ -459,24 +467,30 @@ export function aggregateReview(
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],
   );
   const findings = [...mergeFindings(normalized)].sort(findingSort);
-  const inlineFindings = findings
-    .filter((finding) => finding.locationVerified)
-    .slice(0, MAX_INLINE_COMMENTS);
+  const inlineFindings = config.interactWithPullRequest
+    ? findings.filter((finding) => finding.locationVerified).slice(0, MAX_INLINE_COMMENTS)
+    : [];
   const inlineKeys = new Set(inlineFindings);
-  const bodyFindings = findings.filter((finding) => !inlineKeys.has(finding));
+  const omittedFindings = config.interactWithPullRequest
+    ? findings.filter((finding) => !inlineKeys.has(finding))
+    : [];
   const partial = goals.some((goal) => goal.status === "failed");
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
     (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,
   );
   const event = config.autoApprove && !partial && !hasBlockingFinding ? "APPROVE" : "COMMENT";
-  const summary = findings.length === 0 ? "No actionable issues found." : findingSummary(findings);
+  const publishedFindings = config.interactWithPullRequest ? inlineFindings : findings;
+  const summary =
+    publishedFindings.length === 0
+      ? "No actionable issues found."
+      : findingSummary(publishedFindings);
   return {
     marker,
     summary,
     findings,
     inlineFindings,
-    bodyFindings,
+    omittedFindings,
     event,
     partial,
     allGoalsFailed,
@@ -484,23 +498,9 @@ export function aggregateReview(
   };
 }
 
-function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
-  return findings
-    .map((finding, index) => {
-      const location =
-        finding.path === undefined
-          ? ""
-          : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
-      return `${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}`;
-    })
-    .join("\n");
-}
-
 function findingDestination(review: AggregatedReview): string {
-  if (review.inlineFindings.length > 0 && review.bodyFindings.length > 0)
-    return "See the inline comments and findings below for details.";
   if (review.inlineFindings.length > 0) return "See the inline comments for details.";
-  return "See the findings below for details.";
+  return "No inline findings were published.";
 }
 
 const TOKEN_FORMATTER = new Intl.NumberFormat("en-US");
@@ -692,18 +692,6 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
     sections.push("", review.summary, "", findingDestination(review));
   }
   sections.push("", tokenUsage);
-  if (review.bodyFindings.length > 0) {
-    sections.push(
-      "",
-      "### Findings",
-      "",
-      "#### Index",
-      findingIndexMarkdown(review.bodyFindings),
-      "",
-      "#### Details",
-      review.bodyFindings.map(formatFinding).join("\n\n"),
-    );
-  }
   const body = sections.join("\n");
   if (body.length <= MAX_REVIEW_BODY_LENGTH) return body;
   return `${body.slice(0, MAX_REVIEW_BODY_LENGTH - 120)}\n\n> Review body truncated at 60 KB; see inline comments for the highest-severity findings.`;
@@ -741,13 +729,30 @@ export function buildRunSummary(
       ? "No review goal completed; see the step logs for redacted diagnostics."
       : review.partial && review.findings.length === 0
         ? "No actionable issues were reported by the completed checks."
-        : review.summary,
+        : review.findings.length === 0
+          ? "No actionable issues found."
+          : findingSummary(review.findings),
     "",
     tokenUsage,
   ];
   if (review.findings.length === 0) return lines.join("\n");
 
-  lines.push("", "### Findings", "");
+  if (review.omittedFindings.length > 0) {
+    const omitted = review.omittedFindings.length;
+    lines.push(
+      "",
+      `> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted from the pull request review after the 25 inline-comment limit; all findings are retained in this run summary.`,
+    );
+  }
+  lines.push(
+    "",
+    "### Findings",
+    "",
+    "#### Index",
+    review.findings.map(findingIndexLine).join("\n"),
+    "",
+    "#### Details",
+  );
   const fixed = `${lines.join("\n")}\n`;
   const fixedBytes = Buffer.byteLength(fixed, "utf8");
   const reservedNoticeBytes = Buffer.byteLength(
@@ -806,6 +811,12 @@ export function buildReviewRequest(
   review: AggregatedReview,
   goals: readonly GoalResult[],
 ): PullRequestReviewRequest {
+  const invalidFindings = review.findings.filter((finding) => !finding.locationVerified);
+  if (invalidFindings.length > 0) {
+    throw new Error(
+      `Interactive review contains ${invalidFindings.length} finding${invalidFindings.length === 1 ? "" : "s"} without a verified added-line location.`,
+    );
+  }
   return {
     commit_id: context.headSha,
     body: buildReviewBody(review, goals),

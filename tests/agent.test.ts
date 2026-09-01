@@ -162,6 +162,8 @@ test("passes cancellation to the SDK and rejects the active goal", async (t) => 
         yield* [] as SDKResultMessage[];
       },
       mcpServerStatus: () => Promise.resolve([]),
+      interrupt: () => Promise.resolve(undefined),
+      close: () => undefined,
     };
   }) as unknown as AgentQuery;
   const running = runReviewGoal(
@@ -463,6 +465,21 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   assert.equal(queryFailure.status, "failed");
   assert.equal(queryFailure.error, "query setup failed");
   assert.deepEqual(queryFailure.tokenUsage, { models: [], complete: false });
+
+  const exhaustedStream = await runReviewGoal(
+    "Exhausted SDK stream.",
+    4,
+    goalContext,
+    [],
+    emptyConversation,
+    config,
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    fakeAgentQuery({ resultSubtypes: [] }),
+  );
+  assert.equal(exhaustedStream.status, "failed");
+  assert.match(exhaustedStream.error ?? "", /message stream ended before a terminal result/u);
+  assert.deepEqual(exhaustedStream.tokenUsage, { models: [], complete: false });
 });
 
 test("preserves the latest cumulative usage snapshot when the SDK reader crashes", async (t) => {
@@ -596,6 +613,8 @@ test("stops scheduling review goals after cancellation and removes the shared di
         yield* [] as SDKResultMessage[];
       },
       mcpServerStatus: () => Promise.resolve([]),
+      interrupt: () => Promise.resolve(undefined),
+      close: () => undefined,
     };
   }) as unknown as AgentQuery;
   const running = runReviewGoals(

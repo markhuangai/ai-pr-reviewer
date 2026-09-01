@@ -496,6 +496,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
         if (scenario.readerErrorAfterResults) throw scenario.readerErrorAfterResults;
       },
       mcpServerStatus: () => Promise.resolve(scenario.mcpStatuses ?? []),
+      interrupt: () => Promise.resolve(undefined),
+      close: () => undefined,
     };
     return session;
   }) as unknown as AgentQuery;

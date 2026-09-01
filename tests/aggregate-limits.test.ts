@@ -100,7 +100,8 @@ test("preserves distinct claimed locations for unverified findings", () => {
     },
   ]);
   assert.equal(review.findings.length, 2);
-  assert.match(review.bodyFindings[0]?.body ?? "", /src\/missing-/);
+  assert.equal(review.inlineFindings.length, 0);
+  assert.match(review.omittedFindings[0]?.body ?? "", /src\/missing-/);
 });
 
 test("bounds an oversized merged inline comment", () => {
@@ -126,7 +127,50 @@ test("bounds an oversized merged inline comment", () => {
   assert.ok((request.comments[0]?.body.length ?? 0) <= 60_000);
 });
 
-test("bounds merged evidence so later body findings remain visible", () => {
+test("publishes only the top 25 verified findings and retains overflow in the run summary", () => {
+  const changedFiles = Array.from({ length: 26 }, (_, index) => ({
+    path: `src/change-${String(index).padStart(2, "0")}.ts`,
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    patch: "@@ -0,0 +1 @@\n+changed",
+    addedLines: new Set([1]),
+  }));
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "overflow",
+      status: "completed",
+      submission: {
+        summary: "overflow",
+        findings: changedFiles.map((file, index) => ({
+          title: `Finding ${String(index).padStart(2, "0")}`,
+          severity: index === 25 ? "LOW" : "MODERATE",
+          body: `Evidence ${index}`,
+          path: file.path,
+          line: 1,
+        })),
+      },
+    },
+  ];
+
+  const review = aggregateReview(context, config, changedFiles, goals);
+  const request = buildReviewRequest(context, review, goals);
+
+  assert.equal(review.findings.length, 26);
+  assert.equal(review.inlineFindings.length, 25);
+  assert.equal(review.omittedFindings.length, 1);
+  assert.equal(request.comments.length, 25);
+  assert.doesNotMatch(request.body, /### Findings|Finding 25/u);
+  const summary = buildRunSummary(context, review, goals);
+  assert.match(summary, /Finding 25/u);
+  assert.match(
+    summary,
+    /> 1 additional finding was omitted from the pull request review after the 25 inline-comment limit/u,
+  );
+});
+
+test("bounds merged evidence while retaining omitted findings in the run summary", () => {
   const duplicateGoals: readonly GoalResult[] = Array.from({ length: 50 }, (_, index) => ({
     prompt: `duplicate-${index}`,
     status: "completed",
@@ -167,7 +211,7 @@ test("bounds merged evidence so later body findings remain visible", () => {
             {
               title: "Later body finding",
               severity: "LOW",
-              body: "This distinct finding must remain in the review body.",
+              body: "This distinct finding must remain in the run summary.",
             },
           ],
         },
@@ -177,10 +221,11 @@ test("bounds merged evidence so later body findings remain visible", () => {
   const repeated = review.findings.find((finding) => finding.title === "Repeated issue");
   assert.ok(repeated);
   assert.ok(repeated.body.length <= 16_000);
-  assert.match(buildReviewBody(review, duplicateGoals), /Later body finding/);
+  assert.doesNotMatch(buildReviewBody(review, duplicateGoals), /Later body finding|### Findings/u);
+  assert.match(buildRunSummary(context, review, duplicateGoals), /Later body finding/u);
 });
 
-test("keeps body findings while withholding oversized goal internals", () => {
+test("omits unverified findings from the review body while retaining them in the run summary", () => {
   const goals: readonly GoalResult[] = [
     {
       prompt: "PRIVATE OVERSIZED GOAL ".repeat(30_000),
@@ -191,7 +236,7 @@ test("keeps body findings while withholding oversized goal internals", () => {
           {
             title: "Unverified finding",
             severity: "LOW",
-            body: "This finding must remain visible in the review body.",
+            body: "This finding must remain visible in the run summary.",
             path: "src/other.ts",
             line: 1,
           },
@@ -202,11 +247,12 @@ test("keeps body findings while withholding oversized goal internals", () => {
   const review = aggregateReview(context, config, files, goals);
   const body = buildReviewBody(review, goals);
 
-  assert.match(body, /Unverified finding/);
+  assert.doesNotMatch(body, /Unverified finding|### Findings/u);
+  assert.match(buildRunSummary(context, review, goals), /Unverified finding/u);
   assert.doesNotMatch(body, /PRIVATE OVERSIZED GOAL|PRIVATE OVERSIZED SUMMARY|### Goals/u);
 });
 
-test("writes every inline and body finding to a complete run summary", () => {
+test("writes every published and omitted finding to a complete run summary", () => {
   const goals: readonly GoalResult[] = [
     {
       prompt: "PRIVATE REVIEW GOAL",
@@ -377,10 +423,10 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
   assert.match(summary, /additional findings? (?:was|were) omitted/u);
   for (let index = 0; index < goals.length; index += 1) {
     const identifier = String(index).padStart(3, "0");
-    const hasHeading = summary.includes(`🟡 Low: Finding ${identifier}`);
-    assert.equal(summary.includes(`BEGIN-${identifier}:`), hasHeading);
-    assert.equal(summary.includes(`:END-${identifier}`), hasHeading);
-    if (hasHeading) included += 1;
+    assert.equal(summary.includes(`🟡 Low: Finding ${identifier}`), true);
+    const hasDetails = summary.includes(`BEGIN-${identifier}:`);
+    assert.equal(summary.includes(`:END-${identifier}`), hasDetails);
+    if (hasDetails) included += 1;
   }
   assert.ok(included > 0 && included < goals.length);
 });
@@ -406,11 +452,11 @@ test("renders the maximum supported finding count with linear byte accounting", 
 
   assert.equal(review.findings.length, 5_000);
   assert.match(summary, /Finding 4999/u);
-  assert.doesNotMatch(summary, /additional findings? (?:was|were) omitted/u);
+  assert.match(summary, /additional findings? (?:was|were) omitted from the pull request review/u);
   assert.ok(Buffer.byteLength(summary, "utf8") <= 1_000_000);
 });
 
-test("indexes every body finding before truncating details", () => {
+test("retains every non-inline finding in the run summary", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 9 }, (_, index) => ({
     prompt: `goal-${index}`,
     status: "completed",
@@ -427,8 +473,10 @@ test("indexes every body finding before truncating details", () => {
   }));
   const review = aggregateReview(context, config, files, goals);
   const body = buildReviewBody(review, goals);
-  assert.match(body, /Body finding 1/);
-  assert.match(body, /Body finding 9/);
+  const summary = buildRunSummary(context, review, goals);
+  assert.doesNotMatch(body, /Body finding 1|Body finding 9|### Findings/u);
+  assert.match(summary, /Body finding 1/u);
+  assert.match(summary, /Body finding 9/u);
   assert.ok(body.length <= 60_000);
 });
 
@@ -456,7 +504,7 @@ test("partial goals force a comment and remain actionable", () => {
   assert.equal(review.partial, true);
   assert.equal(review.event, "COMMENT");
   assert.match(body, /^## ⚠️ Review incomplete\n\n1 of 2 checks completed\./u);
-  assert.match(body, /Partial finding/u);
+  assert.doesNotMatch(body, /Partial finding|### Findings/u);
   assert.doesNotMatch(body, /✨ Good job|ai-pr-reviewer:v3|PRIVATE COMPLETED GOAL/u);
   assert.doesNotMatch(
     body,

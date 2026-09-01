@@ -10,6 +10,7 @@ export default tseslint.config(
       "release/**",
       "node_modules/**",
       "build-test/**",
+      ".codex/**",
     ],
   },
   eslint.configs.recommended,

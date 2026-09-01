@@ -252,11 +252,15 @@ test("formats four public severities without exposing goal provenance", () => {
             title: "Cancellation is ignored",
             severity: "MODERATE",
             body: "The retry continues after cancellation.",
+            path: "src/change.ts",
+            line: 1,
           },
           {
             title: "Error loses its reason",
             severity: "LOW",
             body: "The safe diagnostic reason is discarded.",
+            path: "src/change.ts",
+            line: 2,
           },
         ],
       },
@@ -274,9 +278,9 @@ test("formats four public severities without exposing goal provenance", () => {
     request.body,
     /Found \*\*4 actionable issues\*\* — 1 critical, 1 high, 1 moderate, and 1 low\./u,
   );
-  assert.match(request.body, /See the inline comments and findings below for details\./u);
-  assert.match(request.body, /🟠 Moderate: Cancellation is ignored/u);
-  assert.match(request.body, /🟡 Low: Error loses its reason/u);
+  assert.match(request.body, /See the inline comments for details\./u);
+  assert.doesNotMatch(request.body, /Cancellation is ignored|Error loses its reason/u);
+  assert.equal(request.comments.length, 4);
   assert.equal(
     request.comments[0]?.body,
     "🚨 Critical **Authorization can be bypassed**\n\nThe caller can cross the repository boundary.",
@@ -359,11 +363,16 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
   assert.equal(review.findings[0]?.severity, "HIGH");
   assert.equal(review.findings[0]?.goals.length, 2);
   assert.equal(review.inlineFindings.length, 1);
-  assert.equal(review.bodyFindings.length, 1);
+  assert.equal(review.omittedFindings.length, 1);
   assert.equal(review.event, "COMMENT");
-  const request = buildReviewRequest(context, review, goals);
-  assert.equal(request.comments.length, 1);
-  assert.match(request.body, /Location could not be verified/);
+  assert.throws(
+    () => buildReviewRequest(context, review, goals),
+    /without a verified added-line location/u,
+  );
+  assert.doesNotMatch(
+    buildReviewBody(review, goals),
+    /### Findings|Location could not be verified/u,
+  );
 });
 
 test("keeps a generated AI prompt paired with its verified range while merging duplicates", () => {
@@ -636,7 +645,7 @@ test("rejects oversized finding ranges before location verification", () => {
   ]);
   assert.equal(review.findings[0]?.locationVerified, false);
   assert.equal(review.inlineFindings.length, 0);
-  assert.match(review.bodyFindings[0]?.body ?? "", /Location could not be verified/);
+  assert.match(review.omittedFindings[0]?.body ?? "", /Location could not be verified/);
 });
 
 test("omits AI prompts when the inline range cannot be verified", () => {
@@ -659,15 +668,17 @@ test("omits AI prompts when the inline range cannot be verified", () => {
       },
     },
   ]);
-  const request = buildReviewRequest(context, review, [
-    {
-      prompt: "invalid suggestion location",
-      status: "completed",
-      submission: { summary: "unused", findings: [] },
-    },
-  ]);
-
   assert.equal(review.findings[0]?.agentPrompt, undefined);
-  assert.equal(request.comments.length, 0);
-  assert.doesNotMatch(request.body, /Prompt for AI Agents|```suggestion/u);
+  assert.throws(
+    () =>
+      buildReviewRequest(context, review, [
+        {
+          prompt: "invalid suggestion location",
+          status: "completed",
+          submission: { summary: "unused", findings: [] },
+        },
+      ]),
+    /without a verified added-line location/u,
+  );
+  assert.doesNotMatch(buildReviewBody(review, []), /Prompt for AI Agents|```suggestion/u);
 });

@@ -9,6 +9,7 @@ export interface ReviewLifecycleReviewRecord {
   readonly state: string;
   readonly submittedAt?: string;
   readonly isMinimized: boolean;
+  readonly minimizedReason?: string;
 }
 
 export interface ReviewLifecycleCommentRecord {
@@ -20,6 +21,7 @@ export interface ReviewLifecycleCommentRecord {
   readonly author?: GitHubCommentAuthor;
   readonly body: string;
   readonly commitId?: string;
+  readonly originalCommitId?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -28,6 +30,7 @@ export interface ReviewLifecycleThreadRecord {
   readonly nodeId: string;
   readonly isResolved: boolean;
   readonly isOutdated: boolean;
+  readonly resolvedBy?: GitHubCommentAuthor;
   readonly path: string;
   readonly line?: number;
   readonly originalLine?: number;
@@ -56,6 +59,7 @@ export const REVIEW_LIFECYCLE_REVIEWS_QUERY = `
             state
             submittedAt
             isMinimized
+            minimizedReason
           }
           pageInfo { hasNextPage endCursor }
         }
@@ -73,6 +77,7 @@ export const REVIEW_LIFECYCLE_THREADS_QUERY = `
             id
             isResolved
             isOutdated
+            resolvedBy { login __typename }
             path
             line
             originalLine
@@ -83,6 +88,7 @@ export const REVIEW_LIFECYCLE_THREADS_QUERY = `
                 author { login __typename }
                 body
                 commit { oid }
+                originalCommit { oid }
                 createdAt
                 updatedAt
                 pullRequestReview { id databaseId }
@@ -229,6 +235,7 @@ export function readGraphqlReview(value: unknown, index: number): ReviewLifecycl
   const author = readAuthor(review.author, `${path}.author`);
   const commitId = readCommit(review.commit, `${path}.commit`);
   const submittedAt = optionalString(review.submittedAt, `${path}.submittedAt`);
+  const minimizedReason = optionalString(review.minimizedReason, `${path}.minimizedReason`);
   return {
     nodeId: requiredString(review.id, `${path}.id`),
     databaseId: positiveId(review.databaseId, `${path}.databaseId`),
@@ -238,6 +245,7 @@ export function readGraphqlReview(value: unknown, index: number): ReviewLifecycl
     state: review.state,
     ...(submittedAt === undefined ? {} : { submittedAt }),
     isMinimized: review.isMinimized,
+    ...(minimizedReason === undefined ? {} : { minimizedReason }),
   };
 }
 
@@ -259,6 +267,7 @@ export function readGraphqlComment(value: unknown, index: number): ReviewLifecyc
   }
   const author = readAuthor(comment.author, `${path}.author`);
   const commitId = readCommit(comment.commit, `${path}.commit`);
+  const originalCommitId = readCommit(comment.originalCommit, `${path}.originalCommit`);
   return {
     nodeId: requiredString(comment.id, `${path}.id`),
     databaseId: positiveId(comment.databaseId, `${path}.databaseId`),
@@ -274,6 +283,7 @@ export function readGraphqlComment(value: unknown, index: number): ReviewLifecyc
     ...(author === undefined ? {} : { author }),
     body: comment.body === null ? "" : comment.body,
     ...(commitId === undefined ? {} : { commitId }),
+    ...(originalCommitId === undefined ? {} : { originalCommitId }),
     createdAt: requiredString(comment.createdAt, `${path}.createdAt`),
     updatedAt: requiredString(comment.updatedAt, `${path}.updatedAt`),
   };
@@ -288,6 +298,7 @@ export function readGraphqlThread(value: unknown, index: number): ReviewLifecycl
   if (typeof thread.isOutdated !== "boolean") {
     throw new Error(`GitHub returned an invalid ${path}.isOutdated.`);
   }
+  const resolvedBy = readAuthor(thread.resolvedBy, `${path}.resolvedBy`);
   const connection = readGraphqlConnection(thread.comments, `${path}.comments`);
   const comments = connection.nodes.map((comment, commentIndex) =>
     readGraphqlComment(comment, commentIndex),
@@ -299,6 +310,7 @@ export function readGraphqlThread(value: unknown, index: number): ReviewLifecycl
     nodeId: requiredString(thread.id, `${path}.id`),
     isResolved: thread.isResolved,
     isOutdated: thread.isOutdated,
+    ...(resolvedBy === undefined ? {} : { resolvedBy }),
     path: requiredString(thread.path, `${path}.path`),
     ...(line === undefined ? {} : { line }),
     ...(originalLine === undefined ? {} : { originalLine }),
@@ -322,6 +334,7 @@ export const REVIEW_LIFECYCLE_THREAD_COMMENTS_QUERY = `
             author { login __typename }
             body
             commit { oid }
+            originalCommit { oid }
             createdAt
             updatedAt
             pullRequestReview { id databaseId }

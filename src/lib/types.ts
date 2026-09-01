@@ -177,7 +177,7 @@ export interface AggregatedReview {
   readonly summary: string;
   readonly findings: readonly AggregatedFinding[];
   readonly inlineFindings: readonly AggregatedFinding[];
-  readonly bodyFindings: readonly AggregatedFinding[];
+  readonly omittedFindings: readonly AggregatedFinding[];
   readonly event: ReviewEvent;
   readonly partial: boolean;
   readonly allGoalsFailed: boolean;

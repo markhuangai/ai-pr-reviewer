@@ -234,6 +234,11 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
         createdAt: "2026-08-17T00:01:00Z",
         path: "src/change.ts",
         line: 9,
+        isResolved: true,
+        isOutdated: true,
+        resolvedByLogin: "pr-owner",
+        reviewIsMinimized: true,
+        reviewMinimizedReason: "RESOLVED",
         messages: Array.from({ length: 33 }, (_, index): ConversationMessage => ({
           id: 4 + index,
           authorLogin: `reviewer-${index}`,
@@ -283,6 +288,15 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
     .filter((record) => record.kind === "linked_issue")
     .sort((left, right) => Number(left.bodyPart ?? 0) - Number(right.bodyPart ?? 0));
   assert.equal(issueParts.map((record) => record.body).join(""), issueBody);
+  const discussion = pages
+    .flatMap((page) => page.records)
+    .find((record) => record.kind === "discussion_index" && record.id === 4);
+  assert.ok(discussion);
+  assert.equal(discussion.isResolved, true);
+  assert.equal(discussion.isOutdated, true);
+  assert.equal(discussion.resolvedByLogin, "pr-owner");
+  assert.equal(discussion.reviewIsMinimized, true);
+  assert.equal(discussion.reviewMinimizedReason, "RESOLVED");
   assert.equal(
     pages.flatMap((page) => page.records).some((record) => JSON.stringify(record).includes("�")),
     false,

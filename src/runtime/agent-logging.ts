@@ -268,6 +268,8 @@ export type AgentLogWriter = (line: string) => void;
 
 export interface AgentLifecycleState {
   sessionId?: string;
+  activeGoal: boolean;
+  activeGoalReason?: string;
   turnResults: number;
   latestTurnCount: number;
   apiRetries: number;
@@ -280,6 +282,7 @@ export interface AgentLifecycleState {
 
 export function createAgentLifecycleState(): AgentLifecycleState {
   return {
+    activeGoal: false,
     turnResults: 0,
     latestTurnCount: 0,
     apiRetries: 0,
@@ -365,6 +368,74 @@ export function writeAgentLifecycleLog(
   write(agentLogLine(goalIndex, "session", event, "details", value, secrets));
 }
 
+export function writeNamedSessionLifecycleLog(
+  sessionLabel: string,
+  event: string,
+  value: unknown,
+  secrets: readonly string[],
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  write(
+    `[ai-pr-reviewer][${sessionLabel}] session ${event} details: ${boundedAgentLogValue(value, secrets)}`,
+  );
+}
+
+export function writeAgentMonitorEvent(
+  goalIndex: number,
+  event: string,
+  details: Readonly<Record<string, unknown>>,
+  secrets: readonly string[],
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  logAgentEventSafely(
+    goalIndex,
+    secrets,
+    (safeWrite) => {
+      writeAgentLifecycleLog(goalIndex, event, details, secrets, safeWrite);
+    },
+    write,
+  );
+}
+
+export function writeAgentSessionEndLog(
+  goalIndex: number,
+  lifecycle: AgentLifecycleState,
+  promptGateOpen: boolean,
+  repairAttempts: number,
+  submissionAccepted: boolean,
+  stallRecoveries: number,
+  secrets: readonly string[],
+  write: AgentLogWriter = (line) => {
+    core.info(line);
+  },
+): void {
+  writeAgentMonitorEvent(
+    goalIndex,
+    "end",
+    {
+      session_id: lifecycle.sessionId,
+      prompt_gate: promptGateOpen ? "open" : "closed",
+      turn_results: lifecycle.turnResults,
+      latest_turn_count: lifecycle.latestTurnCount,
+      api_retries: lifecycle.apiRetries,
+      repair_attempts: repairAttempts,
+      goal_iterations: lifecycle.goalIterations,
+      compaction_starts: lifecycle.compactionStarts,
+      compaction_successes: lifecycle.compactionSuccesses,
+      compaction_failures: lifecycle.compactionFailures,
+      compaction_boundaries: lifecycle.compactionBoundaries,
+      submission_accepted: submissionAccepted,
+      stall_recoveries: stallRecoveries,
+    },
+    secrets,
+    write,
+  );
+}
+
 function userMessageText(message: SDKUserMessage): string | undefined {
   const content = message.message.content;
   if (typeof content === "string") return content;
@@ -426,6 +497,8 @@ export function logAgentLifecycleMessage(
 ): void {
   if (message.type === "active_goal") {
     if (message.value === null) {
+      state.activeGoal = false;
+      delete state.activeGoalReason;
       writeAgentLifecycleLog(
         goalIndex,
         "goal-cleared",
@@ -435,6 +508,9 @@ export function logAgentLifecycleMessage(
       );
       return;
     }
+    state.activeGoal = true;
+    if (message.value.last_reason === undefined) delete state.activeGoalReason;
+    else state.activeGoalReason = message.value.last_reason;
     state.goalIterations = message.value.iterations;
     writeAgentLifecycleLog(goalIndex, "goal-iteration", message.value, secrets, write);
     return;
@@ -549,6 +625,40 @@ export function logAgentLifecycleMessage(
       write,
     );
   }
+}
+
+export function sdkSessionActivity(
+  message: SDKMessage | SDKActiveGoalMessage,
+  toolUses: ReadonlyMap<string, AgentToolUse> = new Map(),
+): { readonly type: string; readonly subtype?: string; readonly tool?: string } {
+  if (message.type === "active_goal") {
+    return { type: message.type, subtype: message.value === null ? "cleared" : "iteration" };
+  }
+  if (message.type === "result") return { type: message.type, subtype: message.subtype };
+  if (message.type === "system") return { type: message.type, subtype: message.subtype };
+  if (message.type === "assistant") {
+    const content = isRecord(message.message) ? message.message.content : undefined;
+    if (!Array.isArray(content)) return { type: message.type };
+    const toolBlock = [...content]
+      .reverse()
+      .find(
+        (block) =>
+          isRecord(block) &&
+          (block.type === "tool_use" || block.type === "mcp_tool_use") &&
+          typeof block.name === "string",
+      );
+    if (!isRecord(toolBlock) || typeof toolBlock.name !== "string") return { type: message.type };
+    const tool =
+      toolBlock.type === "mcp_tool_use" && typeof toolBlock.server_name === "string"
+        ? `${toolBlock.server_name}.${toolBlock.name}`
+        : toolBlock.name;
+    return { type: message.type, tool };
+  }
+  if (message.type === "user" && typeof message.parent_tool_use_id === "string") {
+    const tool = toolUses.get(message.parent_tool_use_id)?.label;
+    return { type: message.type, ...(tool === undefined ? {} : { tool }) };
+  }
+  return { type: message.type };
 }
 
 export function logAgentMessage(

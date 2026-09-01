@@ -1,4 +1,5 @@
 import {
+  agentInternals,
   assert,
   CancellationError,
   test,
@@ -13,7 +14,69 @@ import {
   type ResolutionQuery,
 } from "../src/runtime/resolution-session.js";
 import type { ReviewLifecycleThreadRecord } from "../src/lib/github-review-lifecycle.js";
-import type { SDKResultMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKActiveGoalMessage,
+  SDKResultMessage,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+
+interface ManualSignal<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function manualSignal<T>(): ManualSignal<T> {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: (value) => resolvePromise?.(value),
+  };
+}
+
+function resolutionResult(index: number, subtype = "success"): SDKResultMessage {
+  return {
+    type: "result",
+    subtype,
+    errors: subtype === "success" ? [] : [`interrupted ${index}`],
+    num_turns: index,
+    duration_ms: 1,
+    duration_api_ms: 1,
+    is_error: subtype !== "success",
+    session_id: "controlled-resolution-session",
+    uuid: `controlled-resolution-result-${index}`,
+    modelUsage: {},
+  } as unknown as SDKResultMessage;
+}
+
+function resolutionSubmitTool(options: Options): {
+  handler(input: Record<string, unknown>): Promise<{
+    readonly content: readonly { readonly text?: string }[];
+  }>;
+} {
+  const output = options.mcpServers?.resolution_output as unknown as {
+    readonly instance: {
+      readonly _registeredTools: Record<
+        string,
+        {
+          handler(input: Record<string, unknown>): Promise<{
+            readonly content: readonly { readonly text?: string }[];
+          }>;
+        }
+      >;
+    };
+  };
+  const submit = output.instance._registeredTools.submit_resolution;
+  assert.ok(submit);
+  return submit;
+}
+
+function resolutionMessageText(message: SDKUserMessage): string {
+  const content = message.message.content;
+  return typeof content === "string" ? content : JSON.stringify(content);
+}
 
 const context: PullRequestContext = {
   repository: "owner/repository",
@@ -105,6 +168,8 @@ function fakeQuery(
         } as unknown as SDKResultMessage;
       },
       mcpServerStatus: () => Promise.resolve([]),
+      interrupt: () => Promise.resolve(undefined),
+      close: () => undefined,
     };
   }) as unknown as ResolutionQuery;
 }
@@ -175,6 +240,8 @@ function scriptedQuery(
         }
       },
       mcpServerStatus: () => Promise.resolve([]),
+      interrupt: () => Promise.resolve(undefined),
+      close: () => undefined,
     };
   }) as unknown as ResolutionQuery;
 }
@@ -228,6 +295,197 @@ test("resolution verifier preserves non-high confidence verdicts for the lifecyc
   assert.equal(result.status, "completed");
   assert.equal(result.verdict, "fixed");
   assert.equal(result.confidence, "medium");
+});
+
+test("finalizes an accepted resolution when the SDK stops yielding messages", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+  const output: string[] = [];
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+  const ready = manualSignal<undefined>();
+  const closed = manualSignal<undefined>();
+  let interrupts = 0;
+  let closes = 0;
+  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage | SDKActiveGoalMessage> {
+      const message = await input.prompt[Symbol.asyncIterator]().next();
+      assert.equal(message.done, false);
+      await markReadEvidence(input.options);
+      yield {
+        type: "active_goal",
+        value: { condition: "verify", iterations: 2, last_reason: "checking verifier" },
+      } as unknown as SDKActiveGoalMessage;
+      const accepted = await resolutionSubmitTool(input.options).handler({
+        verdict: "fixed",
+        confidence: "high",
+        rationale: "guard restored",
+      });
+      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
+      ready.resolve(undefined);
+      await closed.promise;
+    },
+    mcpServerStatus: () => Promise.resolve([]),
+    interrupt: () => {
+      interrupts += 1;
+      return Promise.resolve(undefined);
+    },
+    close: () => {
+      closes += 1;
+      closed.resolve(undefined);
+    },
+  })) as unknown as ResolutionQuery;
+
+  const running = verifyResolution(context, thread, config, "/workspace", query);
+  await ready.promise;
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  const result = await running;
+
+  assert.deepEqual(result, {
+    status: "completed",
+    verdict: "fixed",
+    confidence: "high",
+    rationale: "guard restored",
+  });
+  assert.equal(interrupts, 1);
+  assert.equal(closes, 1);
+  const logs = output.join("");
+  assert.match(logs, /session heartbeat.*"active_goal_reason":"checking verifier"/u);
+  assert.match(logs, /session heartbeat.*"verdict_accepted":true/u);
+  assert.match(logs, /session stall-detected.*"elapsed_since_sdk_message_ms":300000/u);
+  assert.match(logs, /session verdict-finalized.*"terminal_sdk_result":false/u);
+});
+
+test("lets an accepted verdict win an interrupted verifier boundary", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+  const ready = manualSignal<undefined>();
+  const boundary = manualSignal<undefined>();
+  let interrupts = 0;
+  let closes = 0;
+  let extraPrompt = false;
+  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+      const messages = input.prompt[Symbol.asyncIterator]();
+      const initial = await messages.next();
+      assert.equal(initial.done, false);
+      await markReadEvidence(input.options);
+      ready.resolve(undefined);
+      await boundary.promise;
+      const accepted = await resolutionSubmitTool(input.options).handler({
+        verdict: "fixed",
+        confidence: "high",
+        rationale: "accepted during interrupt",
+      });
+      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
+      yield resolutionResult(1, "error_during_execution");
+      const next = await messages.next();
+      extraPrompt = !next.done;
+    },
+    mcpServerStatus: () => Promise.resolve([]),
+    interrupt: () => {
+      interrupts += 1;
+      boundary.resolve(undefined);
+      return Promise.resolve(undefined);
+    },
+    close: () => {
+      closes += 1;
+    },
+  })) as unknown as ResolutionQuery;
+
+  const running = verifyResolution(context, thread, config, "/workspace", query);
+  await ready.promise;
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  const result = await running;
+
+  assert.deepEqual(result, {
+    status: "completed",
+    verdict: "fixed",
+    confidence: "high",
+    rationale: "accepted during interrupt",
+  });
+  assert.equal(extraPrompt, false);
+  assert.equal(interrupts, 1);
+  assert.equal(closes, 1);
+});
+
+test("continues resolution verification across repeated SDK stalls", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+  const output: string[] = [];
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    output.push(chunk.toString());
+    return true;
+  });
+  const ready = [manualSignal<undefined>(), manualSignal<undefined>()];
+  const boundaries = [manualSignal<undefined>(), manualSignal<undefined>()];
+  const continuations: string[] = [];
+  let interrupts = 0;
+  let closes = 0;
+  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+      const messages = input.prompt[Symbol.asyncIterator]();
+      const initial = await messages.next();
+      assert.equal(initial.done, false);
+      await markReadEvidence(input.options);
+      ready[0]?.resolve(undefined);
+      for (let index = 0; index < boundaries.length; index += 1) {
+        const boundary = boundaries[index];
+        assert.ok(boundary);
+        await boundary.promise;
+        yield resolutionResult(index + 1, "error_during_execution");
+        const continuation = await messages.next();
+        assert.equal(continuation.done, false);
+        continuations.push(resolutionMessageText(continuation.value));
+        if (index + 1 < boundaries.length) ready[index + 1]?.resolve(undefined);
+      }
+      const accepted = await resolutionSubmitTool(input.options).handler({
+        verdict: "fixed",
+        confidence: "high",
+        rationale: "recovered verifier",
+      });
+      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
+      yield resolutionResult(3);
+      assert.equal((await messages.next()).done, true);
+    },
+    mcpServerStatus: () => Promise.resolve([]),
+    interrupt: () => {
+      const call = interrupts;
+      interrupts += 1;
+      if (call === 0) return Promise.reject(new Error("resolution interrupt unavailable"));
+      const boundary = boundaries[call - 1];
+      boundary?.resolve(undefined);
+      return Promise.resolve(undefined);
+    },
+    close: () => {
+      closes += 1;
+    },
+  })) as unknown as ResolutionQuery;
+
+  const running = verifyResolution(context, thread, config, "/workspace", query);
+  await ready[0]?.promise;
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  for (let index = 0; index < 4; index += 1) await Promise.resolve();
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  await ready[1]?.promise;
+  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  const result = await running;
+
+  assert.deepEqual(result, {
+    status: "completed",
+    verdict: "fixed",
+    confidence: "high",
+    rationale: "recovered verifier",
+  });
+  assert.equal(interrupts, 3);
+  assert.equal(closes, 1);
+  assert.equal(continuations.length, 2);
+  assert.equal(
+    continuations.every((message) => message.includes("Continue the same resolution verification")),
+    true,
+  );
+  assert.match(output.join(""), /interrupt-failed.*resolution interrupt unavailable/u);
+  assert.match(output.join(""), /interrupted-turn-boundary/u);
+  assert.match(output.join(""), /session end/u);
 });
 
 test("resolution prompt bounds large untrusted thread content", () => {

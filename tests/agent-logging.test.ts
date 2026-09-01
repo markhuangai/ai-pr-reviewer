@@ -332,6 +332,8 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   for (const event of events) agentInternals.logAgentLifecycleMessage(event, 0, [], state, write);
 
   assert.equal(state.sessionId, "session-1");
+  assert.equal(state.activeGoal, false);
+  assert.equal(state.activeGoalReason, undefined);
   assert.equal(state.goalIterations, 2);
   assert.equal(state.turnResults, 1);
   assert.equal(state.latestTurnCount, 4);
@@ -356,6 +358,70 @@ test("logs goal, result, and compaction lifecycle events with counters", () => {
   assert.match(resultError ?? "", /payload truncated/u);
   assert.equal((resultError ?? "").includes("r".repeat(9_000)), false);
   assert.match(lines.join("\n"), /session goal-cleared/u);
+});
+
+test("describes the latest SDK activity for watchdog diagnostics", () => {
+  const tools = new Map([["tool-1", { kind: "agent" as const, label: "Read" }]]);
+  assert.deepEqual(
+    agentInternals.sdkSessionActivity(
+      {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", id: "tool-0", name: "Grep", input: {} },
+            {
+              type: "mcp_tool_use",
+              id: "tool-1",
+              server_name: "review_output",
+              name: "read_review_briefing",
+              input: {},
+            },
+          ],
+        },
+      } as unknown as SDKMessage,
+      tools,
+    ),
+    { type: "assistant", tool: "review_output.read_review_briefing" },
+  );
+  assert.deepEqual(
+    agentInternals.sdkSessionActivity(
+      {
+        type: "user",
+        parent_tool_use_id: "tool-1",
+        message: { role: "user", content: [] },
+      } as unknown as SDKMessage,
+      tools,
+    ),
+    { type: "user", tool: "Read" },
+  );
+  assert.deepEqual(
+    agentInternals.sdkSessionActivity({
+      type: "active_goal",
+      value: { condition: "finish", iterations: 1 },
+    } as unknown as SDKActiveGoalMessage),
+    { type: "active_goal", subtype: "iteration" },
+  );
+  assert.deepEqual(
+    agentInternals.sdkSessionActivity({
+      type: "result",
+      subtype: "success",
+    } as unknown as SDKMessage),
+    { type: "result", subtype: "success" },
+  );
+
+  const state = agentInternals.createAgentLifecycleState();
+  agentInternals.logAgentLifecycleMessage(
+    {
+      type: "active_goal",
+      value: { condition: "finish", iterations: 3, last_reason: "checking call sites" },
+    } as unknown as SDKActiveGoalMessage,
+    0,
+    [],
+    state,
+    () => undefined,
+  );
+  assert.equal(state.activeGoal, true);
+  assert.equal(state.activeGoalReason, "checking call sites");
 });
 
 test("serializes bounded agent log values without throwing on circular input", () => {

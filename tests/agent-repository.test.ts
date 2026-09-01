@@ -448,6 +448,8 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
         createdAt: "2026-08-17T00:00:00Z",
         path: "review.txt",
         line: 1,
+        isResolved: false,
+        isOutdated: false,
         messages: [
           {
             id: 55,
