@@ -167,6 +167,22 @@ test("diagnostic serialization bounds complex values and preserves causes", () =
       (bounded.details as Record<string, unknown> | undefined)?.truncated === true,
     true,
   );
+  const correlated = JSON.parse(
+    diagnosticsInternals.serialized(
+      {
+        component: "github",
+        phase: "request",
+        operation: "rest.large",
+        operation_id: "operation-1",
+        outcome: "failure",
+        details: { values: Array.from({ length: 20 }, () => "x".repeat(2_048)) },
+      },
+      [],
+    ),
+  ) as Record<string, unknown>;
+  assert.equal(correlated.operation, "rest.large");
+  assert.equal(correlated.operation_id, "operation-1");
+  assert.equal(correlated.outcome, "failure");
   assert.equal(
     diagnosticsInternals.stripUrlQuery("https://example.test/path?token=hidden"),
     "https://example.test/path",
@@ -222,7 +238,12 @@ test("diagnostic metadata failures cannot change the action result", async () =>
     }),
   );
   assert.equal(executed, true);
-  assert.equal(lines.length, 0);
+  assert.equal(lines.length, 2);
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  assert.equal(records[0]?.operation_id, records[1]?.operation_id);
+  assert.equal(records[0]?.run_id, "[UNSERIALIZABLE]");
 });
 
 test("diagnostic id failures cannot change the operation result", async () => {

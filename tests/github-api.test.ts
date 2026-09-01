@@ -539,7 +539,12 @@ test("logs network failures and strips signed URL query parameters", async (t) =
   assert.ok(terminal);
   assert.equal(terminal.outcome, "failure");
   assert.equal(JSON.stringify(records).includes("signature="), false);
-  assert.equal(JSON.stringify(records).includes("https://api.example.test/user"), true);
+  const errorDetails = (terminal.details as Record<string, unknown>).error as Record<
+    string,
+    unknown
+  >;
+  assert.equal(typeof errorDetails.message, "string");
+  assert.equal((errorDetails.message as string).endsWith("/user"), true);
 });
 
 test("records header-construction failures without leaking newline-containing tokens", async () => {

@@ -576,8 +576,9 @@ export async function bootstrapRuntime(options = {}) {
         }
         catch (error) {
             cleanupSpan.failure(error);
+            if (!failed)
+                primaryError = error;
             failed = true;
-            primaryError = error;
         }
     }
     if (failed) {

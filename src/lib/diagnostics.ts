@@ -74,6 +74,25 @@ function isObjectLike(value: unknown): value is object {
   return (typeof value === "object" && value !== null) || typeof value === "function";
 }
 
+function snapshotContext(
+  context: Readonly<Record<string, unknown>> | undefined,
+): Readonly<Record<string, unknown>> {
+  const snapshot: Record<string, unknown> = {};
+  if (context === undefined) return snapshot;
+  try {
+    for (const key of Object.keys(context)) {
+      try {
+        snapshot[key] = context[key];
+      } catch {
+        snapshot[key] = "[UNSERIALIZABLE]";
+      }
+    }
+  } catch {
+    return snapshot;
+  }
+  return snapshot;
+}
+
 export function registerSafeDiagnosticError(
   error: unknown,
   message: string,
@@ -307,7 +326,20 @@ function isCancellation(error: unknown): boolean {
   }
 }
 
-function serialized(value: unknown, secrets: readonly string[]): string {
+function correlationFields(value: unknown): Readonly<Record<string, string>> {
+  if (!isRecord(value)) return {};
+  const fields: Record<string, string> = {};
+  for (const key of ["component", "phase", "operation", "operation_id", "outcome"]) {
+    if (typeof value[key] === "string") fields[key] = truncate(value[key], 256);
+  }
+  return fields;
+}
+
+function serialized(
+  value: unknown,
+  secrets: readonly string[],
+  identity?: Readonly<Record<string, unknown>>,
+): string {
   const state: ProjectionState = { nodes: 0, truncated: false, stack: new Set() };
   let projected: unknown;
   try {
@@ -363,9 +395,11 @@ function serialized(value: unknown, secrets: readonly string[]): string {
     });
     if (fallback.length <= MAX_DIAGNOSTIC_LINE_LENGTH) return fallback;
   }
+  const correlation = { ...correlationFields(identity), ...correlationFields(projected) };
   return JSON.stringify({
     schema_version: 1,
     event: "diagnostic.truncated",
+    ...correlation,
     truncated: true,
     original_length: result.length,
   });
@@ -382,7 +416,7 @@ export class DiagnosticLogger {
 
   constructor(options: DiagnosticLoggerOptions) {
     this.component = options.component;
-    this.context = options.context ?? {};
+    this.context = snapshotContext(options.context);
     this.write =
       options.write ??
       ((line) => {
@@ -410,12 +444,13 @@ export class DiagnosticLogger {
     elapsedMs?: number,
   ): void {
     try {
+      const component = descriptor.component ?? this.component;
       const payload: Record<string, unknown> = {
         ...this.context,
         schema_version: 1,
         timestamp: this.timestamp(),
         event,
-        component: descriptor.component ?? this.component,
+        component,
         phase: descriptor.phase,
         operation: descriptor.operation,
         purpose: descriptor.purpose,
@@ -424,7 +459,13 @@ export class DiagnosticLogger {
         ...(elapsedMs === undefined ? {} : { elapsed_ms: Math.max(0, Math.round(elapsedMs)) }),
         ...(details === undefined ? {} : { details }),
       };
-      const line = `[ai-pr-reviewer][${descriptor.component ?? this.component}] ${serialized(payload, [...this.secrets])}`;
+      const line = `[ai-pr-reviewer][${component}] ${serialized(payload, [...this.secrets], {
+        component,
+        phase: descriptor.phase,
+        operation: descriptor.operation,
+        operation_id: operationId,
+        outcome,
+      })}`;
       this.write(line);
     } catch {
       // Diagnostics must not change the action result.

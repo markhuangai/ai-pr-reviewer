@@ -35,6 +35,25 @@ function isRecord(value) {
 function isObjectLike(value) {
     return (typeof value === "object" && value !== null) || typeof value === "function";
 }
+function snapshotContext(context) {
+    const snapshot = {};
+    if (context === undefined)
+        return snapshot;
+    try {
+        for (const key of Object.keys(context)) {
+            try {
+                snapshot[key] = context[key];
+            }
+            catch {
+                snapshot[key] = "[UNSERIALIZABLE]";
+            }
+        }
+    }
+    catch {
+        return snapshot;
+    }
+    return snapshot;
+}
 export function registerSafeDiagnosticError(error, message, primitiveMessages) {
     if (isObjectLike(error))
         safeDiagnosticMessages.set(error, message);
@@ -224,7 +243,17 @@ function isCancellation(error) {
         return false;
     }
 }
-function serialized(value, secrets) {
+function correlationFields(value) {
+    if (!isRecord(value))
+        return {};
+    const fields = {};
+    for (const key of ["component", "phase", "operation", "operation_id", "outcome"]) {
+        if (typeof value[key] === "string")
+            fields[key] = truncate(value[key], 256);
+    }
+    return fields;
+}
+function serialized(value, secrets, identity) {
     const state = { nodes: 0, truncated: false, stack: new Set() };
     let projected;
     try {
@@ -289,9 +318,11 @@ function serialized(value, secrets) {
         if (fallback.length <= MAX_DIAGNOSTIC_LINE_LENGTH)
             return fallback;
     }
+    const correlation = { ...correlationFields(identity), ...correlationFields(projected) };
     return JSON.stringify({
         schema_version: 1,
         event: "diagnostic.truncated",
+        ...correlation,
         truncated: true,
         original_length: result.length,
     });
@@ -306,7 +337,7 @@ export class DiagnosticLogger {
     primitiveDiagnosticMessages = new Map();
     constructor(options) {
         this.component = options.component;
-        this.context = options.context ?? {};
+        this.context = snapshotContext(options.context);
         this.write =
             options.write ??
                 ((line) => {
@@ -326,12 +357,13 @@ export class DiagnosticLogger {
     }
     event(event, descriptor, outcome, operationId, details, elapsedMs) {
         try {
+            const component = descriptor.component ?? this.component;
             const payload = {
                 ...this.context,
                 schema_version: 1,
                 timestamp: this.timestamp(),
                 event,
-                component: descriptor.component ?? this.component,
+                component,
                 phase: descriptor.phase,
                 operation: descriptor.operation,
                 purpose: descriptor.purpose,
@@ -340,7 +372,13 @@ export class DiagnosticLogger {
                 ...(elapsedMs === undefined ? {} : { elapsed_ms: Math.max(0, Math.round(elapsedMs)) }),
                 ...(details === undefined ? {} : { details }),
             };
-            const line = `[ai-pr-reviewer][${descriptor.component ?? this.component}] ${serialized(payload, [...this.secrets])}`;
+            const line = `[ai-pr-reviewer][${component}] ${serialized(payload, [...this.secrets], {
+                component,
+                phase: descriptor.phase,
+                operation: descriptor.operation,
+                operation_id: operationId,
+                outcome,
+            })}`;
             this.write(line);
         }
         catch {
