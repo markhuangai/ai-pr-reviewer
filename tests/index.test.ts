@@ -463,6 +463,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
+  const localApiUrl = `http://127.0.0.1:${address.port}`;
   const previousServerUrl = process.env.GITHUB_SERVER_URL;
   process.env.GITHUB_SERVER_URL = "https://github.com";
   t.after(() => {
@@ -502,7 +503,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   let renderedSummary = "";
 
   const result = await runAction({ get: (name) => values[name] ?? "" }, [], {
-    createApi: (token) => new GitHubApi(token, `http://127.0.0.1:${address.port}`),
+    createApi: (token) => new GitHubApi(token, localApiUrl, undefined, `${localApiUrl}/graphql`),
     readEventContext: () => Promise.resolve(undefined),
     createWorkspace: (context, token) => {
       assert.equal(context.repository, "target/project");
