@@ -436,6 +436,14 @@ function findingSummary(findings: readonly AggregatedFinding[]): string {
   return `Found **${count} actionable issue${count === 1 ? "" : "s"}** — ${severitySummary(findings)}.`;
 }
 
+function findingIndexLine(finding: AggregatedFinding, index: number): string {
+  const location =
+    !finding.locationVerified || finding.path === undefined
+      ? ""
+      : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
+  return `${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}`;
+}
+
 function formatFinding(finding: AggregatedFinding, index: number): string {
   const location =
     finding.locationVerified && finding.path && finding.line
@@ -459,24 +467,30 @@ export function aggregateReview(
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],
   );
   const findings = [...mergeFindings(normalized)].sort(findingSort);
-  const inlineFindings = findings
-    .filter((finding) => finding.locationVerified)
-    .slice(0, MAX_INLINE_COMMENTS);
+  const inlineFindings = config.interactWithPullRequest
+    ? findings.filter((finding) => finding.locationVerified).slice(0, MAX_INLINE_COMMENTS)
+    : [];
   const inlineKeys = new Set(inlineFindings);
-  const bodyFindings = findings.filter((finding) => !inlineKeys.has(finding));
+  const omittedFindings = config.interactWithPullRequest
+    ? findings.filter((finding) => !inlineKeys.has(finding))
+    : [];
   const partial = goals.some((goal) => goal.status === "failed");
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
     (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,
   );
   const event = config.autoApprove && !partial && !hasBlockingFinding ? "APPROVE" : "COMMENT";
-  const summary = findings.length === 0 ? "No actionable issues found." : findingSummary(findings);
+  const publishedFindings = config.interactWithPullRequest ? inlineFindings : findings;
+  const summary =
+    publishedFindings.length === 0
+      ? "No actionable issues found."
+      : findingSummary(publishedFindings);
   return {
     marker,
     summary,
     findings,
     inlineFindings,
-    bodyFindings,
+    omittedFindings,
     event,
     partial,
     allGoalsFailed,
@@ -484,23 +498,9 @@ export function aggregateReview(
   };
 }
 
-function findingIndexMarkdown(findings: readonly AggregatedFinding[]): string {
-  return findings
-    .map((finding, index) => {
-      const location =
-        finding.path === undefined
-          ? ""
-          : ` — ${finding.path}${finding.line === undefined ? "" : `:${finding.line}`}`;
-      return `${index + 1}. ${severityHeading(finding.severity)}: ${finding.title}${location}`;
-    })
-    .join("\n");
-}
-
 function findingDestination(review: AggregatedReview): string {
-  if (review.inlineFindings.length > 0 && review.bodyFindings.length > 0)
-    return "See the inline comments and findings below for details.";
   if (review.inlineFindings.length > 0) return "See the inline comments for details.";
-  return "See the findings below for details.";
+  return "No inline findings were published.";
 }
 
 const TOKEN_FORMATTER = new Intl.NumberFormat("en-US");
@@ -692,18 +692,6 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
     sections.push("", review.summary, "", findingDestination(review));
   }
   sections.push("", tokenUsage);
-  if (review.bodyFindings.length > 0) {
-    sections.push(
-      "",
-      "### Findings",
-      "",
-      "#### Index",
-      findingIndexMarkdown(review.bodyFindings),
-      "",
-      "#### Details",
-      review.bodyFindings.map(formatFinding).join("\n\n"),
-    );
-  }
   const body = sections.join("\n");
   if (body.length <= MAX_REVIEW_BODY_LENGTH) return body;
   return `${body.slice(0, MAX_REVIEW_BODY_LENGTH - 120)}\n\n> Review body truncated at 60 KB; see inline comments for the highest-severity findings.`;
@@ -720,6 +708,20 @@ function runSummaryOmissionNotice(omitted: number): string {
   return omitted === 0
     ? ""
     : `\n\n> ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the run summary reached its size limit.`;
+}
+
+function runSummaryInlineOmissionNotice(review: AggregatedReview): string {
+  const unverified = review.omittedFindings.filter((finding) => !finding.locationVerified).length;
+  const overflow = review.omittedFindings.length - unverified;
+  const reasons = [
+    overflow === 0
+      ? ""
+      : `${overflow} additional finding${overflow === 1 ? " was" : "s were"} omitted from the pull request review after the 25 inline-comment limit;`,
+    unverified === 0
+      ? ""
+      : `${unverified} additional finding${unverified === 1 ? " was" : "s were"} omitted from the pull request review because ${unverified === 1 ? "its location could not be verified against an added line" : "their locations could not be verified against added lines"};`,
+  ].filter((reason) => reason.length > 0);
+  return `> ${reasons.join(" ")} all findings are retained in this run summary.`;
 }
 
 export function buildRunSummary(
@@ -741,41 +743,71 @@ export function buildRunSummary(
       ? "No review goal completed; see the step logs for redacted diagnostics."
       : review.partial && review.findings.length === 0
         ? "No actionable issues were reported by the completed checks."
-        : review.summary,
+        : review.findings.length === 0
+          ? "No actionable issues found."
+          : findingSummary(review.findings),
     "",
     tokenUsage,
   ];
   if (review.findings.length === 0) return lines.join("\n");
 
-  lines.push("", "### Findings", "");
-  const fixed = `${lines.join("\n")}\n`;
-  const fixedBytes = Buffer.byteLength(fixed, "utf8");
-  const reservedNoticeBytes = Buffer.byteLength(
-    runSummaryOmissionNotice(review.findings.length),
+  if (review.omittedFindings.length > 0) {
+    lines.push("", runSummaryInlineOmissionNotice(review));
+  }
+  lines.push("", "### Findings", "", "#### Index");
+  const indexPrefix = `${lines.join("\n")}\n`;
+  const detailsPrefix = "\n\n#### Details\n";
+  const indexLines = review.findings.map(findingIndexLine);
+  const findingBlocks: string[] = [];
+  const fullIndex = indexLines.join("\n");
+  const fullIndexFixed = `${indexPrefix}${fullIndex}${detailsPrefix}`;
+  const fullIndexCanFit =
+    Buffer.byteLength(fullIndexFixed, "utf8") +
+      Buffer.byteLength(runSummaryOmissionNotice(review.findings.length), "utf8") <=
+    MAX_RUN_SUMMARY_BYTES;
+  let included = 0;
+  let indexCount = fullIndexCanFit ? review.findings.length : 0;
+  let indexBytes = fullIndexCanFit ? Buffer.byteLength(fullIndex, "utf8") : 0;
+  let detailBytes = 0;
+  const fixedBytes = Buffer.byteLength(
+    `${indexPrefix}${fullIndexCanFit ? fullIndex : ""}${detailsPrefix}`,
     "utf8",
   );
-  const findings: string[] = [];
-  let findingBytes = 0;
   for (let index = 0; index < review.findings.length; index += 1) {
     const finding = review.findings[index];
     if (finding === undefined) break;
-    const block = formatFinding(finding, index);
-    const separatorBytes = findings.length === 0 ? 0 : 2;
-    const blockBytes = Buffer.byteLength(block, "utf8");
-    const omittedAfterBlock = review.findings.length - findings.length - 1;
-    const noticeBytes = omittedAfterBlock === 0 ? 0 : reservedNoticeBytes;
-    if (
-      fixedBytes + findingBytes + separatorBytes + blockBytes + noticeBytes >
-      MAX_RUN_SUMMARY_BYTES
-    ) {
-      break;
+    const findingBlock = formatFinding(finding, index);
+    const detailSeparatorBytes = included === 0 ? 0 : 2;
+    const nextDetailBytes =
+      detailBytes + detailSeparatorBytes + Buffer.byteLength(findingBlock, "utf8");
+    const nextIncluded = included + 1;
+    const noticeBytes = Buffer.byteLength(
+      runSummaryOmissionNotice(review.findings.length - nextIncluded),
+      "utf8",
+    );
+    if (fullIndexCanFit) {
+      if (fixedBytes + nextDetailBytes + noticeBytes > MAX_RUN_SUMMARY_BYTES) break;
+      included = nextIncluded;
+      findingBlocks.push(findingBlock);
+      detailBytes = nextDetailBytes;
+      continue;
     }
-    findings.push(block);
-    findingBytes += separatorBytes + blockBytes;
+    const indexLine = indexLines[index];
+    if (indexLine === undefined) break;
+    const indexSeparatorBytes = included === 0 ? 0 : 1;
+    const nextIndexBytes = indexBytes + indexSeparatorBytes + Buffer.byteLength(indexLine, "utf8");
+    if (fixedBytes + nextIndexBytes + nextDetailBytes + noticeBytes > MAX_RUN_SUMMARY_BYTES) break;
+    included = nextIncluded;
+    indexCount = nextIncluded;
+    indexBytes = nextIndexBytes;
+    findingBlocks.push(findingBlock);
+    detailBytes = nextDetailBytes;
   }
-  const omitted = review.findings.length - findings.length;
+  const omitted = review.findings.length - included;
   const notice = runSummaryOmissionNotice(omitted);
-  return `${fixed}${findings.join("\n\n")}${notice}`;
+  return `${indexPrefix}${indexLines.slice(0, indexCount).join("\n")}${detailsPrefix}${findingBlocks.join(
+    "\n\n",
+  )}${notice}`;
 }
 
 function inlineCommentBody(finding: AggregatedFinding): string {
@@ -806,6 +838,12 @@ export function buildReviewRequest(
   review: AggregatedReview,
   goals: readonly GoalResult[],
 ): PullRequestReviewRequest {
+  const invalidFindings = review.findings.filter((finding) => !finding.locationVerified);
+  if (invalidFindings.length > 0) {
+    throw new Error(
+      `Interactive review contains ${invalidFindings.length} finding${invalidFindings.length === 1 ? "" : "s"} without a verified added-line location.`,
+    );
+  }
   return {
     commit_id: context.headSha,
     body: buildReviewBody(review, goals),

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 
+import type { GitHubCommentAuthor, PullRequestIssueCommentRecord } from "./github-api.js";
 import type {
-  ExistingReview,
-  GitHubCommentAuthor,
-  PullRequestIssueCommentRecord,
-  PullRequestReviewCommentRecord,
-} from "./github-api.js";
+  ReviewLifecycleCommentRecord,
+  ReviewLifecycleReviewRecord,
+  ReviewLifecycleSnapshot,
+  ReviewLifecycleThreadRecord,
+} from "./github-review-lifecycle.js";
 
 export type ConversationAuthorRole = "human" | "bot" | "workflow" | "unknown";
 
@@ -28,11 +29,17 @@ export interface ConversationMessage {
 export interface InlineConversationThread {
   readonly kind: "inline_thread";
   readonly id: number;
+  readonly reviewId?: number;
   readonly rootAvailable: boolean;
   readonly createdAt: string;
   readonly path: string;
   readonly line?: number;
   readonly originalLine?: number;
+  readonly isResolved: boolean;
+  readonly isOutdated: boolean;
+  readonly resolvedByLogin?: string;
+  readonly reviewIsMinimized?: boolean;
+  readonly reviewMinimizedReason?: string;
   readonly messages: readonly ConversationMessage[];
 }
 
@@ -49,6 +56,8 @@ export interface PullRequestReviewBody {
   readonly createdAt: string;
   readonly state: string;
   readonly commitId: string | null;
+  readonly isMinimized: boolean;
+  readonly minimizedReason?: string;
   readonly message: ConversationMessage;
 }
 
@@ -90,13 +99,16 @@ function messageAuthor(author: GitHubCommentAuthor | undefined): { readonly auth
   return author === undefined ? {} : { authorLogin: author.login };
 }
 
-function reviewMessage(review: ExistingReview, authenticatedLogin: string): ConversationMessage {
+function reviewMessage(
+  review: ReviewLifecycleReviewRecord,
+  authenticatedLogin: string,
+): ConversationMessage {
   const actionAuthored =
     review.author !== undefined &&
     sameLogin(review.author.login, authenticatedLogin) &&
     ACTION_MARKER.test(review.body);
   return {
-    id: review.id,
+    id: review.databaseId,
     ...messageAuthor(review.author),
     authorRole: authorRole(review.author, authenticatedLogin, false, actionAuthored),
     body: review.body,
@@ -107,31 +119,34 @@ function reviewMessage(review: ExistingReview, authenticatedLogin: string): Conv
 }
 
 function reviewCommentMessage(
-  comment: PullRequestReviewCommentRecord,
+  comment: ReviewLifecycleCommentRecord,
+  thread: ReviewLifecycleThreadRecord,
   authenticatedLogin: string,
   actionReviewIds: ReadonlySet<number>,
 ): ConversationMessage {
   return {
-    id: comment.id,
+    id: comment.databaseId,
     ...(comment.reviewId === undefined ? {} : { reviewId: comment.reviewId }),
-    ...(comment.inReplyToId === undefined ? {} : { inReplyToId: comment.inReplyToId }),
+    ...(comment.replyToId === undefined ? {} : { inReplyToId: comment.replyToId }),
     ...messageAuthor(comment.author),
     authorRole: authorRole(
       comment.author,
       authenticatedLogin,
       false,
-      comment.inReplyToId === undefined &&
+      comment.replyToId === undefined &&
         comment.reviewId !== undefined &&
         actionReviewIds.has(comment.reviewId),
     ),
     body: comment.body,
     createdAt: comment.createdAt,
     updatedAt: comment.updatedAt,
-    commitId: comment.commitId,
-    originalCommitId: comment.originalCommitId,
-    path: comment.path,
-    ...(comment.line === undefined ? {} : { line: comment.line }),
-    ...(comment.originalLine === undefined ? {} : { originalLine: comment.originalLine }),
+    ...(comment.commitId === undefined ? {} : { commitId: comment.commitId }),
+    ...(comment.originalCommitId === undefined
+      ? {}
+      : { originalCommitId: comment.originalCommitId }),
+    path: thread.path,
+    ...(thread.line === undefined ? {} : { line: thread.line }),
+    ...(thread.originalLine === undefined ? {} : { originalLine: thread.originalLine }),
   };
 }
 
@@ -165,65 +180,109 @@ function entrySort(left: ReviewConversationEntry, right: ReviewConversationEntry
   );
 }
 
-function conversationDigest(entries: readonly ReviewConversationEntry[]): string {
-  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+function conversationIdentityEntry(
+  entry: ReviewConversationEntry,
+  authenticatedLogin: string,
+): unknown {
+  if (entry.kind !== "inline_thread") {
+    return {
+      kind: entry.kind,
+      id: entry.id,
+      message: entry.message,
+    };
+  }
+  const externalMessages = entry.messages.filter((message) => message.authorRole !== "workflow");
+  const externallyResolved =
+    entry.resolvedByLogin !== undefined && !sameLogin(entry.resolvedByLogin, authenticatedLogin);
+  if (externalMessages.length === 0 && !externallyResolved) return undefined;
+  return {
+    kind: entry.kind,
+    id: entry.id,
+    reviewId: entry.reviewId,
+    rootAvailable: entry.rootAvailable,
+    createdAt: entry.createdAt,
+    path: entry.path,
+    line: entry.line,
+    originalLine: entry.originalLine,
+    messages: externalMessages,
+    ...(externallyResolved
+      ? {
+          isResolved: entry.isResolved,
+          resolvedByLogin: entry.resolvedByLogin,
+        }
+      : {}),
+  };
+}
+
+function conversationDigest(
+  entries: readonly ReviewConversationEntry[],
+  authenticatedLogin = "",
+): string {
+  const identity = entries.flatMap((entry) => {
+    const projected = conversationIdentityEntry(entry, authenticatedLogin);
+    return projected === undefined ? [] : [projected];
+  });
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
 export function buildReviewConversation(
   authenticatedLogin: string,
-  reviews: readonly ExistingReview[],
-  reviewComments: readonly PullRequestReviewCommentRecord[],
+  lifecycle: ReviewLifecycleSnapshot,
   issueComments: readonly PullRequestIssueCommentRecord[],
 ): ReviewConversationSnapshot {
   const actionReviewIds = new Set(
-    reviews
+    lifecycle.reviews
       .filter(
         (review) =>
           review.author !== undefined &&
           sameLogin(review.author.login, authenticatedLogin) &&
           ACTION_MARKER.test(review.body),
       )
-      .map((review) => review.id),
+      .map((review) => review.databaseId),
   );
-  const threads = new Map<number, ConversationMessage[]>();
-  for (const comment of reviewComments) {
-    const rootId = comment.inReplyToId ?? comment.id;
-    const messages = threads.get(rootId) ?? [];
-    messages.push(reviewCommentMessage(comment, authenticatedLogin, actionReviewIds));
-    threads.set(rootId, messages);
-  }
+  const reviewsById = new Map(lifecycle.reviews.map((review) => [review.databaseId, review]));
 
   const entries: ReviewConversationEntry[] = [];
-  for (const [rootId, unsorted] of threads) {
-    const messages = [...unsorted].sort(messageSort);
-    if (
-      !messages.some((message) => message.authorRole !== "workflow" && message.body.trim() !== "")
-    )
-      continue;
-    const root = messages.find((message) => message.id === rootId);
+  for (const thread of lifecycle.threads) {
+    const messages = thread.comments
+      .map((comment) => reviewCommentMessage(comment, thread, authenticatedLogin, actionReviewIds))
+      .sort(messageSort);
+    const root = messages.find((message) => message.inReplyToId === undefined);
     const location = root ?? messages[0];
-    if (location === undefined || location.path === undefined) continue;
+    if (location === undefined) continue;
+    const rootId = root?.id ?? location.inReplyToId ?? location.id;
+    const review = thread.reviewId === undefined ? undefined : reviewsById.get(thread.reviewId);
     entries.push({
       kind: "inline_thread",
       id: rootId,
+      ...(thread.reviewId === undefined ? {} : { reviewId: thread.reviewId }),
       rootAvailable: root !== undefined,
       createdAt: root?.createdAt ?? location.createdAt,
-      path: location.path,
-      ...(location.line === undefined ? {} : { line: location.line }),
-      ...(location.originalLine === undefined ? {} : { originalLine: location.originalLine }),
+      path: thread.path,
+      ...(thread.line === undefined ? {} : { line: thread.line }),
+      ...(thread.originalLine === undefined ? {} : { originalLine: thread.originalLine }),
+      isResolved: thread.isResolved,
+      isOutdated: thread.isOutdated,
+      ...(thread.resolvedBy === undefined ? {} : { resolvedByLogin: thread.resolvedBy.login }),
+      ...(review === undefined ? {} : { reviewIsMinimized: review.isMinimized }),
+      ...(review?.minimizedReason === undefined
+        ? {}
+        : { reviewMinimizedReason: review.minimizedReason }),
       messages,
     });
   }
 
-  for (const review of reviews) {
+  for (const review of lifecycle.reviews) {
     const message = reviewMessage(review, authenticatedLogin);
     if (message.authorRole === "workflow" || message.body.trim().length === 0) continue;
     entries.push({
       kind: "review_body",
-      id: review.id,
+      id: review.databaseId,
       createdAt: message.createdAt,
       state: review.state,
       commitId: review.commitId,
+      isMinimized: review.isMinimized,
+      ...(review.minimizedReason === undefined ? {} : { minimizedReason: review.minimizedReason }),
       message,
     });
   }
@@ -240,7 +299,7 @@ export function buildReviewConversation(
   }
 
   entries.sort(entrySort);
-  return { digest: conversationDigest(entries), entries };
+  return { digest: conversationDigest(entries, authenticatedLogin), entries };
 }
 
 function mapMessage(

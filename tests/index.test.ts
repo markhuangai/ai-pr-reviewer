@@ -350,6 +350,38 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     });
     response.statusCode = 200;
     response.setHeader("Content-Type", "application/json");
+    if (request.method === "POST" && request.url === "/graphql") {
+      let body = "";
+      request.on("data", (chunk: Buffer) => {
+        body += chunk.toString("utf8");
+      });
+      request.on("end", () => {
+        const payload = JSON.parse(body) as { readonly query?: string };
+        const connection = {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        };
+        if (payload.query?.includes("AiPrReviewerReviews") === true) {
+          response.end(
+            JSON.stringify({
+              data: { repository: { pullRequest: { reviews: connection } } },
+            }),
+          );
+          return;
+        }
+        if (payload.query?.includes("AiPrReviewerThreads") === true) {
+          response.end(
+            JSON.stringify({
+              data: { repository: { pullRequest: { reviewThreads: connection } } },
+            }),
+          );
+          return;
+        }
+        response.statusCode = 400;
+        response.end(JSON.stringify({ message: "unknown GraphQL query" }));
+      });
+      return;
+    }
     if (request.url === "/user") {
       response.end(JSON.stringify({ login: "review-action" }));
       return;
@@ -431,6 +463,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
+  const localApiUrl = `http://127.0.0.1:${address.port}`;
   const previousServerUrl = process.env.GITHUB_SERVER_URL;
   process.env.GITHUB_SERVER_URL = "https://github.com";
   t.after(() => {
@@ -470,7 +503,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   let renderedSummary = "";
 
   const result = await runAction({ get: (name) => values[name] ?? "" }, [], {
-    createApi: (token) => new GitHubApi(token, `http://127.0.0.1:${address.port}`),
+    createApi: (token) => new GitHubApi(token, localApiUrl, undefined, `${localApiUrl}/graphql`),
     readEventContext: () => Promise.resolve(undefined),
     createWorkspace: (context, token) => {
       assert.equal(context.repository, "target/project");
@@ -538,10 +571,8 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   assert.equal(cleanupCount, 1);
   assert.match(renderedSummary, /Unchecked result/u);
   assert.equal(requests.length, 6);
-  assert.equal(
-    requests.every((request) => request.method === "GET"),
-    true,
-  );
+  assert.equal(requests.filter((request) => request.method === "GET").length, 4);
+  assert.equal(requests.filter((request) => request.method === "POST").length, 2);
   assert.equal(
     requests.every((request) => request.authorization === "Bearer test-token"),
     true,
@@ -550,13 +581,14 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
     requests.some((request) => request.path === "/user"),
     true,
   );
+  assert.equal(requests.filter((request) => request.path === "/graphql").length, 2);
   assert.equal(
-    requests.filter((request) => request.path?.includes("/reviews?") === true).length,
-    1,
+    requests.some((request) => request.path?.includes("/reviews?") === true),
+    false,
   );
   assert.equal(
-    requests.filter((request) => request.path?.includes("/pulls/9/comments?") === true).length,
-    1,
+    requests.some((request) => request.path?.includes("/pulls/9/comments?") === true),
+    false,
   );
   assert.equal(
     requests.filter((request) => request.path?.includes("/issues/9/comments?") === true).length,
@@ -578,16 +610,21 @@ test("skips an identical current-head review by the authenticated user", async (
     ...emptyConversationApi("Review-Owner"),
     getPullRequestRefs: () =>
       Promise.resolve({ headSha: context.headSha, baseSha: context.baseSha }),
-    listReviews: () =>
-      Promise.resolve([
-        {
-          id: 1,
-          author: { login: "review-owner", type: "User" },
-          body: marker,
-          commitId: context.headSha,
-          state: "COMMENTED",
-        },
-      ]),
+    getReviewLifecycleSnapshot: () =>
+      Promise.resolve({
+        reviews: [
+          {
+            nodeId: "review-node-1",
+            databaseId: 1,
+            author: { login: "review-owner", type: "User" },
+            body: marker,
+            commitId: context.headSha,
+            state: "COMMENTED",
+            isMinimized: false,
+          },
+        ],
+        threads: [],
+      }),
   } as unknown as GitHubApi;
   const diagnosticLines: string[] = [];
   const diagnostics = new DiagnosticLogger({
@@ -1015,18 +1052,34 @@ test("reconciles interactive lifecycle state before and after the current review
 test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
-  let lifecycleCalls = 0;
+  let lifecycleReads = 0;
+  let lifecycleMutations = 0;
   const api = {
     ...emptyConversationApi("review-action"),
     getReviewLifecycleSnapshot: () => {
-      lifecycleCalls += 1;
-      return Promise.reject(new Error("lifecycle must not run"));
+      lifecycleReads += 1;
+      return Promise.resolve({ reviews: [], threads: [] });
     },
-    updateSubmittedReview: () => Promise.resolve(),
-    dismissSubmittedReview: () => Promise.resolve(),
-    updateReviewComment: () => Promise.resolve(),
-    resolveReviewThread: () => Promise.resolve(),
-    minimizeComment: () => Promise.resolve(),
+    updateSubmittedReview: () => {
+      lifecycleMutations += 1;
+      return Promise.resolve();
+    },
+    dismissSubmittedReview: () => {
+      lifecycleMutations += 1;
+      return Promise.resolve();
+    },
+    updateReviewComment: () => {
+      lifecycleMutations += 1;
+      return Promise.resolve();
+    },
+    resolveReviewThread: () => {
+      lifecycleMutations += 1;
+      return Promise.resolve();
+    },
+    minimizeComment: () => {
+      lifecycleMutations += 1;
+      return Promise.resolve();
+    },
   } as unknown as GitHubApi;
   const result = await runAction(actionReader({ "interact-with-pr": "false" }), [], {
     createApi: () => api,
@@ -1043,5 +1096,70 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
-  assert.equal(lifecycleCalls, 0);
+  assert.equal(lifecycleReads, 1);
+  assert.equal(lifecycleMutations, 0);
+});
+
+test("publishes 25 inline findings and writes overflow to the run summary", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const files = Array.from({ length: 26 }, (_, index) => ({
+    path: `src/change-${String(index).padStart(2, "0")}.ts`,
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    patch: "@@ -0,0 +1 @@\n+change",
+    addedLines: new Set([1]),
+  }));
+  let request: PullRequestReviewRequest | undefined;
+  let summary = "";
+  let summaryWrites = 0;
+  const publicationOrder: string[] = [];
+  const api = {
+    ...emptyConversationApi("review-action"),
+    createReview: (_context: PullRequestContext, reviewRequest: PullRequestReviewRequest) => {
+      publicationOrder.push("review");
+      request = reviewRequest;
+      return Promise.resolve();
+    },
+  } as unknown as GitHubApi;
+
+  const result = await runAction(actionReader(), [], {
+    createApi: () => api,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => Promise.resolve(files),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed",
+          submission: {
+            summary: "overflow",
+            findings: files.map((file, index) => ({
+              title: `Finding ${String(index).padStart(2, "0")}`,
+              severity: "MODERATE" as const,
+              body: `Evidence ${index}`,
+              path: file.path,
+              line: 1,
+            })),
+          },
+        },
+      ]),
+    writeSummary: (summaryContext, review, goals) => {
+      publicationOrder.push("summary");
+      summaryWrites += 1;
+      summary = buildRunSummary(summaryContext, review, goals);
+      return Promise.resolve();
+    },
+  });
+
+  assert.equal(result.review?.inlineFindings.length, 25);
+  assert.equal(result.review?.omittedFindings.length, 1);
+  assert.equal(request?.comments.length, 25);
+  assert.doesNotMatch(request?.body ?? "", /Finding 25|### Findings/u);
+  assert.equal(summaryWrites, 1);
+  assert.deepEqual(publicationOrder, ["summary", "review"]);
+  assert.match(summary, /Finding 25/u);
 });

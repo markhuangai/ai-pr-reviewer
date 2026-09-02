@@ -14,6 +14,72 @@ import {
   type SDKMessage,
 } from "./agent-test-helpers.js";
 
+type TimerHandle = ReturnType<typeof setTimeout>;
+
+interface FakeTimer {
+  readonly id: number;
+  readonly callback: () => void;
+  due: number;
+  readonly interval?: number;
+}
+
+class FakeSdkClock {
+  private current = 0;
+  private nextId = 1;
+  private readonly timers = new Map<number, FakeTimer>();
+
+  now(): number {
+    return this.current;
+  }
+
+  setTimeout(callback: () => void, milliseconds: number): TimerHandle {
+    return this.addTimer(callback, milliseconds);
+  }
+
+  clearTimeout(handle: TimerHandle): void {
+    this.timers.delete(handle as unknown as number);
+  }
+
+  setInterval(callback: () => void, milliseconds: number): TimerHandle {
+    return this.addTimer(callback, milliseconds, milliseconds);
+  }
+
+  clearInterval(handle: TimerHandle): void {
+    this.timers.delete(handle as unknown as number);
+  }
+
+  advance(milliseconds: number): void {
+    const target = this.current + milliseconds;
+    for (;;) {
+      const timer = [...this.timers.values()]
+        .filter((candidate) => candidate.due <= target)
+        .sort((left, right) => left.due - right.due || left.id - right.id)[0];
+      if (timer === undefined) break;
+      this.current = timer.due;
+      if (timer.interval === undefined) this.timers.delete(timer.id);
+      else timer.due += timer.interval;
+      timer.callback();
+    }
+    this.current = target;
+  }
+
+  get pendingTimers(): number {
+    return this.timers.size;
+  }
+
+  private addTimer(callback: () => void, milliseconds: number, interval?: number): TimerHandle {
+    const id = this.nextId;
+    this.nextId += 1;
+    this.timers.set(id, {
+      id,
+      callback,
+      due: this.current + milliseconds,
+      ...(interval === undefined ? {} : { interval }),
+    });
+    return id as unknown as TimerHandle;
+  }
+}
+
 test("rejects review submission until the prompt and briefing are complete", () => {
   assert.equal(
     agentInternals.reviewSubmissionRejection(false),
@@ -41,6 +107,8 @@ test("requires the complete prior thread before accepting a located finding", as
         createdAt: "2026-08-17T00:00:00Z",
         path: "src/change.ts",
         line: 4,
+        isResolved: false,
+        isOutdated: false,
         messages: [
           {
             id: 91,
@@ -111,6 +179,8 @@ test("requires a path-scoped discussion read for sibling threads after an id-sco
         createdAt: "2026-08-17T00:00:00Z",
         path: "src/change.ts",
         line: 4,
+        isResolved: false,
+        isOutdated: false,
         messages: [message(91, "First prior finding")],
       },
       {
@@ -120,6 +190,8 @@ test("requires a path-scoped discussion read for sibling threads after an id-sco
         createdAt: "2026-08-17T00:02:00Z",
         path: "src/change.ts",
         line: 9,
+        isResolved: false,
+        isOutdated: false,
         messages: [message(92, "Second prior finding")],
       },
     ],
@@ -169,6 +241,8 @@ test("accepts a finding after reading its exact discussion thread by id", async 
         createdAt: "2026-08-17T00:00:00Z",
         path: "src/change.ts",
         line: 4,
+        isResolved: false,
+        isOutdated: false,
         messages: [
           {
             id: 91,
@@ -189,6 +263,8 @@ test("accepts a finding after reading its exact discussion thread by id", async 
         createdAt: "2026-08-17T00:02:00Z",
         path: "src/change.ts",
         line: 9,
+        isResolved: false,
+        isOutdated: false,
         messages: [],
       },
     ],
@@ -236,6 +312,8 @@ test("matches discussion coverage across renamed paths", async (t) => {
         createdAt: "2026-08-17T00:00:00Z",
         path: "src/old.ts",
         line: 4,
+        isResolved: false,
+        isOutdated: false,
         messages: [
           {
             id: 93,
@@ -327,6 +405,145 @@ test("accepts exactly the four public finding severities", () => {
       false,
       severity,
     );
+  }
+});
+
+test("requires inline locations only for interactive submissions", () => {
+  const finding = {
+    title: "Actionable defect",
+    severity: "HIGH" as const,
+    why: "The defect breaks a supported path.",
+    fix: "Use the validated value.",
+  };
+  const unlocated = { summary: "finding", findings: [finding] };
+  assert.equal(agentInternals.submissionSchema.safeParse(unlocated).success, true);
+  assert.equal(agentInternals.interactiveSubmissionSchema.safeParse(unlocated).success, false);
+  assert.equal(
+    agentInternals.interactiveSubmissionSchema.safeParse({
+      summary: "finding",
+      findings: [{ ...finding, path: "src/change.ts", line: 10 }],
+    }).success,
+    true,
+  );
+});
+
+test("rejects interactive locations outside contiguous added lines", () => {
+  const files = [
+    {
+      path: "src/change.ts",
+      status: "modified",
+      additions: 3,
+      deletions: 0,
+      changes: 3,
+      addedLines: new Set([10, 11, 12]),
+    },
+  ];
+  const finding = {
+    severity: "HIGH" as const,
+    body: "**Why it matters:** broken\n\n**Fix:** repair it",
+  };
+  const invalid = agentInternals.invalidInteractiveFindingLocations(
+    {
+      summary: "locations",
+      findings: [
+        { ...finding, title: "Valid range", path: "src/change.ts", line: 10, endLine: 12 },
+        { ...finding, title: "Missing path", line: 10 },
+        { ...finding, title: "Missing line", path: "src/change.ts" },
+        { ...finding, title: "Unknown path", path: "src/other.ts", line: 10 },
+        { ...finding, title: "Unchanged line", path: "src/change.ts", line: 9 },
+        { ...finding, title: "Mixed range", path: "src/change.ts", line: 11, endLine: 13 },
+        { ...finding, title: "Reversed range", path: "src/change.ts", line: 11, endLine: 10 },
+      ],
+    },
+    files,
+  );
+  assert.deepEqual(invalid, [
+    "2. Missing path (missing path)",
+    "3. Missing line (src/change.ts:missing line)",
+    "4. Unknown path (src/other.ts:10)",
+    "5. Unchanged line (src/change.ts:9)",
+    "6. Mixed range (src/change.ts:11-13)",
+    "7. Reversed range (src/change.ts:11-10)",
+  ]);
+});
+
+test("logs heartbeats, resets activity, repeats recovery, and cleans up timers", async () => {
+  const clock = new FakeSdkClock();
+  const events: Array<{
+    readonly event: string;
+    readonly details: Readonly<Record<string, unknown>>;
+  }> = [];
+  const stalls: number[] = [];
+  const monitor = new agentInternals.SdkSessionMonitor({
+    clock,
+    heartbeatMs: 60,
+    stallMs: 300,
+    snapshot: () => ({ phase: "reviewing" }),
+    write: (event, details) => events.push({ event, details }),
+    onStall: (stall) => {
+      stalls.push(stall.recovery);
+    },
+  });
+
+  monitor.start();
+  monitor.start();
+  assert.equal(clock.pendingTimers, 2);
+  clock.advance(60);
+  assert.equal(events[0]?.event, "heartbeat");
+  assert.equal(events[0]?.details.elapsed_since_sdk_message_ms, 60);
+  monitor.observe({ type: "assistant", tool: "Read" });
+  clock.advance(299);
+  assert.deepEqual(stalls, []);
+  clock.advance(1);
+  await Promise.resolve();
+  assert.deepEqual(stalls, [1]);
+  assert.equal(
+    events.some(
+      ({ event, details }) =>
+        event === "stall-detected" &&
+        details.last_sdk_message_type === "assistant" &&
+        details.last_tool === "Read" &&
+        details.phase === "reviewing",
+    ),
+    true,
+  );
+  clock.advance(300);
+  await Promise.resolve();
+  assert.deepEqual(stalls, [1, 2]);
+  monitor.stop();
+  monitor.stop();
+  assert.equal(clock.pendingTimers, 0);
+  const eventCount = events.length;
+  clock.advance(1_000);
+  assert.equal(events.length, eventCount);
+});
+
+test("contains synchronous and asynchronous stall-handler failures", async () => {
+  for (const onStall of [
+    () => {
+      throw new Error("sync handler failed");
+    },
+    () => Promise.reject(new Error("async handler failed")),
+  ]) {
+    const clock = new FakeSdkClock();
+    const events: Array<{ readonly event: string; readonly details: Record<string, unknown> }> = [];
+    const monitor = new agentInternals.SdkSessionMonitor({
+      clock,
+      heartbeatMs: 60,
+      stallMs: 300,
+      snapshot: () => ({}),
+      write: (event, details) => events.push({ event, details: { ...details } }),
+      onStall,
+    });
+    monitor.start();
+    clock.advance(300);
+    for (let index = 0; index < 4; index += 1) await Promise.resolve();
+    assert.equal(
+      events.some(({ event }) => event === "stall-handler-failed"),
+      true,
+    );
+    monitor.stop();
+    assert.equal(clock.pendingTimers, 0);
   }
 });
 
@@ -463,7 +680,8 @@ test("teaches the four severity definitions before review submission", () => {
   assert.match(prompt, /Set endLine only when the finding spans a contiguous range/u);
   assert.doesNotMatch(prompt, /raw replacement text|apply suggestions/u);
   assert.match(agentInternals.repairPrompt(1), /MEDIUM and INFO are invalid/u);
-  assert.match(agentInternals.repairPrompt(1), /path, line, and endLine are optional/u);
+  assert.match(agentInternals.repairPrompt(1), /requires path and line/u);
+  assert.match(agentInternals.repairPrompt(1, true, false), /optional location fields/u);
   assert.doesNotMatch(agentInternals.repairPrompt(1), /suggestion/u);
   assert.doesNotMatch(agentInternals.repairPrompt(1), /read_pr_conversation|read_pr_diff/u);
   assert.match(agentInternals.repairPrompt(1, false), /read_review_briefing/u);

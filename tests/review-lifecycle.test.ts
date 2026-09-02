@@ -407,7 +407,7 @@ test("does not mutate a stale thread after a concurrent discussion change", asyn
   assert.deepEqual(calls, []);
 });
 
-test("minimizes only old finding reviews whose inline threads are all resolved", async () => {
+test("minimizes old finding reviews when every inline thread is resolved", async () => {
   const snapshot: ReviewLifecycleSnapshot = {
     reviews: [
       review(2, findingBody()),
@@ -426,8 +426,8 @@ test("minimizes only old finding reviews whose inline threads are all resolved",
     context,
     "review-action",
   );
-  assert.deepEqual(minimized, [2]);
-  assert.deepEqual(calls, ["minimize:review-node-2"]);
+  assert.deepEqual(minimized, [2, 3]);
+  assert.deepEqual(calls, ["minimize:review-node-2", "minimize:review-node-3"]);
 });
 
 test("renders one deterministic fixed disposition while preserving the original finding", () => {
@@ -690,7 +690,7 @@ test("does not resolve when the comment update or resolve recheck observes anoth
   assert.deepEqual(resolveCalls, []);
 });
 
-test("guards minimization against current, minimized, unrelated, and threadless reviews", async () => {
+test("guards minimization while allowing legacy body and threadless reviews", async () => {
   const oldFinding = review(2, findingBody());
   const snapshot: ReviewLifecycleSnapshot = {
     reviews: [
@@ -717,9 +717,13 @@ test("guards minimization against current, minimized, unrelated, and threadless 
   const calls: string[] = [];
   assert.deepEqual(
     await finalizeReviewLifecycle(apiFor(snapshot, calls), context, "review-action"),
-    [2],
+    [2, 7, 8],
   );
-  assert.deepEqual(calls, ["minimize:review-node-2"]);
+  assert.deepEqual(calls, [
+    "minimize:review-node-2",
+    "minimize:review-node-7",
+    "minimize:review-node-8",
+  ]);
 });
 
 test("does not minimize a review after a thread reopens during the finalization read", async () => {

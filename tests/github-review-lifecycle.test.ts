@@ -93,7 +93,8 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
                         commit: { oid: "a".repeat(40) },
                         state: "COMMENTED",
                         submittedAt: "2026-08-31T00:00:00Z",
-                        isMinimized: false,
+                        isMinimized: true,
+                        minimizedReason: "RESOLVED",
                       },
                     ],
                     pageInfo: { hasNextPage: false, endCursor: null },
@@ -115,8 +116,9 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
                     nodes: [
                       {
                         id: "thread-node-1",
-                        isResolved: false,
+                        isResolved: true,
                         isOutdated: true,
+                        resolvedBy: { login: "pr-owner", __typename: "User" },
                         path: "src/change.ts",
                         line: 4,
                         originalLine: 4,
@@ -128,6 +130,7 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
                               author: { login: "review-action", __typename: "User" },
                               body: "finding",
                               commit: { oid: "a".repeat(40) },
+                              originalCommit: { oid: "c".repeat(40) },
                               createdAt: "2026-08-31T00:00:01Z",
                               updatedAt: "2026-08-31T00:00:01Z",
                               pullRequestReview: { id: "review-node-42", databaseId: 42 },
@@ -160,6 +163,7 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
                       author: { login: "review-action", __typename: "User" },
                       body: "reply",
                       commit: { oid: "b".repeat(40) },
+                      originalCommit: { oid: "a".repeat(40) },
                       createdAt: "2026-08-31T00:00:02Z",
                       updatedAt: "2026-08-31T00:00:02Z",
                       pullRequestReview: { id: "review-node-42", databaseId: 42 },
@@ -245,6 +249,10 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
   );
   const snapshot = await api.getReviewLifecycleSnapshot(context);
   assert.equal(snapshot.reviews[0]?.databaseId, 42);
+  assert.equal(snapshot.reviews[0]?.minimizedReason, "RESOLVED");
+  assert.equal(snapshot.threads[0]?.resolvedBy?.login, "pr-owner");
+  assert.equal(snapshot.threads[0]?.comments[0]?.originalCommitId, "c".repeat(40));
+  assert.equal(snapshot.threads[0]?.comments[1]?.originalCommitId, "a".repeat(40));
   assert.equal(snapshot.threads[0]?.comments[0]?.reviewNodeId, "review-node-42");
   await api.updateSubmittedReview("review-node-42", "stale body");
   await api.dismissSubmittedReview("review-node-42", "superseded");
@@ -261,6 +269,10 @@ test("reads paginated lifecycle nodes and applies GraphQL mutations", async (t) 
     reviewId: "review-node-42",
     message: "superseded",
   });
+  assert.match(requests[0]?.query ?? "", /minimizedReason/u);
+  assert.match(requests[1]?.query ?? "", /resolvedBy/u);
+  assert.match(requests[1]?.query ?? "", /originalCommit/u);
+  assert.match(requests[2]?.query ?? "", /originalCommit/u);
 });
 
 test("validates lifecycle GraphQL records and optional fields", () => {
@@ -322,6 +334,23 @@ test("validates lifecycle GraphQL records and optional fields", () => {
     () => readGraphqlReview({ ...review, isMinimized: "no" }, 0),
     /invalid GraphQL review at index 0\.isMinimized/u,
   );
+  assert.equal(
+    readGraphqlReview(
+      {
+        id: "review-node",
+        databaseId: 1,
+        author: { login: "reviewer", __typename: "User" },
+        body: "review",
+        commit: { oid: "a".repeat(40) },
+        state: "COMMENTED",
+        submittedAt: "submitted",
+        isMinimized: true,
+        minimizedReason: "RESOLVED",
+      },
+      0,
+    ).minimizedReason,
+    "RESOLVED",
+  );
 
   const rawComment = {
     id: "comment-node",
@@ -368,6 +397,11 @@ test("validates lifecycle GraphQL records and optional fields", () => {
       ),
     /invalid GraphQL review comment at index 0\.commit\.oid/u,
   );
+  assert.equal(
+    readGraphqlComment({ ...rawComment, originalCommit: { oid: "b".repeat(40) } }, 0)
+      .originalCommitId,
+    "b".repeat(40),
+  );
 
   const thread = readGraphqlThread(
     {
@@ -398,6 +432,25 @@ test("validates lifecycle GraphQL records and optional fields", () => {
   assert.throws(
     () => readGraphqlThread({ ...thread, isOutdated: "no" }, 0),
     /invalid GraphQL review thread at index 0\.isOutdated/u,
+  );
+  assert.equal(
+    readGraphqlThread(
+      {
+        id: "thread-node",
+        isResolved: true,
+        isOutdated: false,
+        resolvedBy: { login: "pr-owner", __typename: "User" },
+        path: "src/file.ts",
+        line: null,
+        originalLine: null,
+        comments: {
+          nodes: [rawComment],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+      0,
+    ).resolvedBy?.login,
+    "pr-owner",
   );
 
   assert.deepEqual(

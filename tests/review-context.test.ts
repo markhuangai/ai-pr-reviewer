@@ -92,6 +92,66 @@ function issueComment(
   };
 }
 
+function buildConversation(
+  authenticatedLogin: string,
+  reviews: readonly ExistingReview[],
+  comments: readonly PullRequestReviewCommentRecord[],
+  issueComments: readonly PullRequestIssueCommentRecord[],
+) {
+  const lifecycleReviews: ReviewLifecycleReviewRecord[] = reviews.map((item) => ({
+    nodeId: `review-node-${item.id}`,
+    databaseId: item.id,
+    ...(item.author === undefined ? {} : { author: item.author }),
+    body: item.body,
+    commitId: item.commitId,
+    state: item.state,
+    ...(item.submittedAt === undefined ? {} : { submittedAt: item.submittedAt }),
+    isMinimized: false,
+  }));
+  const grouped = new Map<number, PullRequestReviewCommentRecord[]>();
+  for (const comment of comments) {
+    const rootId = comment.inReplyToId ?? comment.id;
+    const thread = grouped.get(rootId) ?? [];
+    thread.push(comment);
+    grouped.set(rootId, thread);
+  }
+  const threads: ReviewLifecycleThreadRecord[] = [...grouped].map(([rootId, threadComments]) => {
+    const root = threadComments.find((comment) => comment.id === rootId);
+    const location = root ?? threadComments[0];
+    assert.ok(location);
+    return {
+      nodeId: `thread-node-${rootId}`,
+      isResolved: false,
+      isOutdated: false,
+      path: location.path,
+      ...(location.line === undefined ? {} : { line: location.line }),
+      ...(location.originalLine === undefined ? {} : { originalLine: location.originalLine }),
+      ...(root?.reviewId === undefined ? {} : { reviewId: root.reviewId }),
+      ...(root?.reviewId === undefined ? {} : { reviewNodeId: `review-node-${root.reviewId}` }),
+      comments: threadComments.map((comment) => ({
+        nodeId: `comment-node-${comment.id}`,
+        databaseId: comment.id,
+        ...(comment.reviewId === undefined ? {} : { reviewId: comment.reviewId }),
+        ...(comment.reviewId === undefined
+          ? {}
+          : { reviewNodeId: `review-node-${comment.reviewId}` }),
+        ...(comment.inReplyToId === undefined ? {} : { replyToId: comment.inReplyToId }),
+        ...(comment.author === undefined ? {} : { author: comment.author }),
+        body: comment.body,
+        commitId: comment.commitId,
+        originalCommitId: comment.originalCommitId,
+        createdAt: comment.createdAt,
+        updatedAt: comment.updatedAt,
+      })),
+    };
+  });
+  return buildReviewConversation(
+    authenticatedLogin,
+    { reviews: lifecycleReviews, threads },
+    issueComments,
+  );
+}
+
 test("reconciles prepared lifecycle candidates before skipping an identical review", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
@@ -396,12 +456,8 @@ test("refreshes the conversation digest after lifecycle comment edits before dup
     body: reviewMarker(
       context,
       readReviewConfig(reader),
-      buildReviewConversation(
-        "review-action",
-        [oldReview, duplicateReviewBase],
-        conversationAfter,
-        [],
-      ).digest,
+      buildConversation("review-action", [oldReview, duplicateReviewBase], conversationAfter, [])
+        .digest,
       [[]],
     ),
   };
@@ -433,6 +489,7 @@ test("refreshes the conversation digest after lifecycle comment edits before dup
     author: oldReview.author,
     body: rootConversationComment.body,
     commitId: oldSha,
+    originalCommitId: oldSha,
     createdAt: rootConversationComment.createdAt,
     updatedAt: rootConversationComment.updatedAt,
   };
@@ -466,16 +523,12 @@ test("refreshes the conversation digest after lifecycle comment edits before dup
     reviews: [oldLifecycleReview, duplicateLifecycleReview],
     threads: [initialThread],
   };
-  let conversationReads = 0;
   let goalRuns = 0;
   const calls: string[] = [];
   const api = {
     ...emptyConversationApi("review-action"),
     listReviews: () => Promise.resolve([oldReview, duplicateReview]),
-    listReviewComments: () => {
-      conversationReads += 1;
-      return Promise.resolve(conversationReads === 1 ? conversationBefore : conversationAfter);
-    },
+    listReviewComments: () => Promise.resolve(conversationBefore),
     getReviewLifecycleSnapshot: () => Promise.resolve(snapshot),
     getPullRequestHeadSha: () => Promise.resolve(context.headSha),
     updateSubmittedReview: () => Promise.resolve(),
@@ -523,7 +576,6 @@ test("refreshes the conversation digest after lifecycle comment edits before dup
     writeSummary: () => Promise.resolve(),
   });
   assert.deepEqual(result, { skipped: true });
-  assert.equal(conversationReads, 2);
   assert.equal(goalRuns, 0);
   assert.deepEqual(calls, ["comment:200", "resolve:old-thread-node-digest"]);
 });
@@ -577,7 +629,7 @@ test("includes all reviewer comments and complete non-action inline threads", ()
     issueComment(45, "pr-owner", "   "),
   ];
 
-  const snapshot = buildReviewConversation("review-action", reviews, comments, issueComments);
+  const snapshot = buildConversation("review-action", reviews, comments, issueComments);
 
   assert.equal(snapshot.digest.length, 64);
   assert.deepEqual(
@@ -652,8 +704,8 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
   ];
   const issues = [issueComment(70, "pr-owner", "Human comment")];
 
-  const forward = buildReviewConversation("review-action", reviews, [orphan, root, reply], issues);
-  const reversed = buildReviewConversation(
+  const forward = buildConversation("review-action", reviews, [orphan, root, reply], issues);
+  const reversed = buildConversation(
     "review-action",
     [...reviews].reverse(),
     [reply, root, orphan],
@@ -670,7 +722,7 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
   assert.equal(orphanEntry.originalLine, undefined);
   assert.equal(orphanEntry.messages[0]?.inReplyToId, 50);
 
-  const changed = buildReviewConversation(
+  const changed = buildConversation(
     "review-action",
     reviews,
     [{ ...orphan, body: "Changed owner context" }, root, reply],
@@ -679,9 +731,190 @@ test("keeps orphaned human reply threads and produces a canonical digest", () =>
   assert.notEqual(changed.digest, forward.digest);
 });
 
+test("keeps action-only thread lifecycle metadata in future review context", () => {
+  const headSha = "a".repeat(40);
+  const actionReview: ReviewLifecycleReviewRecord = {
+    nodeId: "review-node-action",
+    databaseId: 90,
+    author: author("review-action"),
+    body: `<!-- ai-pr-reviewer:v3:${headSha}:${"b".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: headSha,
+    state: "COMMENTED",
+    submittedAt: timestamp,
+    isMinimized: true,
+    minimizedReason: "RESOLVED",
+  };
+  const actionThread: ReviewLifecycleThreadRecord = {
+    nodeId: "thread-node-action",
+    isResolved: true,
+    isOutdated: true,
+    resolvedBy: author("pr-owner"),
+    path: "src/change.ts",
+    line: 20,
+    originalLine: 10,
+    reviewId: actionReview.databaseId,
+    reviewNodeId: actionReview.nodeId,
+    comments: [
+      {
+        nodeId: "comment-node-action",
+        databaseId: 91,
+        reviewId: actionReview.databaseId,
+        reviewNodeId: actionReview.nodeId,
+        author: author("review-action"),
+        body: "Prior automated finding",
+        commitId: headSha,
+        originalCommitId: "c".repeat(40),
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    ],
+  };
+
+  const snapshot = buildReviewConversation(
+    "review-action",
+    { reviews: [actionReview], threads: [actionThread] },
+    [],
+  );
+  assert.equal(snapshot.entries.length, 1);
+  const entry = snapshot.entries[0];
+  assert.equal(entry?.kind, "inline_thread");
+  if (entry?.kind !== "inline_thread") assert.fail("Expected an inline thread.");
+  assert.equal(entry.isResolved, true);
+  assert.equal(entry.isOutdated, true);
+  assert.equal(entry.resolvedByLogin, "pr-owner");
+  assert.equal(entry.reviewIsMinimized, true);
+  assert.equal(entry.reviewMinimizedReason, "RESOLVED");
+  assert.equal(entry.messages[0]?.originalCommitId, "c".repeat(40));
+});
+
+test("keeps duplicate identity stable for workflow-only lifecycle changes", () => {
+  const headSha = "a".repeat(40);
+  const actionReview: ReviewLifecycleReviewRecord = {
+    nodeId: "review-node-action",
+    databaseId: 100,
+    author: author("review-action"),
+    body: `<!-- ai-pr-reviewer:v3:${headSha}:${"d".repeat(64)} -->\n## 🔎 AI review`,
+    commitId: headSha,
+    state: "COMMENTED",
+    submittedAt: timestamp,
+    isMinimized: false,
+  };
+  const root = {
+    nodeId: "comment-node-action",
+    databaseId: 101,
+    reviewId: actionReview.databaseId,
+    reviewNodeId: actionReview.nodeId,
+    author: author("review-action"),
+    body: "Automated finding",
+    commitId: headSha,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const actionThread: ReviewLifecycleThreadRecord = {
+    nodeId: "thread-node-action",
+    isResolved: false,
+    isOutdated: false,
+    path: "src/change.ts",
+    line: 20,
+    originalLine: 10,
+    reviewId: actionReview.databaseId,
+    reviewNodeId: actionReview.nodeId,
+    comments: [root],
+  };
+  const original = buildReviewConversation(
+    "review-action",
+    { reviews: [actionReview], threads: [actionThread] },
+    [],
+  );
+  const workflowUpdated = buildReviewConversation(
+    "review-action",
+    {
+      reviews: [{ ...actionReview, isMinimized: true, minimizedReason: "RESOLVED" }],
+      threads: [
+        {
+          ...actionThread,
+          isResolved: true,
+          resolvedBy: author("review-action"),
+          comments: [{ ...root, body: "Workflow-updated finding", updatedAt: "later" }],
+        },
+      ],
+    },
+    [],
+  );
+  assert.equal(workflowUpdated.digest, original.digest);
+
+  const externallyResolved = buildReviewConversation(
+    "review-action",
+    {
+      reviews: [actionReview],
+      threads: [{ ...actionThread, isResolved: true, resolvedBy: author("pr-owner") }],
+    },
+    [],
+  );
+  assert.notEqual(externallyResolved.digest, original.digest);
+
+  const humanReply = {
+    ...root,
+    nodeId: "comment-node-human",
+    databaseId: 102,
+    replyToId: root.databaseId,
+    author: author("pr-owner"),
+    body: "This is a false positive.",
+  };
+  const externallyDiscussed = buildReviewConversation(
+    "review-action",
+    {
+      reviews: [actionReview],
+      threads: [{ ...actionThread, comments: [root, humanReply] }],
+    },
+    [],
+  );
+  assert.notEqual(externallyDiscussed.digest, original.digest);
+});
+
+test("keeps duplicate identity stable for external minimization and outdated changes", () => {
+  const reviewRecord: ReviewLifecycleReviewRecord = {
+    ...review(110, "reviewer", "Human review"),
+    nodeId: "review-node-human-lifecycle",
+    databaseId: 110,
+    commitId: null,
+    isMinimized: false,
+  };
+  const comment = {
+    ...reviewComment(111, reviewRecord.databaseId, "reviewer", "Finding"),
+    nodeId: "comment-node-human-lifecycle",
+    databaseId: 111,
+    reviewNodeId: reviewRecord.nodeId,
+  };
+  const thread: ReviewLifecycleThreadRecord = {
+    nodeId: "thread-node-human-lifecycle",
+    isResolved: false,
+    isOutdated: false,
+    path: "src/change.ts",
+    line: 10,
+    reviewId: reviewRecord.databaseId,
+    reviewNodeId: reviewRecord.nodeId,
+    comments: [comment],
+  };
+  const original = buildReviewConversation(
+    "review-action",
+    { reviews: [reviewRecord], threads: [thread] },
+    [],
+  );
+  const lifecycleChanged = buildReviewConversation(
+    "review-action",
+    {
+      reviews: [{ ...reviewRecord, isMinimized: true, minimizedReason: "OUTDATED" }],
+      threads: [{ ...thread, isOutdated: true }],
+    },
+    [],
+  );
+  assert.equal(lifecycleChanged.digest, original.digest);
+});
+
 test("does not let another reviewer spoof the action marker", () => {
   const marker = "<!-- ai-pr-reviewer:v3:head:digest -->";
-  const snapshot = buildReviewConversation(
+  const snapshot = buildConversation(
     "review-action",
     [review(80, "other-reviewer", marker)],
     [reviewComment(81, 80, "other-reviewer", "Independent finding")],
@@ -692,7 +925,7 @@ test("does not let another reviewer spoof the action marker", () => {
 });
 
 test("maps every exposed body without changing snapshot identity metadata", () => {
-  const snapshot = buildReviewConversation(
+  const snapshot = buildConversation(
     "review-action",
     [review(1, "reviewer", "review secret")],
     [
@@ -754,6 +987,7 @@ test("sorts messages and entries by their canonical tie breakers", () => {
     createdAt: timestamp,
     state: "COMMENTED",
     commitId: "commit",
+    isMinimized: false,
     message: root,
   };
   assert.ok(

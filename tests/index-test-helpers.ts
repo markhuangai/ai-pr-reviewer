@@ -144,5 +144,6 @@ export function emptyConversationApi(login = "review-owner") {
     listReviews: () => Promise.resolve([]),
     listReviewComments: () => Promise.resolve([]),
     listIssueComments: () => Promise.resolve([]),
+    getReviewLifecycleSnapshot: () => Promise.resolve({ reviews: [], threads: [] }),
   };
 }

@@ -9,12 +9,16 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
+import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { PreparedContextFile } from "../lib/context-files.js";
+import type { ReviewConversationSnapshot } from "../lib/review-context.js";
 import type {
   ChangedFile,
+  GoalResult,
   GoalSubmission,
   HttpMcpServer,
   PullRequestContext,
+  ReviewBriefing,
   ReviewConfig,
   ReviewFinding,
 } from "../lib/types.js";
@@ -23,6 +27,8 @@ import {
   chunkAgentLogValue,
   completeAgentLogValue,
   createAgentLifecycleState,
+  errorMessage,
+  isRecord,
   logAgentEventSafely,
   logAgentLifecycleMessage,
   logAgentMessage,
@@ -30,12 +36,15 @@ import {
   logQueuedUserMessage,
   modelUsageSnapshot,
   redactAgentLog,
+  sdkSessionActivity,
+  type AgentLifecycleState,
   type AgentLogWriter,
 } from "./agent-logging.js";
 import {
   BRIEFING_PAGE_BYTES,
   MODEL_TOOL_RESULT_BYTES,
   PullRequestConversationReader,
+  type PullRequestDiffArtifact,
   PullRequestDiffReader,
   RepositoryFilePageReader,
   ReviewBriefingReader,
@@ -153,30 +162,42 @@ Use only authorized read-only tools. Never modify files, execute local commands 
 
 Keep epistemic labels and working analysis internal. Report each supported defect once with its concrete trigger or path, impact, and fix, using the required schema and submission tool. If nothing meets the proof bar, submit an empty findings list.`;
 
+const findingShape = {
+  title: z.string().trim().min(1).max(MAX_FINDING_TITLE_LENGTH),
+  severity: z
+    .enum(SEVERITY_VALUES)
+    .describe(
+      "Finding severity. Informational observations and style-only suggestions are omitted.",
+    ),
+  why: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_FINDING_PROSE_LENGTH)
+    .describe("One or two direct sentences explaining the concrete impact."),
+  fix: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_FINDING_PROSE_LENGTH)
+    .describe("One or two direct sentences explaining how to fix the defect."),
+  endLine: z.number().int().min(1).max(1_000_000).optional(),
+  confidence: z.enum(["high", "medium", "low"]).optional(),
+} as const;
+
 const findingSchema = z
   .object({
-    title: z.string().trim().min(1).max(MAX_FINDING_TITLE_LENGTH),
-    severity: z
-      .enum(SEVERITY_VALUES)
-      .describe(
-        "Finding severity. Informational observations and style-only suggestions are omitted.",
-      ),
-    why: z
-      .string()
-      .trim()
-      .min(1)
-      .max(MAX_FINDING_PROSE_LENGTH)
-      .describe("One or two direct sentences explaining the concrete impact."),
-    fix: z
-      .string()
-      .trim()
-      .min(1)
-      .max(MAX_FINDING_PROSE_LENGTH)
-      .describe("One or two direct sentences explaining how to fix the defect."),
+    ...findingShape,
     path: z.string().min(1).max(500).optional(),
     line: z.number().int().min(1).max(1_000_000).optional(),
-    endLine: z.number().int().min(1).max(1_000_000).optional(),
-    confidence: z.enum(["high", "medium", "low"]).optional(),
+  })
+  .strict();
+
+const inlineFindingSchema = z
+  .object({
+    ...findingShape,
+    path: z.string().min(1).max(500),
+    line: z.number().int().min(1).max(1_000_000),
   })
   .strict();
 
@@ -184,6 +205,13 @@ export const submissionSchema = z
   .object({
     summary: z.string().max(10_000),
     findings: z.array(findingSchema).max(100),
+  })
+  .strict();
+
+export const interactiveSubmissionSchema = z
+  .object({
+    summary: z.string().max(10_000),
+    findings: z.array(inlineFindingSchema).max(100),
   })
   .strict();
 
@@ -217,6 +245,254 @@ export class PromptStream implements AsyncIterable<SDKUserMessage> {
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return this;
   }
+}
+
+export const SDK_SESSION_HEARTBEAT_MS = 60_000;
+export const SDK_SESSION_STALL_MS = 300_000;
+
+export interface SdkSessionActivity {
+  readonly type: string;
+  readonly subtype?: string;
+  readonly tool?: string;
+}
+
+export interface SdkSessionStall {
+  readonly recovery: number;
+  readonly elapsedSinceMessageMs: number;
+}
+
+export interface SdkSessionClock {
+  now(): number;
+  setTimeout(callback: () => void, milliseconds: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+  setInterval(callback: () => void, milliseconds: number): ReturnType<typeof setInterval>;
+  clearInterval(handle: ReturnType<typeof setInterval>): void;
+}
+
+const systemSessionClock: SdkSessionClock = {
+  now: () => Date.now(),
+  setTimeout: (callback, milliseconds) => setTimeout(callback, milliseconds),
+  clearTimeout: (handle) => {
+    clearTimeout(handle);
+  },
+  setInterval: (callback, milliseconds) => setInterval(callback, milliseconds),
+  clearInterval: (handle) => {
+    clearInterval(handle);
+  },
+};
+
+export interface SdkSessionMonitorOptions {
+  readonly snapshot: () => Readonly<Record<string, unknown>>;
+  readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
+  readonly onStall: (stall: SdkSessionStall) => void | Promise<void>;
+  readonly heartbeatMs?: number;
+  readonly stallMs?: number;
+  readonly clock?: SdkSessionClock;
+}
+
+export class SdkSessionMonitor {
+  private readonly clock: SdkSessionClock;
+  private readonly heartbeatMs: number;
+  private readonly stallMs: number;
+  private readonly startedAt: number;
+  private lastMessageAt: number;
+  private lastActivity: SdkSessionActivity | undefined;
+  private recoveries = 0;
+  private heartbeatHandle: ReturnType<typeof setInterval> | undefined;
+  private watchdogHandle: ReturnType<typeof setTimeout> | undefined;
+  private stopped = false;
+
+  constructor(private readonly options: SdkSessionMonitorOptions) {
+    this.clock = options.clock ?? systemSessionClock;
+    this.heartbeatMs = options.heartbeatMs ?? SDK_SESSION_HEARTBEAT_MS;
+    this.stallMs = options.stallMs ?? SDK_SESSION_STALL_MS;
+    if (this.heartbeatMs < 1 || this.stallMs < 1) {
+      throw new RangeError("SDK session monitor intervals must be positive.");
+    }
+    this.startedAt = this.clock.now();
+    this.lastMessageAt = this.startedAt;
+  }
+
+  start(): void {
+    if (this.stopped || this.heartbeatHandle !== undefined) return;
+    this.heartbeatHandle = this.clock.setInterval(() => {
+      this.writeHeartbeat();
+    }, this.heartbeatMs);
+    this.armWatchdog();
+  }
+
+  observe(activity: SdkSessionActivity): void {
+    if (this.stopped) return;
+    this.lastActivity = activity;
+    this.lastMessageAt = this.clock.now();
+    this.armWatchdog();
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.heartbeatHandle !== undefined) this.clock.clearInterval(this.heartbeatHandle);
+    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
+    this.heartbeatHandle = undefined;
+    this.watchdogHandle = undefined;
+  }
+
+  get recoveryCount(): number {
+    return this.recoveries;
+  }
+
+  private details(now = this.clock.now(), timingFirst = false): Readonly<Record<string, unknown>> {
+    const snapshot = this.options.snapshot();
+    const timing = {
+      elapsed_session_ms: Math.max(0, now - this.startedAt),
+      elapsed_since_sdk_message_ms: Math.max(0, now - this.lastMessageAt),
+      last_sdk_message_type: this.lastActivity?.type ?? "none",
+      ...(this.lastActivity?.subtype === undefined
+        ? {}
+        : { last_sdk_message_subtype: this.lastActivity.subtype }),
+      ...(this.lastActivity?.tool === undefined ? {} : { last_tool: this.lastActivity.tool }),
+      stall_recoveries: this.recoveries,
+    };
+    return timingFirst ? { ...timing, ...snapshot } : { ...snapshot, ...timing };
+  }
+
+  private writeHeartbeat(): void {
+    if (this.stopped) return;
+    this.options.write("heartbeat", this.details());
+  }
+
+  private armWatchdog(): void {
+    if (this.stopped) return;
+    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
+    this.watchdogHandle = this.clock.setTimeout(() => {
+      this.handleStall();
+    }, this.stallMs);
+  }
+
+  private handleStall(): void {
+    if (this.stopped) return;
+    const now = this.clock.now();
+    const elapsedSinceMessageMs = Math.max(0, now - this.lastMessageAt);
+    if (elapsedSinceMessageMs < this.stallMs) {
+      this.armWatchdog();
+      return;
+    }
+    this.recoveries += 1;
+    const stall = { recovery: this.recoveries, elapsedSinceMessageMs };
+    this.options.write("stall-detected", {
+      ...this.details(now, true),
+      recovery: this.recoveries,
+    });
+    this.armWatchdog();
+    void Promise.resolve()
+      .then(() => this.options.onStall(stall))
+      .catch((error: unknown) => {
+        this.options.write("stall-handler-failed", {
+          recovery: stall.recovery,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
+}
+
+export interface ReviewSessionRecoveryMonitorOptions {
+  readonly snapshot: () => Readonly<Record<string, unknown>>;
+  readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
+  readonly hasAcceptedSubmission: () => boolean;
+  readonly setPhase: (phase: string) => void;
+  readonly finishAcceptedInput: () => void;
+  readonly markBoundaryPending: () => void;
+  readonly interrupt: () => Promise<unknown>;
+  readonly closeAcceptedSession: () => void;
+  readonly finalizeAcceptedSubmission: () => void | Promise<void>;
+}
+
+export function createReviewSessionRecoveryMonitor(
+  options: ReviewSessionRecoveryMonitorOptions,
+): SdkSessionMonitor {
+  return new SdkSessionMonitor({
+    snapshot: options.snapshot,
+    write: options.write,
+    onStall: (stall) => {
+      const submissionAccepted = options.hasAcceptedSubmission();
+      options.setPhase(submissionAccepted ? "finalizing-submission" : "interrupting-stalled-turn");
+      options.write("interrupt-started", {
+        recovery: stall.recovery,
+        elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs,
+        submission_accepted: submissionAccepted,
+      });
+      if (submissionAccepted) {
+        options.finishAcceptedInput();
+        let finalization: void | Promise<void>;
+        try {
+          finalization = options.finalizeAcceptedSubmission();
+        } catch (error) {
+          options.write("submission-finalization-failed", {
+            recovery: stall.recovery,
+            error: errorMessage(error),
+          });
+          options.closeAcceptedSession();
+          finalization = undefined;
+        }
+        if (finalization !== undefined) {
+          void Promise.resolve(finalization)
+            .catch((error: unknown) => {
+              options.write("submission-finalization-failed", {
+                recovery: stall.recovery,
+                error: errorMessage(error),
+              });
+            })
+            .finally(() => {
+              options.closeAcceptedSession();
+            });
+        }
+      } else options.markBoundaryPending();
+      void options
+        .interrupt()
+        .then((receipt) => {
+          const stillQueued =
+            isRecord(receipt) && Array.isArray(receipt.still_queued)
+              ? receipt.still_queued.length
+              : undefined;
+          options.write("interrupt-finished", {
+            recovery: stall.recovery,
+            ...(stillQueued === undefined ? {} : { still_queued: stillQueued }),
+          });
+        })
+        .catch((error: unknown) => {
+          options.write("interrupt-failed", {
+            recovery: stall.recovery,
+            error: errorMessage(error),
+          });
+        });
+      if (!submissionAccepted) return;
+    },
+  });
+}
+
+export function reviewSessionSnapshot(
+  phase: string,
+  lifecycle: Pick<
+    AgentLifecycleState,
+    "sessionId" | "activeGoal" | "activeGoalReason" | "goalIterations" | "turnResults"
+  >,
+  repairAttempts: number,
+  submissionAccepted: boolean,
+  awaitingInterruptedTurnBoundary: boolean,
+): Readonly<Record<string, unknown>> {
+  return {
+    phase,
+    submission_accepted: submissionAccepted,
+    awaiting_interrupted_turn_boundary: awaitingInterruptedTurnBoundary,
+    session_id: lifecycle.sessionId,
+    active_goal: lifecycle.activeGoal,
+    ...(lifecycle.activeGoalReason === undefined
+      ? {}
+      : { active_goal_reason: lifecycle.activeGoalReason }),
+    goal_iterations: lifecycle.goalIterations,
+    turn_results: lifecycle.turnResults,
+    repair_attempts: repairAttempts,
+  };
 }
 
 export function toSubmission(input: SubmissionInput): GoalSubmission {
@@ -256,6 +532,34 @@ export function toSubmission(input: SubmissionInput): GoalSubmission {
     };
   });
   return { summary: input.summary, findings };
+}
+
+function validAddedLineLocation(finding: ReviewFinding, files: readonly ChangedFile[]): boolean {
+  if (finding.path === undefined || finding.line === undefined) return false;
+  const file = files.find((candidate) => candidate.path === finding.path);
+  if (file === undefined) return false;
+  const endLine = finding.endLine ?? finding.line;
+  if (endLine < finding.line || endLine - finding.line + 1 > 1_000) return false;
+  for (let line = finding.line; line <= endLine; line += 1) {
+    if (!file.addedLines.has(line)) return false;
+  }
+  return true;
+}
+
+export function invalidInteractiveFindingLocations(
+  submission: GoalSubmission,
+  files: readonly ChangedFile[],
+): readonly string[] {
+  return submission.findings.flatMap((finding, index) => {
+    if (validAddedLineLocation(finding, files)) return [];
+    const location =
+      finding.path === undefined
+        ? "missing path"
+        : finding.line === undefined
+          ? `${finding.path}:missing line`
+          : `${finding.path}:${finding.line}${finding.endLine === undefined ? "" : `-${finding.endLine}`}`;
+    return [`${index + 1}. ${finding.title} (${location})`];
+  });
 }
 
 export function safeAgentEnvironment(
@@ -347,6 +651,7 @@ function buildGoalPrompt(
   conversationEntries: number,
   contextFiles: readonly PreparedContextFile[],
   repositoryRoot = "the current working directory",
+  interactWithPullRequest = true,
 ): string {
   return `You are an isolated pull-request reviewer. Treat the following instruction as your one review goal:
 
@@ -366,7 +671,7 @@ Read the relevant changed files and nearby definitions before deciding. This ses
 Classify each finding with exactly one of these severities:
 ${SEVERITY_GUIDANCE}
 
-After reading the briefing and the relevant code and discussion, call mcp__review_output__submit_review exactly once. Submit only new, actionable, evidence-based findings. Keep each title short. State why the defect matters and how to fix it in one or two direct sentences each. Use a changed-file path and an added-line number only when the line is present in the pull-request diff; otherwise omit the location. Set endLine only when the finding spans a contiguous range of added lines in the same file. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
+After reading the briefing and the relevant code and discussion, call mcp__review_output__submit_review exactly once. Submit only new, actionable, evidence-based findings. Keep each title short. State why the defect matters and how to fix it in one or two direct sentences each. ${interactWithPullRequest ? "Every finding must cite a changed-file path and an added-line number that participates in the failure. A submission with a missing or invalid added-line anchor is rejected for same-session repair; do not attach a finding to an unrelated line." : "A summary-only finding may omit its location. When supplied, use a changed-file path and an added-line number only when that line is present in the pull-request diff."} Set endLine only when the finding spans a contiguous range of added lines in the same file. A resolved, outdated, or minimized prior thread is historical context, not proof that its finding was fixed or false; verify the current checkout and report a regression when the earlier resolution no longer applies. Include an empty findings array when this goal found no actionable issue. Do not put markdown outside the tool call.`;
 }
 
 export function reviewSubmissionRejection(
@@ -382,7 +687,11 @@ export function reviewSubmissionRejection(
   return undefined;
 }
 
-export function repairPrompt(attempt: number, briefingComplete = true): string {
+export function repairPrompt(
+  attempt: number,
+  briefingComplete = true,
+  interactWithPullRequest = true,
+): string {
   const missingReaders = [
     ...(briefingComplete ? [] : ["mcp__review_output__read_review_briefing"]),
   ];
@@ -390,7 +699,10 @@ export function repairPrompt(attempt: number, briefingComplete = true): string {
     missingReaders.length === 0
       ? "Do not continue investigating. Call mcp__review_output__submit_review now"
       : `Continue calling ${missingReaders.join(" and ")} until each returns done=true, then call mcp__review_output__submit_review`;
-  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Each finding needs title, severity, why, and fix; path, line, and endLine are optional location fields. Severity must be ${SEVERITY_VALUES.join(", ")}; MEDIUM and INFO are invalid. Use an empty findings array if no issue is supported by the evidence.`;
+  const locationContract = interactWithPullRequest
+    ? "Each finding also requires path and line on a participating added line; endLine is optional and every line in its range must be added."
+    : "Path, line, and endLine are optional location fields.";
+  return `The previous turn did not produce an accepted review submission. This is repair attempt ${attempt} of ${MAX_REPAIR_ATTEMPTS}. ${nextAction} with a schema-valid JSON object containing summary and findings. Each finding needs title, severity, why, and fix. ${locationContract} Severity must be ${SEVERITY_VALUES.join(", ")}; MEDIUM and INFO are invalid. Use an empty findings array if no issue is supported by the evidence.`;
 }
 
 export function makeUserMessage(text: string): SDKUserMessage {
@@ -475,6 +787,7 @@ export function startReviewPrompt(
     core.info(line);
   },
   repositoryRoot = process.cwd(),
+  interactWithPullRequest = true,
 ): void {
   const goalMessage = makeUserMessage(goalCommand(goal));
   const reviewMessage = makeUserMessage(
@@ -486,6 +799,7 @@ export function startReviewPrompt(
       conversationEntries,
       contextFiles,
       repositoryRoot,
+      interactWithPullRequest,
     ),
   );
   input.push(goalMessage);
@@ -509,14 +823,112 @@ export function startReviewPrompt(
   );
 }
 
+type ReviewGoalRunner = (
+  goal: string,
+  goalIndex: number,
+  context: PullRequestContext,
+  files: readonly ChangedFile[],
+  conversation: ReviewConversationSnapshot,
+  config: ReviewConfig,
+  diff: PullRequestDiffArtifact,
+  cwd: string,
+  queryAgent: AgentQuery,
+  contextFiles: readonly PreparedContextFile[],
+  abortController: AbortController | undefined,
+  briefing: ReviewBriefing,
+) => Promise<GoalResult>;
+
+export async function runReviewGoalsWithRunner(
+  runGoal: ReviewGoalRunner,
+  context: PullRequestContext,
+  files: readonly ChangedFile[],
+  conversation: ReviewConversationSnapshot,
+  config: ReviewConfig,
+  contextFilesByGoal: readonly (readonly PreparedContextFile[])[],
+  cwd: string,
+  queryAgent: AgentQuery,
+  abortController: AbortController | undefined,
+  briefing: ReviewBriefing,
+): Promise<readonly GoalResult[]> {
+  const signal = abortController?.signal;
+  throwIfAborted(signal);
+  if (contextFilesByGoal.length !== config.reviewPrompts.length) {
+    throw new Error("Prepared context files must match the configured review goals.");
+  }
+  for (let index = 0; index < config.reviewPrompts.length; index += 1) {
+    const goal = config.reviewPrompts[index];
+    if (goal === undefined) continue;
+    const prepared = contextFilesByGoal[index] ?? [];
+    if (
+      prepared.length !== goal.files.length ||
+      prepared.some((file, fileIndex) => file.path !== goal.files[fileIndex])
+    ) {
+      throw new Error(`Prepared context files do not match review goal ${index + 1}.`);
+    }
+  }
+  const diff = await createPullRequestDiff(context, cwd, undefined, signal);
+  const results: Array<GoalResult | undefined> = Array.from(
+    { length: config.reviewPrompts.length },
+    () => undefined,
+  );
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < config.reviewPrompts.length) {
+      throwIfAborted(signal);
+      const index = cursor;
+      cursor += 1;
+      const goal = config.reviewPrompts[index];
+      if (goal === undefined) return;
+      throwIfAborted(signal);
+      results[index] = await runGoal(
+        goal.prompt,
+        index,
+        context,
+        files,
+        conversation,
+        config,
+        diff,
+        cwd,
+        queryAgent,
+        contextFilesByGoal[index] ?? [],
+        abortController,
+        briefing,
+      );
+    }
+  };
+  try {
+    const workerCount = Math.min(config.parallelCount, config.reviewPrompts.length);
+    const outcomes = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+    const failure = outcomes.find(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    if (failure !== undefined) throw failure.reason;
+    throwIfAborted(signal);
+    return results.map(
+      (result, index) =>
+        result ?? {
+          prompt: config.reviewPrompts[index]?.prompt ?? "",
+          status: "failed",
+          error: "Worker did not return a result.",
+        },
+    );
+  } finally {
+    await diff.cleanup();
+  }
+}
+
 export const agentInternals = {
   boundedAgentLogValue,
   changedFilePrompt,
   chunkAgentLogValue,
   completeAgentLogValue,
   createPullRequestDiff,
+  createReviewSessionRecoveryMonitor,
+  reviewSessionSnapshot,
   createAgentLifecycleState,
   goalCommand,
+  interactiveSubmissionSchema,
+  invalidInteractiveFindingLocations,
   logAgentLifecycleMessage,
   logAgentMessage,
   logAgentMessageSafely,
@@ -550,5 +962,9 @@ export const agentInternals = {
   BRIEFING_PAGE_BYTES,
   MODEL_TOOL_RESULT_BYTES,
   safeAgentEnvironment,
+  sdkSessionActivity,
+  SdkSessionMonitor,
+  SDK_SESSION_HEARTBEAT_MS,
+  SDK_SESSION_STALL_MS,
   toSdkMcpServer,
 };

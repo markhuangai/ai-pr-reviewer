@@ -32,6 +32,7 @@ import {
 import { redact } from "./lib/redaction.js";
 import { DiagnosticLogger, type DiagnosticDescriptor } from "./lib/diagnostics.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
+import type { ReviewLifecycleSnapshot } from "./lib/github-review-lifecycle.js";
 import {
   finalizeReviewLifecycle,
   isReviewLifecycleApi,
@@ -141,7 +142,8 @@ function isApprovalRejection(error: unknown): error is GitHubApiError {
 }
 
 interface LoadedConversation {
-  readonly reviews: Awaited<ReturnType<GitHubApi["listReviews"]>>;
+  readonly reviews: ReviewLifecycleSnapshot["reviews"];
+  readonly lifecycle: ReviewLifecycleSnapshot;
   readonly snapshot: ReviewConversationSnapshot;
 }
 
@@ -150,14 +152,14 @@ async function loadConversation(
   context: PullRequestContext,
   authenticatedLogin: string,
 ): Promise<LoadedConversation> {
-  const [reviews, reviewComments, issueComments] = await Promise.all([
-    api.listReviews(context),
-    api.listReviewComments(context),
+  const [lifecycle, issueComments] = await Promise.all([
+    api.getReviewLifecycleSnapshot(context),
     api.listIssueComments(context),
   ]);
   return {
-    reviews,
-    snapshot: buildReviewConversation(authenticatedLogin, reviews, reviewComments, issueComments),
+    reviews: lifecycle.reviews,
+    lifecycle,
+    snapshot: buildReviewConversation(authenticatedLogin, lifecycle, issueComments),
   };
 }
 
@@ -423,7 +425,13 @@ export async function runAction(
                 "action.lifecycle.prepare",
                 "capture and prepare stale action-owned reviews",
               ),
-              () => prepareReviewLifecycle(lifecycleApi, context, authenticatedLogin),
+              () =>
+                prepareReviewLifecycle(
+                  lifecycleApi,
+                  context,
+                  authenticatedLogin,
+                  conversation.lifecycle,
+                ),
             );
       if (lifecyclePreparation?.reconciledCleanReviewIds.length) {
         core.info(
@@ -596,6 +604,11 @@ export async function runAction(
             reviewBriefingDigest(context, briefing),
           ),
       );
+      if (config.interactWithPullRequest && review.omittedFindings.length > 0) {
+        core.warning(
+          `Published ${review.inlineFindings.length} verified inline finding${review.inlineFindings.length === 1 ? "" : "s"} and omitted ${review.omittedFindings.length} additional finding${review.omittedFindings.length === 1 ? "" : "s"} from the pull request review; the workflow summary retains every finding.`,
+        );
+      }
       if (!config.interactWithPullRequest) {
         await diagnostics.withSpan(
           actionDescriptor(
@@ -687,6 +700,17 @@ export async function runAction(
             body: `${request.body}\n\n> The pull request refs changed after capture, so this review was posted as a comment.`,
           };
         }
+      }
+      if (review.omittedFindings.length > 0) {
+        await diagnostics.withSpan(
+          actionDescriptor(
+            "publication",
+            "action.summary.write-overflow",
+            "write findings omitted from the interactive review to the workflow summary",
+          ),
+          () => dependencies.writeSummary(context, review, goals),
+        );
+        throwIfAborted(signal);
       }
       try {
         await diagnostics.withSpan(
