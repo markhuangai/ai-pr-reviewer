@@ -321,7 +321,7 @@ test("resolution verifier preserves non-high confidence verdicts for the lifecyc
   assert.equal(result.confidence, "medium");
 });
 
-test("finalizes an accepted resolution when the SDK stops yielding messages", async (t) => {
+test("finalizes a silent accepted resolution after its completion grace", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
   const output: string[] = [];
   t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
@@ -363,7 +363,7 @@ test("finalizes an accepted resolution when the SDK stops yielding messages", as
 
   const running = verifyResolution(context, thread, config, "/workspace", query);
   await ready.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  t.mock.timers.tick(agentInternals.SDK_SUBMISSION_GRACE_MS);
   const result = await running;
 
   assert.deepEqual(result, {
@@ -375,9 +375,8 @@ test("finalizes an accepted resolution when the SDK stops yielding messages", as
   assert.equal(interrupts, 1);
   assert.equal(closes, 1);
   const logs = output.join("");
-  assert.match(logs, /session heartbeat.*"active_goal_reason":"checking verifier"/u);
-  assert.match(logs, /session heartbeat.*"verdict_accepted":true/u);
-  assert.match(logs, /session stall-detected.*"elapsed_since_sdk_message_ms":300000/u);
+  assert.match(logs, /session submission-accepted.*"grace_ms":30000/u);
+  assert.match(logs, /session submission-deadline.*"grace_ms":30000/u);
   assert.match(logs, /session verdict-finalized.*"terminal_sdk_result":false/u);
 });
 
@@ -772,4 +771,125 @@ test("configures a read-only verifier and processes verifiers in bounded batches
     await runResolutionVerifiers(context, [], config, "/workspace", scriptedQuery([])),
     [],
   );
+});
+
+test("bounds verifier completion while preserving failures and cancellation", async (t) => {
+  for (const mode of [
+    "activity",
+    "provider-failure",
+    "reader-timeout",
+    "close-failure",
+    "cancellation",
+    "interrupt-failure",
+    "interrupt-pending",
+  ] as const) {
+    await t.test(mode, async (st) => {
+      st.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+      const ready = manualSignal<undefined>();
+      const activity = manualSignal<undefined>();
+      const observed = manualSignal<undefined>();
+      const terminal = manualSignal<undefined>();
+      const closing = manualSignal<undefined>();
+      const closed = manualSignal<undefined>();
+      const controller = new AbortController();
+      let closes = 0;
+      let interrupts = 0;
+      const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+        async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage | SDKActiveGoalMessage> {
+          const messages = input.prompt[Symbol.asyncIterator]();
+          await messages.next();
+          await markReadEvidence(input.options);
+          const submit = resolutionSubmitTool(input.options);
+          const accepted = await submit.handler({
+            verdict: "fixed",
+            confidence: "high",
+            rationale: "Current guard verified",
+          });
+          assert.equal(accepted.content[0]?.text, "Resolution accepted.");
+          ready.resolve(undefined);
+          if (mode === "activity") {
+            await activity.promise;
+            yield {
+              type: "active_goal",
+              value: { condition: "verify", iterations: 3 },
+            } as SDKActiveGoalMessage;
+            const duplicate = await submit.handler({
+              verdict: "not_fixed",
+              confidence: "high",
+              rationale: "Replacement",
+            });
+            assert.match(duplicate.content[0]?.text ?? "", /already accepted/u);
+            observed.resolve(undefined);
+          }
+          if (mode === "provider-failure") {
+            yield resolutionResult(1, "error_during_execution");
+            terminal.resolve(undefined);
+          }
+          await closed.promise;
+          assert.equal((await messages.next()).done, true);
+        },
+        mcpServerStatus: () => assert.fail("verifiers do not configure external MCP servers"),
+        interrupt: () => {
+          interrupts += 1;
+          if (mode === "interrupt-pending") return new Promise<never>(() => undefined);
+          if (mode === "interrupt-failure")
+            return Promise.reject(new Error("verifier interrupt unavailable"));
+          return Promise.resolve(undefined);
+        },
+        close: () => {
+          closes += 1;
+          closing.resolve(undefined);
+          if (mode === "close-failure") throw new Error("verifier close failed");
+          if (mode !== "reader-timeout") closed.resolve(undefined);
+        },
+      })) as unknown as ResolutionQuery;
+      const running = verifyResolution(context, thread, config, "/workspace", query, controller);
+      await ready.promise;
+      if (mode === "cancellation") {
+        const cancellation = new CancellationError("SIGTERM");
+        const rejected = assert.rejects(running, (error: unknown) => error === cancellation);
+        controller.abort(cancellation);
+        await rejected;
+        assert.equal(closes, 1);
+        assert.equal(interrupts, 0);
+        return;
+      }
+      if (mode === "activity") {
+        st.mock.timers.tick(agentInternals.SDK_SUBMISSION_GRACE_MS - 1);
+        activity.resolve(undefined);
+        await observed.promise;
+        assert.equal(closes, 0);
+        st.mock.timers.tick(1);
+      } else if (mode === "provider-failure") await terminal.promise;
+      else st.mock.timers.tick(agentInternals.SDK_SUBMISSION_GRACE_MS);
+      if (mode === "reader-timeout") {
+        await closing.promise;
+        st.mock.timers.tick(agentInternals.SDK_SESSION_CLOSE_MS);
+      }
+      const result = await running;
+      closed.resolve(undefined);
+      const expectedError =
+        mode === "provider-failure"
+          ? /interrupted 1/u
+          : mode === "reader-timeout"
+            ? /reader did not stop within 5000 ms/u
+            : mode === "close-failure"
+              ? /verifier close failed/u
+              : undefined;
+      assert.equal(result.status, expectedError === undefined ? "completed" : "failed");
+      if (expectedError !== undefined) assert.match(result.error ?? "", expectedError);
+      else
+        assert.deepEqual(result, {
+          status: "completed",
+          verdict: "fixed",
+          confidence: "high",
+          rationale: "Current guard verified",
+        });
+      assert.equal(closes, 1);
+      assert.equal(interrupts, mode === "provider-failure" ? 0 : 1);
+      assert.equal(controller.signal.aborted, false);
+      st.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+      assert.equal(closes, 1);
+    });
+  }
 });

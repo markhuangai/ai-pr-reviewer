@@ -61,6 +61,7 @@ import {
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
   SDK_SESSION_STALL_MS,
+  closeSdkSession,
   createReviewSessionRecoveryMonitor,
   interactiveSubmissionSchema,
   invalidInteractiveFindingLocations,
@@ -558,6 +559,7 @@ export async function runReviewGoal(
         }
       }
       submission = candidate;
+      monitor?.acceptSubmission();
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
     { alwaysLoad: true },
@@ -599,6 +601,13 @@ export async function runReviewGoal(
     if (session === undefined || sessionClosed) return;
     sessionClosed = true;
     session.close();
+  };
+  let shutdown: Promise<void> | undefined;
+  const finishSession = (): Promise<void> => {
+    monitor?.stop();
+    sessionState.expectedSessionClose = true;
+    input.finish();
+    return (shutdown ??= closeSdkSession(closeSession, reader));
   };
   const tokenUsageState: {
     models: readonly ReviewModelUsage[];
@@ -668,15 +677,15 @@ export async function runReviewGoal(
         sessionPhase = "waiting-for-interrupted-turn-boundary";
       },
       interrupt: () => activeSession.interrupt(),
-      closeAcceptedSession: closeSession,
       finalizeAcceptedSubmission: () => {
-        if (stalledSubmissionFinalization !== undefined) return stalledSubmissionFinalization;
         stalledSubmission.resolve(undefined);
         stalledSubmissionFinalization = (async () => {
           stalledMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
-          closeSession();
+          await finishSession();
         })();
-        return stalledSubmissionFinalization;
+        void stalledSubmissionFinalization.catch((error: unknown) => {
+          turn.reject(error);
+        });
       },
     });
     monitor = activeMonitor;
@@ -694,6 +703,7 @@ export async function runReviewGoal(
             logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
           });
           if (message.type === "result") {
+            if (submission !== undefined) activeMonitor.stop();
             const snapshot = modelUsageSnapshot(message.modelUsage);
             tokenUsageState.latestSnapshotValid = snapshot !== undefined;
             if (snapshot !== undefined) tokenUsageState.models = snapshot;
@@ -746,15 +756,16 @@ export async function runReviewGoal(
         stalledSubmission.promise.then(() => ({ kind: "stalled-submission" as const })),
       ]);
       throwIfAborted(signal);
-      if (outcome.kind === "stalled-submission") {
+      if (outcome.kind === "stalled-submission" || stalledSubmissionFinalization !== undefined) {
         const acceptedSubmission = submission;
         if (acceptedSubmission === undefined) {
           throw new Error("The SDK session closed for stall recovery without an accepted review.");
         }
         activeMonitor.stop();
-        sessionPhase = "finalizing-stalled-submission";
+        sessionPhase = "finalizing-accepted-submission";
         if (stalledSubmissionFinalization !== undefined) await stalledSubmissionFinalization;
-        await reader;
+        await finishSession();
+        throwIfAborted(signal);
         writeAgentMonitorEvent(
           goalIndex,
           "submission-finalized",
@@ -794,10 +805,8 @@ export async function runReviewGoal(
           activeMonitor.stop();
           const interruptedMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
           throwIfAborted(signal);
-          sessionState.expectedSessionClose = true;
-          input.finish();
-          closeSession();
-          await reader;
+          await finishSession();
+          throwIfAborted(signal);
           writeAgentMonitorEvent(
             goalIndex,
             "submission-finalized",
@@ -846,9 +855,7 @@ export async function runReviewGoal(
       }
       if (result.subtype !== "success") {
         sessionPhase = "finalizing-failed-turn";
-        sessionState.expectedSessionClose = true;
-        input.finish();
-        await reader;
+        await finishSession();
         throwIfAborted(signal);
         return withTokenUsage(
           {
@@ -863,35 +870,22 @@ export async function runReviewGoal(
       }
       if (submission !== undefined) {
         sessionPhase = "checking-mcp-status";
-        const mcpFailures = await readMcpFailures();
+        activeMonitor.stop();
+        const mcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
         throwIfAborted(signal);
-        sessionState.expectedSessionClose = true;
-        input.finish();
-        await reader;
+        await finishSession();
         throwIfAborted(signal);
-        if (mcpFailures.length > 0) {
-          return withTokenUsage(
-            {
-              prompt: goal,
-              status: "failed",
-              submission,
-              error: `Configured MCP server failure: ${mcpFailures.join("; ")}`,
-            },
-            tokenUsageState.models,
-            readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-          );
-        }
-        return withTokenUsage(
-          { prompt: goal, status: "completed", submission },
+        return acceptedSubmissionResult(
+          goal,
+          submission,
+          mcpStatus,
           tokenUsageState.models,
           readerFailure === undefined && tokenUsageState.latestSnapshotValid,
         );
       }
       if (repairAttempts >= MAX_REPAIR_ATTEMPTS) {
         sessionPhase = "repair-exhausted";
-        sessionState.expectedSessionClose = true;
-        input.finish();
-        await reader;
+        await finishSession();
         throwIfAborted(signal);
         return withTokenUsage(
           {
@@ -922,26 +916,24 @@ export async function runReviewGoal(
     }
   } catch (error) {
     sessionPhase = "failed";
-    sessionState.expectedSessionClose = true;
-    input.finish();
-    monitor?.stop();
-    closeSession();
-    if (reader) await reader.catch(() => undefined);
+    let failure = readerFailure?.message ?? errorMessage(error);
+    try {
+      await finishSession();
+    } catch (cleanupError) {
+      if (cleanupError !== error)
+        failure += `; session cleanup failed: ${errorMessage(cleanupError)}`;
+    }
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      write(
-        agentLogLine(
-          goalIndex,
-          "session",
-          "failure",
-          "error",
-          readerFailure?.message ?? errorMessage(error),
-          logSecrets,
-        ),
-      );
+      write(agentLogLine(goalIndex, "session", "failure", "error", failure, logSecrets));
     });
     return withTokenUsage(
-      { prompt: goal, status: "failed", error: readerFailure?.message ?? errorMessage(error) },
+      {
+        prompt: goal,
+        status: "failed",
+        ...(submission === undefined ? {} : { submission }),
+        error: failure,
+      },
       tokenUsageState.models,
       false,
     );

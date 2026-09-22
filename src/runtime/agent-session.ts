@@ -249,6 +249,32 @@ export class PromptStream implements AsyncIterable<SDKUserMessage> {
 
 export const SDK_SESSION_HEARTBEAT_MS = 60_000;
 export const SDK_SESSION_STALL_MS = 300_000;
+export const SDK_SUBMISSION_GRACE_MS = 30_000;
+export const SDK_SESSION_CLOSE_MS = 5_000;
+
+export async function closeSdkSession(
+  close: () => void,
+  reader: Promise<void> | undefined,
+): Promise<void> {
+  close();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      reader,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `SDK message reader did not stop within ${SDK_SESSION_CLOSE_MS} ms after close().`,
+            ),
+          );
+        }, SDK_SESSION_CLOSE_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 export interface SdkSessionActivity {
   readonly type: string;
@@ -285,6 +311,7 @@ export interface SdkSessionMonitorOptions {
   readonly snapshot: () => Readonly<Record<string, unknown>>;
   readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
   readonly onStall: (stall: SdkSessionStall) => void | Promise<void>;
+  readonly onSubmissionDeadline?: () => void;
   readonly heartbeatMs?: number;
   readonly stallMs?: number;
   readonly clock?: SdkSessionClock;
@@ -301,6 +328,8 @@ export class SdkSessionMonitor {
   private heartbeatHandle: ReturnType<typeof setInterval> | undefined;
   private watchdogHandle: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
+  private submissionAccepted = false;
+  private submissionHandle: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly options: SdkSessionMonitorOptions) {
     this.clock = options.clock ?? systemSessionClock;
@@ -328,11 +357,24 @@ export class SdkSessionMonitor {
     this.armWatchdog();
   }
 
+  acceptSubmission(): void {
+    if (this.stopped || this.submissionAccepted) return;
+    this.submissionAccepted = true;
+    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
+    this.options.write("submission-accepted", { grace_ms: SDK_SUBMISSION_GRACE_MS });
+    this.submissionHandle = this.clock.setTimeout(() => {
+      this.stop();
+      this.options.write("submission-deadline", { grace_ms: SDK_SUBMISSION_GRACE_MS });
+      this.options.onSubmissionDeadline?.();
+    }, SDK_SUBMISSION_GRACE_MS);
+  }
+
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
     if (this.heartbeatHandle !== undefined) this.clock.clearInterval(this.heartbeatHandle);
     if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
+    if (this.submissionHandle !== undefined) this.clock.clearTimeout(this.submissionHandle);
     this.heartbeatHandle = undefined;
     this.watchdogHandle = undefined;
   }
@@ -362,7 +404,7 @@ export class SdkSessionMonitor {
   }
 
   private armWatchdog(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.submissionAccepted) return;
     if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
     this.watchdogHandle = this.clock.setTimeout(() => {
       this.handleStall();
@@ -403,70 +445,52 @@ export interface ReviewSessionRecoveryMonitorOptions {
   readonly finishAcceptedInput: () => void;
   readonly markBoundaryPending: () => void;
   readonly interrupt: () => Promise<unknown>;
-  readonly closeAcceptedSession: () => void;
-  readonly finalizeAcceptedSubmission: () => void | Promise<void>;
+  readonly finalizeAcceptedSubmission: () => void;
 }
 
 export function createReviewSessionRecoveryMonitor(
   options: ReviewSessionRecoveryMonitorOptions,
 ): SdkSessionMonitor {
+  let finalizing = false;
+  const recover = (stall?: SdkSessionStall): void => {
+    if (finalizing) return;
+    const submissionAccepted = options.hasAcceptedSubmission();
+    options.setPhase(submissionAccepted ? "finalizing-submission" : "interrupting-stalled-turn");
+    const details = {
+      recovery: stall?.recovery ?? 0,
+      ...(stall === undefined ? {} : { elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs }),
+      submission_accepted: submissionAccepted,
+    };
+    options.write("interrupt-started", details);
+    if (submissionAccepted) {
+      finalizing = true;
+      options.finishAcceptedInput();
+      options.finalizeAcceptedSubmission();
+    } else options.markBoundaryPending();
+    void Promise.resolve()
+      .then(options.interrupt)
+      .then((receipt) => {
+        const stillQueued =
+          isRecord(receipt) && Array.isArray(receipt.still_queued)
+            ? receipt.still_queued.length
+            : undefined;
+        options.write("interrupt-finished", {
+          recovery: details.recovery,
+          ...(stillQueued === undefined ? {} : { still_queued: stillQueued }),
+        });
+      })
+      .catch((error: unknown) => {
+        options.write("interrupt-failed", {
+          recovery: details.recovery,
+          error: errorMessage(error),
+        });
+      });
+  };
   return new SdkSessionMonitor({
     snapshot: options.snapshot,
     write: options.write,
-    onStall: (stall) => {
-      const submissionAccepted = options.hasAcceptedSubmission();
-      options.setPhase(submissionAccepted ? "finalizing-submission" : "interrupting-stalled-turn");
-      options.write("interrupt-started", {
-        recovery: stall.recovery,
-        elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs,
-        submission_accepted: submissionAccepted,
-      });
-      if (submissionAccepted) {
-        options.finishAcceptedInput();
-        let finalization: void | Promise<void>;
-        try {
-          finalization = options.finalizeAcceptedSubmission();
-        } catch (error) {
-          options.write("submission-finalization-failed", {
-            recovery: stall.recovery,
-            error: errorMessage(error),
-          });
-          options.closeAcceptedSession();
-          finalization = undefined;
-        }
-        if (finalization !== undefined) {
-          void Promise.resolve(finalization)
-            .catch((error: unknown) => {
-              options.write("submission-finalization-failed", {
-                recovery: stall.recovery,
-                error: errorMessage(error),
-              });
-            })
-            .finally(() => {
-              options.closeAcceptedSession();
-            });
-        }
-      } else options.markBoundaryPending();
-      void options
-        .interrupt()
-        .then((receipt) => {
-          const stillQueued =
-            isRecord(receipt) && Array.isArray(receipt.still_queued)
-              ? receipt.still_queued.length
-              : undefined;
-          options.write("interrupt-finished", {
-            recovery: stall.recovery,
-            ...(stillQueued === undefined ? {} : { still_queued: stillQueued }),
-          });
-        })
-        .catch((error: unknown) => {
-          options.write("interrupt-failed", {
-            recovery: stall.recovery,
-            error: errorMessage(error),
-          });
-        });
-      if (!submissionAccepted) return;
-    },
+    onStall: recover,
+    onSubmissionDeadline: recover,
   });
 }
 
@@ -966,5 +990,7 @@ export const agentInternals = {
   SdkSessionMonitor,
   SDK_SESSION_HEARTBEAT_MS,
   SDK_SESSION_STALL_MS,
+  SDK_SUBMISSION_GRACE_MS,
+  SDK_SESSION_CLOSE_MS,
   toSdkMcpServer,
 };
