@@ -603,11 +603,12 @@ export async function runReviewGoal(
     session.close();
   };
   let shutdown: Promise<void> | undefined;
-  const finishSession = (): Promise<void> => {
+  const finishSession = async (): Promise<void> => {
     monitor?.stop();
     sessionState.expectedSessionClose = true;
     input.finish();
-    return (shutdown ??= closeSdkSession(closeSession, reader));
+    await (shutdown ??= closeSdkSession(closeSession, reader));
+    if (readerFailure !== undefined) throw readerFailure;
   };
   const tokenUsageState: {
     models: readonly ReviewModelUsage[];

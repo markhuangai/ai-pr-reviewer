@@ -484,6 +484,8 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
     "mcp-timeout",
     "natural-mcp-timeout",
     "reader-timeout",
+    "reader-failure",
+    "natural-reader-failure",
     "close-failure",
     "interrupt-failure",
     "interrupt-pending",
@@ -508,6 +510,7 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
       let closes = 0;
       let checks = 0;
       const natural = mode.startsWith("natural") || mode === "provider-failure";
+      const readerFails = mode.endsWith("reader-failure") || mode === "cancellation";
       const unavailable = mode.replace("natural-", "");
       const pendingStatus = ["mcp-timeout", "natural-mcp-timeout", "cancellation"].includes(mode);
       const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
@@ -539,6 +542,7 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
           }
           await closed.promise;
           assert.equal((await messages.next()).done, true);
+          if (readerFails) throw new Error("reader failed during shutdown");
         },
         mcpServerStatus: () => {
           checks += 1;
@@ -618,8 +622,9 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
       }
       const result = await running;
       closed.resolve(undefined);
-      const expectedError =
-        mode === "provider-failure"
+      const expectedError = readerFails
+        ? /reader failed during shutdown/u
+        : mode === "provider-failure"
           ? /interrupted 1/u
           : ["missing", "pending", "disabled", "unknown"].includes(unavailable)
             ? /Configured MCP server failure: security: (status unavailable|pending|disabled|unknown)/u
@@ -635,7 +640,7 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
       assert.equal(result.status, expectedError === undefined ? "completed" : "failed");
       if (expectedError !== undefined) assert.match(result.error ?? "", expectedError);
       assert.equal(result.submission?.summary, "Accepted evidence");
-      assert.equal(result.tokenUsage?.complete, natural);
+      assert.equal(result.tokenUsage?.complete, natural && !readerFails);
       assert.equal(closes, 1);
       assert.equal(checks, mode === "provider-failure" ? 0 : 1);
       assert.equal(interrupts, natural ? 0 : 1);

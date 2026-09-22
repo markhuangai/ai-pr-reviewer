@@ -778,6 +778,8 @@ test("bounds verifier completion while preserving failures and cancellation", as
     "activity",
     "provider-failure",
     "reader-timeout",
+    "reader-failure",
+    "natural-reader-failure",
     "close-failure",
     "cancellation",
     "interrupt-failure",
@@ -794,6 +796,8 @@ test("bounds verifier completion while preserving failures and cancellation", as
       const controller = new AbortController();
       let closes = 0;
       let interrupts = 0;
+      const natural = mode === "provider-failure" || mode === "natural-reader-failure";
+      const readerFails = mode.endsWith("reader-failure") || mode === "cancellation";
       const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
         async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage | SDKActiveGoalMessage> {
           const messages = input.prompt[Symbol.asyncIterator]();
@@ -821,12 +825,16 @@ test("bounds verifier completion while preserving failures and cancellation", as
             assert.match(duplicate.content[0]?.text ?? "", /already accepted/u);
             observed.resolve(undefined);
           }
-          if (mode === "provider-failure") {
-            yield resolutionResult(1, "error_during_execution");
+          if (natural) {
+            yield resolutionResult(
+              1,
+              mode === "provider-failure" ? "error_during_execution" : "success",
+            );
             terminal.resolve(undefined);
           }
           await closed.promise;
           assert.equal((await messages.next()).done, true);
+          if (readerFails) throw new Error("verifier reader failed during shutdown");
         },
         mcpServerStatus: () => assert.fail("verifiers do not configure external MCP servers"),
         interrupt: () => {
@@ -860,7 +868,7 @@ test("bounds verifier completion while preserving failures and cancellation", as
         await observed.promise;
         assert.equal(closes, 0);
         st.mock.timers.tick(1);
-      } else if (mode === "provider-failure") await terminal.promise;
+      } else if (natural) await terminal.promise;
       else st.mock.timers.tick(agentInternals.SDK_SUBMISSION_GRACE_MS);
       if (mode === "reader-timeout") {
         await closing.promise;
@@ -868,8 +876,9 @@ test("bounds verifier completion while preserving failures and cancellation", as
       }
       const result = await running;
       closed.resolve(undefined);
-      const expectedError =
-        mode === "provider-failure"
+      const expectedError = readerFails
+        ? /verifier reader failed during shutdown/u
+        : mode === "provider-failure"
           ? /interrupted 1/u
           : mode === "reader-timeout"
             ? /reader did not stop within 5000 ms/u
@@ -886,7 +895,7 @@ test("bounds verifier completion while preserving failures and cancellation", as
           rationale: "Current guard verified",
         });
       assert.equal(closes, 1);
-      assert.equal(interrupts, mode === "provider-failure" ? 0 : 1);
+      assert.equal(interrupts, natural ? 0 : 1);
       assert.equal(controller.signal.aborted, false);
       st.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
       assert.equal(closes, 1);
