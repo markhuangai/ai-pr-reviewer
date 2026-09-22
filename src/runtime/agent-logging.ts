@@ -34,13 +34,13 @@ export async function readAcceptedSubmissionMcpFailures(
   mcpServerStatus: () => Promise<readonly McpServerStatusRecord[]>,
   configuredMcpNames: ReadonlySet<string>,
 ): Promise<readonly string[]> {
-  return (await mcpServerStatus())
-    .filter(
-      (status) =>
-        configuredMcpNames.has(status.name) &&
-        (status.status === "failed" || status.status === "needs-auth"),
-    )
-    .map((status) => `${status.name}: ${status.error ?? status.status}`);
+  const statuses = await mcpServerStatus();
+  return [...configuredMcpNames].flatMap((name) => {
+    const status = statuses.find((entry) => entry.name === name);
+    return status?.status === "connected"
+      ? []
+      : [`${name}: ${status?.error ?? status?.status ?? "status unavailable"}`];
+  });
 }
 
 export async function readAcceptedSubmissionMcpStatus(
@@ -216,7 +216,7 @@ function redactBoundedAgentLogString(
           crossingSecretStart = Math.min(crossingSecretStart, start);
           break;
         }
-        start = prefix.lastIndexOf(firstCharacter, start - 1);
+        start = start === 0 ? -1 : prefix.lastIndexOf(firstCharacter, start - 1);
       }
     }
   }

@@ -95,6 +95,8 @@ Authentication is API-key only. The removed `ai-auth-mode` input is rejected ins
 
 Every isolated goal fixes Claude Code's `API_TIMEOUT_MS` and `CLAUDE_STREAM_IDLE_TIMEOUT_MS` controls at 300000 milliseconds and sets `CLAUDE_CODE_MAX_RETRIES` to `1`. Each model API request therefore gets at most two five-minute attempts. Retry events include the attempt, retry limit, delay, HTTP status, and error class in the action log. Independently, the action emits a session heartbeat every minute and interrupts a turn after five minutes without an SDK message, so transport keep-alives cannot hide an otherwise silent session. Configure a job-level timeout such as `timeout-minutes: 60` as the outer bound on repeated same-session recovery.
 
+An accepted review submission or stale-thread verdict starts a fixed 30-second grace period for the SDK's terminal result. Additional messages, tool calls, and duplicate submissions do not extend it. If the grace expires, the action finalizes the accepted output without another model turn. Review goals retain their required MCP status check, bounded to 30 seconds; each query is then closed individually, with at most five seconds to finish its message reader. Natural provider failures, required MCP failures or unknown status, and shutdown failures remain explicit failures. Cancellation takes precedence. Forced finalization marks token accounting incomplete, so reported usage and cost remain lower bounds. Logs identify acceptance, grace expiry, and finalization; the workflow timeout still bounds sessions that have not submitted valid output.
+
 ### Custom system prompt
 
 Use `system-prompt` when the built-in reviewer instructions should be replaced for every isolated goal session:

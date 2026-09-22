@@ -43,6 +43,7 @@ test("runs a complete SDK review turn through the real diff and submission tools
     },
   });
   const query = fakeAgentQuery({
+    mcpStatuses: [{ name: "security", status: "connected" }],
     preflightTools: true,
     submission: {
       summary: "One issue",

@@ -547,6 +547,51 @@ test("contains synchronous and asynchronous stall-handler failures", async () =>
   }
 });
 
+test("accepted output has one deadline that activity and duplicate acceptance cannot extend", () => {
+  const clock = new FakeSdkClock();
+  const events: string[] = [];
+  let deadlines = 0;
+  const monitor = new agentInternals.SdkSessionMonitor({
+    clock,
+    snapshot: () => ({}),
+    write: (event) => events.push(event),
+    onStall: () => assert.fail("accepted output must not resume investigation"),
+    onSubmissionDeadline: () => {
+      deadlines += 1;
+    },
+  });
+  monitor.start();
+  monitor.acceptSubmission();
+  clock.advance(agentInternals.SDK_SUBMISSION_GRACE_MS - 1);
+  monitor.observe({ type: "assistant", tool: "Read" });
+  monitor.acceptSubmission();
+  assert.equal(deadlines, 0);
+  clock.advance(1);
+  assert.equal(deadlines, 1);
+  assert.deepEqual(events, ["submission-accepted", "submission-deadline"]);
+  assert.equal(clock.pendingTimers, 0);
+  monitor.acceptSubmission();
+  monitor.observe({ type: "assistant" });
+  clock.advance(agentInternals.SDK_SESSION_STALL_MS);
+  assert.equal(deadlines, 1);
+});
+
+test("natural completion cancels the accepted-output deadline", () => {
+  const clock = new FakeSdkClock();
+  const monitor = new agentInternals.SdkSessionMonitor({
+    clock,
+    snapshot: () => ({}),
+    write: () => undefined,
+    onStall: () => assert.fail("unexpected stall"),
+    onSubmissionDeadline: () => assert.fail("completion deadline survived cleanup"),
+  });
+  monitor.start();
+  monitor.acceptSubmission();
+  monitor.stop();
+  clock.advance(agentInternals.SDK_SESSION_STALL_MS);
+  assert.equal(clock.pendingTimers, 0);
+});
+
 test("rejects model-authored apply suggestions", () => {
   assert.equal(
     agentInternals.submissionSchema.safeParse({

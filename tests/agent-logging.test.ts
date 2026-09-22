@@ -1,12 +1,39 @@
 import {
   agentInternals,
   assert,
+  execFileAsync,
   test,
   type PullRequestContext,
   type SDKActiveGoalMessage,
   type SDKMessage,
   type SDKUserMessage,
 } from "./agent-test-helpers.js";
+
+test("terminates backward secret scans at zero without exposing crossing secrets", async () => {
+  const moduleUrl = new URL("../src/runtime/agent-logging.js", import.meta.url).href;
+  const script = `
+    import { strict as assert } from "node:assert";
+    import { boundedAgentLogValue } from ${JSON.stringify(moduleUrl)};
+    const secret = "SYNTHETIC-SECRET";
+    for (const tail of ["Something unrelated", "SSSS unrelated", secret + " trailing"]) {
+      const value = boundedAgentLogValue({ padding: "x".repeat(1010), tail }, [secret]);
+      assert.match(value, /payload truncated/);
+      assert.ok(!value.includes(secret));
+    }
+    const longSecret = "S" + "q".repeat(1100);
+    assert.match(boundedAgentLogValue("Something unrelated ".repeat(100), [longSecret]), /Something/);
+    assert.equal(boundedAgentLogValue(longSecret + " suffix", [longSecret]), '"[REDACTED]" [1108 chars]');
+    const crossing = "prefix-" + longSecret;
+    assert.equal(boundedAgentLogValue(crossing, [longSecret]), '"prefix-[REDACTED]" [1108 chars]');
+    assert.match(boundedAgentLogValue("the " + secret, [secret]), /\\[REDACTED\\]/);
+    console.log("completed");
+  `;
+  const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", script], {
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+  });
+  assert.equal(stdout.trim(), "completed");
+});
 
 test("logs assistant, agent-tool, and MCP events with bounded redacted payloads", () => {
   const secret = "mcp-header-secret";
