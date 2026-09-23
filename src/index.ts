@@ -563,6 +563,7 @@ export async function runAction(
             conversation.snapshot.digest,
             preparedContextFiles.identity,
             reviewBriefingDigest(context, briefing),
+            rawGoals,
           ),
       );
       if (config.interactWithPullRequest && review.omittedFindings.length > 0) {

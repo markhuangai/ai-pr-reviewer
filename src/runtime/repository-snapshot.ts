@@ -50,21 +50,37 @@ function guidanceCandidates(files: readonly ChangedFile[]): readonly string[] | 
   );
 }
 
-function appliesToChangedPath(guidancePath: string, files: readonly ChangedFile[]): boolean {
+function sortedChangedPaths(files: readonly ChangedFile[]): readonly string[] {
+  return [
+    ...new Set(
+      files.flatMap((file) => [
+        file.path,
+        ...(file.previousPath === undefined ? [] : [file.previousPath]),
+      ]),
+    ),
+  ]
+    .filter(validPath)
+    .sort();
+}
+
+function appliesToChangedPath(guidancePath: string, changedPaths: readonly string[]): boolean {
   if (
     !validPath(guidancePath) ||
     (guidancePath !== "AGENTS.md" && !guidancePath.endsWith("/AGENTS.md"))
   )
     return false;
   const directory = guidancePath.slice(0, -"AGENTS.md".length);
-  return files.some((file) =>
-    [file.path, file.previousPath].some(
-      (changedPath) =>
-        changedPath !== undefined &&
-        validPath(changedPath) &&
-        (directory === "" || changedPath.startsWith(directory)),
-    ),
-  );
+  if (directory === "") return changedPaths.length > 0;
+
+  let lower = 0;
+  let upper = changedPaths.length;
+  while (lower < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    const path = changedPaths[middle];
+    if (path !== undefined && path < directory) lower = middle + 1;
+    else upper = middle;
+  }
+  return changedPaths[lower]?.startsWith(directory) ?? false;
 }
 
 function sortGuidancePaths(paths: Iterable<string>): string[] {
@@ -181,8 +197,8 @@ export class RepositorySnapshot {
     return revision === "base" ? this.mergeBaseSha : this.headSha;
   }
 
-  private query(args: readonly string[]): Promise<RepositoryQuerySource> {
-    const result = this.queryOperation.then(() => this.runQuery(args));
+  private query(args: readonly string[], acceptNoMatches = false): Promise<RepositoryQuerySource> {
+    const result = this.queryOperation.then(() => this.runQuery(args, acceptNoMatches));
     this.queryOperation = result.then(
       () => undefined,
       () => undefined,
@@ -190,7 +206,10 @@ export class RepositorySnapshot {
     return result;
   }
 
-  private async runQuery(args: readonly string[]): Promise<RepositoryQuerySource> {
+  private async runQuery(
+    args: readonly string[],
+    acceptNoMatches = false,
+  ): Promise<RepositoryQuerySource> {
     throwIfAborted(this.signal);
     let directory: string | undefined;
     try {
@@ -212,6 +231,7 @@ export class RepositorySnapshot {
         "Git snapshot query",
         this.signal,
         remainingBytes,
+        acceptNoMatches,
       );
       const { size: sizeBytes } = await stat(outputPath);
       if (sizeBytes > this.maxQueryStorageBytes - this.queryStorageBytes) {
@@ -313,19 +333,44 @@ export class RepositorySnapshot {
     )
       return [];
     const candidateSet = candidates === undefined ? undefined : new Set(candidates);
+    const changedPaths = candidateSet === undefined ? sortedChangedPaths(files) : [];
     const presentByRevision = new Map<"base" | "head", ReadonlySet<string>>();
     for (const revision of ["base", "head"] as const) {
       const present = new Set<string>();
       if (candidateSet === undefined) {
-        const source = await this.query(["ls-tree", "-r", "-z", "--name-only", this.sha(revision)]);
-        try {
-          const paths = (await readFile(source.path)).toString("utf8").split("\0");
-          for (const path of paths) {
-            if (appliesToChangedPath(path, files)) present.add(path);
+        const sha = this.sha(revision);
+        const paths = new Set<string>();
+        for (const onlyUnmatched of [false, true]) {
+          const source = await this.query(
+            [
+              "grep",
+              ...(onlyUnmatched ? ["-L"] : []),
+              "--name-only",
+              "-z",
+              "-I",
+              "-E",
+              "--no-textconv",
+              ".*",
+              sha,
+              "--",
+              ":(glob)**/AGENTS.md",
+            ],
+            true,
+          );
+          try {
+            const prefix = `${sha}:`;
+            const results = (await readFile(source.path, "utf8")).split("\0");
+            for (const result of results) {
+              if (result.length === 0) continue;
+              if (!result.startsWith(prefix))
+                throw new Error("Repository guidance query returned an unexpected path prefix.");
+              paths.add(result.slice(prefix.length));
+            }
+          } finally {
+            await source.cleanup();
           }
-        } finally {
-          await source.cleanup();
         }
+        for (const path of paths) if (appliesToChangedPath(path, changedPaths)) present.add(path);
       } else {
         const candidatePaths = candidates ?? [];
         for (let offset = 0; offset < candidatePaths.length; offset += GUIDANCE_PATH_BATCH_SIZE) {

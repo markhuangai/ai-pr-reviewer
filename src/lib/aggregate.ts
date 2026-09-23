@@ -480,6 +480,7 @@ export function aggregateReview(
   conversationDigest = EMPTY_CONVERSATION_DIGEST,
   contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
   briefingDigest = "",
+  coverageGoals: readonly GoalResult[] = goals,
 ): AggregatedReview {
   const marker = reviewMarker(context, config, conversationDigest, contextFiles, briefingDigest);
   const normalized = goals.flatMap(
@@ -494,12 +495,12 @@ export function aggregateReview(
   const omittedFindings = config.interactWithPullRequest
     ? findings.filter((finding) => !inlineKeys.has(finding))
     : [];
-  const hasCoverageAssessment = goals.some(
+  const hasCoverageAssessment = coverageGoals.some(
     (goal) => (goal.submission?.assessment.coverage.length ?? 0) > 0,
   );
   const partial =
     goals.some((goal) => goal.status !== "completed") ||
-    (hasCoverageAssessment && missingReviewCoverage(files, goals).length > 0);
+    (hasCoverageAssessment && missingReviewCoverage(files, coverageGoals).length > 0);
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
     (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,

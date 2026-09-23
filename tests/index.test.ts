@@ -250,6 +250,63 @@ test("redacts generated AI prompts without dropping them", () => {
   assert.equal(failedGoal?.submission, undefined);
 });
 
+test("keeps secret-bearing coverage paths for completeness without publishing them", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  const changedPath = "src/test-ai-secret.ts";
+  const files = [
+    {
+      path: changedPath,
+      status: "modified" as const,
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    },
+  ];
+  let summary = "";
+  let publishedGoals: readonly GoalResult[] = [];
+
+  const result = await runAction(actionReader({ "interact-with-pr": "false" }), [], {
+    createApi: () => emptyConversationApi("review-action") as unknown as GitHubApi,
+    readEventContext: () => Promise.resolve(context),
+    createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+    readFiles: () => Promise.resolve(files),
+    runGoals: () =>
+      Promise.resolve([
+        {
+          prompt: "correctness",
+          status: "completed" as const,
+          submission: {
+            assessment: {
+              coverage: [
+                {
+                  paths: [changedPath],
+                  disposition: "reviewed" as const,
+                  rationale: "The complete changed file was reviewed.",
+                  evidenceRefs: ["ev-1"],
+                },
+              ],
+              candidates: [],
+            },
+            summary: "clean",
+            findings: [],
+          },
+        },
+      ]),
+    writeSummary: (summaryContext, review, goals) => {
+      summary = buildRunSummary(summaryContext, review, goals);
+      publishedGoals = goals;
+      return Promise.resolve();
+    },
+  });
+
+  const output = JSON.stringify({ review: result.review, summary, goals: publishedGoals });
+  assert.equal(result.review?.partial, false);
+  assert.match(output, /\[REDACTED\]\.ts/u);
+  assert.doesNotMatch(output, /test-ai-secret/u);
+});
+
 test("workspace validation rejects ignored content", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
 

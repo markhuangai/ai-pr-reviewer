@@ -325,10 +325,14 @@ test("discovers base and head guidance for changed, renamed, and deleted paths",
 test("bounds guidance candidates and still finds applicable ancestor files", async (t) => {
   const repository = await makeRepository(t, async (root) => {
     await mkdir(join(root, "group-0"), { recursive: true });
+    await mkdir(join(root, "group-1"), { recursive: true });
     await mkdir(join(root, "elsewhere"), { recursive: true });
+    await mkdir(join(root, "group-0-other"), { recursive: true });
     await writeFile(join(root, "AGENTS.md"), "root guidance\n");
     await writeFile(join(root, "group-0/AGENTS.md"), "group guidance\n");
+    await writeFile(join(root, "group-1/AGENTS.md"), "");
     await writeFile(join(root, "elsewhere/AGENTS.md"), "unrelated guidance\n");
+    await writeFile(join(root, "group-0-other/AGENTS.md"), "prefix lookalike guidance\n");
     await writeFile(join(root, "fooAGENTS.md"), "lookalike guidance\n");
   });
   const changed: readonly ChangedFile[] = [
@@ -364,8 +368,40 @@ test("bounds guidance candidates and still finds applicable ancestor files", asy
   const guidance = await snapshot.guidance(changed);
   assert.deepEqual(
     guidance.map((entry) => `${entry.path}:${entry.revision}:${entry.content}`),
-    ["AGENTS.md:head:root guidance\n", "group-0/AGENTS.md:head:group guidance\n"],
+    [
+      "AGENTS.md:head:root guidance\n",
+      "group-0/AGENTS.md:head:group guidance\n",
+      "group-1/AGENTS.md:head:",
+    ],
   );
+});
+
+test("treats an empty guidance search as no applicable guidance after candidate overflow", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "review.txt"), "updated review content\n");
+  });
+  const changed: readonly ChangedFile[] = Array.from({ length: 8 }, (_, index) => ({
+    path: `group-${index}/${Array.from({ length: 600 }, (_unused, depth) => `d${depth}`).join("/")}/file.ts`,
+    status: "added" as const,
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    addedLines: new Set([1]),
+  }));
+  assert.equal(repositorySnapshotInternals.guidanceCandidates(changed), undefined);
+
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    changed,
+    undefined,
+    repository.temporaryRoot,
+  );
+  t.after(() => snapshot.cleanup());
+
+  assert.deepEqual(await snapshot.guidance(changed), []);
 });
 
 test("spools repository files beyond the former Git output cap", async (t) => {
