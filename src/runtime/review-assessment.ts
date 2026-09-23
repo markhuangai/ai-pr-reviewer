@@ -492,8 +492,12 @@ export class ReviewEvidenceLedger {
       if (source === undefined) continue;
       const result = toolResponseDocument(call.tool_response);
       const nativeAssessment = nativeQueryAssessment(call.tool_name, call.tool_input, result);
+      const missingDiffPageMetadata =
+        source.kind === "repository_diff" &&
+        (typeof result?.done !== "boolean" || typeof result.content !== "string");
       const status =
         call.tool_response === undefined ||
+        missingDiffPageMetadata ||
         explicitToolFailure(call.tool_response) ||
         (result !== undefined && explicitToolFailure(result))
           ? "failed"

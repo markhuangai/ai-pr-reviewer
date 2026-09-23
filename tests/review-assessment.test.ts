@@ -114,6 +114,7 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        content: "diff page",
         done: false,
         nextCursor: "diff-cursor",
       }),
@@ -147,6 +148,7 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        content: "diff tail",
         done: true,
       }),
     ),
@@ -190,6 +192,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        content: "diff page",
         done: false,
         nextCursor: "recoverable-cursor",
       }),
@@ -220,6 +223,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        content: "diff tail",
         done: true,
       }),
     ),
@@ -237,6 +241,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
       { paths: ["src/change.ts"] },
       jsonResponse({
         paths: ["src/change.ts"],
+        content: "diff page",
         done: false,
         nextCursor: "expired-cursor",
       }),
@@ -440,16 +445,45 @@ test("records partial pagination from a top-level MCP content array", () => {
   const ledger = new ReviewEvidenceLedger("/repo");
   const [reference] = ledger.observeBatch([
     call("mcp__review_output__read_pr_diff", { paths: ["src/change.ts"] }, [
-      { type: "text", text: JSON.stringify({ done: false, nextCursor: "next-page" }) },
+      {
+        type: "text",
+        text: JSON.stringify({ content: "diff page", done: false, nextCursor: "next-page" }),
+      },
     ]),
   ]);
   assert.equal(reference?.status, "partial");
   assert.equal(
     reviewAssessmentInternals.toolResponseDocument([
-      { type: "text", text: JSON.stringify({ done: false, nextCursor: "next-page" }) },
+      {
+        type: "text",
+        text: JSON.stringify({ content: "diff page", done: false, nextCursor: "next-page" }),
+      },
     ])?.done,
     false,
   );
+});
+
+test("rejects unstructured full-diff responses as evidence", () => {
+  const responses = [
+    [{ type: "text", text: "Wait for the full review prompt before reading." }],
+    jsonResponse({ done: true }),
+  ];
+  for (const response of responses) {
+    const ledger = new ReviewEvidenceLedger("/repo");
+    const [reference] = ledger.observeBatch([
+      call("mcp__review_output__read_pr_diff", {}, response),
+    ]);
+    assert.equal(reference?.status, "failed");
+    assert.ok(reference);
+    assert.ok(
+      findInvalidReviewAssessment(
+        { coverage: [coverage("src/change.ts", [reference.id])], candidates: [] },
+        [],
+        [changedFile],
+        ledger.issued,
+      ).some((issue) => issue.includes("no completed repository evidence")),
+    );
+  }
 });
 
 test("validates coverage, candidate evidence, and one-to-one finding links", () => {

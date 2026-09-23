@@ -51,7 +51,11 @@ function guidanceCandidates(files: readonly ChangedFile[]): readonly string[] | 
 }
 
 function appliesToChangedPath(guidancePath: string, files: readonly ChangedFile[]): boolean {
-  if (!validPath(guidancePath) || !guidancePath.endsWith("AGENTS.md")) return false;
+  if (
+    !validPath(guidancePath) ||
+    (guidancePath !== "AGENTS.md" && !guidancePath.endsWith("/AGENTS.md"))
+  )
+    return false;
   const directory = guidancePath.slice(0, -"AGENTS.md".length);
   return files.some((file) =>
     [file.path, file.previousPath].some(
@@ -349,7 +353,7 @@ export class RepositorySnapshot {
     const snapshots: RepositoryGuidanceSnapshot[] = [];
     let includedBytes = 0;
     const presentPaths = sortGuidancePaths(
-      [...presentByRevision.values()].flatMap((paths) => [...paths]),
+      new Set([...presentByRevision.values()].flatMap((paths) => [...paths])),
     );
     for (const path of presentPaths) {
       for (const revision of ["base", "head"] as const) {

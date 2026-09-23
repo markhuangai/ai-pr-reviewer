@@ -250,6 +250,14 @@ test("discovers base and head guidance for changed, renamed, and deleted paths",
   const firstGuidance = repositoryGuidanceForRun(snapshot, snapshot, changed);
   assert.equal(repositoryGuidanceForRun(snapshot, snapshot, changed), firstGuidance);
   const guidance = await firstGuidance;
+  for (const [path, count] of [
+    ["AGENTS.md", 2],
+    ["src/AGENTS.md", 2],
+    ["src/nested/AGENTS.md", 2],
+    ["gone/AGENTS.md", 1],
+  ] as const) {
+    assert.equal(guidance.filter((entry) => entry.path === path).length, count);
+  }
   assert.deepEqual(await snapshot.file("head", "linked/AGENTS.md"), {
     revision: "head",
     path: "linked/AGENTS.md",
@@ -321,15 +329,26 @@ test("bounds guidance candidates and still finds applicable ancestor files", asy
     await writeFile(join(root, "AGENTS.md"), "root guidance\n");
     await writeFile(join(root, "group-0/AGENTS.md"), "group guidance\n");
     await writeFile(join(root, "elsewhere/AGENTS.md"), "unrelated guidance\n");
+    await writeFile(join(root, "fooAGENTS.md"), "lookalike guidance\n");
   });
-  const changed: readonly ChangedFile[] = Array.from({ length: 8 }, (_, index) => ({
-    path: `group-${index}/${Array.from({ length: 600 }, (_unused, depth) => `d${depth}`).join("/")}/file.ts`,
-    status: "added",
-    additions: 1,
-    deletions: 0,
-    changes: 1,
-    addedLines: new Set([1]),
-  }));
+  const changed: readonly ChangedFile[] = [
+    ...Array.from({ length: 8 }, (_, index) => ({
+      path: `group-${index}/${Array.from({ length: 600 }, (_unused, depth) => `d${depth}`).join("/")}/file.ts`,
+      status: "added" as const,
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    })),
+    {
+      path: "foobar/nested/file.ts",
+      status: "added",
+      additions: 1,
+      deletions: 0,
+      changes: 1,
+      addedLines: new Set([1]),
+    },
+  ];
   assert.equal(repositorySnapshotInternals.guidanceCandidates(changed), undefined);
 
   const snapshot = new RepositorySnapshot(

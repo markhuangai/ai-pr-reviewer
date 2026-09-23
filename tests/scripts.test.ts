@@ -456,7 +456,7 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   ): Promise<readonly GoalResult[]> => {
     observedCalls += 1;
     assert.equal(replayContext.headSha, headSha);
-    const changedFile = files.find((file) => file.addedLines.size > 0);
+    const changedFile = files[0];
     assert.ok(changedFile);
     replayFindingPath = changedFile.path;
     replayFindingLine = changedFile.addedLines.values().next().value ?? 1;
