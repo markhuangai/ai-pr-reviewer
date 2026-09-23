@@ -251,28 +251,11 @@ test("redacts generated AI prompts without dropping them", () => {
 });
 
 test("workspace validation rejects ignored content", async (t) => {
-  const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-workspace-"));
-  t.after(() => rm(workspace, { force: true, recursive: true }));
-  await execFileAsync("git", ["init", "--quiet"], { cwd: workspace });
-  await writeFile(join(workspace, ".gitignore"), ".env\n");
-  await writeFile(join(workspace, "tracked.txt"), "tracked\n");
-  await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], { cwd: workspace });
-  await execFileAsync("git", ["commit", "--quiet", "--message=initial"], { cwd: workspace });
-  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace });
-  const context: PullRequestContext = {
-    repository: "owner/repository",
-    owner: "owner",
-    name: "repository",
-    number: 1,
-    headSha: stdout.trim(),
-    baseSha: "base",
-    baseRef: "main",
-    title: "Change",
-    htmlUrl: "https://github.com/owner/repository/pull/1",
-  };
+  const { context, workspace } = await cleanWorkspace(t);
 
   await indexInternals.assertWorkspace(context, workspace);
-  await writeFile(join(workspace, ".env"), "SECRET=ignored\n");
+  await mkdir(join(workspace, "build"), { recursive: true });
+  await writeFile(join(workspace, "build", "ignored.txt"), "ignored build output\n");
 
   await assert.rejects(
     indexInternals.assertWorkspace(context, workspace),
@@ -316,17 +299,18 @@ test("attempts workspace cleanup when context cleanup fails", async (t) => {
 test("summary-only URL reviews make GET requests and write one run summary", async (t) => {
   const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-index-"));
   t.after(() => rm(workspace, { force: true, recursive: true }));
-  await execFileAsync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: workspace });
-  await writeFile(join(workspace, "review.txt"), "base\n");
-  await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync("git", ["commit", "--quiet", "--message=base"], { cwd: workspace });
-  const { stdout: baseOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+  await execFileAsync("git", ["clone", "--quiet", "--shared", process.cwd(), workspace]);
+  const sourceHead = (
+    await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    })
+  ).stdout.trim();
+  await execFileAsync("git", ["checkout", "--quiet", "--detach", sourceHead], { cwd: workspace });
+  const { stdout: baseOutput } = await execFileAsync("git", ["rev-parse", "HEAD^"], {
     cwd: workspace,
     encoding: "utf8",
   });
-  await writeFile(join(workspace, "review.txt"), "head\n");
-  await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync("git", ["commit", "--quiet", "--message=head"], { cwd: workspace });
   const { stdout: headOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], {
     cwd: workspace,
     encoding: "utf8",
@@ -502,6 +486,17 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   const result = await runAction({ get: (name) => values[name] ?? "" }, [], {
     createApi: (token) => new GitHubApi(token, localApiUrl, undefined, `${localApiUrl}/graphql`),
     readEventContext: () => Promise.resolve(undefined),
+    readFiles: () =>
+      Promise.resolve([
+        {
+          path: "review.txt",
+          status: "modified",
+          additions: 1,
+          deletions: 1,
+          changes: 2,
+          addedLines: new Set([1]),
+        },
+      ]),
     createWorkspace: (context, token) => {
       assert.equal(context.repository, "target/project");
       assert.equal(context.title, "External test-ai-secret");

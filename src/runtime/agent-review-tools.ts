@@ -928,7 +928,7 @@ export class ReviewQueryReaderStore {
     ) {
       return this.invalidCursor("Continue this diff read with the same changed-path selection.");
     }
-    const page = await entry.reader.readNext({ nextCursor: cursor });
+    const page = await entry.reader.readNext({ ...entry.metadata, nextCursor: cursor });
     if (page.done) await this.finish(cursor);
     return jsonToolResult({
       ...entry.metadata,

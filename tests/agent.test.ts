@@ -7,7 +7,7 @@ import {
   fakeAgentQuery,
   goalContext,
   join,
-  makeRepository,
+  makeExistingCommitRepository,
   makeReviewDiff,
   mkdir,
   mkdtemp,
@@ -562,9 +562,7 @@ test("accepts only complete non-negative SDK model usage snapshots", () => {
 });
 
 test("runs parallel review goals over independent readers and cleans the shared diff", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "head change\n");
-  });
+  const repository = await makeExistingCommitRepository(t);
   const results = await runReviewGoals(
     repository.context,
     [],
@@ -589,9 +587,7 @@ test("runs parallel review goals over independent readers and cleans the shared 
 });
 
 test("stops scheduling review goals after cancellation and removes the shared diff", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "head change\n");
-  });
+  const repository = await makeExistingCommitRepository(t);
   const previousTemporaryRoot = process.env.RUNNER_TEMP;
   process.env.RUNNER_TEMP = repository.temporaryRoot;
   t.after(() => {

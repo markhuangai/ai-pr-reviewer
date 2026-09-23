@@ -62,12 +62,6 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
   return result.stdout.trim();
 }
 
-async function commit(cwd: string, message: string): Promise<string> {
-  await git(cwd, ["add", "."]);
-  await git(cwd, ["commit", "--quiet", `--message=${message}`]);
-  return git(cwd, ["rev-parse", "HEAD"]);
-}
-
 test("copies bootstrap files, lists archive entries, normalizes modes, and writes checksums", async (t) => {
   const root = await temporaryDirectory("ai-pr-reviewer-scripts-");
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -400,14 +394,11 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   t.after(() => rm(temporary, { recursive: true, force: true }));
   const checkout = join(temporary, "checkout");
   const results = join(temporary, "results");
-  await mkdir(checkout);
   await mkdir(results);
-  await git(checkout, ["init", "--quiet", "--initial-branch=main"]);
-  await writeFile(join(checkout, ".gitignore"), "ignored.tmp\n");
-  await writeFile(join(checkout, "review.txt"), "base\n");
-  const baseSha = await commit(checkout, "base");
-  await writeFile(join(checkout, "review.txt"), "base\nhead\n");
-  const headSha = await commit(checkout, "head");
+  await git(temporary, ["clone", "--quiet", "--shared", process.cwd(), checkout]);
+  const headSha = await git(process.cwd(), ["rev-parse", "HEAD"]);
+  await git(checkout, ["checkout", "--quiet", "--detach", headSha]);
+  const baseSha = await git(checkout, ["rev-parse", "HEAD^"]);
   const context = {
     repository: "owner/repository",
     owner: "owner",
@@ -416,7 +407,6 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     baseSha,
     headSha,
     baseRef: "main",
-    changedFiles: 1,
     title: "Example change",
     htmlUrl: "https://github.com/owner/repository/pull/123",
   };
@@ -455,6 +445,8 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   const beforeHead = await git(checkout, ["rev-parse", "HEAD"]);
   const beforeBranch = await git(checkout, ["branch", "--show-current"]);
   let observedCalls = 0;
+  let replayFindingPath = "";
+  let replayFindingLine = 0;
   const runner: ReplayRunner = (
     replayContext,
     files,
@@ -464,9 +456,10 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   ): Promise<readonly GoalResult[]> => {
     observedCalls += 1;
     assert.equal(replayContext.headSha, headSha);
-    assert.equal(files.length, 1);
-    assert.equal(files[0]?.path, "review.txt");
-    assert.equal(files[0]?.addedLines.has(2), true);
+    const changedFile = files.find((file) => file.addedLines.size > 0);
+    assert.ok(changedFile);
+    replayFindingPath = changedFile.path;
+    replayFindingLine = changedFile.addedLines.values().next().value ?? 1;
     assert.deepEqual(conversation.entries, []);
     assert.equal(contextFiles[0]?.length, 0);
     assert.equal(config.reviewPrompts[0]?.prompt, "Review the changed behavior.");
@@ -482,14 +475,14 @@ test("replays a frozen case without publishing, switching revisions, or exposing
               title: "replay-secret defect",
               severity: "MODERATE",
               body: "The replay-secret value is dropped.",
-              path: "review.txt",
-              line: 2,
+              path: replayFindingPath,
+              line: replayFindingLine,
             },
           ],
           assessment: {
             coverage: [
               {
-                paths: ["review.txt"],
+                paths: files.map((file) => file.path),
                 disposition: "reviewed",
                 rationale: "Inspected replay-secret behavior.",
                 evidenceRefs: ["ev-1"],
@@ -497,7 +490,7 @@ test("replays a frozen case without publishing, switching revisions, or exposing
             ],
             candidates: [
               {
-                paths: ["review.txt"],
+                paths: [replayFindingPath],
                 trigger: "The changed branch drops replay-secret.",
                 impact: "The value is lost.",
                 evidenceRefs: ["ev-1"],

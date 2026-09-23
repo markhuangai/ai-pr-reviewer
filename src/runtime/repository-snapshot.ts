@@ -12,6 +12,7 @@ const MAX_REPOSITORY_QUERY_STORAGE_BYTES = 256 * 1024 * 1024;
 const MAX_GUIDANCE_FILE_BYTES = 64 * 1024;
 const MAX_GUIDANCE_TOTAL_BYTES = 256 * 1024;
 const GUIDANCE_PATH_BATCH_SIZE = 128;
+const MAX_GUIDANCE_CANDIDATES = 4_096;
 
 function isGitMetadataPath(value: string): boolean {
   return /(?:^|[\\/])\.git(?:$|[\\/])/iu.test(value);
@@ -26,7 +27,7 @@ function validPath(value: string): boolean {
   );
 }
 
-function guidanceCandidates(files: readonly ChangedFile[]): readonly string[] {
+function guidanceCandidates(files: readonly ChangedFile[]): readonly string[] | undefined {
   const candidates = new Set<string>();
   for (const file of files) {
     for (const changedPath of [
@@ -34,15 +35,36 @@ function guidanceCandidates(files: readonly ChangedFile[]): readonly string[] {
       ...(file.previousPath === undefined ? [] : [file.previousPath]),
     ]) {
       if (!validPath(changedPath)) continue;
-      const parts = changedPath.split("/");
-      const directories = parts.slice(0, -1);
+      const directories = changedPath.split("/").slice(0, -1);
+      let prefix = "";
       for (let depth = 0; depth <= directories.length; depth += 1) {
-        candidates.add([...directories.slice(0, depth), "AGENTS.md"].join("/"));
+        candidates.add(`${prefix}AGENTS.md`);
+        if (candidates.size > MAX_GUIDANCE_CANDIDATES) return undefined;
+        const directory = directories[depth];
+        if (directory !== undefined) prefix += `${directory}/`;
       }
-      if (parts.at(-1) === "AGENTS.md") candidates.add(changedPath);
     }
   }
   return [...candidates].sort(
+    (left, right) => left.split("/").length - right.split("/").length || left.localeCompare(right),
+  );
+}
+
+function appliesToChangedPath(guidancePath: string, files: readonly ChangedFile[]): boolean {
+  if (!validPath(guidancePath) || !guidancePath.endsWith("AGENTS.md")) return false;
+  const directory = guidancePath.slice(0, -"AGENTS.md".length);
+  return files.some((file) =>
+    [file.path, file.previousPath].some(
+      (changedPath) =>
+        changedPath !== undefined &&
+        validPath(changedPath) &&
+        (directory === "" || changedPath.startsWith(directory)),
+    ),
+  );
+}
+
+function sortGuidancePaths(paths: Iterable<string>): string[] {
+  return [...paths].sort(
     (left, right) => left.split("/").length - right.split("/").length || left.localeCompare(right),
   );
 }
@@ -278,27 +300,47 @@ export class RepositorySnapshot {
 
   async guidance(files: readonly ChangedFile[]): Promise<readonly RepositoryGuidanceSnapshot[]> {
     const candidates = guidanceCandidates(files);
-    if (candidates.length === 0) return [];
-    const candidateSet = new Set(candidates);
+    if (candidates?.length === 0) return [];
+    if (
+      candidates === undefined &&
+      !files.some((file) =>
+        [file.path, file.previousPath].some((path) => path !== undefined && validPath(path)),
+      )
+    )
+      return [];
+    const candidateSet = candidates === undefined ? undefined : new Set(candidates);
     const presentByRevision = new Map<"base" | "head", ReadonlySet<string>>();
     for (const revision of ["base", "head"] as const) {
       const present = new Set<string>();
-      for (let offset = 0; offset < candidates.length; offset += GUIDANCE_PATH_BATCH_SIZE) {
-        const batch = candidates.slice(offset, offset + GUIDANCE_PATH_BATCH_SIZE);
-        const source = await this.query([
-          "ls-tree",
-          "-r",
-          "-z",
-          "--name-only",
-          this.sha(revision),
-          "--",
-          ...batch.map((path) => `:(literal)${path}`),
-        ]);
+      if (candidateSet === undefined) {
+        const source = await this.query(["ls-tree", "-r", "-z", "--name-only", this.sha(revision)]);
         try {
           const paths = (await readFile(source.path)).toString("utf8").split("\0");
-          for (const path of paths) if (candidateSet.has(path)) present.add(path);
+          for (const path of paths) {
+            if (appliesToChangedPath(path, files)) present.add(path);
+          }
         } finally {
           await source.cleanup();
+        }
+      } else {
+        const candidatePaths = candidates ?? [];
+        for (let offset = 0; offset < candidatePaths.length; offset += GUIDANCE_PATH_BATCH_SIZE) {
+          const batch = candidatePaths.slice(offset, offset + GUIDANCE_PATH_BATCH_SIZE);
+          const source = await this.query([
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            this.sha(revision),
+            "--",
+            ...batch.map((path) => `:(literal)${path}`),
+          ]);
+          try {
+            const paths = (await readFile(source.path)).toString("utf8").split("\0");
+            for (const path of paths) if (candidateSet.has(path)) present.add(path);
+          } finally {
+            await source.cleanup();
+          }
         }
       }
       presentByRevision.set(revision, present);
@@ -306,7 +348,10 @@ export class RepositorySnapshot {
 
     const snapshots: RepositoryGuidanceSnapshot[] = [];
     let includedBytes = 0;
-    for (const path of candidates) {
+    const presentPaths = sortGuidancePaths(
+      [...presentByRevision.values()].flatMap((paths) => [...paths]),
+    );
+    for (const path of presentPaths) {
       for (const revision of ["base", "head"] as const) {
         if (!presentByRevision.get(revision)?.has(path)) continue;
         const snapshot = await this.file(revision, path);
@@ -352,6 +397,24 @@ export class RepositorySnapshot {
   }
 }
 
+const repositoryGuidanceByRun = new WeakMap<
+  object,
+  Promise<readonly RepositoryGuidanceSnapshot[]>
+>();
+
+export function repositoryGuidanceForRun(
+  runKey: object,
+  snapshot: RepositorySnapshot,
+  files: readonly ChangedFile[],
+): Promise<readonly RepositoryGuidanceSnapshot[]> {
+  let pending = repositoryGuidanceByRun.get(runKey);
+  if (pending === undefined) {
+    pending = snapshot.guidance(files);
+    repositoryGuidanceByRun.set(runKey, pending);
+  }
+  return pending;
+}
+
 export const repositorySnapshotInternals = {
   MAX_REPOSITORY_QUERY_STORAGE_BYTES,
   validPath,
@@ -359,6 +422,8 @@ export const repositorySnapshotInternals = {
   isWithin,
   checkedCommit,
   guidanceCandidates,
+  appliesToChangedPath,
+  MAX_GUIDANCE_CANDIDATES,
   MAX_GUIDANCE_FILE_BYTES,
   MAX_GUIDANCE_TOTAL_BYTES,
 };

@@ -184,6 +184,13 @@ function isText(value: unknown): value is string {
 }
 
 function toolResponseDocument(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (Array.isArray(value)) {
+    for (const block of value) {
+      const parsed = toolResponseDocument(block);
+      if (parsed !== undefined) return parsed;
+    }
+    return undefined;
+  }
   if (isRecord(value)) {
     if (isText(value.text)) {
       try {

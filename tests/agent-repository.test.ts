@@ -6,6 +6,8 @@ import {
   fakeAgentQuery,
   git,
   join,
+  makeExistingCommitRepository,
+  makeDiffFromSnapshots,
   makeRepository,
   mkdir,
   mkdtemp,
@@ -25,7 +27,7 @@ import {
   type ReviewConversationSnapshot,
   writeFile,
 } from "./agent-test-helpers.js";
-import { readPullRequestFilesFromCheckout } from "../src/lib/github-api.js";
+import { repositoryGuidanceForRun } from "../src/runtime/repository-snapshot.js";
 
 test("serializes repeated diff reads and rejects reads after close or premature EOF", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-reader-state-"));
@@ -245,7 +247,9 @@ test("discovers base and head guidance for changed, renamed, and deleted paths",
     repository.temporaryRoot,
   );
   t.after(() => snapshot.cleanup());
-  const guidance = await snapshot.guidance(changed);
+  const firstGuidance = repositoryGuidanceForRun(snapshot, snapshot, changed);
+  assert.equal(repositoryGuidanceForRun(snapshot, snapshot, changed), firstGuidance);
+  const guidance = await firstGuidance;
   assert.deepEqual(await snapshot.file("head", "linked/AGENTS.md"), {
     revision: "head",
     path: "linked/AGENTS.md",
@@ -307,6 +311,41 @@ test("discovers base and head guidance for changed, renamed, and deleted paths",
         record.revision === "head" &&
         record.body === "head root guidance\n",
     ),
+  );
+});
+
+test("bounds guidance candidates and still finds applicable ancestor files", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await mkdir(join(root, "group-0"), { recursive: true });
+    await mkdir(join(root, "elsewhere"), { recursive: true });
+    await writeFile(join(root, "AGENTS.md"), "root guidance\n");
+    await writeFile(join(root, "group-0/AGENTS.md"), "group guidance\n");
+    await writeFile(join(root, "elsewhere/AGENTS.md"), "unrelated guidance\n");
+  });
+  const changed: readonly ChangedFile[] = Array.from({ length: 8 }, (_, index) => ({
+    path: `group-${index}/${Array.from({ length: 600 }, (_unused, depth) => `d${depth}`).join("/")}/file.ts`,
+    status: "added",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    addedLines: new Set([1]),
+  }));
+  assert.equal(repositorySnapshotInternals.guidanceCandidates(changed), undefined);
+
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    changed,
+    undefined,
+    repository.temporaryRoot,
+  );
+  t.after(() => snapshot.cleanup());
+  const guidance = await snapshot.guidance(changed);
+  assert.deepEqual(
+    guidance.map((entry) => `${entry.path}:${entry.revision}:${entry.content}`),
+    ["AGENTS.md:head:root guidance\n", "group-0/AGENTS.md:head:group guidance\n"],
   );
 });
 
@@ -616,9 +655,10 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
       },
     ],
   };
-  const diff = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const diff = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   try {
@@ -704,10 +744,28 @@ test("interleaves full, selected, and fixed-file cursors without mixing their ev
       await writeFile(join(root, "small.txt"), "small base\n");
     },
   );
-  const files = await readPullRequestFilesFromCheckout(repository.context, repository.root);
-  const diff = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const files: readonly ChangedFile[] = [
+    {
+      path: "large.txt",
+      status: "modified",
+      additions: 80,
+      deletions: 80,
+      changes: 160,
+      addedLines: new Set(Array.from({ length: 80 }, (_, index) => index + 1)),
+    },
+    {
+      path: "small.txt",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      changes: 2,
+      addedLines: new Set([1]),
+    },
+  ];
+  const diff = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   try {
@@ -745,10 +803,20 @@ test("discovers base and head repository guidance for a direct goal without a su
       await writeFile(join(root, "src/change.ts"), "export const value = 'base';\n");
     },
   );
-  const files = await readPullRequestFilesFromCheckout(repository.context, repository.root);
-  const diff = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const files: readonly ChangedFile[] = [
+    {
+      path: "src/change.ts",
+      status: "modified",
+      additions: 1,
+      deletions: 1,
+      changes: 2,
+      addedLines: new Set([1]),
+    },
+  ];
+  const diff = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   const guidanceRecords: string[] = [];
@@ -790,9 +858,7 @@ test("discovers base and head repository guidance for a direct goal without a su
 });
 
 test("handles sparse goal arrays without leaking the shared diff", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "head change\n");
-  });
+  const repository = await makeExistingCommitRepository(t);
   const prompts = new Array<ReviewConfig["reviewPrompts"][number]>(1);
   const results = await runReviewGoals(
     repository.context,

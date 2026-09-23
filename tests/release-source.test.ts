@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,53 +15,66 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function repository(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-release-source-"));
-  await git(root, "init", "--initial-branch=main");
-  await writeFile(join(root, "action.txt"), "release candidate\n");
-  await git(root, "add", "action.txt");
-  await git(root, "commit", "-m", "release candidate");
-  await git(root, "tag", "v1.0.0-rc.0");
-  return root;
+async function repository(): Promise<{
+  readonly root: string;
+  readonly temporary: string;
+  readonly headSha: string;
+  readonly ancestors: readonly string[];
+}> {
+  const temporary = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-release-source-"));
+  const root = join(temporary, "repository.git");
+  await git(temporary, "clone", "--quiet", "--bare", "--shared", "--no-tags", process.cwd(), root);
+  const ancestors = (await git(root, "rev-list", "HEAD")).split("\n");
+  const headSha = ancestors[0];
+  if (headSha === undefined) throw new Error("The source checkout must contain a commit.");
+  return { root, temporary, headSha, ancestors };
 }
 
-test("accepts an ancestor release candidate with an identical tree", async () => {
-  const root = await repository();
+test("accepts a release candidate at the stable commit with an identical tree", async () => {
+  const { root, temporary, headSha } = await repository();
   try {
-    await git(root, "commit", "--allow-empty", "-m", "promote release candidate");
-    const result = await verifyReleaseSource("v1.0.0-rc.0", "HEAD", root);
+    await git(root, "tag", "v1.0.0-rc.0", headSha);
+    const result = await verifyReleaseSource("v1.0.0-rc.0", headSha, root);
     assert.equal(result.sourceCommit, await git(root, "rev-parse", "v1.0.0-rc.0"));
-    assert.equal(result.tree, await git(root, "rev-parse", "HEAD^{tree}"));
+    assert.equal(result.tree, await git(root, "rev-parse", `${headSha}^{tree}`));
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(temporary, { recursive: true, force: true });
   }
 });
 
 test("rejects source changes after the release candidate", async () => {
-  const root = await repository();
+  const { root, temporary, headSha, ancestors } = await repository();
   try {
-    await writeFile(join(root, "action.txt"), "stable changed\n");
-    await git(root, "add", "action.txt");
-    await git(root, "commit", "-m", "change stable source");
+    const headTree = await git(root, "rev-parse", `${headSha}^{tree}`);
+    let releaseCandidate: string | undefined;
+    for (const ancestor of ancestors.slice(1)) {
+      if ((await git(root, "rev-parse", `${ancestor}^{tree}`)) !== headTree) {
+        releaseCandidate = ancestor;
+        break;
+      }
+    }
+    assert.ok(releaseCandidate, "the source history must contain a distinct ancestor tree");
+    await git(root, "tag", "v1.0.0-rc.0", releaseCandidate);
     await assert.rejects(
-      verifyReleaseSource("v1.0.0-rc.0", "HEAD", root),
+      verifyReleaseSource("v1.0.0-rc.0", headSha, root),
       /does not have the same Git tree/i,
     );
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(temporary, { recursive: true, force: true });
   }
 });
 
-test("rejects a matching tree without release-candidate ancestry", async () => {
-  const root = await repository();
+test("rejects a stable commit that predates the release candidate", async () => {
+  const { root, temporary, headSha, ancestors } = await repository();
   try {
-    const tree = await git(root, "rev-parse", "HEAD^{tree}");
-    const unrelated = await git(root, "commit-tree", tree, "-m", "unrelated stable commit");
+    const priorCommit = ancestors[1];
+    assert.ok(priorCommit, "the source checkout must contain a parent commit");
+    await git(root, "tag", "v1.0.0-rc.0", headSha);
     await assert.rejects(
-      verifyReleaseSource("v1.0.0-rc.0", unrelated, root),
+      verifyReleaseSource("v1.0.0-rc.0", priorCommit, root),
       /is not an ancestor/i,
     );
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(temporary, { recursive: true, force: true });
   }
 });

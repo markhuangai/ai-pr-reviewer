@@ -93,6 +93,8 @@ export type {
 
 export const execFileAsync = promisify(execFile);
 
+export { makeDiffFromSnapshots, makeExistingCommitRepository } from "./git-test-helpers.js";
+
 export const emptyConversation: ReviewConversationSnapshot = {
   digest: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8eacb808f73f18510b2e0b23",
   entries: [],
@@ -152,10 +154,9 @@ export async function git(cwd: string, args: readonly string[]): Promise<string>
   return stdout.trim();
 }
 
-export async function commit(cwd: string, message: string): Promise<string> {
+async function writeTree(cwd: string): Promise<string> {
   await git(cwd, ["add", "."]);
-  await git(cwd, ["commit", "--quiet", `--message=${message}`]);
-  return git(cwd, ["rev-parse", "HEAD"]);
+  return git(cwd, ["write-tree"]);
 }
 
 export interface TestRepository {
@@ -180,9 +181,9 @@ export async function makeRepository(
   await git(root, ["init", "--quiet"]);
   await writeFile(join(root, "review.txt"), "base\n");
   await prepareBase?.(root);
-  const baseSha = await commit(root, "base");
+  const baseSha = await writeTree(root);
   await change(root);
-  const headSha = await commit(root, "head");
+  const headSha = await writeTree(root);
   return {
     root,
     temporaryRoot,

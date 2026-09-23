@@ -436,6 +436,22 @@ test("marks tool failures and cursor errors failed and bounds the returned evide
   assert.match(ledger.renderReferences(failed, 1), /additional references are omitted/u);
 });
 
+test("records partial pagination from a top-level MCP content array", () => {
+  const ledger = new ReviewEvidenceLedger("/repo");
+  const [reference] = ledger.observeBatch([
+    call("mcp__review_output__read_pr_diff", { paths: ["src/change.ts"] }, [
+      { type: "text", text: JSON.stringify({ done: false, nextCursor: "next-page" }) },
+    ]),
+  ]);
+  assert.equal(reference?.status, "partial");
+  assert.equal(
+    reviewAssessmentInternals.toolResponseDocument([
+      { type: "text", text: JSON.stringify({ done: false, nextCursor: "next-page" }) },
+    ])?.done,
+    false,
+  );
+});
+
 test("validates coverage, candidate evidence, and one-to-one finding links", () => {
   const evidence = new Map<string, ReviewEvidenceReference>([["ev-1", repositoryEvidence()]]);
   const valid: ReviewAssessment = {

@@ -82,8 +82,13 @@ import {
   acceptedSubmissionResult,
   findInvalidReviewAssessment,
 } from "./review-assessment.js";
-import { RepositorySnapshot, type RepositoryFileSnapshot } from "./repository-snapshot.js";
+import {
+  RepositorySnapshot,
+  repositoryGuidanceForRun,
+  type RepositoryFileSnapshot,
+} from "./repository-snapshot.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
+
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -133,7 +138,8 @@ export async function runReviewGoal(
     signal,
   );
   const repositoryGuidance =
-    briefing.repositoryGuidance ?? (await repositorySnapshot.guidance(files));
+    briefing.repositoryGuidance ??
+    (await repositoryGuidanceForRun(diff, repositorySnapshot, files));
   const briefingReader = new ReviewBriefingReader(context, files, conversation, {
     ...briefing,
     repositoryGuidance,
