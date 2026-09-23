@@ -559,11 +559,15 @@ test("does not include secrets in duplicate markers", () => {
   assert.notEqual(briefingMarker, marker);
   assert.notEqual(briefingMarker, reviewMarker(context, config, "", [], "briefing-b"));
   assert.equal(
-    aggregateReview(context, config, files, [], "conversation-a").marker,
+    aggregateReview(context, config, files, [], { conversationDigest: "conversation-a" }).marker,
     contextualMarker,
   );
   assert.equal(
-    aggregateReview(context, config, files, [], "", [], "briefing-a").marker,
+    aggregateReview(context, config, files, [], {
+      conversationDigest: "",
+      contextFiles: [],
+      briefingDigest: "briefing-a",
+    }).marker,
     briefingMarker,
   );
   assert.notEqual(
@@ -603,7 +607,10 @@ test("binds duplicate review identity to context contents and goal authorization
   );
   assert.notEqual(first, reviewMarker(context, config, "conversation", [[], [ticket, policy]]));
   assert.equal(
-    aggregateReview(context, config, files, [], "conversation", [[ticket, policy], []]).marker,
+    aggregateReview(context, config, files, [], {
+      conversationDigest: "conversation",
+      contextFiles: [[ticket, policy], []],
+    }).marker,
     first,
   );
   assert.equal(first.includes(ticket.path), false);

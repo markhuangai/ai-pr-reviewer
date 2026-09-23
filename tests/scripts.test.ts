@@ -399,6 +399,10 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   const headSha = await git(process.cwd(), ["rev-parse", "HEAD"]);
   await git(checkout, ["checkout", "--quiet", "--detach", headSha]);
   const baseSha = await git(checkout, ["rev-parse", "HEAD^"]);
+  const changedPath = (await git(checkout, ["diff", "--name-only", "-z", baseSha, headSha]))
+    .split("\0")
+    .filter((path) => path.length > 0)[0];
+  assert.ok(changedPath);
   const context = {
     repository: "owner/repository",
     owner: "owner",
@@ -407,7 +411,8 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     baseSha,
     headSha,
     baseRef: "main",
-    title: "Example change",
+    title: "Example mcp-replay-credential",
+    body: "PR body replay-secret",
     htmlUrl: "https://github.com/owner/repository/pull/123",
   };
   const input: ReplayCase = parseReplayCase({
@@ -423,7 +428,45 @@ test("replays a frozen case without publishing, switching revisions, or exposing
       parallelCount: 1,
       maxTurns: 25,
       interactWithPullRequest: false,
-      mcpServers: {},
+      mcpServers: {
+        security: {
+          type: "http",
+          url: "https://mcp.example.test",
+          headers: {
+            "X-MCP-Key": "mcp-replay-credential",
+            "X-Path-Secret": changedPath,
+          },
+        },
+      },
+    },
+    conversation: {
+      digest: "conversation-digest",
+      entries: [
+        {
+          kind: "pr_comment",
+          id: 1,
+          createdAt: "2026-09-23T00:00:00Z",
+          message: {
+            id: 1,
+            authorRole: "human",
+            body: "Discussion mcp-replay-credential replay-secret",
+            createdAt: "2026-09-23T00:00:00Z",
+            updatedAt: "2026-09-23T00:00:00Z",
+          },
+        },
+      ],
+    },
+    briefing: {
+      linkedIssues: [
+        {
+          number: 321,
+          title: "Issue mcp-replay-credential",
+          state: "OPEN",
+          body: "Issue body replay-secret",
+          htmlUrl: "https://github.com/owner/repository/issues/321",
+        },
+      ],
+      linkedIssueReferencesTruncated: false,
     },
   });
   assert.throws(() =>
@@ -453,14 +496,24 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     conversation,
     config,
     contextFiles,
+    replayCheckout,
+    _queryAgent,
+    _abortController,
+    briefing,
   ): Promise<readonly GoalResult[]> => {
     observedCalls += 1;
     assert.equal(replayContext.headSha, headSha);
+    assert.equal(replayContext.title, "Example [REDACTED]");
+    assert.equal(replayContext.body, "PR body [REDACTED]");
+    assert.equal(replayCheckout, checkout);
+    assert.doesNotMatch(JSON.stringify(conversation), /mcp-replay-credential|replay-secret/u);
+    assert.ok(briefing);
+    assert.equal(briefing.linkedIssues[0]?.title, "Issue [REDACTED]");
+    assert.equal(briefing.linkedIssues[0]?.body, "Issue body [REDACTED]");
     const changedFile = files[0];
     assert.ok(changedFile);
     replayFindingPath = changedFile.path;
     replayFindingLine = changedFile.addedLines.values().next().value ?? 1;
-    assert.deepEqual(conversation.entries, []);
     assert.equal(contextFiles[0]?.length, 0);
     assert.equal(config.reviewPrompts[0]?.prompt, "Review the changed behavior.");
     assert.equal(JSON.stringify(config).includes("known-defect"), false);
@@ -482,7 +535,10 @@ test("replays a frozen case without publishing, switching revisions, or exposing
           assessment: {
             coverage: [
               {
-                paths: files.map((file) => file.path),
+                paths: files.flatMap((file) => [
+                  file.path,
+                  ...(file.previousPath === undefined ? [] : [file.previousPath]),
+                ]),
                 disposition: "reviewed",
                 rationale: "Inspected replay-secret behavior.",
                 evidenceRefs: ["ev-1"],
@@ -512,6 +568,8 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   assert.equal(output.partial, false);
   assert.equal(output.findings instanceof Array, true);
   assert.equal(JSON.stringify(output).includes("replay-secret"), false);
+  assert.equal(JSON.stringify(output).includes("mcp-replay-credential"), false);
+  assert.equal(JSON.stringify(output).includes(changedPath), false);
   assert.equal("prompt" in (output.goals[0] ?? {}), false);
   assert.equal(serializeReplayOutput(output), serializeReplayOutput(output));
   await assert.rejects(

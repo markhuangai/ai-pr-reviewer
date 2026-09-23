@@ -555,16 +555,12 @@ export async function runAction(
           "aggregate and validate goal review results",
         ),
         () =>
-          aggregateReview(
-            context,
-            config,
-            files,
-            goals,
-            conversation.snapshot.digest,
-            preparedContextFiles.identity,
-            reviewBriefingDigest(context, briefing),
-            rawGoals,
-          ),
+          aggregateReview(context, config, files, goals, {
+            conversationDigest: conversation.snapshot.digest,
+            contextFiles: preparedContextFiles.identity,
+            briefingDigest: reviewBriefingDigest(context, briefing),
+            coverageGoals: rawGoals,
+          }),
       );
       if (config.interactWithPullRequest && review.omittedFindings.length > 0) {
         core.warning(

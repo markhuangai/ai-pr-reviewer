@@ -11,10 +11,18 @@ import { prepareContextFiles } from "../src/lib/context-files.js";
 import { readGitMergeBase } from "../src/lib/git-changed-files.js";
 import { readPullRequestFilesFromCheckout } from "../src/lib/github-api.js";
 import { REVIEW_INPUT_LIMITS, reviewSecretCandidates } from "../src/lib/input.js";
-import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
+import {
+  mapConversationBodies,
+  type ReviewConversationSnapshot,
+} from "../src/lib/review-context.js";
 import { redact, redactGoalResults } from "../src/lib/redaction.js";
 import { emptyReviewBriefing } from "../src/lib/review-evidence.js";
-import type { GoalResult, PullRequestContext, ReviewConfig } from "../src/lib/types.js";
+import type {
+  GoalResult,
+  PullRequestContext,
+  ReviewBriefing,
+  ReviewConfig,
+} from "../src/lib/types.js";
 import { runReviewGoals } from "../src/runtime/agent.js";
 import { isWithinRepository } from "../src/runtime/agent-review-tools.js";
 
@@ -375,27 +383,48 @@ export async function replayCase(
   const mergeBaseSha = await verifyCheckout(checkout, context);
   const root = await realpath(checkout);
   const config = replayConfig(input.config);
+  const secrets = reviewSecretCandidates(config);
   const files = await readPullRequestFilesFromCheckout(context, root);
   const contextFiles = await prepareContextFiles(config.reviewPrompts, root);
   let rawGoals: readonly GoalResult[];
   try {
+    const redactedContext: PullRequestContext = {
+      ...context,
+      title: redact(context.title, secrets),
+      ...(context.body === undefined ? {} : { body: redact(context.body, secrets) }),
+    };
+    const conversation = (input.conversation ?? {
+      digest: "empty",
+      entries: [],
+    }) as ReviewConversationSnapshot;
+    const redactedConversation = mapConversationBodies(conversation, (body) =>
+      redact(body, secrets),
+    );
+    const briefing = { ...emptyReviewBriefing(), ...input.briefing };
+    const redactedBriefing: ReviewBriefing = {
+      linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
+      linkedIssues: briefing.linkedIssues.map((issue) => ({
+        ...issue,
+        title: redact(issue.title, secrets),
+        body: redact(issue.body, secrets),
+      })),
+    };
     rawGoals = await runner(
-      context,
+      redactedContext,
       files,
-      (input.conversation ?? { digest: "empty", entries: [] }) as ReviewConversationSnapshot,
+      redactedConversation,
       config,
       contextFiles.filesByGoal,
       root,
       undefined,
       undefined,
-      { ...emptyReviewBriefing(), ...input.briefing },
+      redactedBriefing,
     );
   } finally {
     await contextFiles.cleanup();
   }
-  const secrets = reviewSecretCandidates(config);
   const goals = redactGoalResults(rawGoals, secrets);
-  const review = aggregateReview(context, config, files, goals);
+  const review = aggregateReview(context, config, files, goals, { coverageGoals: rawGoals });
   return {
     version: 1,
     caseId: redact(input.caseId, secrets),

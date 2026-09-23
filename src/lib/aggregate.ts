@@ -44,6 +44,13 @@ const SEVERITY_ICON: Record<Severity, string> = {
 
 const EMPTY_CONVERSATION_DIGEST = createHash("sha256").update("[]").digest("hex");
 
+interface AggregateReviewOptions {
+  readonly conversationDigest?: string;
+  readonly contextFiles?: ContextFileIdentityByGoal;
+  readonly briefingDigest?: string;
+  readonly coverageGoals?: readonly GoalResult[];
+}
+
 function normalizeText(value: string): string {
   return value
     .toLowerCase()
@@ -477,12 +484,15 @@ export function aggregateReview(
   config: ReviewConfig,
   files: readonly ChangedFile[],
   goals: readonly GoalResult[],
-  conversationDigest = EMPTY_CONVERSATION_DIGEST,
-  contextFiles: ContextFileIdentityByGoal = config.reviewPrompts.map(() => []),
-  briefingDigest = "",
-  coverageGoals: readonly GoalResult[] = goals,
+  options: AggregateReviewOptions = {},
 ): AggregatedReview {
-  const marker = reviewMarker(context, config, conversationDigest, contextFiles, briefingDigest);
+  const marker = reviewMarker(
+    context,
+    config,
+    options.conversationDigest ?? EMPTY_CONVERSATION_DIGEST,
+    options.contextFiles ?? config.reviewPrompts.map(() => []),
+    options.briefingDigest ?? "",
+  );
   const normalized = goals.flatMap(
     (goal, index) =>
       goal.submission?.findings.map((finding) => normalizeFinding(finding, index, files)) ?? [],
@@ -495,6 +505,7 @@ export function aggregateReview(
   const omittedFindings = config.interactWithPullRequest
     ? findings.filter((finding) => !inlineKeys.has(finding))
     : [];
+  const coverageGoals = options.coverageGoals ?? goals;
   const hasCoverageAssessment = coverageGoals.some(
     (goal) => (goal.submission?.assessment.coverage.length ?? 0) > 0,
   );
