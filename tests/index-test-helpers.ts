@@ -73,19 +73,7 @@ export async function cleanWorkspace(t: TestContext) {
   await execFileAsync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: workspace });
   await writeFile(join(workspace, "review.txt"), "head\n");
   await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message=head",
-    ],
-    { cwd: workspace },
-  );
+  await execFileAsync("git", ["commit", "--quiet", "--message=head"], { cwd: workspace });
   const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
     cwd: workspace,
     encoding: "utf8",

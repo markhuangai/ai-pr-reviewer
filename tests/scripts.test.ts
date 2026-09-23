@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
@@ -15,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { checkPackageAge, checkPackageAgeFile } from "../scripts/check-package-age.js";
 import {
@@ -28,7 +30,19 @@ import { prepareRuntime } from "../scripts/prepare-runtime.js";
 import { selectReleaseAliasCli } from "../scripts/select-release-alias.js";
 import { validateReleaseCli } from "../scripts/validate-release.js";
 import { writeChecksum } from "../scripts/write-checksum.js";
+import {
+  parseReplayCase,
+  replayCase,
+  serializeReplayOutput,
+  validateReplayOutputPath,
+  writeReplayOutput,
+  type ReplayCase,
+  type ReplayRunner,
+} from "../scripts/replay-review.js";
 import { runRuntimeEntry } from "../src/runtime/index.js";
+import type { GoalResult } from "../src/lib/types.js";
+
+const execFileAsync = promisify(execFile);
 
 async function temporaryDirectory(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
@@ -41,6 +55,17 @@ async function closeServer(server: Server): Promise<void> {
       else resolve();
     });
   });
+}
+
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const result = await execFileAsync("git", [...args], { cwd, encoding: "utf8" });
+  return result.stdout.trim();
+}
+
+async function commit(cwd: string, message: string): Promise<string> {
+  await git(cwd, ["add", "."]);
+  await git(cwd, ["commit", "--quiet", `--message=${message}`]);
+  return git(cwd, ["rev-parse", "HEAD"]);
 }
 
 test("copies bootstrap files, lists archive entries, normalizes modes, and writes checksums", async (t) => {
@@ -368,6 +393,255 @@ test("runs release CLI workers with real files and output records", async (t) =>
   assert.match(await readFile(releaseOutput, "utf8"), /release_tag=v1\.0\.0-rc\.0/u);
   await assert.rejects(selectReleaseAliasCli([], undefined), /Missing required --release-tag/u);
   await assert.rejects(validateReleaseCli([], undefined), /Missing required --version/u);
+});
+
+test("replays a frozen case without publishing, switching revisions, or exposing labels", async (t) => {
+  const temporary = await temporaryDirectory("ai-pr-reviewer-replay-");
+  t.after(() => rm(temporary, { recursive: true, force: true }));
+  const checkout = join(temporary, "checkout");
+  const results = join(temporary, "results");
+  await mkdir(checkout);
+  await mkdir(results);
+  await git(checkout, ["init", "--quiet", "--initial-branch=main"]);
+  await writeFile(join(checkout, ".gitignore"), "ignored.tmp\n");
+  await writeFile(join(checkout, "review.txt"), "base\n");
+  const baseSha = await commit(checkout, "base");
+  await writeFile(join(checkout, "review.txt"), "base\nhead\n");
+  const headSha = await commit(checkout, "head");
+  const context = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 123,
+    baseSha,
+    headSha,
+    baseRef: "main",
+    changedFiles: 1,
+    title: "Example change",
+    htmlUrl: "https://github.com/owner/repository/pull/123",
+  };
+  const input: ReplayCase = parseReplayCase({
+    version: 1,
+    caseId: "case-replay-secret",
+    labels: { expected: ["known-defect"], private: "replay-secret" },
+    context,
+    config: {
+      aiBaseUrl: "https://api.example.test",
+      model: "consumer-model-id",
+      systemPrompt: "Consumer replacement prompt.",
+      reviewPrompts: [{ prompt: "Review the changed behavior." }],
+      parallelCount: 1,
+      maxTurns: 25,
+      interactWithPullRequest: false,
+      mcpServers: {},
+    },
+  });
+  assert.throws(() =>
+    parseReplayCase({
+      ...input,
+      config: {
+        ...input.config,
+        reviewPrompts: [{ prompt: "Review", files: ["relative/context.txt"] }],
+      },
+    }),
+  );
+
+  const previousSecret = process.env.AI_PR_REVIEWER_SECRET;
+  process.env.AI_PR_REVIEWER_SECRET = "replay-secret";
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.AI_PR_REVIEWER_SECRET;
+    else process.env.AI_PR_REVIEWER_SECRET = previousSecret;
+  });
+  const beforeHead = await git(checkout, ["rev-parse", "HEAD"]);
+  const beforeBranch = await git(checkout, ["branch", "--show-current"]);
+  let observedCalls = 0;
+  const runner: ReplayRunner = (
+    replayContext,
+    files,
+    conversation,
+    config,
+    contextFiles,
+  ): Promise<readonly GoalResult[]> => {
+    observedCalls += 1;
+    assert.equal(replayContext.headSha, headSha);
+    assert.equal(files.length, 1);
+    assert.equal(files[0]?.path, "review.txt");
+    assert.equal(files[0]?.addedLines.has(2), true);
+    assert.deepEqual(conversation.entries, []);
+    assert.equal(contextFiles[0]?.length, 0);
+    assert.equal(config.reviewPrompts[0]?.prompt, "Review the changed behavior.");
+    assert.equal(JSON.stringify(config).includes("known-defect"), false);
+    return Promise.resolve([
+      {
+        prompt: "Review the changed behavior.",
+        status: "completed",
+        submission: {
+          summary: "Found a replay-secret example.",
+          findings: [
+            {
+              title: "replay-secret defect",
+              severity: "MODERATE",
+              body: "The replay-secret value is dropped.",
+              path: "review.txt",
+              line: 2,
+            },
+          ],
+          assessment: {
+            coverage: [
+              {
+                paths: ["review.txt"],
+                disposition: "reviewed",
+                rationale: "Inspected replay-secret behavior.",
+                evidenceRefs: ["ev-1"],
+              },
+            ],
+            candidates: [
+              {
+                paths: ["review.txt"],
+                trigger: "The changed branch drops replay-secret.",
+                impact: "The value is lost.",
+                evidenceRefs: ["ev-1"],
+                countercheck: "Checked for a caller guard.",
+                counterevidenceRefs: [],
+                verdict: "supported",
+                findingIndex: 0,
+              },
+            ],
+          },
+        },
+      },
+    ]);
+  };
+  const output = await replayCase(input, checkout, runner);
+  assert.equal(observedCalls, 1);
+  assert.equal(output.caseId, "case-[REDACTED]");
+  assert.deepEqual(output.labels, { expected: ["known-defect"], private: "[REDACTED]" });
+  assert.equal(output.partial, false);
+  assert.equal(output.findings instanceof Array, true);
+  assert.equal(JSON.stringify(output).includes("replay-secret"), false);
+  assert.equal("prompt" in (output.goals[0] ?? {}), false);
+  assert.equal(serializeReplayOutput(output), serializeReplayOutput(output));
+  await assert.rejects(
+    validateReplayOutputPath(join(checkout, "result.json"), checkout),
+    /outside the checkout/u,
+  );
+
+  const outputPath = join(results, "case-001.json");
+  await writeReplayOutput(output, outputPath, checkout);
+  const outputText = await readFile(outputPath, "utf8");
+  assert.equal(outputText, serializeReplayOutput(output));
+  assert.equal(outputText.includes("replay-secret"), false);
+  await assert.rejects(writeReplayOutput(output, outputPath, checkout), /already exists/u);
+  assert.equal(await git(checkout, ["rev-parse", "HEAD"]), beforeHead);
+  assert.equal(await git(checkout, ["branch", "--show-current"]), beforeBranch);
+  assert.equal(
+    await git(checkout, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+      "--ignored=matching",
+    ]),
+    "",
+  );
+
+  await writeFile(join(checkout, "ignored.tmp"), "ignored workspace content\n");
+  await assert.rejects(replayCase(input, checkout, runner), /must be pristine/u);
+  await rm(join(checkout, "ignored.tmp"));
+  await assert.rejects(
+    replayCase({ ...input, context: { ...input.context, headSha: baseSha } }, checkout, runner),
+    /does not match case head/u,
+  );
+});
+
+test("accepts Action-supported replay limits and reserves the internal MCP server", () => {
+  const context = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: "a".repeat(40),
+    baseSha: "b".repeat(40),
+    baseRef: "main",
+    title: "Review case",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+  const supported = parseReplayCase({
+    version: 1,
+    caseId: "supported-boundaries",
+    context,
+    config: {
+      model: "consumer-model-id",
+      reviewPrompts: Array.from({ length: 50 }, (_, index) => ({
+        prompt: index === 0 ? "x".repeat(12_000) : "Review the change.",
+        files: Array.from({ length: 25 }, (_, fileIndex) => `/tmp/context-${fileIndex}.txt`),
+      })),
+      parallelCount: 10,
+      maxTurns: 500,
+      mcpServers: {},
+    },
+  });
+  assert.equal(supported.config.reviewPrompts.length, 50);
+  assert.equal(supported.config.reviewPrompts[0]?.prompt.length, 12_000);
+  assert.equal(supported.config.reviewPrompts[0]?.files.length, 25);
+  const maxRunFiles = parseReplayCase({
+    ...supported,
+    config: {
+      ...supported.config,
+      reviewPrompts: Array.from({ length: 4 }, (_, goalIndex) => ({
+        prompt: "Review the change.",
+        files: Array.from(
+          { length: 25 },
+          (_, fileIndex) => `/tmp/run-${goalIndex * 25 + fileIndex}.txt`,
+        ),
+      })),
+    },
+  });
+  assert.equal(maxRunFiles.config.reviewPrompts.flatMap((goal) => goal.files).length, 100);
+  assert.throws(() =>
+    parseReplayCase({
+      ...maxRunFiles,
+      config: {
+        ...maxRunFiles.config,
+        reviewPrompts: Array.from({ length: 5 }, (_, goalIndex) => ({
+          prompt: "Review the change.",
+          files: Array.from(
+            { length: 25 },
+            (_, fileIndex) => `/tmp/over-limit-${goalIndex * 25 + fileIndex}.txt`,
+          ),
+        })),
+      },
+    }),
+  );
+  assert.throws(() =>
+    parseReplayCase({
+      ...supported,
+      config: { ...supported.config, reviewPrompts: [{ prompt: "x".repeat(12_001) }] },
+    }),
+  );
+  assert.throws(() =>
+    parseReplayCase({
+      ...supported,
+      config: {
+        ...supported.config,
+        mcpServers: {
+          review_output: { type: "http", url: "https://mcp.example.test" },
+        },
+      },
+    }),
+  );
+});
+
+test("replay package command loads the compiled entrypoint", async () => {
+  await assert.rejects(
+    execFileAsync("npm", ["run", "replay:review"], { encoding: "utf8" }),
+    (error: unknown) => {
+      if (!(error instanceof Error) || !("stderr" in error) || typeof error.stderr !== "string")
+        return false;
+      assert.match(error.stderr, /Usage: npm run replay:review/u);
+      assert.doesNotMatch(error.stderr, /ERR_MODULE_NOT_FOUND/u);
+      return true;
+    },
+  );
 });
 
 test("runs the guarded runtime entry worker", async () => {

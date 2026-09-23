@@ -24,15 +24,7 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
 
 async function commit(cwd: string, message: string): Promise<string> {
   await git(cwd, ["add", "."]);
-  await git(cwd, [
-    "-c",
-    "user.name=Test User",
-    "-c",
-    "user.email=test@example.test",
-    "commit",
-    "--quiet",
-    `--message=${message}`,
-  ]);
+  await git(cwd, ["commit", "--quiet", `--message=${message}`]);
   return git(cwd, ["rev-parse", "HEAD"]);
 }
 

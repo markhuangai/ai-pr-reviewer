@@ -264,6 +264,26 @@ function verifyLocation(finding: ReviewFinding, files: readonly ChangedFile[]): 
   return true;
 }
 
+function missingReviewCoverage(
+  files: readonly ChangedFile[],
+  goals: readonly GoalResult[],
+): readonly string[] {
+  const covered = new Set<string>();
+  for (const goal of goals) {
+    for (const entry of goal.submission?.assessment.coverage ?? []) {
+      if (entry.disposition !== "incomplete") for (const path of entry.paths) covered.add(path);
+    }
+  }
+  return [
+    ...new Set(
+      files.flatMap((file) => [
+        file.path,
+        ...(file.previousPath === undefined ? [] : [file.previousPath]),
+      ]),
+    ),
+  ].filter((path) => !covered.has(path));
+}
+
 function normalizeFinding(
   finding: ReviewFinding,
   goalIndex: number,
@@ -474,7 +494,12 @@ export function aggregateReview(
   const omittedFindings = config.interactWithPullRequest
     ? findings.filter((finding) => !inlineKeys.has(finding))
     : [];
-  const partial = goals.some((goal) => goal.status === "failed");
+  const hasCoverageAssessment = goals.some(
+    (goal) => (goal.submission?.assessment.coverage.length ?? 0) > 0,
+  );
+  const partial =
+    goals.some((goal) => goal.status !== "completed") ||
+    (hasCoverageAssessment && missingReviewCoverage(files, goals).length > 0);
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
     (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,
@@ -749,6 +774,31 @@ export function buildRunSummary(
     "",
     tokenUsage,
   ];
+  if (review.partial) {
+    const incompleteCoverage = new Map<string, string>();
+    for (const goal of goals) {
+      for (const entry of goal.submission?.assessment.coverage ?? []) {
+        if (entry.disposition === "incomplete")
+          for (const path of entry.paths) incompleteCoverage.set(path, entry.rationale);
+      }
+    }
+    if (incompleteCoverage.size > 0) {
+      const shown = [...incompleteCoverage].slice(0, 20);
+      lines.push(
+        "",
+        "### Incomplete investigation",
+        "",
+        "Required evidence gathering could not finish for these changed paths:",
+        ...shown.map(
+          ([path, rationale]) =>
+            `- <code>${escapeHtmlText(path)}</code>: ${escapeMarkdownText(rationale)}`,
+        ),
+        ...(incompleteCoverage.size > shown.length
+          ? [`- ${incompleteCoverage.size - shown.length} additional path(s) omitted.`]
+          : []),
+      );
+    }
+  }
   if (review.findings.length === 0) return lines.join("\n");
 
   if (review.omittedFindings.length > 0) {

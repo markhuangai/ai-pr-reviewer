@@ -5,7 +5,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import type { GoalResult, GoalSubmission, ReviewModelUsage } from "../lib/types.js";
+import type { GoalResult, ReviewModelUsage } from "../lib/types.js";
 
 const MAX_AGENT_LOG_PREVIEW_LENGTH = 200;
 const MAX_AGENT_LOG_CHUNK_LENGTH = 8_000;
@@ -67,31 +67,6 @@ export async function readAcceptedSubmissionMcpStatus(
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
-}
-
-export function acceptedSubmissionResult(
-  goal: string,
-  submission: GoalSubmission,
-  status: AcceptedSubmissionMcpStatus,
-  models: readonly ReviewModelUsage[],
-  tokenAccountingComplete: boolean,
-): GoalResult {
-  const error =
-    status.error === undefined
-      ? status.failures.length === 0
-        ? undefined
-        : `Configured MCP server failure: ${status.failures}`
-      : `Configured MCP server status check failed: ${status.error}`;
-  return withTokenUsage(
-    {
-      prompt: goal,
-      status: error === undefined ? "completed" : "failed",
-      submission,
-      ...(error === undefined ? {} : { error }),
-    },
-    models,
-    tokenAccountingComplete,
-  );
 }
 
 export function acceptedSubmissionDetails(

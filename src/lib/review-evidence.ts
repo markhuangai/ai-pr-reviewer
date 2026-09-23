@@ -88,7 +88,8 @@ export function reviewBriefingDigest(
   if (
     (context.body ?? "").length === 0 &&
     briefing.linkedIssues.length === 0 &&
-    !briefing.linkedIssueReferencesTruncated
+    !briefing.linkedIssueReferencesTruncated &&
+    (briefing.repositoryGuidance?.length ?? 0) === 0
   )
     return "";
   return createHash("sha256")
@@ -97,6 +98,7 @@ export function reviewBriefingDigest(
         body: context.body ?? "",
         linkedIssues: briefing.linkedIssues,
         linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
+        repositoryGuidance: briefing.repositoryGuidance ?? [],
       }),
     )
     .digest("hex");

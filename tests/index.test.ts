@@ -67,7 +67,11 @@ test("correlates action phases and cleanup outcomes in diagnostics", async (t) =
           {
             prompt: "correctness",
             status: "completed",
-            submission: { summary: "clean", findings: [] },
+            submission: {
+              assessment: { coverage: [], candidates: [] },
+              summary: "clean",
+              findings: [],
+            },
           },
         ]),
       writeSummary: () => Promise.resolve(),
@@ -143,7 +147,7 @@ test("redacts generated AI prompts without dropping them", () => {
   const [goal, failedGoal] = indexInternals.redactGoals(
     [
       {
-        prompt: "security",
+        prompt: "private-token security",
         status: "completed",
         tokenUsage: {
           complete: true,
@@ -159,6 +163,27 @@ test("redacts generated AI prompts without dropping them", () => {
           ],
         },
         submission: {
+          assessment: {
+            coverage: [
+              {
+                paths: ["private-token/path"],
+                disposition: "incomplete",
+                rationale: "private-token investigation did not finish",
+                evidenceRefs: ["ev-1"],
+              },
+            ],
+            candidates: [
+              {
+                paths: ["src/change.ts"],
+                trigger: "private-token is missing",
+                impact: "private-token is lost",
+                evidenceRefs: ["ev-1"],
+                countercheck: "Checked for private-token guards.",
+                counterevidenceRefs: [],
+                verdict: "unresolved",
+              },
+            ],
+          },
           summary: "finding",
           findings: [
             {
@@ -203,6 +228,13 @@ test("redacts generated AI prompts without dropping them", () => {
   );
 
   assert.equal(goal?.submission?.findings[0]?.body, "The value [REDACTED] is exposed.");
+  assert.equal(goal?.prompt, "[REDACTED] security");
+  assert.equal(goal?.submission?.assessment.coverage[0]?.paths[0], "[REDACTED]/path");
+  assert.equal(
+    goal?.submission?.assessment.coverage[0]?.rationale,
+    "[REDACTED] investigation did not finish",
+  );
+  assert.equal(goal?.submission?.assessment.candidates[0]?.trigger, "[REDACTED] is missing");
   assert.equal(goal?.tokenUsage?.models[0]?.model, "provider-[REDACTED]");
   assert.equal(goal?.tokenUsage?.models[0]?.canonicalModel, "[REDACTED]-canonical");
   assert.equal(
@@ -225,19 +257,7 @@ test("workspace validation rejects ignored content", async (t) => {
   await writeFile(join(workspace, ".gitignore"), ".env\n");
   await writeFile(join(workspace, "tracked.txt"), "tracked\n");
   await execFileAsync("git", ["add", ".gitignore", "tracked.txt"], { cwd: workspace });
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message=initial",
-    ],
-    { cwd: workspace },
-  );
+  await execFileAsync("git", ["commit", "--quiet", "--message=initial"], { cwd: workspace });
   const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspace });
   const context: PullRequestContext = {
     repository: "owner/repository",
@@ -299,38 +319,14 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   await execFileAsync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: workspace });
   await writeFile(join(workspace, "review.txt"), "base\n");
   await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message=base",
-    ],
-    { cwd: workspace },
-  );
+  await execFileAsync("git", ["commit", "--quiet", "--message=base"], { cwd: workspace });
   const { stdout: baseOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], {
     cwd: workspace,
     encoding: "utf8",
   });
   await writeFile(join(workspace, "review.txt"), "head\n");
   await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message=head",
-    ],
-    { cwd: workspace },
-  );
+  await execFileAsync("git", ["commit", "--quiet", "--message=head"], { cwd: workspace });
   const { stdout: headOutput } = await execFileAsync("git", ["rev-parse", "HEAD"], {
     cwd: workspace,
     encoding: "utf8",
@@ -484,6 +480,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       prompt: "correctness",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "one issue",
         findings: [
           {
@@ -704,7 +701,11 @@ test("passes immutable context snapshots to goals and cleans them after the run"
           {
             prompt: "Review ticket requirements.",
             status: "completed",
-            submission: { summary: "clean", findings: [] },
+            submission: {
+              assessment: { coverage: [], candidates: [] },
+              summary: "clean",
+              findings: [],
+            },
           },
         ];
       },
@@ -748,7 +749,11 @@ test("falls back from a rejected approval to a comment review", async (t) => {
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -786,7 +791,11 @@ test("downgrades a stale auto-approval to a captured comment", async (t) => {
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -822,7 +831,11 @@ test("downgrades approval when the captured base changed", async (t) => {
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -854,7 +867,11 @@ test("propagates non-approval review failures", async (t) => {
           {
             prompt: "correctness",
             status: "completed",
-            submission: { summary: "finding", findings: [] },
+            submission: {
+              assessment: { coverage: [], candidates: [] },
+              summary: "finding",
+              findings: [],
+            },
           },
         ]),
       writeSummary: () => Promise.resolve(),
@@ -905,7 +922,11 @@ test("reviews the captured pull request discussion without rechecking it", async
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -941,7 +962,11 @@ test("reviews the captured event refs without querying their live state", async 
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -1035,7 +1060,11 @@ test("reconciles interactive lifecycle state before and after the current review
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -1090,7 +1119,11 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     writeSummary: () => Promise.resolve(),
@@ -1136,6 +1169,7 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
           prompt: "correctness",
           status: "completed",
           submission: {
+            assessment: { coverage: [], candidates: [] },
             summary: "overflow",
             findings: files.map((file, index) => ({
               title: `Finding ${String(index).padStart(2, "0")}`,

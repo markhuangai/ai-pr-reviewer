@@ -18,8 +18,6 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 async function repository(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-release-source-"));
   await git(root, "init", "--initial-branch=main");
-  await git(root, "config", "user.name", "Release Test");
-  await git(root, "config", "user.email", "release-test@example.com");
   await writeFile(join(root, "action.txt"), "release candidate\n");
   await git(root, "add", "action.txt");
   await git(root, "commit", "-m", "release candidate");

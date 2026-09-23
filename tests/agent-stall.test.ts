@@ -5,8 +5,9 @@ import {
   emptyConversation,
   goalContext,
   makeReviewDiff,
+  observedReviewOutputTools,
   reviewConfig,
-  runReviewGoal,
+  runReviewGoalWithEmptyGuidance as runReviewGoal,
   test,
   type AgentQuery,
   type Options,
@@ -23,12 +24,7 @@ interface ReviewOutputTool {
 }
 
 function reviewOutputTools(options: Options): Readonly<Record<string, ReviewOutputTool>> {
-  const server = options.mcpServers?.review_output as unknown as {
-    readonly instance: {
-      readonly _registeredTools: Readonly<Record<string, ReviewOutputTool>>;
-    };
-  };
-  return server.instance._registeredTools;
+  return observedReviewOutputTools(options);
 }
 
 async function completeReviewBriefing(options: Options): Promise<void> {
@@ -170,7 +166,10 @@ test("repairs an interactive finding whose anchor is not an added line", async (
   assert.equal(result.submission?.findings[0]?.title, "Correct anchor");
   assert.match(toolResults[0] ?? "", /participating added line/u);
   assert.equal(toolResults[1], "Review submission accepted.");
-  assert.match(prompts[0] ?? "", /requires path and line on a participating added line/u);
+  assert.match(
+    prompts[0] ?? "",
+    /Every interactive finding must cite a participating added line in a changed file/u,
+  );
 });
 
 test("finalizes a silent accepted submission after its completion grace", async (t) => {
@@ -232,7 +231,11 @@ test("finalizes a silent accepted submission after its completion grace", async 
   const result = await running;
 
   assert.equal(result.status, "completed");
-  assert.deepEqual(result.submission, { summary: "No issues", findings: [] });
+  assert.deepEqual(result.submission, {
+    summary: "No issues",
+    findings: [],
+    assessment: { coverage: [], candidates: [] },
+  });
   assert.deepEqual(result.tokenUsage, { models: [], complete: false });
   assert.equal(interrupts, 1);
   assert.equal(closes, 1);
@@ -308,7 +311,11 @@ test("accepted stalled submissions win an interruption result while MCP status i
   const result = await running;
 
   assert.equal(result.status, "failed");
-  assert.deepEqual(result.submission, { summary: "No issues", findings: [] });
+  assert.deepEqual(result.submission, {
+    summary: "No issues",
+    findings: [],
+    assessment: { coverage: [], candidates: [] },
+  });
   assert.match(result.error ?? "", /MCP status check timed out after 30000 ms/u);
   assert.equal(mcpStatusChecks, 1);
   assert.equal(interrupts, 1);

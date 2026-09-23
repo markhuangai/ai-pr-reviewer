@@ -18,20 +18,7 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
 
 async function commit(cwd: string, message: string): Promise<string> {
   await git(cwd, ["add", "--all"]);
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message",
-      message,
-    ],
-    { cwd },
-  );
+  await execFileAsync("git", ["commit", "--quiet", "--message", message], { cwd });
   return git(cwd, ["rev-parse", "HEAD"]);
 }
 

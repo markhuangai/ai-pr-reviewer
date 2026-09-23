@@ -32,6 +32,7 @@ test("keeps verified findings at separate locations distinct", () => {
         prompt: "locations",
         status: "completed",
         submission: {
+          assessment: { coverage: [], candidates: [] },
           summary: "two locations",
           findings: [
             {
@@ -62,6 +63,7 @@ test("keeps distinct non-Latin findings separate", () => {
       prompt: "中文",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "中文",
         findings: [
           { title: "安全问题", severity: "HIGH", body: "这里存在安全缺陷。" },
@@ -79,6 +81,7 @@ test("preserves distinct claimed locations for unverified findings", () => {
       prompt: "locations",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "locations",
         findings: [
           {
@@ -109,6 +112,7 @@ test("bounds an oversized merged inline comment", () => {
     prompt: `goal-${index}`,
     status: "completed",
     submission: {
+      assessment: { coverage: [], candidates: [] },
       summary: "large",
       findings: [
         {
@@ -142,6 +146,7 @@ test("publishes only the top 25 verified findings and retains overflow in the ru
       prompt: "overflow",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "overflow",
         findings: changedFiles.map((file, index) => ({
           title: `Finding ${String(index).padStart(2, "0")}`,
@@ -175,6 +180,7 @@ test("bounds merged evidence while retaining omitted findings in the run summary
     prompt: `duplicate-${index}`,
     status: "completed",
     submission: {
+      assessment: { coverage: [], candidates: [] },
       summary: "duplicate",
       findings: [
         {
@@ -206,6 +212,7 @@ test("bounds merged evidence while retaining omitted findings in the run summary
         prompt: "later",
         status: "completed",
         submission: {
+          assessment: { coverage: [], candidates: [] },
           summary: "later",
           findings: [
             {
@@ -231,6 +238,7 @@ test("omits unverified findings from the review body while retaining them in the
       prompt: "PRIVATE OVERSIZED GOAL ".repeat(30_000),
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "PRIVATE OVERSIZED SUMMARY",
         findings: [
           {
@@ -262,6 +270,7 @@ test("writes every published and omitted finding to a complete run summary", () 
       prompt: "PRIVATE REVIEW GOAL",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "PRIVATE MODEL SUMMARY",
         findings: [
           {
@@ -297,7 +306,11 @@ test("labels partial and all-failed run summaries", () => {
     {
       prompt: "completed",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
     },
     { prompt: "failed", status: "failed", error: "PRIVATE FAILURE" },
   ];
@@ -377,7 +390,11 @@ test("keeps the collapsed token block within review and run-summary limits", () 
     {
       prompt: "many models",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
       tokenUsage: {
         complete: true,
         models: Array.from({ length: 1_000 }, (_, index) => ({
@@ -408,6 +425,7 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
       prompt: `goal-${identifier}`,
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "large",
         findings: [
           {
@@ -450,6 +468,7 @@ test("caps the finding index when it alone exceeds the run-summary byte limit", 
       prompt: "large index",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "large index",
         findings: largeFiles.map((file, index) => {
           const identifier = String(index).padStart(4, "0");
@@ -482,6 +501,7 @@ test("renders the maximum supported finding count with linear byte accounting", 
     prompt: `goal-${goalIndex}`,
     status: "completed",
     submission: {
+      assessment: { coverage: [], candidates: [] },
       summary: "many findings",
       findings: Array.from({ length: 100 }, (_, findingIndex) => {
         const identifier = String(goalIndex * 100 + findingIndex).padStart(4, "0");
@@ -507,6 +527,7 @@ test("retains every non-inline finding in the run summary", () => {
     prompt: `goal-${index}`,
     status: "completed",
     submission: {
+      assessment: { coverage: [], candidates: [] },
       summary: "large body finding",
       findings: [
         {
@@ -532,6 +553,7 @@ test("partial goals force a comment and remain actionable", () => {
       prompt: "PRIVATE COMPLETED GOAL",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "PRIVATE PARTIAL SUMMARY",
         findings: [
           {
@@ -577,7 +599,11 @@ test("binary changed-file metadata does not block an otherwise qualified approva
       {
         prompt: "correctness",
         status: "completed",
-        submission: { summary: "No text findings.", findings: [] },
+        submission: {
+          assessment: { coverage: [], candidates: [] },
+          summary: "No text findings.",
+          findings: [],
+        },
       },
     ],
   );

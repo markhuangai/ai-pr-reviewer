@@ -19,6 +19,8 @@ import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import type {
+  HookCallback,
+  HookInput,
   Options,
   SDKActiveGoalMessage,
   SDKMessage,
@@ -96,6 +98,55 @@ export const emptyConversation: ReviewConversationSnapshot = {
   entries: [],
 };
 
+export const emptyRepositoryGuidanceBriefing = {
+  linkedIssues: [],
+  linkedIssueReferencesTruncated: false,
+  repositoryGuidance: [],
+} satisfies ReviewBriefing;
+
+export function runReviewGoalWithEmptyGuidance(
+  ...args: Parameters<typeof runReviewGoal>
+): ReturnType<typeof runReviewGoal> {
+  const [
+    goal,
+    index,
+    context,
+    files,
+    conversation,
+    config,
+    diff,
+    cwd,
+    queryAgent,
+    contextFiles,
+    abort,
+    briefing,
+  ] = args;
+  return runReviewGoal(
+    goal,
+    index,
+    context,
+    files,
+    conversation,
+    config,
+    diff,
+    cwd,
+    queryAgent,
+    contextFiles,
+    abort,
+    {
+      ...emptyRepositoryGuidanceBriefing,
+      ...(briefing ?? {}),
+      repositoryGuidance: briefing?.repositoryGuidance ?? [],
+    },
+  );
+}
+
+function pageText(value: unknown): string {
+  if (typeof value !== "string")
+    throw new TypeError("Expected a text page from the repository tool.");
+  return value;
+}
+
 export async function git(cwd: string, args: readonly string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
   return stdout.trim();
@@ -103,15 +154,7 @@ export async function git(cwd: string, args: readonly string[]): Promise<string>
 
 export async function commit(cwd: string, message: string): Promise<string> {
   await git(cwd, ["add", "."]);
-  await git(cwd, [
-    "-c",
-    "user.name=Test User",
-    "-c",
-    "user.email=test@example.test",
-    "commit",
-    "--quiet",
-    `--message=${message}`,
-  ]);
+  await git(cwd, ["commit", "--quiet", `--message=${message}`]);
   return git(cwd, ["rev-parse", "HEAD"]);
 }
 
@@ -193,6 +236,151 @@ export async function callRegisteredTool(
   return registeredTool.handler(input);
 }
 
+const observedReviewTools = new WeakMap<Options, Readonly<Record<string, RegisteredTool>>>();
+
+export function observedReviewOutputTools(
+  options: Options,
+): Readonly<Record<string, RegisteredTool>> {
+  const existing = observedReviewTools.get(options);
+  if (existing !== undefined) return existing;
+  const server = options.mcpServers?.review_output as unknown as {
+    readonly instance: {
+      readonly _registeredTools: Readonly<Record<string, RegisteredTool>>;
+    };
+  };
+  const rawTools = server.instance._registeredTools;
+  const callbacks = (options.hooks?.PostToolBatch ?? []).flatMap(
+    (matcher) => matcher.hooks,
+  ) as readonly HookCallback[];
+  const controller = new AbortController();
+  const changedPaths = new Set<string>();
+  const repositoryDiffReferences: string[] = [];
+  let invocation = 0;
+
+  const observe = async (
+    name: string,
+    toolInput: Record<string, unknown>,
+    toolResponse: Awaited<ReturnType<RegisteredTool["handler"]>>,
+  ): Promise<void> => {
+    invocation += 1;
+    const hookInput = {
+      hook_event_name: "PostToolBatch",
+      session_id: "test-session",
+      transcript_path: "",
+      cwd: options.cwd,
+      permission_mode: "dontAsk",
+      tool_calls: [
+        {
+          tool_name: `mcp__review_output__${name}`,
+          tool_input: toolInput,
+          tool_use_id: `observed-tool-${invocation}`,
+          tool_response: toolResponse,
+        },
+      ],
+    } as HookInput;
+    for (const hook of callbacks) {
+      const output = await hook(hookInput, undefined, { signal: controller.signal });
+      const specific = "hookSpecificOutput" in output ? output.hookSpecificOutput : undefined;
+      if (
+        specific === undefined ||
+        !("additionalContext" in specific) ||
+        typeof specific.additionalContext !== "string"
+      )
+        continue;
+      if (name === "read_pr_diff") {
+        for (const match of specific.additionalContext.matchAll(
+          /^(ev-[1-9][0-9]*) complete repository_diff /gmu,
+        )) {
+          const id = match[1];
+          if (id !== undefined) repositoryDiffReferences.push(id);
+        }
+      }
+    }
+  };
+
+  const tools = Object.fromEntries(
+    Object.entries(rawTools).map(([name, raw]) => [
+      name,
+      {
+        handler: async (input: Record<string, unknown>) => {
+          let toolInput = input;
+          if (name === "submit_review" && !Object.hasOwn(input, "assessment")) {
+            if (repositoryDiffReferences.length === 0) {
+              const diffTool = rawTools.read_pr_diff;
+              if (diffTool !== undefined) {
+                let cursor: string | undefined;
+                let done = false;
+                while (!done) {
+                  const diffInput = cursor === undefined ? {} : { cursor };
+                  const response = await diffTool.handler(diffInput);
+                  await observe("read_pr_diff", diffInput, response);
+                  const page = JSON.parse(response.content[0]?.text ?? "{}") as {
+                    readonly done?: unknown;
+                    readonly nextCursor?: unknown;
+                  };
+                  done = page.done === true;
+                  cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+                }
+              }
+            }
+            const reference = repositoryDiffReferences.at(-1);
+            const findings = Array.isArray(input.findings) ? input.findings : [];
+            toolInput = {
+              ...input,
+              assessment: {
+                coverage: [...changedPaths].map((path) => ({
+                  paths: [path],
+                  disposition: reference === undefined ? "incomplete" : "reviewed",
+                  rationale:
+                    reference === undefined
+                      ? "No completed fixed diff read was recorded."
+                      : "The changed path was inspected in the fixed diff.",
+                  evidenceRefs: reference === undefined ? [] : [reference],
+                })),
+                candidates: findings.flatMap((finding, findingIndex) => {
+                  if (typeof finding !== "object" || finding === null || Array.isArray(finding))
+                    return [];
+                  const value = finding as Record<string, unknown>;
+                  const path = typeof value.path === "string" ? value.path : [...changedPaths][0];
+                  if (path === undefined) return [];
+                  return [
+                    {
+                      paths: [path],
+                      trigger:
+                        typeof value.title === "string" ? value.title : "Test finding trigger",
+                      impact: typeof value.why === "string" ? value.why : "Test finding impact",
+                      evidenceRefs: reference === undefined ? [] : [reference],
+                      countercheck: "Checked for an existing guard.",
+                      counterevidenceRefs: [],
+                      verdict: "supported",
+                      findingIndex,
+                    },
+                  ];
+                }),
+              },
+            };
+          }
+          const response = await raw.handler(toolInput);
+          if (name === "read_review_briefing") {
+            const page = JSON.parse(response.content[0]?.text ?? "{}") as {
+              readonly records?: readonly Readonly<Record<string, unknown>>[];
+            };
+            for (const record of page.records ?? []) {
+              if (record.kind !== "changed_file" || typeof record.path !== "string") continue;
+              changedPaths.add(record.path);
+              if (typeof record.previousPath === "string") changedPaths.add(record.previousPath);
+            }
+          }
+          await observe(name, toolInput, response);
+          return response;
+        },
+      },
+    ]),
+  ) as Readonly<Record<string, RegisteredTool>>;
+  observedReviewTools.set(options, tools);
+  return tools;
+}
+
 export interface FakeQueryScenario {
   readonly submission?: Record<string, unknown>;
   readonly resultSubtypes?: readonly string[];
@@ -217,8 +405,16 @@ export interface FakeQueryScenario {
   readonly assertUnreadThreadRejection?: boolean;
   readonly readDiffPath?: string;
   readonly readRepositoryFilePath?: string;
+  readonly probeInterleavedQueryCursors?: boolean;
+  readonly expectedInterleavedFileContent?: string;
+  readonly inspectBriefingRecords?: (records: readonly Readonly<Record<string, unknown>>[]) => void;
   readonly probeThreadErrors?: boolean;
   readonly probeUnknownCursor?: boolean;
+  readonly probeDiffCursorBinding?: boolean;
+  readonly probeFileCursorBinding?: boolean;
+  readonly probeThreadCursorBinding?: boolean;
+  readonly expectSubmissionRejection?: boolean;
+  readonly inspectSubmissionResult?: (result: RegisteredToolResult) => void;
 }
 
 export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
@@ -234,20 +430,73 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
         readonly _registeredTools: Readonly<Record<string, RegisteredTool>>;
       };
     };
-    const tools = outputServer.instance._registeredTools;
+    const rawTools = outputServer.instance._registeredTools;
+    const hookCallbacks = (input.options.hooks?.PostToolBatch ?? []).flatMap(
+      (matcher) => matcher.hooks,
+    ) as readonly HookCallback[];
+    const observationController = new AbortController();
+    let observedToolUse = 0;
+    const observedReferences: string[] = [];
+    const tools = Object.fromEntries(
+      Object.entries(rawTools).map(([name, registered]) => [
+        name,
+        {
+          ...registered,
+          handler: async (toolInput: Record<string, unknown>) => {
+            const toolResponse = await registered.handler(toolInput);
+            observedToolUse += 1;
+            const hookInput = {
+              hook_event_name: "PostToolBatch",
+              session_id: "test-session",
+              transcript_path: "",
+              cwd: input.options.cwd,
+              permission_mode: "dontAsk",
+              tool_calls: [
+                {
+                  tool_name: `mcp__review_output__${name}`,
+                  tool_input: toolInput,
+                  tool_use_id: `test-tool-${observedToolUse}`,
+                  tool_response: toolResponse,
+                },
+              ],
+            } as HookInput;
+            for (const hook of hookCallbacks) {
+              const output = await hook(hookInput, undefined, {
+                signal: observationController.signal,
+              });
+              const specific =
+                "hookSpecificOutput" in output ? output.hookSpecificOutput : undefined;
+              if (
+                specific !== undefined &&
+                "additionalContext" in specific &&
+                typeof specific.additionalContext === "string"
+              ) {
+                for (const match of specific.additionalContext.matchAll(
+                  /^(ev-[1-9][0-9]*) complete repository_diff /gmu,
+                )) {
+                  const id = match[1];
+                  if (id !== undefined) observedReferences.push(id);
+                }
+              }
+            }
+            return toolResponse;
+          },
+        },
+      ]),
+    ) as Readonly<Record<string, RegisteredTool>>;
     const preflight = scenario.preflightTools
       ? Promise.all([
-          tools.read_review_briefing?.handler({}),
-          tools.read_pr_conversation?.handler({}),
-          tools.read_pr_diff?.handler({}),
-          tools.read_repository_file?.handler({ revision: "head", path: "review.txt" }),
-          tools.read_pr_threads?.handler({}),
-          tools.submit_review?.handler({}),
+          rawTools.read_review_briefing?.handler({}),
+          rawTools.read_pr_conversation?.handler({}),
+          rawTools.read_pr_diff?.handler({}),
+          rawTools.read_repository_file?.handler({ revision: "head", path: "review.txt" }),
+          rawTools.read_pr_threads?.handler({}),
+          rawTools.submit_review?.handler({}),
         ])
       : undefined;
     const preflightContextFile =
       scenario.preflightTools && scenario.contextFilePath !== undefined
-        ? tools.read_context_file?.handler({ path: scenario.contextFilePath })
+        ? rawTools.read_context_file?.handler({ path: scenario.contextFilePath })
         : undefined;
     const session = {
       async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
@@ -312,10 +561,110 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           assert.ok(briefingTool);
           assert.ok(submitTool);
           let briefingDone = false;
+          const changedPaths = new Set<string>();
           while (!briefingDone) {
             const result = await briefingTool.handler({});
-            const page = JSON.parse(result.content[0]?.text ?? "{}") as { readonly done?: unknown };
+            const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+              readonly done?: unknown;
+              readonly records?: readonly Readonly<Record<string, unknown>>[];
+            };
+            scenario.inspectBriefingRecords?.(page.records ?? []);
+            for (const record of page.records ?? []) {
+              if (record.kind !== "changed_file" || typeof record.path !== "string") continue;
+              changedPaths.add(record.path);
+              if (typeof record.previousPath === "string") changedPaths.add(record.previousPath);
+            }
             briefingDone = page.done === true;
+          }
+          if (scenario.probeInterleavedQueryCursors) {
+            const decode = (result: RegisteredToolResult) =>
+              JSON.parse(result.content[0]?.text ?? "{}") as {
+                readonly changedPaths?: unknown;
+                readonly content?: unknown;
+                readonly done?: unknown;
+                readonly nextCursor?: unknown;
+                readonly path?: unknown;
+                readonly paths?: readonly unknown[];
+                readonly revision?: unknown;
+              };
+            const cursorOf = (page: ReturnType<typeof decode>): string => {
+              assert.equal(page.done, false);
+              assert.equal(typeof page.nextCursor, "string");
+              return page.nextCursor as string;
+            };
+            const fullFirst = await diffTool.handler({ paths: [] });
+            const fullPage = decode(fullFirst);
+            assert.equal(fullFirst.isError, undefined);
+            assert.equal(fullPage.changedPaths, true);
+            const fullCursor = cursorOf(fullPage);
+            const selectedFirst = await diffTool.handler({ paths: ["large.txt"] });
+            const selectedPage = decode(selectedFirst);
+            assert.equal(selectedFirst.isError, undefined);
+            assert.deepEqual(selectedPage.paths, ["large.txt"]);
+            const selectedCursor = cursorOf(selectedPage);
+            const fileFirst = await repositoryFileTool.handler({
+              revision: "head",
+              path: "large.txt",
+            });
+            const filePage = decode(fileFirst);
+            assert.equal(fileFirst.isError, undefined);
+            assert.equal(filePage.path, "large.txt");
+            assert.equal(filePage.revision, "head");
+            const fileCursor = cursorOf(filePage);
+            const wrongSelection = await diffTool.handler({
+              paths: ["large.txt"],
+              cursor: fullCursor,
+            });
+            assert.equal(wrongSelection.isError, true);
+
+            let fullDone = false;
+            let selectedDone = false;
+            let fileDone = false;
+            const fullContent = [pageText(fullPage.content)];
+            const selectedContent = [pageText(selectedPage.content)];
+            const fileContent = [pageText(filePage.content)];
+            while (!fullDone || !selectedDone || !fileDone) {
+              if (!fullDone) {
+                const result: RegisteredToolResult = await diffTool.handler({
+                  paths: [],
+                  cursor: fullCursor,
+                });
+                const page = decode(result);
+                assert.equal(result.isError, undefined);
+                assert.equal(page.changedPaths, true);
+                fullContent.push(pageText(page.content));
+                fullDone = page.done === true;
+              }
+              if (!selectedDone) {
+                const result: RegisteredToolResult = await diffTool.handler({
+                  paths: ["large.txt"],
+                  cursor: selectedCursor,
+                });
+                const page = decode(result);
+                assert.equal(result.isError, undefined);
+                assert.deepEqual(page.paths, ["large.txt"]);
+                selectedContent.push(pageText(page.content));
+                selectedDone = page.done === true;
+              }
+              if (!fileDone) {
+                const result: RegisteredToolResult = await repositoryFileTool.handler({
+                  revision: "head",
+                  path: "large.txt",
+                  cursor: fileCursor,
+                });
+                const page = decode(result);
+                assert.equal(result.isError, undefined);
+                assert.equal(page.path, "large.txt");
+                assert.equal(page.revision, "head");
+                fileContent.push(pageText(page.content));
+                fileDone = page.done === true;
+              }
+            }
+            assert.match(fullContent.join(""), /diff --git a\/large\.txt/u);
+            assert.match(fullContent.join(""), /diff --git a\/small\.txt/u);
+            assert.match(selectedContent.join(""), /diff --git a\/large\.txt/u);
+            assert.doesNotMatch(selectedContent.join(""), /diff --git a\/small\.txt/u);
+            assert.equal(fileContent.join(""), scenario.expectedInterleavedFileContent);
           }
           if (scenario.contextFilePath !== undefined) {
             const contextFileTool = tools.read_context_file;
@@ -357,10 +706,13 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           if (scenario.readDiffPath !== undefined) {
             let done = false;
             let cursor: string | undefined;
+            let cursorBindingProbed = false;
             while (!done) {
               const result = await callRegisteredTool(
                 diffTool,
-                cursor === undefined ? { paths: [scenario.readDiffPath] } : { cursor },
+                cursor === undefined
+                  ? { paths: [scenario.readDiffPath] }
+                  : { paths: [scenario.readDiffPath], cursor },
               );
               assert.equal(result.isError, undefined);
               const page = JSON.parse(result.content[0]?.text ?? "{}") as {
@@ -369,18 +721,26 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               };
               done = page.done === true;
               cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+              if (scenario.probeDiffCursorBinding && !cursorBindingProbed && cursor !== undefined) {
+                const mismatch = await callRegisteredTool(diffTool, {
+                  paths: ["unrelated-file.ts"],
+                  cursor,
+                });
+                assert.equal(mismatch.isError, true);
+                cursorBindingProbed = true;
+              }
             }
           }
           if (scenario.readRepositoryFilePath !== undefined) {
             let done = false;
             let cursor: string | undefined;
+            let cursorBindingProbed = false;
             while (!done) {
-              const result = await callRegisteredTool(
-                repositoryFileTool,
-                cursor === undefined
-                  ? { revision: "head", path: scenario.readRepositoryFilePath }
-                  : { revision: "head", path: scenario.readRepositoryFilePath, cursor },
-              );
+              const result = await callRegisteredTool(repositoryFileTool, {
+                revision: "head",
+                path: scenario.readRepositoryFilePath,
+                ...(cursor === undefined ? {} : { cursor }),
+              });
               assert.equal(result.isError, undefined);
               const page = JSON.parse(result.content[0]?.text ?? "{}") as {
                 readonly done?: unknown;
@@ -388,6 +748,15 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               };
               done = page.done === true;
               cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+              if (scenario.probeFileCursorBinding && !cursorBindingProbed && cursor !== undefined) {
+                const mismatch = await callRegisteredTool(repositoryFileTool, {
+                  revision: "base",
+                  path: "unrelated-file.ts",
+                  cursor,
+                });
+                assert.equal(mismatch.isError, true);
+                cursorBindingProbed = true;
+              }
             }
           }
           if (scenario.probeThreadErrors) {
@@ -421,10 +790,11 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               let threadDone = false;
               let threadCursor: string | undefined;
               let repeatedSelector = false;
+              let selectorBindingProbed = false;
               while (!threadDone) {
                 const startingCursor = threadCursor;
                 const result = await threadTool.handler(
-                  startingCursor === undefined ? selector : { cursor: startingCursor },
+                  startingCursor === undefined ? selector : { ...selector, cursor: startingCursor },
                 );
                 const page = JSON.parse(result.content[0]?.text ?? "{}") as {
                   readonly done?: unknown;
@@ -432,6 +802,22 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 };
                 threadDone = page.done === true;
                 threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+                if (
+                  scenario.probeThreadCursorBinding &&
+                  !selectorBindingProbed &&
+                  threadCursor !== undefined
+                ) {
+                  const differentSelector =
+                    "id" in selector
+                      ? { id: Number(selector.id) + 1 }
+                      : { path: `${String(selector.path)}.other` };
+                  const rejected: RegisteredToolResult = await threadTool.handler({
+                    ...differentSelector,
+                    cursor: threadCursor,
+                  });
+                  assert.equal(rejected.isError, true);
+                  selectorBindingProbed = true;
+                }
                 if (
                   scenario.repeatThreadSelector &&
                   !repeatedSelector &&
@@ -460,13 +846,62 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             }
           }
           let diffDone = false;
+          let fullDiffCursor: string | undefined;
           while (!diffDone) {
-            const result = await diffTool.handler({});
-            const page = JSON.parse(result.content[0]?.text ?? "{}") as { readonly done?: unknown };
+            const result = await diffTool.handler(
+              fullDiffCursor === undefined ? {} : { cursor: fullDiffCursor },
+            );
+            const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+              readonly done?: unknown;
+              readonly nextCursor?: unknown;
+            };
             diffDone = page.done === true;
+            fullDiffCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
           }
-          const result = await submitTool.handler(scenario.submission);
-          assert.equal(result.content[0]?.text, "Review submission accepted.");
+          const evidenceRef = observedReferences.at(-1);
+          const defaultAssessment = {
+            coverage: [...changedPaths].map((path) => ({
+              paths: [path],
+              disposition: evidenceRef === undefined ? "incomplete" : "reviewed",
+              rationale:
+                evidenceRef === undefined
+                  ? "No completed diff read was recorded."
+                  : "The changed path was inspected in the fixed diff.",
+              evidenceRefs: evidenceRef === undefined ? [] : [evidenceRef],
+            })),
+            candidates: (Array.isArray(scenario.submission.findings)
+              ? scenario.submission.findings
+              : []
+            ).flatMap((finding, findingIndex) => {
+              if (typeof finding !== "object" || finding === null || Array.isArray(finding))
+                return [];
+              const value = finding as Record<string, unknown>;
+              const path = typeof value.path === "string" ? value.path : [...changedPaths][0];
+              if (path === undefined) return [];
+              return [
+                {
+                  paths: [path],
+                  trigger: typeof value.title === "string" ? value.title : "Test finding trigger",
+                  impact: typeof value.why === "string" ? value.why : "Test finding impact",
+                  evidenceRefs: evidenceRef === undefined ? [] : [evidenceRef],
+                  countercheck: "Checked for an existing guard.",
+                  counterevidenceRefs: [],
+                  verdict: "supported",
+                  findingIndex,
+                },
+              ];
+            }),
+          };
+          const preparedSubmission = {
+            ...scenario.submission,
+            assessment: Object.hasOwn(scenario.submission, "assessment")
+              ? scenario.submission.assessment
+              : defaultAssessment,
+          };
+          const result = await submitTool.handler(preparedSubmission);
+          scenario.inspectSubmissionResult?.(result);
+          if (scenario.expectSubmissionRejection) assert.equal(result.isError, true);
+          else assert.equal(result.content[0]?.text, "Review submission accepted.");
         }
         const subtypes = scenario.resultSubtypes ?? ["success"];
         for (let index = 0; index < subtypes.length; index += 1) {
