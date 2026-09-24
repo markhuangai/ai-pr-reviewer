@@ -143,10 +143,14 @@ test("requires the complete prior thread before accepting a located finding", as
     await makeReviewDiff(t),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: {
+      submission: (evidenceRef) => ({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Still broken",
             severity: "HIGH",
             why: "The old guard no longer applies.",
@@ -155,7 +159,7 @@ test("requires the complete prior thread before accepting a located finding", as
             line: 4,
           },
         ],
-      },
+      }),
       skipConversationRead: true,
       assertUnreadThreadRejection: true,
       readThreadPath: "src/change.ts",
@@ -224,10 +228,14 @@ test("requires a path-scoped discussion read for sibling threads after an id-sco
     await makeReviewDiff(t),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: {
+      submission: (evidenceRef) => ({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Still broken",
             severity: "HIGH",
             why: "The old guard no longer applies.",
@@ -236,7 +244,7 @@ test("requires a path-scoped discussion read for sibling threads after an id-sco
             line: 9,
           },
         ],
-      },
+      }),
       skipConversationRead: true,
       assertUnreadThreadRejection: true,
       assertUnreadThreadAfterId: true,
@@ -306,10 +314,14 @@ test("accepts a finding after reading its exact discussion thread by id", async 
     await makeReviewDiff(t),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: {
+      submission: (evidenceRef) => ({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Still broken",
             severity: "HIGH",
             why: "The old guard no longer applies.",
@@ -318,7 +330,7 @@ test("accepts a finding after reading its exact discussion thread by id", async 
             line: 4,
           },
         ],
-      },
+      }),
       skipConversationRead: true,
       assertUnreadThreadRejection: true,
       readThreadId: 91,
@@ -376,10 +388,14 @@ test("matches discussion coverage across renamed paths", async (t) => {
     await makeReviewDiff(t),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: {
+      submission: (evidenceRef) => ({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Still broken",
             severity: "HIGH",
             why: "The old guard no longer applies.",
@@ -388,7 +404,7 @@ test("matches discussion coverage across renamed paths", async (t) => {
             line: 4,
           },
         ],
-      },
+      }),
       skipConversationRead: true,
       assertUnreadThreadRejection: true,
       readThreadPath: "src/new.ts",
@@ -403,9 +419,12 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "finding",
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         findings: [
           {
+            evidenceRefs: ["ev-1"],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Actionable defect",
             severity,
             why: "The defect breaks a supported path.",
@@ -421,9 +440,12 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "legacy finding",
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         findings: [
           {
+            evidenceRefs: ["ev-1"],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Legacy severity",
             severity,
             why: "The defect breaks a supported path.",
@@ -439,6 +461,9 @@ test("accepts exactly the four public finding severities", () => {
 
 test("requires inline locations only for interactive submissions", () => {
   const finding = {
+    evidenceRefs: ["ev-1"],
+    countercheck: "Checked the relevant caller for a guard.",
+    counterevidenceRefs: [],
     title: "Actionable defect",
     severity: "HIGH" as const,
     why: "The defect breaks a supported path.",
@@ -447,7 +472,7 @@ test("requires inline locations only for interactive submissions", () => {
   const unlocated = {
     summary: "finding",
     findings: [finding],
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
   };
   assert.equal(agentInternals.submissionSchema.safeParse(unlocated).success, true);
   assert.equal(agentInternals.interactiveSubmissionSchema.safeParse(unlocated).success, false);
@@ -455,7 +480,7 @@ test("requires inline locations only for interactive submissions", () => {
     agentInternals.interactiveSubmissionSchema.safeParse({
       summary: "finding",
       findings: [{ ...finding, path: "src/change.ts", line: 10 }],
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
     }).success,
     true,
   );
@@ -488,7 +513,7 @@ test("rejects interactive locations outside contiguous added lines", () => {
         { ...finding, title: "Mixed range", path: "src/change.ts", line: 11, endLine: 13 },
         { ...finding, title: "Reversed range", path: "src/change.ts", line: 11, endLine: 10 },
       ],
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
     },
     files,
   );
@@ -631,9 +656,12 @@ test("rejects model-authored apply suggestions", () => {
   assert.equal(
     agentInternals.submissionSchema.safeParse({
       summary: "finding",
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
       findings: [
         {
+          evidenceRefs: ["ev-1"],
+          countercheck: "Checked the relevant caller for a guard.",
+          counterevidenceRefs: [],
           title: "Replace the affected region",
           severity: "HIGH",
           why: "The current region returns the wrong value.",
@@ -650,6 +678,9 @@ test("rejects model-authored apply suggestions", () => {
 
 test("rejects required finding prose that normalizes to empty", () => {
   const finding = {
+    evidenceRefs: ["ev-1"],
+    countercheck: "Checked the relevant caller for a guard.",
+    counterevidenceRefs: [],
     title: "Actionable defect",
     severity: "HIGH",
     why: "The defect breaks a supported path.",
@@ -661,7 +692,7 @@ test("rejects required finding prose that normalizes to empty", () => {
       agentInternals.submissionSchema.safeParse({
         summary: "finding",
         findings: [{ ...finding, [field]: " \t\n " }],
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
       }).success,
       false,
       field,
@@ -672,9 +703,12 @@ test("rejects required finding prose that normalizes to empty", () => {
 test("renders structured finding prose and a deterministic AI prompt", () => {
   const submission = agentInternals.toSubmission({
     summary: "finding",
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
     findings: [
       {
+        evidenceRefs: ["ev-1"],
+        countercheck: "Checked the relevant caller for a guard.",
+        counterevidenceRefs: [],
         title: "  Return   the result ",
         severity: "HIGH",
         why: " The current path   drops the result. ",
@@ -708,9 +742,12 @@ test("renders structured finding prose and a deterministic AI prompt", () => {
 test("does not create an AI prompt without an inline target", () => {
   const submission = agentInternals.toSubmission({
     summary: "finding",
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
     findings: [
       {
+        evidenceRefs: ["ev-1"],
+        countercheck: "Checked the relevant caller for a guard.",
+        counterevidenceRefs: [],
         title: "Return the result",
         severity: "HIGH",
         why: "The current path drops the result.",
@@ -763,9 +800,12 @@ test("teaches the four severity definitions before review submission", () => {
   assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
   assert.match(prompt, /Set endLine only when the finding spans a contiguous range/u);
   assert.doesNotMatch(prompt, /raw replacement text|apply suggestions/u);
-  assert.match(agentInternals.repairPrompt(1), /MEDIUM and INFO are invalid/u);
-  assert.match(agentInternals.repairPrompt(1), /requires path and line/u);
-  assert.match(agentInternals.repairPrompt(1, true, false), /optional location fields/u);
+  assert.match(agentInternals.repairPrompt(1), /Severity must be CRITICAL, HIGH, MODERATE, LOW/u);
+  assert.match(
+    agentInternals.repairPrompt(1),
+    /Every finding needs a changed path and participating added line/u,
+  );
+  assert.match(agentInternals.repairPrompt(1, true, false), /Publication locations are optional/u);
   assert.doesNotMatch(agentInternals.repairPrompt(1), /suggestion/u);
   assert.doesNotMatch(agentInternals.repairPrompt(1), /read_pr_conversation|read_pr_diff/u);
   assert.match(agentInternals.repairPrompt(1, false), /read_review_briefing/u);

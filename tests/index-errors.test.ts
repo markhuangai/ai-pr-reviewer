@@ -405,10 +405,11 @@ test("cancellation prevents new summaries and pull request writes", async (t) =>
             controller.abort(reason);
             return Promise.resolve([
               {
+                inspection: { observedPaths: ["review.txt"], missingPaths: [] },
                 prompt: "correctness",
                 status: "completed",
                 submission: {
-                  assessment: { coverage: [], candidates: [] },
+                  limitations: [],
                   summary: "clean",
                   findings: [],
                 },
@@ -469,10 +470,11 @@ test("correlates full action cleanup failures with the parent failure", async (t
         runGoals: () =>
           Promise.resolve([
             {
+              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
               prompt: "correctness",
               status: "completed",
               submission: {
-                assessment: { coverage: [], candidates: [] },
+                limitations: [],
                 summary: "clean",
                 findings: [],
               },
@@ -559,7 +561,14 @@ test("writes failed and partial summary-only results before reporting failure", 
     runAction(
       actionReader({ "interact-with-pr": "false" }),
       [],
-      dependencies([{ prompt: "correctness", status: "failed", error: "provider failed" }]),
+      dependencies([
+        {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+          prompt: "correctness",
+          status: "failed",
+          error: "provider failed",
+        },
+      ]),
     ),
     /All review goals failed/u,
   );
@@ -572,15 +581,21 @@ test("writes failed and partial summary-only results before reporting failure", 
       [],
       dependencies([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "one",
           status: "completed",
           submission: {
             summary: "clean",
             findings: [],
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
           },
         },
-        { prompt: "two", status: "failed", error: "provider failed" },
+        {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+          prompt: "two",
+          status: "failed",
+          error: "provider failed",
+        },
       ]),
     ),
     /partial result/u,
@@ -613,6 +628,7 @@ test("does not post an interactive review when every goal fails", async (t) => {
       runGoals: () =>
         Promise.resolve([
           {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
             prompt: "correctness",
             status: "failed",
             error: "failed",

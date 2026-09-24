@@ -244,7 +244,7 @@ function pullRequestContext(context: ReplayCase["context"]): PullRequestContext 
 }
 
 export interface ReplayOutput {
-  readonly version: 1;
+  readonly version: 2;
   readonly caseId: string;
   readonly labels?: unknown;
   readonly repository: string;
@@ -426,7 +426,7 @@ export async function replayCase(
   const goals = redactGoalResults(rawGoals, secrets);
   const review = aggregateReview(context, config, files, goals, { coverageGoals: rawGoals });
   return {
-    version: 1,
+    version: 2,
     caseId: redact(input.caseId, secrets),
     ...(input.labels === undefined ? {} : { labels: redactJson(input.labels, secrets) }),
     repository: redact(context.repository, secrets),

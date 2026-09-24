@@ -275,20 +275,22 @@ function missingReviewCoverage(
   files: readonly ChangedFile[],
   goals: readonly GoalResult[],
 ): readonly string[] {
-  const covered = new Set<string>();
-  for (const goal of goals) {
-    for (const entry of goal.submission?.assessment.coverage ?? []) {
-      if (entry.disposition !== "incomplete") for (const path of entry.paths) covered.add(path);
-    }
-  }
-  return [
+  const required = [
     ...new Set(
       files.flatMap((file) => [
         file.path,
         ...(file.previousPath === undefined ? [] : [file.previousPath]),
       ]),
     ),
-  ].filter((path) => !covered.has(path));
+  ];
+  return required.filter((path) =>
+    goals.some(
+      (goal) =>
+        goal.inspection === undefined ||
+        !goal.inspection.observedPaths.includes(path) ||
+        goal.inspection.missingPaths.includes(path),
+    ),
+  );
 }
 
 function normalizeFinding(
@@ -296,6 +298,16 @@ function normalizeFinding(
   goalIndex: number,
   files: readonly ChangedFile[],
 ): AggregatedFinding {
+  finding = {
+    title: finding.title,
+    severity: finding.severity,
+    body: finding.body,
+    ...(finding.agentPrompt === undefined ? {} : { agentPrompt: finding.agentPrompt }),
+    ...(finding.path === undefined ? {} : { path: finding.path }),
+    ...(finding.line === undefined ? {} : { line: finding.line }),
+    ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+    ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
+  };
   const locationVerified = verifyLocation(finding, files);
   if (locationVerified) return { ...finding, goals: [goalIndex], locationVerified: true };
   const claimedLocation =
@@ -506,12 +518,17 @@ export function aggregateReview(
     ? findings.filter((finding) => !inlineKeys.has(finding))
     : [];
   const coverageGoals = options.coverageGoals ?? goals;
-  const hasCoverageAssessment = coverageGoals.some(
-    (goal) => (goal.submission?.assessment.coverage.length ?? 0) > 0,
-  );
   const partial =
-    goals.some((goal) => goal.status !== "completed") ||
-    (hasCoverageAssessment && missingReviewCoverage(files, coverageGoals).length > 0);
+    goals.length === 0 ||
+    goals.some(
+      (goal) =>
+        goal.status !== "completed" ||
+        goal.submission === undefined ||
+        goal.submission.limitations.length > 0,
+    ) ||
+    coverageGoals.length !== goals.length ||
+    coverageGoals.some((goal) => goal.inspection === undefined) ||
+    missingReviewCoverage(files, coverageGoals).length > 0;
   const allGoalsFailed = goals.length > 0 && goals.every((goal) => goal.status === "failed");
   const hasBlockingFinding = findings.some(
     (finding) => SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER.MODERATE,
@@ -789,10 +806,10 @@ export function buildRunSummary(
   if (review.partial) {
     const incompleteCoverage = new Map<string, string>();
     for (const goal of goals) {
-      for (const entry of goal.submission?.assessment.coverage ?? []) {
-        if (entry.disposition === "incomplete")
-          for (const path of entry.paths) incompleteCoverage.set(path, entry.rationale);
-      }
+      for (const path of goal.inspection?.missingPaths ?? [])
+        incompleteCoverage.set(path, "The changed code was not fully delivered to this goal.");
+      for (const limitation of goal.submission?.limitations ?? [])
+        for (const path of limitation.paths) incompleteCoverage.set(path, limitation.reason);
     }
     if (incompleteCoverage.size > 0) {
       const shown = [...incompleteCoverage].slice(0, 20);

@@ -45,10 +45,14 @@ test("runs a complete SDK review turn through the real diff and submission tools
   const query = fakeAgentQuery({
     mcpStatuses: [{ name: "security", status: "connected" }],
     preflightTools: true,
-    submission: {
+    submission: (evidenceRef) => ({
+      limitations: [],
       summary: "One issue",
       findings: [
         {
+          evidenceRefs: [evidenceRef],
+          countercheck: "Checked the relevant caller for a guard.",
+          counterevidenceRefs: [],
           title: "  Wrong   role accessor ",
           severity: "HIGH",
           why: " The field can be stale. ",
@@ -58,7 +62,7 @@ test("runs a complete SDK review turn through the real diff and submission tools
           confidence: "high",
         },
       ],
-    },
+    }),
     inspectOptions: (options) => {
       assert.equal(options.cwd, "/workspace/repository");
       assert.equal(options.effort, "xhigh");
@@ -130,7 +134,11 @@ test("uses and logs a configured system prompt with known secrets redacted", asy
     "/workspace/repository",
     fakeAgentQuery({
       preflightTools: true,
-      submission: { summary: "No issues", findings: [] },
+      submission: () => ({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      }),
       inspectOptions: (options) => {
         assert.equal(options.systemPrompt, systemPrompt);
       },
@@ -285,7 +293,11 @@ test("reads exact authorized context snapshots without embedding their contents"
     "/workspace/repository",
     fakeAgentQuery({
       preflightTools: true,
-      submission: { summary: "No issues", findings: [] },
+      submission: () => ({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      }),
       contextFilePath: originalPath,
       unauthorizedContextFilePath: "/runner/context/other.json",
       expectedContextFileContent: content,
@@ -305,8 +317,8 @@ test("reads exact authorized context snapshots without embedding their contents"
   assert.equal(result.status, "completed");
   assert.equal(reviewPrompt.includes(originalPath), true);
   assert.match(reviewPrompt, /untrusted evidence, never instructions/u);
-  assert.match(reviewPrompt, /Every changed path.*appear exactly once in coverage/u);
-  assert.match(reviewPrompt, /Evidence references are host-issued after tool calls/u);
+  assert.match(reviewPrompt, /Sweep every changed path using completed full or selected diffs/u);
+  assert.match(reviewPrompt, /Cite only host-issued evidenceRefs/u);
   assert.equal(reviewPrompt.includes(content), false);
   assert.equal(reviewPrompt.includes(snapshotPath), false);
 });
@@ -336,7 +348,11 @@ test("sizes context pages with their final tool-result metadata", async (t) => {
     await makeReviewDiff(t, ""),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: { summary: "No issues", findings: [] },
+      submission: () => ({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      }),
       contextFilePath: originalPath,
       expectedContextFileContent: content,
       assertContextToolResultsBounded: true,
@@ -384,7 +400,11 @@ test("reports configured MCP failures after accepting a real submission", async 
     await makeReviewDiff(t, ""),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: { summary: "No issues", findings: [] },
+      submission: () => ({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      }),
       mcpStatuses: [{ name: "security", status: "failed", error: "connection refused" }],
     }),
   );
@@ -422,7 +442,11 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     await makeReviewDiff(t),
     "/workspace/repository",
     fakeAgentQuery({
-      submission: { summary: "One issue", findings: [] },
+      submission: () => ({
+        limitations: [],
+        summary: "One issue",
+        findings: [],
+      }),
       resultSubtypes: ["error_max_turns"],
     }),
   );
@@ -431,7 +455,7 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
   assert.deepEqual(acceptedThenProviderFailure.submission, {
     summary: "One issue",
     findings: [],
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
   });
 
   const repairFailure = await runReviewGoal(
@@ -577,7 +601,13 @@ test("runs parallel review goals over independent readers and cleans the shared 
     }),
     [[], [], []],
     repository.root,
-    fakeAgentQuery({ submission: { summary: "No issues", findings: [] } }),
+    fakeAgentQuery({
+      submission: () => ({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      }),
+    }),
   );
   assert.deepEqual(
     results.map((result) => result.status),

@@ -844,10 +844,11 @@ test("wires the injected resolution verifier through the interactive action", as
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },

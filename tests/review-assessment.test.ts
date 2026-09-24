@@ -1,3 +1,4 @@
+import { ReviewQueryReaderStore } from "../src/runtime/review-context-tools.js";
 import { strict as assert } from "node:assert";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,17 +7,22 @@ import test from "node:test";
 
 import type {
   ChangedFile,
-  ReviewAssessment,
+  ReviewFindingEvidence,
   ReviewEvidenceReference,
   ReviewFinding,
 } from "../src/lib/types.js";
 import {
   ReviewEvidenceLedger,
-  findInvalidReviewAssessment,
+  reviewFindingGaps,
+  reviewInspection,
   reviewAssessmentInternals,
-  reviewAssessmentSchema,
   reviewEvidenceResultSchema,
 } from "../src/runtime/review-assessment.js";
+
+import { submissionSchema, reviewSubmissionGaps } from "../src/runtime/review-submission.js";
+import { ReviewSubmissionRecovery } from "../src/runtime/review-submission.js";
+import { createReviewStateTool } from "../src/runtime/review-context-tools.js";
+import { MODEL_TOOL_RESULT_BYTES } from "../src/runtime/agent-review-tools.js";
 
 const changedFile: ChangedFile = {
   path: "src/change.ts",
@@ -35,18 +41,11 @@ const finding: ReviewFinding = {
   line: 1,
 };
 
-function coverage(
-  path: string,
-  evidenceRefs: readonly string[],
-  disposition: "reviewed" | "not_applicable" | "incomplete" = "reviewed",
-): ReviewAssessment["coverage"][number] {
-  return {
-    paths: [path],
-    disposition,
-    rationale: "The affected behavior was checked against the fixed repository snapshot.",
-    evidenceRefs,
-  };
-}
+const proof: ReviewFindingEvidence = {
+  evidenceRefs: ["ev-1"],
+  countercheck: "Checked the caller and found no error handling.",
+  counterevidenceRefs: [],
+};
 
 let nextToolUse = 0;
 
@@ -86,27 +85,27 @@ function repositoryEvidence(
   };
 }
 
-test("accepts the bounded assessment contract and rejects extra fields", () => {
-  const assessment: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [
-      {
-        paths: ["src/change.ts"],
-        trigger: "A caller ignores the returned error.",
-        impact: "The operation appears to succeed while data is missing.",
-        evidenceRefs: ["ev-1"],
-        countercheck: "Checked for a caller guard and found none.",
-        counterevidenceRefs: [],
-        verdict: "supported",
-        findingIndex: 0,
-      },
-    ],
+test("accepts the small closed submission contract with inline finding proof", () => {
+  const submission = {
+    summary: "Checked the change.",
+    findings: [],
+    limitations: [],
   };
-  assert.equal(reviewAssessmentSchema.safeParse(assessment).success, true);
-  assert.equal(
-    reviewAssessmentSchema.safeParse({ ...assessment, unsupported: true }).success,
-    false,
-  );
+  assert.equal(submissionSchema.safeParse(submission).success, true);
+  assert.equal(submissionSchema.safeParse({ ...submission, assessment: {} }).success, false);
+  const raw = {
+    ...proof,
+    title: finding.title,
+    severity: finding.severity,
+    why: finding.body,
+    fix: "Handle the error.",
+  };
+  assert.equal(submissionSchema.safeParse({ ...submission, findings: [raw] }).success, true);
+  for (const change of [{ evidenceRefs: [] }, { countercheck: " " }, { findingIndex: 0 }])
+    assert.equal(
+      submissionSchema.safeParse({ ...submission, findings: [{ ...raw, ...change }] }).success,
+      false,
+    );
   assert.equal(reviewEvidenceResultSchema.safeParse(repositoryEvidence()).success, true);
   assert.equal(
     reviewEvidenceResultSchema.safeParse({ ...repositoryEvidence(), status: "unknown" }).success,
@@ -368,25 +367,18 @@ test("records native repository reads, searches, context, briefing, discussion, 
   assert.equal(ledger.issued.get("ev-6")?.kind, "conversation");
   assert.equal(ledger.issued.get("ev-7")?.path, undefined);
   assert.equal(ledger.issued.get("ev-8")?.kind, "external_tool");
-  const assessment: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [
-      {
-        paths: ["src/change.ts"],
-        trigger: "The result is ignored.",
-        impact: "The caller hides a failure.",
-        evidenceRefs: ["ev-2"],
-        countercheck: "Checked the caller guard.",
-        counterevidenceRefs: [],
-        verdict: "supported",
-        findingIndex: 0,
-      },
-    ],
-  };
   assert.deepEqual(
-    findInvalidReviewAssessment(assessment, [finding], [changedFile], ledger.issued),
+    reviewFindingGaps(
+      { ...finding, ...proof, evidenceRefs: ["ev-2"] },
+      [changedFile],
+      ledger.issued,
+    ),
     [],
   );
+  assert.deepEqual(reviewInspection([changedFile], ledger.issued), {
+    observedPaths: [changedFile.path],
+    missingPaths: [],
+  });
 });
 
 test("does not issue native-read evidence for symlink paths", async (t) => {
@@ -447,16 +439,10 @@ test("does not accept an empty native search as changed-path coverage", () => {
   assert.equal(search.kind, "repository_search");
   assert.equal(search.status, "complete");
 
-  const issues = findInvalidReviewAssessment(
-    { coverage: [coverage(changedFile.path, [search.id])], candidates: [] },
-    [],
-    [changedFile],
-    ledger.issued,
-  );
-  assert.ok(issues.some((issue) => /no completed repository evidence/u.test(issue)));
+  assert.deepEqual(reviewInspection([changedFile], ledger.issued).missingPaths, [changedFile.path]);
 });
 
-test("marks bounded or unverified native repository reads and searches partial", async (t) => {
+test("limits native read evidence to the returned range without certifying the whole file", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-bounded-read-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourcePath = join(root, "src/change.ts");
@@ -471,7 +457,7 @@ test("marks bounded or unverified native repository reads and searches partial",
         type: "text",
         file: {
           filePath: sourcePath,
-          content: "limited source",
+          content: "source\n".repeat(20),
           numLines: 20,
           startLine: 10,
           totalLines: 80,
@@ -495,24 +481,27 @@ test("marks bounded or unverified native repository reads and searches partial",
   ]);
   assert.deepEqual(
     observed.map((reference) => reference.status),
-    ["partial", "partial"],
+    ["complete", "partial"],
   );
-  assert.deepEqual(observed[0]?.bounds, { offset: 10, limit: 20, truncated: true });
+  assert.deepEqual(observed[0]?.bounds, {
+    offset: 10,
+    limit: 20,
+    startLine: 10,
+    numLines: 20,
+    totalLines: 80,
+  });
   assert.deepEqual(observed[1]?.bounds, { offset: 3, headLimit: 5, truncated: true });
-  const assessment: ReviewAssessment = {
-    coverage: [
-      coverage(
-        "src/change.ts",
-        observed.map((reference) => reference.id),
-      ),
-    ],
-    candidates: [],
-  };
-  assert.ok(
-    findInvalidReviewAssessment(assessment, [], [changedFile], ledger.issued).some((issue) =>
-      /completed repository evidence/u.test(issue),
-    ),
-  );
+  assert.deepEqual(reviewInspection([changedFile], ledger.issued).missingPaths, [changedFile.path]);
+  for (const [line, endLine, valid] of [
+    [10, 29, true],
+    [9, 10, false],
+    [29, 30, false],
+  ] as const)
+    assert.equal(
+      reviewFindingGaps({ ...finding, ...proof, line, endLine }, [changedFile], ledger.issued)
+        .length,
+      valid ? 0 : 1,
+    );
 });
 
 test("does not issue evidence for paths outside the checkout or inside Git metadata", () => {
@@ -610,249 +599,98 @@ test("rejects unstructured full-diff responses as evidence", () => {
     ]);
     assert.equal(reference?.status, "failed");
     assert.ok(reference);
-    assert.ok(
-      findInvalidReviewAssessment(
-        { coverage: [coverage("src/change.ts", [reference.id])], candidates: [] },
-        [],
-        [changedFile],
-        ledger.issued,
-      ).some((issue) => issue.includes("no completed repository evidence")),
-    );
+    assert.deepEqual(reviewInspection([changedFile], ledger.issued).missingPaths, [
+      changedFile.path,
+    ]);
   }
 });
 
-test("validates coverage, candidate evidence, and one-to-one finding links", () => {
-  const evidence = new Map<string, ReviewEvidenceReference>([["ev-1", repositoryEvidence()]]);
-  const valid: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [
-      {
-        paths: ["src/change.ts"],
-        trigger: "The new branch drops the result.",
-        impact: "The request reports success without saving the value.",
-        evidenceRefs: ["ev-1"],
-        countercheck: "Checked the caller and adjacent guard.",
-        counterevidenceRefs: [],
-        verdict: "supported",
-        findingIndex: 0,
-      },
-    ],
-  };
-  assert.deepEqual(findInvalidReviewAssessment(valid, [finding], [changedFile], evidence), []);
-  assert.ok(
-    findInvalidReviewAssessment(
-      { ...valid, coverage: [coverage("src/change.ts", ["ev-99"])] },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /unknown evidence/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      { ...valid, coverage: [coverage("src/unchanged.ts", ["ev-1"])] },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /unchanged path/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      {
-        ...valid,
-        coverage: [coverage("src/change.ts", ["ev-1"]), coverage("src/change.ts", ["ev-1"])],
-      },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /classified more than once/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      { ...valid, coverage: [] },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /no coverage classification/u.test(issue)),
-  );
+test("requires complete repository proof applicable to each finding", () => {
+  for (const reference of [
+    repositoryEvidence(),
+    repositoryEvidence({ status: "partial" }),
+    repositoryEvidence({ kind: "briefing" }),
+    repositoryEvidence({ changedPaths: false, paths: ["unrelated.ts"] }),
+  ]) {
+    const evidence = new Map([[reference.id, reference]]);
+    const valid =
+      reference.kind === "repository_diff" &&
+      reference.status === "complete" &&
+      reference.changedPaths === true;
+    assert.equal(
+      reviewFindingGaps({ ...finding, ...proof }, [changedFile], evidence).length,
+      valid ? 0 : 1,
+    );
+    assert.equal(reviewInspection([changedFile], evidence).missingPaths.length, valid ? 0 : 1);
+  }
+  assert.equal(reviewFindingGaps({ ...finding, ...proof }, [changedFile], new Map()).length, 1);
 });
 
-test("requires completed repository evidence for reviewed coverage and supported findings", () => {
-  const briefing = new Map<string, ReviewEvidenceReference>([
-    ["ev-1", { id: "ev-1", kind: "briefing", status: "complete" }],
-  ]);
-  const assessment: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [
-      {
-        paths: ["src/change.ts"],
-        trigger: "The caller drops the value.",
-        impact: "The write is lost.",
-        evidenceRefs: ["ev-1"],
-        countercheck: "Looked for a guard.",
-        counterevidenceRefs: [],
-        verdict: "supported",
-        findingIndex: 0,
-      },
-    ],
-  };
-  assert.ok(
-    findInvalidReviewAssessment(assessment, [finding], [changedFile], briefing).some((issue) =>
-      /completed repository evidence/u.test(issue),
-    ),
-  );
-  const partial = new Map<string, ReviewEvidenceReference>([
-    ["ev-1", repositoryEvidence({ status: "partial" })],
-  ]);
-  const firstCandidate = assessment.candidates[0];
-  assert.ok(firstCandidate);
-  assert.ok(
-    findInvalidReviewAssessment(assessment, [finding], [changedFile], partial).some((issue) =>
-      /lacks evidence for an affected path/u.test(issue),
-    ),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      {
-        ...assessment,
-        candidates: [{ ...firstCandidate, evidenceRefs: [] }],
-      },
-      [finding],
-      [changedFile],
-      partial,
-    ).some((issue) => /no host-issued evidence/u.test(issue)),
-  );
-});
-
-test("accepts justified exclusions and unresolved hypotheses without findings", () => {
-  const evidence = new Map<string, ReviewEvidenceReference>([["ev-1", repositoryEvidence()]]);
-  const notApplicable: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"], "not_applicable")],
-    candidates: [],
-  };
-  assert.deepEqual(findInvalidReviewAssessment(notApplicable, [], [changedFile], evidence), []);
-  assert.ok(
-    findInvalidReviewAssessment(
-      { ...notApplicable, coverage: [coverage("src/change.ts", [], "not_applicable")] },
-      [],
-      [changedFile],
-      evidence,
-    ).some((issue) => /not_applicable path.*completed repository evidence/u.test(issue)),
-  );
-  const unresolved: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [
-      {
-        paths: ["src/change.ts"],
-        trigger: "The caller may mishandle an absent value.",
-        impact: "The request may fail.",
-        evidenceRefs: ["ev-1"],
-        countercheck: "Inspected the available caller but could not resolve the condition.",
-        counterevidenceRefs: [],
-        verdict: "unresolved",
-      },
-    ],
-  };
-  assert.deepEqual(findInvalidReviewAssessment(unresolved, [], [changedFile], evidence), []);
-  const incomplete = { coverage: [coverage("src/change.ts", [], "incomplete")], candidates: [] };
-  assert.deepEqual(findInvalidReviewAssessment(incomplete, [], [changedFile], evidence), []);
-});
-
-test("requires completed repository counterevidence for disproved candidates", () => {
-  const evidence = new Map<string, ReviewEvidenceReference>([
+test("validates repository counterevidence directly on the finding", () => {
+  const references = new Map<string, ReviewEvidenceReference>([
     ["ev-1", repositoryEvidence()],
     ["ev-2", { id: "ev-2", kind: "conversation", status: "complete" }],
+    ["ev-3", repositoryEvidence({ id: "ev-3", changedPaths: false, paths: ["guard.ts"] })],
   ]);
-  const candidate = {
-    paths: ["src/change.ts"],
-    trigger: "The caller may drop an error.",
-    impact: "The update may be lost.",
-    evidenceRefs: ["ev-1"],
-    countercheck: "Found a caller guard.",
-    counterevidenceRefs: ["ev-2"],
-    verdict: "disproved" as const,
-  };
-  const assessment: ReviewAssessment = {
-    coverage: [coverage("src/change.ts", ["ev-1"])],
-    candidates: [candidate],
-  };
-  assert.ok(
-    findInvalidReviewAssessment(assessment, [], [changedFile], evidence).some((issue) =>
-      /completed repository counterevidence/u.test(issue),
-    ),
-  );
-  const completeCounterevidence = new Map(evidence).set("ev-3", {
-    id: "ev-3",
-    kind: "repository_read",
-    status: "complete",
-    path: "src/guard.ts",
-  });
-  assert.deepEqual(
-    findInvalidReviewAssessment(
-      { ...assessment, candidates: [{ ...candidate, counterevidenceRefs: ["ev-3"] }] },
-      [],
-      [changedFile],
-      completeCounterevidence,
-    ),
-    [],
-  );
+  for (const [id, valid] of [
+    ["ev-2", false],
+    ["ev-3", true],
+    ["ev-99", false],
+  ] as const)
+    assert.equal(
+      reviewFindingGaps(
+        { ...finding, ...proof, counterevidenceRefs: [id] },
+        [changedFile],
+        references,
+      ).length,
+      valid ? 0 : 1,
+    );
 });
 
-test("requires a supported finding link for every finding", () => {
-  const evidence = new Map<string, ReviewEvidenceReference>([["ev-1", repositoryEvidence()]]);
-  const unsupported = {
-    paths: ["src/change.ts"],
-    trigger: "The change drops the result.",
-    impact: "The update is lost.",
-    evidenceRefs: ["ev-1"],
-    countercheck: "Checked the caller.",
-    counterevidenceRefs: [],
-    verdict: "supported" as const,
+test("accepts explicit limitations but rejects unseen completion and invalid summary locations", () => {
+  const ledger = new ReviewEvidenceLedger("/repo");
+  const small = { summary: "done", findings: [], limitations: [] };
+  const gaps = (input: unknown) =>
+    reviewSubmissionGaps(input, [changedFile], ledger, false, true, () => []);
+  assert.equal(gaps(small)[0]?.category, "inspection");
+  assert.deepEqual(
+    gaps({
+      ...small,
+      limitations: [
+        { paths: [], reason: "The provider stopped before required investigation finished." },
+      ],
+    }),
+    [],
+  );
+  assert.equal(
+    gaps({ ...small, limitations: [{ paths: ["unrelated.ts"], reason: "unavailable" }] })[0]
+      ?.category,
+    "schema",
+  );
+  const [reference] = ledger.observeBatch([
+    call("read_pr_diff", {}, jsonResponse({ page: 1, content: "diff", done: true })),
+  ]);
+  assert.ok(reference);
+  const supported = {
+    ...proof,
+    evidenceRefs: [reference.id],
+    title: finding.title,
+    severity: finding.severity,
+    why: finding.body,
+    fix: "Handle the error.",
   };
-  const validCoverage = [coverage("src/change.ts", ["ev-1"])];
-  assert.ok(
-    findInvalidReviewAssessment(
-      { coverage: validCoverage, candidates: [unsupported] },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /does not identify its finding/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      {
-        coverage: validCoverage,
-        candidates: [
-          { ...unsupported, findingIndex: 0 },
-          { ...unsupported, findingIndex: 0 },
-        ],
-      },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /needs one supported candidate/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      {
-        coverage: validCoverage,
-        candidates: [{ ...unsupported, verdict: "unresolved", findingIndex: 0 }],
-      },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /non-supported candidate/u.test(issue)),
-  );
-  assert.ok(
-    findInvalidReviewAssessment(
-      {
-        coverage: validCoverage,
-        candidates: [{ ...unsupported, findingIndex: 0, paths: ["other.ts"] }],
-      },
-      [finding],
-      [changedFile],
-      evidence,
-    ).some((issue) => /not linked to its changed path/u.test(issue)),
-  );
+  assert.deepEqual(gaps({ ...small, findings: [supported] }), []);
+  for (const location of [
+    { path: "unrelated.ts" },
+    { line: 1 },
+    { path: changedFile.path, line: 2 },
+    { path: changedFile.path, line: 1, endLine: 2 },
+  ])
+    assert.ok(
+      gaps({ ...small, findings: [{ ...supported, ...location }] }).some(
+        (gap) => gap.category === "location",
+      ),
+    );
 });
 
 test("covers only exact repository paths unless a complete diff covers all changed paths", () => {
@@ -921,4 +759,94 @@ test("covers only exact repository paths unless a complete diff covers all chang
     reviewAssessmentInternals.toolResponseDocument(jsonResponse({ done: true }))?.done,
     true,
   );
+});
+
+test("keeps four structured state snapshots without advancing or evicting source cursors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "review-state-readers-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "source");
+  const content = "source line\n".repeat(8_000);
+  await writeFile(path, content);
+  const readers = new ReviewQueryReaderStore(() => undefined);
+  t.after(() => Promise.all(readers.cleanupOperations()));
+  const source = { path, sizeBytes: Buffer.byteLength(content), cleanup: () => Promise.resolve() };
+  const query = readers.createSource(source, "repository_file", {
+    path: changedFile.path,
+    revision: "head",
+    kind: "text",
+  });
+  await query.reader.readNext({ nextCursor: query.cursor });
+  for (let index = 1; index < 32; index += 1)
+    readers.createSource(source, "repository_file", {
+      path: `optional-${index}.ts`,
+      revision: "base",
+      kind: "text",
+    });
+  const ledger = new ReviewEvidenceLedger(root);
+  const recovery = new ReviewSubmissionRecovery();
+  const state = createReviewStateTool({
+    signal: undefined,
+    isActive: () => true,
+    files: [
+      changedFile,
+      ...Array.from({ length: 600 }, (_, index) => ({ ...changedFile, path: `other-${index}.ts` })),
+    ],
+    headSha: "b".repeat(40),
+    mergeBaseSha: "a".repeat(40),
+    briefingComplete: () => true,
+    ledger,
+    readers,
+    recovery,
+    gaps: () => [],
+  });
+  const document = (result: unknown) => {
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) <= MODEL_TOOL_RESULT_BYTES);
+    const parsed = reviewAssessmentInternals.toolResponseDocument(result);
+    assert.ok(parsed);
+    return parsed;
+  };
+  const first = document(await state.handler({ paths: undefined, cursor: undefined }, {}));
+  assert.equal(first.done, false);
+  assert.equal(first.content, undefined);
+  const records = first.records as {
+    kind: string;
+    tool?: string;
+    arguments?: Record<string, unknown>;
+  }[];
+  assert.deepEqual(records[0], {
+    kind: "next_call",
+    tool: "read_repository_file",
+    arguments: { revision: "head", path: changedFile.path, cursor: query.cursor },
+  });
+  assert.ok(
+    !JSON.stringify(records.filter((record) => record.tool === "read_pr_diff")).includes(
+      changedFile.path,
+    ),
+  );
+  const cursor = String(first.nextCursor);
+  const original = document(await state.handler({ paths: undefined, cursor }, {}));
+  recovery.observeUse("rejected", {});
+  for (let index = 0; index < 3; index += 1)
+    await state.handler({ paths: undefined, cursor: undefined }, {});
+  assert.deepEqual(document(await state.handler({ paths: undefined, cursor }, {})), original);
+  await state.handler({ paths: undefined, cursor: undefined }, {});
+  const expired = await state.handler({ paths: undefined, cursor }, {});
+  assert.equal(expired.isError, true);
+  assert.match(JSON.stringify(expired), /expired/u);
+  assert.equal(readers.has(query.cursor), true);
+  assert.equal(ledger.issued.size, 0);
+  const mismatch = document(
+    await readers.readPage(query.cursor, "repository_file", { revision: "base", path: "wrong.ts" }),
+  );
+  assert.deepEqual(mismatch.nextCall, {
+    tool: "read_repository_file",
+    arguments: { revision: "head", path: changedFile.path, cursor: query.cursor },
+  });
+  const resumed = document(
+    await readers.readPage(query.cursor, "repository_file", {
+      revision: "head",
+      path: changedFile.path,
+    }),
+  );
+  assert.equal(resumed.page, 2);
 });

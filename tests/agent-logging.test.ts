@@ -23,23 +23,12 @@ test("retains valid findings while marking explicitly incomplete investigation",
         line: 1,
       },
     ],
-    assessment: {
-      coverage: [
-        {
-          paths: ["src/change.ts"],
-          disposition: "reviewed",
-          rationale: "Completed the fixed repository read.",
-          evidenceRefs: ["ev-1"],
-        },
-        {
-          paths: ["src/other.ts"],
-          disposition: "incomplete",
-          rationale: "The required read failed before the file could be inspected.",
-          evidenceRefs: ["ev-2"],
-        },
-      ],
-      candidates: [],
-    },
+    limitations: [
+      {
+        paths: ["src/other.ts"],
+        reason: "The required read failed before the file could be inspected.",
+      },
+    ],
   };
   const result = acceptedSubmissionResult(
     "correctness",

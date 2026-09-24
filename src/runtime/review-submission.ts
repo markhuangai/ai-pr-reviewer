@@ -6,7 +6,6 @@ import type {
   ChangedFile,
   GoalSubmission,
   GoalResult,
-  ReviewAssessment,
   ReviewFinding,
   ReviewEvidenceReference,
 } from "../lib/types.js";
@@ -14,10 +13,10 @@ import { isRecord } from "./agent-logging.js";
 import { jsonToolResult } from "./agent-review-tools.js";
 import {
   type ReviewEvidenceLedger,
-  reviewAssessmentSchema,
-  reviewAssessmentGaps,
-  reviewCandidateGaps,
-  reviewCoverageGaps,
+  findingEvidenceShape,
+  reviewLimitationSchema,
+  reviewFindingGaps,
+  reviewInspection,
   type ReviewValidationGap,
 } from "./review-assessment.js";
 const MAX_FINDING_TITLE_LENGTH = 120;
@@ -133,6 +132,7 @@ export class ReviewSubmissionRecovery {
 }
 
 const findingShape = {
+  ...findingEvidenceShape,
   title: z.string().trim().min(1).max(MAX_FINDING_TITLE_LENGTH),
   severity: z
     .enum(SEVERITY_VALUES)
@@ -175,7 +175,7 @@ export const submissionSchema = z
   .object({
     summary: z.string().max(10_000),
     findings: z.array(findingSchema).max(100),
-    assessment: reviewAssessmentSchema,
+    limitations: z.array(reviewLimitationSchema).max(100),
   })
   .strict();
 
@@ -183,7 +183,7 @@ export const interactiveSubmissionSchema = z
   .object({
     summary: z.string().max(10_000),
     findings: z.array(inlineFindingSchema).max(100),
-    assessment: reviewAssessmentSchema,
+    limitations: z.array(reviewLimitationSchema).max(100),
   })
   .strict();
 
@@ -225,7 +225,7 @@ export function toSubmission(input: SubmissionInput): GoalSubmission {
       ...(finding.confidence === undefined ? {} : { confidence: finding.confidence }),
     };
   });
-  return { summary: input.summary, findings, assessment: input.assessment as ReviewAssessment };
+  return { summary: input.summary, findings, limitations: input.limitations };
 }
 
 function validAddedLineLocation(finding: ReviewFinding, files: readonly ChangedFile[]): boolean {
@@ -256,6 +256,16 @@ export function invalidInteractiveFindingLocations(
   });
 }
 
+function findingLocationValid(
+  finding: ReviewFinding,
+  files: readonly ChangedFile[],
+  interactive: boolean,
+): boolean {
+  if (interactive || finding.line !== undefined || finding.endLine !== undefined)
+    return validAddedLineLocation(finding, files);
+  return finding.path === undefined || files.some((file) => file.path === finding.path);
+}
+
 export function retainValidReviewFindings(
   input: unknown,
   files: readonly ChangedFile[],
@@ -263,86 +273,38 @@ export function retainValidReviewFindings(
   canReport: (finding: ReviewFinding) => boolean,
   interactive = false,
 ): GoalSubmission | undefined {
-  if (
-    !isRecord(input) ||
-    !Array.isArray(input.findings) ||
-    input.findings.length > 100 ||
-    !isRecord(input.assessment) ||
-    !Array.isArray(input.assessment.candidates) ||
-    input.assessment.candidates.length > 100
-  )
+  if (!isRecord(input) || !Array.isArray(input.findings) || input.findings.length > 100)
     return undefined;
   const findings: ReviewFinding[] = [];
-  const candidates: ReviewAssessment["candidates"][number][] = [];
-  for (const [index, raw] of input.findings.entries()) {
+  for (const raw of input.findings) {
     const parsed = findingSchema.safeParse(raw);
     if (!parsed.success) continue;
-    const finding = toSubmission({
-      summary: "",
-      findings: [parsed.data],
-      assessment: { coverage: [], candidates: [] },
-    }).findings[0];
-    if (finding === undefined || !canReport(finding)) continue;
+    const { evidenceRefs, countercheck, counterevidenceRefs } = parsed.data;
+    const finding = toSubmission({ summary: "", findings: [parsed.data], limitations: [] })
+      .findings[0];
     if (
-      (interactive ||
-        finding.path !== undefined ||
-        finding.line !== undefined ||
-        finding.endLine !== undefined) &&
-      !validAddedLineLocation(finding, files)
+      finding === undefined ||
+      !canReport(finding) ||
+      !findingLocationValid(finding, files, interactive) ||
+      reviewFindingGaps(
+        { ...finding, evidenceRefs, countercheck, counterevidenceRefs },
+        files,
+        references,
+      ).length > 0
     )
       continue;
-    const matches = input.assessment.candidates.filter(
-      (candidate: unknown) => isRecord(candidate) && candidate.findingIndex === index,
-    );
-    if (matches.length !== 1) continue;
-    const parsedCandidate = reviewAssessmentSchema.shape.candidates.element.safeParse(matches[0]);
-    if (!parsedCandidate.success) continue;
-    const candidate = { ...parsedCandidate.data, findingIndex: 0 };
-    if (reviewCandidateGaps([candidate], [finding], files, references).length > 0) continue;
-    candidates.push({ ...candidate, findingIndex: findings.length });
     findings.push(finding);
   }
   if (findings.length === 0) return undefined;
-  const rawCoverage: unknown[] =
-    Array.isArray(input.assessment.coverage) && input.assessment.coverage.length <= 1_000
-      ? input.assessment.coverage
-      : [];
-  const provided = rawCoverage.flatMap((raw) => {
-    const parsed = reviewAssessmentSchema.shape.coverage.element.safeParse(raw);
-    return parsed.success ? [parsed.data] : [];
-  });
-  const gaps = reviewCoverageGaps(provided, files, references);
-  const paths = [
-    ...new Set(
-      files.flatMap((file) => [
-        file.path,
-        ...(file.previousPath === undefined ? [] : [file.previousPath]),
-      ]),
-    ),
-  ];
-  const coverage = paths.map((path): ReviewAssessment["coverage"][number] => {
-    const entries = provided.filter((entry) => entry.paths.includes(path));
-    const entry = entries[0];
-    const classifications = rawCoverage.filter(
-      (raw) => isRecord(raw) && Array.isArray(raw.paths) && raw.paths.includes(path),
-    ).length;
-    if (
-      entry !== undefined &&
-      classifications === 1 &&
-      !gaps.some((gap) => gap.paths.includes(path))
-    )
-      return { ...entry, paths: [path] };
-    return {
-      paths: [path],
-      disposition: "incomplete",
-      rationale: "Required investigation was not established by the latest submission.",
-      evidenceRefs: [],
-    };
-  });
   return {
     summary: "Review incomplete; retained independently validated findings.",
     findings,
-    assessment: { coverage, candidates },
+    limitations: [
+      {
+        paths: [],
+        reason: "The latest review submission could not be finalized within the configured limit.",
+      },
+    ],
   };
 }
 
@@ -395,9 +357,42 @@ export function reviewSubmissionGaps(
       },
     ];
   const candidate = toSubmission(parsed.data);
-  const gaps: ReviewValidationGap[] = [
-    ...reviewAssessmentGaps(candidate.assessment, candidate.findings, files, evidenceLedger.issued),
-  ];
+  const gaps: ReviewValidationGap[] = parsed.data.findings.flatMap(
+    ({ evidenceRefs, countercheck, counterevidenceRefs }, index) =>
+      reviewFindingGaps(
+        {
+          ...(candidate.findings[index] as ReviewFinding),
+          evidenceRefs,
+          countercheck,
+          counterevidenceRefs,
+        },
+        files,
+        evidenceLedger.issued,
+      ),
+  );
+  const validPaths = new Set(
+    files.flatMap((file) => [
+      file.path,
+      ...(file.previousPath === undefined ? [] : [file.previousPath]),
+    ]),
+  );
+  for (const limitation of candidate.limitations)
+    if (limitation.paths.some((path) => !validPaths.has(path)))
+      gaps.push({
+        category: "schema",
+        message:
+          "Limitation paths must belong to the captured change, or be empty for a goal-wide limitation.",
+        paths: limitation.paths,
+      });
+  const missing = reviewInspection(files, evidenceLedger.issued).missingPaths;
+  if (missing.length > 0 && candidate.limitations.length === 0)
+    for (const path of missing)
+      gaps.push({
+        category: "inspection",
+        message:
+          "Changed code has not been delivered; read its selected diff or declare the required investigation incomplete.",
+        paths: [path],
+      });
   if (!briefingComplete)
     gaps.unshift({
       category: "briefing",
@@ -411,10 +406,11 @@ export function reviewSubmissionGaps(
       message: "Read prior discussion threads for these finding paths first.",
       paths: unread,
     });
-  if (interactive && invalidInteractiveFindingLocations(candidate, files).length > 0)
+  if (candidate.findings.some((finding) => !findingLocationValid(finding, files, interactive)))
     gaps.push({
       category: "location",
-      message: "Every interactive finding must cite a participating added line in a changed file.",
+      message:
+        "Every supplied finding location must match the captured change; interactive findings require a participating added line.",
       paths: candidate.findings.flatMap((finding) =>
         finding.path === undefined ? [] : [finding.path],
       ),
@@ -443,7 +439,7 @@ export function reviewSubmissionRejectionResult(
   return {
     ...jsonToolResult({
       message:
-        "Review submission rejected. Call read_review_state to recover the full manifest, existing evidence, and validation gaps; correct the latest submission.",
+        "Review submission rejected. Call read_review_state for inspection progress, existing evidence, and exact next calls; correct only the reported gaps.",
       gaps,
       omittedGaps: validationGaps.length - gaps.length,
       remainingCorrections,

@@ -1,3 +1,4 @@
+import { ReviewQueryReaderStore } from "../src/runtime/review-context-tools.js";
 import {
   access,
   agentInternals,
@@ -10,10 +11,17 @@ import {
   makeDiffFromSnapshots,
   makeExistingCommitRepository,
   makeRepository,
+  fakeAgentQuery,
+  reviewConfig,
+  runReviewGoals,
+  runReviewGoalWithEmptyGuidance as runReviewGoal,
+  type ReviewConfig,
+  type SDKResultMessage,
   mkdir,
   mkdtemp,
   readCompleteDiff,
   readFile,
+  readdir,
   rm,
   stat,
   streamGitToFile,
@@ -26,9 +34,12 @@ import {
   type ReviewConversationSnapshot,
   writeFile,
 } from "./agent-test-helpers.js";
+import { reviewProtocolQuery } from "./review-protocol-test-helpers.js";
+import { dirname } from "node:path";
+import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import {
   MODEL_TOOL_RESULT_BYTES,
-  ReviewQueryReaderStore,
+  toolResultSerializedBytes,
 } from "../src/runtime/agent-review-tools.js";
 
 test("streams a complete diff larger than the former character budget", async (t) => {
@@ -541,4 +552,121 @@ test("changed-file prompt contains metadata without REST patches", () => {
   assert.match(prompt, /path="src\/new\.ts"/u);
   assert.match(prompt, /previousPath="src\/old\.ts"/u);
   assert.equal(prompt.includes("secret patch text"), false);
+});
+
+test("handles sparse goal arrays without leaking the shared diff", async (t) => {
+  const repository = await makeExistingCommitRepository(t);
+  const prompts = new Array<ReviewConfig["reviewPrompts"][number]>(1);
+  const results = await runReviewGoals(
+    repository.context,
+    [],
+    emptyConversation,
+    reviewConfig({ reviewPrompts: prompts }),
+    [[]],
+    repository.root,
+    fakeAgentQuery({
+      submission: () => ({
+        limitations: [],
+        summary: "unused",
+        findings: [],
+      }),
+    }),
+  );
+  assert.deepEqual(results, [
+    {
+      prompt: "",
+      status: "failed",
+      error: "Worker did not return a result.",
+    },
+  ]);
+  assert.deepEqual(await readdir(repository.temporaryRoot), []);
+});
+
+test("bounds selected-diff metadata before creating a query and resumes the largest accepted selection", async (t) => {
+  const prefix = `${"p".repeat(220)}/${"q".repeat(200)}`;
+  const paths = Array.from({ length: 49 }, (_, index) => `${prefix}/file-${index}.ts`);
+  const metadataBytes = (selection: string[]) =>
+    toolResultSerializedBytes(
+      JSON.stringify({
+        mergeBaseSha: "a".repeat(40),
+        headSha: "b".repeat(40),
+        paths: selection,
+      }),
+    );
+  let tail = "last.ts";
+  for (;;) {
+    const next = (tail.split("/").at(-1)?.length ?? 0) === 200 ? `${tail}/x` : `${tail}x`;
+    if (metadataBytes([...paths, next]) > MODEL_TOOL_RESULT_BYTES - 1_024) break;
+    tail = next;
+  }
+  paths.push(tail);
+  const oversized = [...paths.slice(0, -1), `${tail}xx`];
+  assert.ok(metadataBytes(paths) <= MODEL_TOOL_RESULT_BYTES - 1_024);
+  assert.ok(metadataBytes(oversized) > MODEL_TOOL_RESULT_BYTES - 1_024);
+  const repository = await makeRepository(t, async (root) => {
+    for (const path of paths) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), "changed\n".repeat(200));
+    }
+  });
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const result = await runReviewGoal(
+    "check",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig(),
+    diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      const document = (response: { content: readonly { text?: string }[] }) =>
+        JSON.parse(response.content[0]?.text ?? "{}") as Record<string, unknown>;
+      let briefingDone = false;
+      while (!briefingDone)
+        briefingDone = document(yield* protocol.call("read_review_briefing", {})).done === true;
+      const rejected = yield* protocol.call("read_pr_diff", { paths: oversized });
+      assert.equal(rejected.isError, true);
+      assert.match(JSON.stringify(rejected), /request fewer paths/u);
+      const rejectedState = document(yield* protocol.call("read_review_state", {}));
+      assert.doesNotMatch(JSON.stringify(rejectedState.records), /"cursor":/u);
+      const first = document(yield* protocol.call("read_pr_diff", { paths }));
+      assert.equal(first.done, false);
+      const stateResult = yield* protocol.call("read_review_state", {});
+      assert.ok(Buffer.byteLength(JSON.stringify(stateResult)) <= MODEL_TOOL_RESULT_BYTES);
+      const state = document(stateResult);
+      const next = (
+        state.records as { kind: string; tool: string; arguments: Record<string, unknown> }[]
+      )[0];
+      assert.ok(next);
+      assert.equal(next.kind, "next_call");
+      assert.deepEqual(next.arguments, { paths, cursor: first.nextCursor });
+      const resumed = document(yield* protocol.call(next.tool, next.arguments));
+      assert.equal(resumed.page, 2);
+      const accepted = yield* protocol.call("submit_review", {
+        summary: "Incomplete",
+        findings: [],
+        limitations: [{ paths: [], reason: "The remaining changes were not inspected." }],
+      });
+      assert.equal(accepted.isError, undefined);
+      yield {
+        type: "result",
+        subtype: "success",
+        num_turns: 2,
+        modelUsage: {},
+      } as SDKResultMessage;
+    }),
+  );
+  assert.equal(result.status, "incomplete");
 });

@@ -14,10 +14,11 @@ import { config, context, files } from "./aggregate-test-fixtures.js";
 test("renders a clean review without exposing goal internals", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "PRIVATE REVIEW GOAL",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "PRIVATE MODEL SUMMARY",
         findings: [],
       },
@@ -33,9 +34,81 @@ test("renders a clean review without exposing goal internals", () => {
   assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
 });
 
+test("requires canonical inspection and completed investigation from every goal", () => {
+  const complete = {
+    prompt: "check",
+    status: "completed",
+    submission: { summary: "clean", findings: [], limitations: [] },
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+  } satisfies GoalResult;
+  const withoutInspection: GoalResult = {
+    prompt: complete.prompt,
+    status: complete.status,
+    submission: complete.submission,
+  };
+  const variants: readonly GoalResult[] = [
+    withoutInspection,
+    { ...complete, inspection: { observedPaths: [], missingPaths: [] } },
+    {
+      ...complete,
+      inspection: {
+        observedPaths: files.map((file) => file.path),
+        missingPaths: ["src/change.ts"],
+      },
+    },
+    {
+      ...complete,
+      submission: {
+        summary: "partial",
+        findings: [],
+        limitations: [{ paths: [], reason: "The required caller was unavailable." }],
+      },
+    },
+  ];
+  for (const invalid of variants) {
+    const review = aggregateReview(context, config, files, [complete, invalid]);
+    assert.equal(review.event, "COMMENT");
+    assert.equal(review.partial, true);
+  }
+  assert.equal(aggregateReview(context, config, [], [withoutInspection]).event, "COMMENT");
+  assert.equal(aggregateReview(context, config, [], []).event, "COMMENT");
+  assert.equal(
+    aggregateReview(context, config, files, [complete], { coverageGoals: [] }).event,
+    "COMMENT",
+  );
+});
+
+test("projects only public finding fields even when callers supply private proof", () => {
+  const privateFinding = {
+    title: "Unchecked result",
+    severity: "HIGH" as const,
+    body: "A caller ignores an error.",
+    path: "src/change.ts",
+    line: 1,
+    evidenceRefs: ["ev-7"],
+    countercheck: "PRIVATE PROOF",
+    counterevidenceRefs: [],
+  };
+  const goals: GoalResult[] = [
+    {
+      prompt: "check",
+      status: "completed",
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+      submission: { summary: "done", findings: [privateFinding], limitations: [] },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  assert.equal(review.findings.length, 1);
+  assert.doesNotMatch(
+    JSON.stringify(review),
+    /evidenceRefs|countercheck|counterevidenceRefs|PRIVATE PROOF|ev-7/u,
+  );
+});
+
 test("retains supported findings while suppressing approval for incomplete coverage", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: [...["src/change.ts"]], missingPaths: [...["src/other.ts"]] },
       prompt: "correctness",
       status: "incomplete",
       error: "required evidence read did not finish",
@@ -57,34 +130,9 @@ test("retains supported findings while suppressing approval for incomplete cover
             line: 1,
           },
         ],
-        assessment: {
-          coverage: [
-            {
-              paths: ["src/change.ts"],
-              disposition: "reviewed",
-              rationale: "The fixed diff and caller were inspected.",
-              evidenceRefs: ["ev-1"],
-            },
-            {
-              paths: ["src/other.ts"],
-              disposition: "incomplete",
-              rationale: "The file read ended before completion.",
-              evidenceRefs: ["ev-2"],
-            },
-          ],
-          candidates: [
-            {
-              paths: ["src/change.ts"],
-              trigger: "The caller drops the returned error.",
-              impact: "The operation appears successful while the update failed.",
-              evidenceRefs: ["ev-1"],
-              countercheck: "Checked the caller for a guard.",
-              counterevidenceRefs: [],
-              verdict: "supported",
-              findingIndex: 0,
-            },
-          ],
-        },
+        limitations: [
+          { paths: ["src/other.ts"], reason: "The file read ended before completion." },
+        ],
       },
     },
   ];
@@ -105,10 +153,11 @@ test("retains supported findings while suppressing approval for incomplete cover
 test("combines token usage across every goal without showing cost when pricing is absent", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "one",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
@@ -127,10 +176,11 @@ test("combines token usage across every goal without showing cost when pricing i
       },
     },
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "two",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
@@ -187,10 +237,11 @@ test("prices raw model IDs before canonical IDs and labels unknown models as a l
   };
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "pricing",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
@@ -258,10 +309,11 @@ test("rounds only the grand total and preserves escaped currency and model text"
   const dangerousModel = "</details>\n# injected";
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "pricing",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
@@ -318,10 +370,11 @@ test("rounds only the grand total and preserves escaped currency and model text"
 test("formats four public severities without exposing goal provenance", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "PRIVATE SECURITY GOAL",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "PRIVATE FINDING SUMMARY",
         findings: [
           {
@@ -394,10 +447,11 @@ test("allows only low findings through the automatic approval threshold", () => 
   ] as const) {
     const review = aggregateReview(context, config, files, [
       {
+        inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
         prompt: "threshold",
         status: "completed",
         submission: {
-          assessment: { coverage: [], candidates: [] },
+          limitations: [],
           summary: "threshold",
           findings: [{ title: `${severity} issue`, severity, body: "Actionable defect." }],
         },
@@ -410,10 +464,11 @@ test("allows only low findings through the automatic approval threshold", () => 
 test("deduplicates findings, preserves the strongest severity, and verifies diff locations", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "correctness",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "found issue",
         findings: [
           {
@@ -434,10 +489,11 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
       },
     },
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "security",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "same issue",
         findings: [
           {
@@ -471,10 +527,11 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
 test("keeps a generated AI prompt paired with its verified range while merging duplicates", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "correctness",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "found issue",
         findings: [
           {
@@ -489,10 +546,11 @@ test("keeps a generated AI prompt paired with its verified range while merging d
       },
     },
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "security",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "same issue",
         findings: [
           {
@@ -680,10 +738,11 @@ test("includes stable pricing configuration in duplicate marker identity", () =>
 test("maps ranges and renders default-collapsed AI prompts with safe fences", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "range",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "range",
         findings: [
           {
@@ -729,10 +788,11 @@ test("maps ranges and renders default-collapsed AI prompts with safe fences", ()
 test("rejects oversized finding ranges before location verification", () => {
   const review = aggregateReview(context, config, files, [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "range",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "range",
         findings: [
           {
@@ -755,10 +815,11 @@ test("rejects oversized finding ranges before location verification", () => {
 test("omits AI prompts when the inline range cannot be verified", () => {
   const review = aggregateReview(context, config, files, [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "invalid suggestion location",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "invalid suggestion location",
         findings: [
           {
@@ -778,10 +839,11 @@ test("omits AI prompts when the inline range cannot be verified", () => {
     () =>
       buildReviewRequest(context, review, [
         {
+          inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
           prompt: "invalid suggestion location",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "unused",
             findings: [],
           },

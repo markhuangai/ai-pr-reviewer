@@ -51,7 +51,6 @@ import {
   type PullRequestDiffArtifact,
   PullRequestDiffReader,
   ReviewBriefingReader,
-  ReviewQueryReaderStore,
   jsonToolResult,
 } from "./agent-review-tools.js";
 import {
@@ -77,6 +76,7 @@ import {
 } from "./agent-session.js";
 import {
   ReviewEvidenceLedger,
+  reviewInspection,
   acceptedSubmissionResult,
   type ReviewValidationGap,
 } from "./review-assessment.js";
@@ -87,7 +87,11 @@ import {
   reviewSubmissionGaps,
   reviewSubmissionRejectionResult,
 } from "./review-submission.js";
-import { createReviewStateTool, createReviewContextTools } from "./review-context-tools.js";
+import {
+  ReviewQueryReaderStore,
+  createReviewStateTool,
+  createReviewContextTools,
+} from "./review-context-tools.js";
 import {
   RepositorySnapshot,
   repositoryGuidanceForRun,
@@ -262,6 +266,7 @@ export async function runReviewGoal(
         headSha: context.headSha,
         ...(selectedPaths === undefined ? { changedPaths: true } : { paths: selectedPaths }),
       };
+      queryReaders.assertResumableSelection(metadata);
       if (selectedPaths === undefined) {
         const query = queryReaders.createSource(
           {
@@ -359,6 +364,7 @@ export async function runReviewGoal(
           if (!hasOneSelector || selector === undefined)
             return queryReaders.invalidCursor(
               "Continue a discussion read with the same id or path selector.",
+              cursor,
             );
           return queryReaders.readPage(cursor, "thread", { selector });
         }
@@ -458,7 +464,7 @@ export async function runReviewGoal(
   }
   const outputTool = tool(
     "submit_review",
-    "Submit concise findings and a complete evidence-backed assessment for this isolated review goal. Every changed path needs one coverage classification; reviewed and not_applicable paths need completed repository evidence. Supported candidates must cite completed repository evidence and link to a finding. One initial submission plus five corrections are allowed.",
+    "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host tracks changed-code inspection. Empty limitations declares completed investigation. One initial submission plus five corrections are allowed.",
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
     (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
@@ -507,7 +513,7 @@ export async function runReviewGoal(
   const mcpServers: Record<string, McpServerConfig> = {
     [outputServerName]: createSdkMcpServer({
       name: outputServerName,
-      version: "1.0.0",
+      version: "2.0.0",
       instructions:
         contextFileTool === undefined
           ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; at most five corrections are allowed."
@@ -557,7 +563,7 @@ export async function runReviewGoal(
   const withDiagnostics = (result: GoalResult): GoalResult => {
     const diagnostics = recovery.diagnostics(evidenceLedger.issued.size, sessionPhase);
     writeAgentMonitorEvent(goalIndex, "review-recovery", diagnostics, logSecrets);
-    return { ...result, diagnostics };
+    return { ...result, inspection: reviewInspection(files, evidenceLedger.issued), diagnostics };
   };
   const retainedSubmission = (): GoalSubmission | undefined =>
     retainValidReviewFindings(
