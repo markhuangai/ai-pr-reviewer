@@ -16,7 +16,11 @@ test("renders a clean review without exposing goal internals", () => {
     {
       prompt: "PRIVATE REVIEW GOAL",
       status: "completed",
-      submission: { summary: "PRIVATE MODEL SUMMARY", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "PRIVATE MODEL SUMMARY",
+        findings: [],
+      },
     },
   ];
   const review = aggregateReview(context, config, files, goals);
@@ -29,12 +33,77 @@ test("renders a clean review without exposing goal internals", () => {
   assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
 });
 
+test("retains supported findings while suppressing approval for incomplete coverage", () => {
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "correctness",
+      status: "incomplete",
+      error: "required evidence read did not finish",
+      submission: {
+        summary: "One supported issue; another path was not inspected.",
+        findings: [
+          {
+            title: "Unchecked return",
+            severity: "HIGH",
+            body: "The new caller drops a required error.",
+            path: "src/change.ts",
+            line: 1,
+          },
+        ],
+        assessment: {
+          coverage: [
+            {
+              paths: ["src/change.ts"],
+              disposition: "reviewed",
+              rationale: "The fixed diff and caller were inspected.",
+              evidenceRefs: ["ev-1"],
+            },
+            {
+              paths: ["src/other.ts"],
+              disposition: "incomplete",
+              rationale: "The file read ended before completion.",
+              evidenceRefs: ["ev-2"],
+            },
+          ],
+          candidates: [
+            {
+              paths: ["src/change.ts"],
+              trigger: "The caller drops the returned error.",
+              impact: "The operation appears successful while the update failed.",
+              evidenceRefs: ["ev-1"],
+              countercheck: "Checked the caller for a guard.",
+              counterevidenceRefs: [],
+              verdict: "supported",
+              findingIndex: 0,
+            },
+          ],
+        },
+      },
+    },
+  ];
+  const review = aggregateReview(context, config, files, goals);
+  const body = buildReviewBody(review, goals);
+  const summary = buildRunSummary(context, review, goals);
+
+  assert.equal(review.partial, true);
+  assert.equal(review.allGoalsFailed, false);
+  assert.equal(review.event, "COMMENT");
+  assert.equal(review.findings.length, 1);
+  assert.match(body, /Review incomplete/u);
+  assert.match(summary, /Required evidence gathering could not finish/u);
+  assert.match(summary, /src\/other\.ts/u);
+});
+
 test("combines token usage across every goal without showing cost when pricing is absent", () => {
   const goals: readonly GoalResult[] = [
     {
       prompt: "one",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
       tokenUsage: {
         complete: true,
         models: [
@@ -52,7 +121,11 @@ test("combines token usage across every goal without showing cost when pricing i
     {
       prompt: "two",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
       tokenUsage: {
         complete: true,
         models: [
@@ -108,7 +181,11 @@ test("prices raw model IDs before canonical IDs and labels unknown models as a l
     {
       prompt: "pricing",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
       tokenUsage: {
         complete: true,
         models: [
@@ -175,7 +252,11 @@ test("rounds only the grand total and preserves escaped currency and model text"
     {
       prompt: "pricing",
       status: "completed",
-      submission: { summary: "clean", findings: [] },
+      submission: {
+        assessment: { coverage: [], candidates: [] },
+        summary: "clean",
+        findings: [],
+      },
       tokenUsage: {
         complete: true,
         models: [
@@ -232,6 +313,7 @@ test("formats four public severities without exposing goal provenance", () => {
       prompt: "PRIVATE SECURITY GOAL",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "PRIVATE FINDING SUMMARY",
         findings: [
           {
@@ -307,6 +389,7 @@ test("allows only low findings through the automatic approval threshold", () => 
         prompt: "threshold",
         status: "completed",
         submission: {
+          assessment: { coverage: [], candidates: [] },
           summary: "threshold",
           findings: [{ title: `${severity} issue`, severity, body: "Actionable defect." }],
         },
@@ -322,6 +405,7 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
       prompt: "correctness",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "found issue",
         findings: [
           {
@@ -345,6 +429,7 @@ test("deduplicates findings, preserves the strongest severity, and verifies diff
       prompt: "security",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "same issue",
         findings: [
           {
@@ -381,6 +466,7 @@ test("keeps a generated AI prompt paired with its verified range while merging d
       prompt: "correctness",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "found issue",
         findings: [
           {
@@ -398,6 +484,7 @@ test("keeps a generated AI prompt paired with its verified range while merging d
       prompt: "security",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "same issue",
         findings: [
           {
@@ -472,11 +559,15 @@ test("does not include secrets in duplicate markers", () => {
   assert.notEqual(briefingMarker, marker);
   assert.notEqual(briefingMarker, reviewMarker(context, config, "", [], "briefing-b"));
   assert.equal(
-    aggregateReview(context, config, files, [], "conversation-a").marker,
+    aggregateReview(context, config, files, [], { conversationDigest: "conversation-a" }).marker,
     contextualMarker,
   );
   assert.equal(
-    aggregateReview(context, config, files, [], "", [], "briefing-a").marker,
+    aggregateReview(context, config, files, [], {
+      conversationDigest: "",
+      contextFiles: [],
+      briefingDigest: "briefing-a",
+    }).marker,
     briefingMarker,
   );
   assert.notEqual(
@@ -516,7 +607,10 @@ test("binds duplicate review identity to context contents and goal authorization
   );
   assert.notEqual(first, reviewMarker(context, config, "conversation", [[], [ticket, policy]]));
   assert.equal(
-    aggregateReview(context, config, files, [], "conversation", [[ticket, policy], []]).marker,
+    aggregateReview(context, config, files, [], {
+      conversationDigest: "conversation",
+      contextFiles: [[ticket, policy], []],
+    }).marker,
     first,
   );
   assert.equal(first.includes(ticket.path), false);
@@ -581,6 +675,7 @@ test("maps ranges and renders default-collapsed AI prompts with safe fences", ()
       prompt: "range",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "range",
         findings: [
           {
@@ -629,6 +724,7 @@ test("rejects oversized finding ranges before location verification", () => {
       prompt: "range",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "range",
         findings: [
           {
@@ -654,6 +750,7 @@ test("omits AI prompts when the inline range cannot be verified", () => {
       prompt: "invalid suggestion location",
       status: "completed",
       submission: {
+        assessment: { coverage: [], candidates: [] },
         summary: "invalid suggestion location",
         findings: [
           {
@@ -675,7 +772,11 @@ test("omits AI prompts when the inline range cannot be verified", () => {
         {
           prompt: "invalid suggestion location",
           status: "completed",
-          submission: { summary: "unused", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "unused",
+            findings: [],
+          },
         },
       ]),
     /without a verified added-line location/u,

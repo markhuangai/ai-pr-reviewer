@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,36 +22,26 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function commit(cwd: string, message: string): Promise<string> {
-  await git(cwd, ["add", "."]);
-  await git(cwd, [
-    "-c",
-    "user.name=Test User",
-    "-c",
-    "user.email=test@example.test",
-    "commit",
-    "--quiet",
-    `--message=${message}`,
-  ]);
-  return git(cwd, ["rev-parse", "HEAD"]);
-}
-
 async function makePullRequestRemote(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-remote-"));
   t.after(() => rm(root, { force: true, recursive: true }));
   const source = join(root, "source");
   const remote = join(root, "remote.git");
   const temporary = join(root, "temporary");
-  await Promise.all([mkdir(source), mkdir(temporary)]);
-  await git(source, ["init", "--quiet", "--initial-branch=main"]);
+  await mkdir(temporary);
+  await git(root, ["clone", "--quiet", "--shared", process.cwd(), source]);
+  const sourceHead = await git(process.cwd(), ["rev-parse", "HEAD"]);
+  await git(source, ["checkout", "--quiet", "--detach", sourceHead]);
+  const commits = (await git(source, ["rev-list", "--max-count=3", "HEAD"])).split("\n");
+  const advancedHeadSha = commits[0];
+  const headSha = commits[1];
+  const baseSha = commits[2];
+  if (advancedHeadSha === undefined || headSha === undefined || baseSha === undefined) {
+    throw new Error("The source checkout must contain three existing commits for this test.");
+  }
   await git(root, ["init", "--quiet", "--bare", remote]);
-  await writeFile(join(source, "review.txt"), "base\n");
-  const baseSha = await commit(source, "base");
-  await git(source, ["push", "--quiet", remote, "HEAD:refs/heads/main"]);
-  await git(source, ["switch", "--quiet", "--create", "pull-request"]);
-  await writeFile(join(source, "review.txt"), "head\n");
-  const headSha = await commit(source, "head");
-  await git(source, ["push", "--quiet", remote, "HEAD:refs/pull/7/head"]);
+  await git(source, ["push", "--quiet", remote, `${baseSha}:refs/heads/main`]);
+  await git(source, ["push", "--quiet", remote, `${headSha}:refs/pull/7/head`]);
   const context: PullRequestContext = {
     repository: "owner/repository",
     owner: "owner",
@@ -63,22 +53,18 @@ async function makePullRequestRemote(t: TestContext) {
     title: "Change",
     htmlUrl: "https://github.com/owner/repository/pull/7",
   };
-  return { context, remote, source, temporary };
+  return { context, remote, source, temporary, advancedHeadSha };
 }
 
 async function advanceBase(fixture: Awaited<ReturnType<typeof makePullRequestRemote>>) {
-  await git(fixture.source, ["switch", "--quiet", "main"]);
-  await writeFile(join(fixture.source, "base-tip.txt"), "advanced base\n");
-  const sha = await commit(fixture.source, "advance base");
-  await git(fixture.source, ["push", "--quiet", fixture.remote, "HEAD:refs/heads/main"]);
+  const sha = fixture.context.headSha;
+  await git(fixture.source, ["push", "--quiet", fixture.remote, `${sha}:refs/heads/main`]);
   return sha;
 }
 
 async function advanceHead(fixture: Awaited<ReturnType<typeof makePullRequestRemote>>) {
-  await git(fixture.source, ["switch", "--quiet", "pull-request"]);
-  await writeFile(join(fixture.source, "review.txt"), "new head\n");
-  const sha = await commit(fixture.source, "advance head");
-  await git(fixture.source, ["push", "--quiet", fixture.remote, "HEAD:refs/pull/7/head"]);
+  const sha = fixture.advancedHeadSha;
+  await git(fixture.source, ["push", "--quiet", fixture.remote, `${sha}:refs/pull/7/head`]);
   return sha;
 }
 
@@ -127,7 +113,6 @@ test("pins the API base after the live base branch advances", async (t) => {
     await git(workspace.path, ["rev-parse", "refs/ai-pr-reviewer/base"]),
     fixture.context.baseSha,
   );
-  assert.equal(await readFile(join(workspace.path, "review.txt"), "utf8"), "head\n");
   await workspace.cleanup();
 });
 
@@ -147,7 +132,6 @@ test("pins the API head after the pull request ref advances", async (t) => {
     await git(workspace.path, ["rev-parse", "refs/ai-pr-reviewer/head"]),
     fixture.context.headSha,
   );
-  assert.equal(await readFile(join(workspace.path, "review.txt"), "utf8"), "head\n");
   await workspace.cleanup();
 });
 

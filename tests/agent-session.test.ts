@@ -5,7 +5,7 @@ import {
   goalContext,
   makeReviewDiff,
   reviewConfig,
-  runReviewGoal,
+  runReviewGoalWithEmptyGuidance as runReviewGoal,
   test,
   type ConversationMessage,
   type PullRequestContext,
@@ -128,7 +128,16 @@ test("requires the complete prior thread before accepting a located finding", as
     "Check the changed behavior.",
     0,
     goalContext,
-    [],
+    [
+      {
+        path: "src/change.ts",
+        status: "modified",
+        additions: 2,
+        deletions: 0,
+        changes: 2,
+        addedLines: new Set([4, 9]),
+      },
+    ],
     conversation,
     reviewConfig(),
     await makeReviewDiff(t),
@@ -200,7 +209,16 @@ test("requires a path-scoped discussion read for sibling threads after an id-sco
     "Check the changed behavior.",
     0,
     goalContext,
-    [],
+    [
+      {
+        path: "src/change.ts",
+        status: "modified",
+        additions: 2,
+        deletions: 0,
+        changes: 2,
+        addedLines: new Set([4, 9]),
+      },
+    ],
     conversation,
     reviewConfig(),
     await makeReviewDiff(t),
@@ -273,7 +291,16 @@ test("accepts a finding after reading its exact discussion thread by id", async 
     "Check the changed behavior.",
     0,
     goalContext,
-    [],
+    [
+      {
+        path: "src/change.ts",
+        status: "modified",
+        additions: 2,
+        deletions: 0,
+        changes: 2,
+        addedLines: new Set([4, 9]),
+      },
+    ],
     conversation,
     reviewConfig(),
     await makeReviewDiff(t),
@@ -376,6 +403,7 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "finding",
+        assessment: { coverage: [], candidates: [] },
         findings: [
           {
             title: "Actionable defect",
@@ -393,6 +421,7 @@ test("accepts exactly the four public finding severities", () => {
     assert.equal(
       agentInternals.submissionSchema.safeParse({
         summary: "legacy finding",
+        assessment: { coverage: [], candidates: [] },
         findings: [
           {
             title: "Legacy severity",
@@ -415,13 +444,18 @@ test("requires inline locations only for interactive submissions", () => {
     why: "The defect breaks a supported path.",
     fix: "Use the validated value.",
   };
-  const unlocated = { summary: "finding", findings: [finding] };
+  const unlocated = {
+    summary: "finding",
+    findings: [finding],
+    assessment: { coverage: [], candidates: [] },
+  };
   assert.equal(agentInternals.submissionSchema.safeParse(unlocated).success, true);
   assert.equal(agentInternals.interactiveSubmissionSchema.safeParse(unlocated).success, false);
   assert.equal(
     agentInternals.interactiveSubmissionSchema.safeParse({
       summary: "finding",
       findings: [{ ...finding, path: "src/change.ts", line: 10 }],
+      assessment: { coverage: [], candidates: [] },
     }).success,
     true,
   );
@@ -454,6 +488,7 @@ test("rejects interactive locations outside contiguous added lines", () => {
         { ...finding, title: "Mixed range", path: "src/change.ts", line: 11, endLine: 13 },
         { ...finding, title: "Reversed range", path: "src/change.ts", line: 11, endLine: 10 },
       ],
+      assessment: { coverage: [], candidates: [] },
     },
     files,
   );
@@ -596,6 +631,7 @@ test("rejects model-authored apply suggestions", () => {
   assert.equal(
     agentInternals.submissionSchema.safeParse({
       summary: "finding",
+      assessment: { coverage: [], candidates: [] },
       findings: [
         {
           title: "Replace the affected region",
@@ -625,6 +661,7 @@ test("rejects required finding prose that normalizes to empty", () => {
       agentInternals.submissionSchema.safeParse({
         summary: "finding",
         findings: [{ ...finding, [field]: " \t\n " }],
+        assessment: { coverage: [], candidates: [] },
       }).success,
       false,
       field,
@@ -635,6 +672,7 @@ test("rejects required finding prose that normalizes to empty", () => {
 test("renders structured finding prose and a deterministic AI prompt", () => {
   const submission = agentInternals.toSubmission({
     summary: "finding",
+    assessment: { coverage: [], candidates: [] },
     findings: [
       {
         title: "  Return   the result ",
@@ -670,6 +708,7 @@ test("renders structured finding prose and a deterministic AI prompt", () => {
 test("does not create an AI prompt without an inline target", () => {
   const submission = agentInternals.toSubmission({
     summary: "finding",
+    assessment: { coverage: [], candidates: [] },
     findings: [
       {
         title: "Return the result",

@@ -360,6 +360,15 @@ export async function readPullRequestFilesFromCheckout(
   signal?: AbortSignal,
 ): Promise<readonly ChangedFile[]> {
   const mergeBaseSha = await readGitMergeBase(cwd, context.baseSha, context.headSha, signal);
+  return readPullRequestFilesFromSnapshots(context, cwd, mergeBaseSha, signal);
+}
+
+export async function readPullRequestFilesFromSnapshots(
+  context: PullRequestContext,
+  cwd: string,
+  mergeBaseSha: string,
+  signal?: AbortSignal,
+): Promise<readonly ChangedFile[]> {
   const commonArgs = [
     `--attr-source=${mergeBaseSha}`,
     "diff",

@@ -7,6 +7,8 @@ import {
   emptyConversation,
   git,
   join,
+  makeDiffFromSnapshots,
+  makeExistingCommitRepository,
   makeRepository,
   mkdir,
   mkdtemp,
@@ -24,6 +26,10 @@ import {
   type ReviewConversationSnapshot,
   writeFile,
 } from "./agent-test-helpers.js";
+import {
+  MODEL_TOOL_RESULT_BYTES,
+  ReviewQueryReaderStore,
+} from "../src/runtime/agent-review-tools.js";
 
 test("streams a complete diff larger than the former character budget", async (t) => {
   const repository = await makeRepository(t, async (root) => {
@@ -31,9 +37,10 @@ test("streams a complete diff larger than the former character budget", async (t
     await writeFile(join(root, "review.txt"), `${lines.join("\n")}\n`);
     await writeFile(join(root, "later.txt"), "final-file-content\n");
   });
-  const artifact = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const artifact = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   try {
@@ -54,6 +61,44 @@ test("streams a complete diff larger than the former character budget", async (t
     await artifact.cleanup();
     await assert.rejects(access(artifactPath));
   }
+});
+
+test("sizes continuation pages with the metadata returned for a selected diff", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-diff-cursor-metadata-"));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const path = join(root, "diff.txt");
+  const content = `${Array.from({ length: 140 }, (_, index) => `${index}-${"x".repeat(460)}`).join("\n")}\n`;
+  await writeFile(path, content);
+  const selectedPaths = Array.from({ length: 6 }, (_, index) => `${index}/${"p".repeat(3_500)}`);
+  const metadata = {
+    mergeBaseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    paths: selectedPaths,
+  };
+  const store = new ReviewQueryReaderStore(() => undefined);
+  t.after(() => Promise.all(store.cleanupOperations()).then(() => undefined));
+  const { cursor } = store.createSource(
+    { path, sizeBytes: Buffer.byteLength(content), cleanup: () => Promise.resolve() },
+    "diff",
+    metadata,
+  );
+  let received = "";
+  while (true) {
+    const result = await store.readPage(cursor, "diff", { paths: selectedPaths });
+    assert.equal(result.isError, undefined);
+    const textBlock = result.content[0];
+    assert.ok(textBlock?.type === "text");
+    assert.ok(Buffer.byteLength(JSON.stringify(result), "utf8") <= MODEL_TOOL_RESULT_BYTES);
+    const page = JSON.parse(textBlock.text) as {
+      readonly content: string;
+      readonly done: boolean;
+      readonly nextCursor?: string;
+    };
+    received += page.content;
+    if (page.done) break;
+    assert.equal(page.nextCursor, cursor);
+  }
+  assert.equal(received, content);
 });
 
 test("preserves Git stream failures and cleans conflicting outputs", async (t) => {
@@ -108,9 +153,10 @@ test("ignores pull-request diff attributes while omitting binary contents", asyn
       await writeFile(join(root, "binary.bin"), Buffer.from([0, 1, 2, 3]));
     },
   );
-  const artifact = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const artifact = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   try {
@@ -125,9 +171,7 @@ test("ignores pull-request diff attributes while omitting binary contents", asyn
 });
 
 test("returns one completed page for an empty diff", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "head\n");
-  });
+  const repository = await makeExistingCommitRepository(t);
   const artifact = await agentInternals.createPullRequestDiff(
     { ...repository.context, baseSha: repository.headSha },
     repository.root,
@@ -439,9 +483,10 @@ test("includes deletions and renames in the fenced Git diff", async (t) => {
       await writeFile(join(root, "old-name.txt"), "renamed content\n");
     },
   );
-  const artifact = await agentInternals.createPullRequestDiff(
-    repository.context,
+  const artifact = await makeDiffFromSnapshots(
     repository.root,
+    repository.baseSha,
+    repository.headSha,
     repository.temporaryRoot,
   );
   try {
@@ -455,9 +500,7 @@ test("includes deletions and renames in the fenced Git diff", async (t) => {
 });
 
 test("rejects non-full and unavailable commit SHAs", async (t) => {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "head\n");
-  });
+  const repository = await makeExistingCommitRepository(t);
   await assert.rejects(
     agentInternals.createPullRequestDiff(
       { ...repository.context, baseSha: repository.baseSha.slice(0, 12) },

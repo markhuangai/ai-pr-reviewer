@@ -26,6 +26,39 @@ const MAX_MCP_HEADERS = 50;
 const MAX_PRICED_MODELS = 100;
 const MAX_MODEL_NAME_LENGTH = 500;
 const MAX_CURRENCY_LENGTH = 32;
+const MIN_PARALLEL_COUNT = 1;
+const MAX_PARALLEL_COUNT = 10;
+const MIN_MAX_TURNS = 2;
+const MAX_MAX_TURNS = 500;
+const MAX_MCP_TOOL_POLICIES = 100;
+const MAX_MCP_TOOL_NAME_LENGTH = 200;
+const MAX_MCP_SERVER_NAME_LENGTH = 64;
+const MIN_MCP_TIMEOUT = 1_000;
+const MAX_MCP_TIMEOUT = 300_000;
+const MAX_URL_LENGTH = 2_000;
+
+export const REVIEW_INPUT_LIMITS = Object.freeze({
+  maxPrompts: MAX_PROMPTS,
+  maxPromptLength: MAX_PROMPT_LENGTH,
+  maxContextFilesPerPrompt: MAX_CONTEXT_FILES_PER_PROMPT,
+  maxContextFilesPerRun: MAX_CONTEXT_FILES_PER_RUN,
+  maxContextFilePathLength: MAX_CONTEXT_FILE_PATH_LENGTH,
+  maxMcpServers: MAX_MCP_SERVERS,
+  maxMcpHeaders: MAX_MCP_HEADERS,
+  maxMcpToolPolicies: MAX_MCP_TOOL_POLICIES,
+  maxMcpToolNameLength: MAX_MCP_TOOL_NAME_LENGTH,
+  maxMcpServerNameLength: MAX_MCP_SERVER_NAME_LENGTH,
+  minMcpTimeout: MIN_MCP_TIMEOUT,
+  maxMcpTimeout: MAX_MCP_TIMEOUT,
+  maxPricedModels: MAX_PRICED_MODELS,
+  maxModelNameLength: MAX_MODEL_NAME_LENGTH,
+  maxCurrencyLength: MAX_CURRENCY_LENGTH,
+  minParallelCount: MIN_PARALLEL_COUNT,
+  maxParallelCount: MAX_PARALLEL_COUNT,
+  minMaxTurns: MIN_MAX_TURNS,
+  maxMaxTurns: MAX_MAX_TURNS,
+  maxUrlLength: MAX_URL_LENGTH,
+});
 
 function required(value: string, name: string): string {
   const trimmed = value.trim();
@@ -86,7 +119,7 @@ function readOptionalInteger(
 }
 
 function readUrl(value: unknown, path: string, requireHttps = false): string {
-  const text = readString(value, path, 2_000);
+  const text = readString(value, path, MAX_URL_LENGTH);
   let url: URL;
   try {
     url = new URL(text);
@@ -190,7 +223,7 @@ export function reviewSecretCandidates(config: ReviewConfig): readonly string[] 
 function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error(`${path} must be a sequence.`);
-  if (value.length > 100) throw new Error(`${path} has too many tool policies.`);
+  if (value.length > MAX_MCP_TOOL_POLICIES) throw new Error(`${path} has too many tool policies.`);
   return value.map((item, index) => {
     const itemPath = `${path}[${index}]`;
     if (!isRecord(item)) throw new Error(`${itemPath} must be a mapping.`);
@@ -198,7 +231,7 @@ function parseToolPolicies(value: unknown, path: string): readonly McpToolPolicy
     for (const key of Object.keys(item)) {
       if (!allowed.has(key)) throw new Error(`${itemPath}.${key} is not supported.`);
     }
-    const name = readString(item.name, `${itemPath}.name`, 200);
+    const name = readString(item.name, `${itemPath}.name`, MAX_MCP_TOOL_NAME_LENGTH);
     const permission = item.permission_policy;
     if (
       permission !== undefined &&
@@ -238,7 +271,7 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
     throw new Error("Input 'mcp-servers' has too many servers.");
   const servers: Record<string, HttpMcpServer> = {};
   for (const [name, rawServer] of serverEntries) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    if (name.length > MAX_MCP_SERVER_NAME_LENGTH || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
       throw new Error(`mcp-servers.${name} is not a valid server name.`);
     }
     if (name === "review_output") {
@@ -261,8 +294,8 @@ function parseMcpServers(raw: string): Readonly<Record<string, HttpMcpServer>> {
     const timeout = readOptionalInteger(
       rawServer.timeout,
       `mcp-servers.${name}.timeout`,
-      1_000,
-      300_000,
+      MIN_MCP_TIMEOUT,
+      MAX_MCP_TIMEOUT,
     );
     const alwaysLoad = readOptionalBoolean(rawServer.alwaysLoad, `mcp-servers.${name}.alwaysLoad`);
     servers[name] = {
@@ -449,8 +482,18 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     ...(systemPrompt.length === 0 ? {} : { systemPrompt }),
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
-    parallelCount: parseInteger(reader.get("parallel-count") || "5", "parallel-count", 1, 10),
-    maxTurns: parseInteger(reader.get("max-turns") || "50", "max-turns", 2, 500),
+    parallelCount: parseInteger(
+      reader.get("parallel-count") || "5",
+      "parallel-count",
+      MIN_PARALLEL_COUNT,
+      MAX_PARALLEL_COUNT,
+    ),
+    maxTurns: parseInteger(
+      reader.get("max-turns") || "50",
+      "max-turns",
+      MIN_MAX_TURNS,
+      MAX_MAX_TURNS,
+    ),
     autoApprove: parseBoolean(reader.get("auto-approve"), "auto-approve", false),
     interactWithPullRequest: parseBoolean(reader.get("interact-with-pr"), "interact-with-pr", true),
     ...(pullRequestUrl.length === 0

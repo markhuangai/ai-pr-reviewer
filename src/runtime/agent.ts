@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
 import {
   createSdkMcpServer,
   query as sdkQuery,
   tool,
+  type HookCallback,
   type McpServerConfig,
   type SDKActiveGoalMessage,
   type SDKMessage,
@@ -35,7 +35,6 @@ import {
   logQueuedUserMessage,
   modelUsageSnapshot,
   acceptedSubmissionDetails,
-  acceptedSubmissionResult,
   readAcceptedSubmissionMcpFailures,
   readAcceptedSubmissionMcpStatus,
   runAgentCleanup,
@@ -51,9 +50,8 @@ import {
   PullRequestConversationReader,
   type PullRequestDiffArtifact,
   PullRequestDiffReader,
-  RepositoryFilePageReader,
   ReviewBriefingReader,
-  StringPageReader,
+  ReviewQueryReaderStore,
   jsonToolResult,
 } from "./agent-review-tools.js";
 import {
@@ -62,6 +60,7 @@ import {
   REVIEW_SYSTEM_PROMPT,
   SDK_SESSION_STALL_MS,
   closeSdkSession,
+  createDeferred,
   createReviewSessionRecoveryMonitor,
   interactiveSubmissionSchema,
   invalidInteractiveFindingLocations,
@@ -79,26 +78,17 @@ import {
   runReviewGoalsWithRunner,
 } from "./agent-session.js";
 import {
+  ReviewEvidenceLedger,
+  acceptedSubmissionResult,
+  findInvalidReviewAssessment,
+} from "./review-assessment.js";
+import {
   RepositorySnapshot,
+  repositoryGuidanceForRun,
   type RepositoryFileSnapshot,
-  type RepositoryQuerySource,
 } from "./repository-snapshot.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-function deferred<T>(): Deferred<T> {
-  let resolvePromise: (value: T) => void = () => undefined;
-  let rejectPromise: (error: unknown) => void = () => undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  void promise.catch(() => undefined);
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
-}
+
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -111,19 +101,34 @@ export async function runReviewGoal(
   queryAgent: AgentQuery = sdkQuery,
   contextFiles: readonly PreparedContextFile[] = [],
   abortController?: AbortController,
-  briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
+  briefing: ReviewBriefing = {
+    linkedIssues: [],
+    linkedIssueReferencesTruncated: false,
+  },
 ): Promise<GoalResult> {
   const signal = abortController?.signal;
   throwIfAborted(signal);
   let submission: GoalSubmission | undefined;
+  let submissionValidationIssue: string | undefined;
   let reviewPromptActive = false;
   const logSecrets = reviewSecretCandidates(config);
   const effectiveSystemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT;
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
-  const briefingReader = new ReviewBriefingReader(context, files, conversation, briefing);
   const conversationReader = new PullRequestConversationReader(conversation);
-  const diffReader = diff.createReader();
+  const evidenceLedger = new ReviewEvidenceLedger(cwd);
+  const evidenceHook: HookCallback = (input) => {
+    if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
+    const references = evidenceLedger.observeBatch(input.tool_calls);
+    if (references.length === 0) return Promise.resolve({ continue: true });
+    return Promise.resolve({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PostToolBatch",
+        additionalContext: evidenceLedger.renderReferences(references),
+      },
+    });
+  };
   const repositorySnapshot = new RepositorySnapshot(
     cwd,
     context.baseSha,
@@ -132,13 +137,13 @@ export async function runReviewGoal(
     files,
     signal,
   );
-  type QueryReader = StringPageReader | RepositoryFilePageReader;
-  interface QueryReaderEntry {
-    readonly reader: QueryReader;
-    readonly cleanup?: () => Promise<void>;
-  }
-  const queryReaders = new Map<string, QueryReaderEntry>();
-  const queryReaderCompletions = new Map<string, () => void>();
+  const repositoryGuidance =
+    briefing.repositoryGuidance ??
+    (await repositoryGuidanceForRun(diff, repositorySnapshot, files));
+  const briefingReader = new ReviewBriefingReader(context, files, conversation, {
+    ...briefing,
+    repositoryGuidance,
+  });
   const discussionQueryCursors = new Map<string, string>();
   const queryReaderDiscussionKeys = new Map<string, string>();
   const detachDiscussionQuery = (cursor: string): void => {
@@ -147,6 +152,7 @@ export async function runReviewGoal(
     if (discussionKey !== undefined && discussionQueryCursors.get(discussionKey) === cursor)
       discussionQueryCursors.delete(discussionKey);
   };
+  const queryReaders = new ReviewQueryReaderStore(detachDiscussionQuery, signal);
   const discussionReadPaths = new Set<string>();
   const discussionReadThreadIds = new Set<number>();
   const discussionPathScopes = new Map<string, string>();
@@ -155,75 +161,6 @@ export async function runReviewGoal(
     if (file.previousPath !== undefined) discussionPathScopes.set(file.previousPath, file.path);
   }
   const discussionPathScope = (path: string): string => discussionPathScopes.get(path) ?? path;
-  const createQueryReader = (
-    content: string,
-    onComplete?: () => void,
-    discussionKey?: string,
-  ): { readonly cursor: string; readonly reader: StringPageReader } => {
-    while (queryReaders.size >= 32) {
-      const oldest = queryReaders.keys().next().value;
-      if (oldest === undefined) break;
-      const evicted = queryReaders.get(oldest);
-      queryReaders.delete(oldest);
-      queryReaderCompletions.delete(oldest);
-      detachDiscussionQuery(oldest);
-      if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
-    }
-    const cursor = randomUUID();
-    const reader = new StringPageReader(content);
-    queryReaders.set(cursor, { reader });
-    if (onComplete !== undefined) queryReaderCompletions.set(cursor, onComplete);
-    if (discussionKey !== undefined) {
-      discussionQueryCursors.set(discussionKey, cursor);
-      queryReaderDiscussionKeys.set(cursor, discussionKey);
-    }
-    return { cursor, reader };
-  };
-  const createQuerySourceReader = (
-    source: RepositoryQuerySource,
-  ): { readonly cursor: string; readonly reader: RepositoryFilePageReader } => {
-    while (queryReaders.size >= 32) {
-      const oldest = queryReaders.keys().next().value;
-      if (oldest === undefined) break;
-      const evicted = queryReaders.get(oldest);
-      queryReaders.delete(oldest);
-      queryReaderCompletions.delete(oldest);
-      detachDiscussionQuery(oldest);
-      if (evicted !== undefined) void closeQueryReader(evicted).catch(() => undefined);
-    }
-    const cursor = randomUUID();
-    const reader = new RepositoryFilePageReader(source.path, source.sizeBytes, signal);
-    queryReaders.set(cursor, { reader, cleanup: source.cleanup });
-    return { cursor, reader };
-  };
-  async function closeQueryReader(entry: QueryReaderEntry): Promise<void> {
-    if (entry.reader instanceof RepositoryFilePageReader) await entry.reader.close();
-    await entry.cleanup?.();
-  }
-  const completeQueryReader = (cursor: string): void => {
-    const onComplete = queryReaderCompletions.get(cursor);
-    queryReaderCompletions.delete(cursor);
-    onComplete?.();
-  };
-  const finishQueryReader = async (cursor: string): Promise<void> => {
-    const entry = queryReaders.get(cursor);
-    if (entry === undefined) return;
-    queryReaders.delete(cursor);
-    detachDiscussionQuery(cursor);
-    await closeQueryReader(entry);
-    completeQueryReader(cursor);
-  };
-  const readQueryPage = async (cursor: string): Promise<CallToolResult> => {
-    const entry = queryReaders.get(cursor);
-    if (entry === undefined)
-      return {
-        content: [{ type: "text", text: "Unknown repository query cursor." }],
-        isError: true,
-      };
-    const page = await entry.reader.readNext({ nextCursor: cursor });
-    if (page.done) await finishQueryReader(cursor);
-    return jsonToolResult({ ...page, ...(page.done ? {} : { nextCursor: cursor }) });
-  };
   const contextReaders = new Map(
     contextFiles.map((file) => [
       file.path,
@@ -270,7 +207,7 @@ export async function runReviewGoal(
   );
   const diffTool = tool(
     "read_pr_diff",
-    "Read a bounded page of the immutable pull request diff. Omit paths for the complete diff or provide exact changed paths; continue with the returned cursor when present.",
+    "Read a bounded page of the immutable base-to-head diff. Omit paths for the complete diff or provide exact changed paths. Continue with the returned cursor and repeat the same paths when you selected paths.",
     {
       paths: z.array(z.string().min(1).max(4_096)).max(50).optional(),
       cursor: z.string().min(1).max(100).optional(),
@@ -282,31 +219,46 @@ export async function runReviewGoal(
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
         };
       }
-      if (cursor !== undefined) return readQueryPage(cursor);
-      if (paths === undefined || paths.length === 0) {
-        const page = await diffReader.readNext({
-          mergeBaseSha: diff.mergeBaseSha,
-          headSha: context.headSha,
-        });
+      const selectedPaths = paths === undefined || paths.length === 0 ? undefined : paths;
+      if (cursor !== undefined)
+        return queryReaders.readPage(
+          cursor,
+          "diff",
+          selectedPaths === undefined ? undefined : { paths: selectedPaths },
+        );
+      const metadata = {
+        mergeBaseSha: diff.mergeBaseSha,
+        headSha: context.headSha,
+        ...(selectedPaths === undefined ? { changedPaths: true } : { paths: selectedPaths }),
+      };
+      if (selectedPaths === undefined) {
+        const query = queryReaders.createSource(
+          {
+            path: diff.path,
+            sizeBytes: diff.size,
+            cleanup: () => Promise.resolve(),
+          },
+          "diff",
+          metadata,
+        );
+        const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
+        if (page.done) await queryReaders.finish(query.cursor);
         return jsonToolResult({
+          ...metadata,
           ...page,
-          mergeBaseSha: diff.mergeBaseSha,
-          headSha: context.headSha,
+          ...(page.done ? {} : { nextCursor: query.cursor }),
         });
       }
-      const query = createQuerySourceReader(await repositorySnapshot.diff(paths));
-      const page = await query.reader.readNext({
-        paths,
-        mergeBaseSha: diff.mergeBaseSha,
-        headSha: context.headSha,
-        nextCursor: query.cursor,
-      });
-      if (page.done) await finishQueryReader(query.cursor);
+      const query = queryReaders.createSource(
+        await repositorySnapshot.diff(selectedPaths),
+        "diff",
+        metadata,
+      );
+      const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
+      if (page.done) await queryReaders.finish(query.cursor);
       return jsonToolResult({
+        ...metadata,
         ...page,
-        paths,
-        mergeBaseSha: diff.mergeBaseSha,
-        headSha: context.headSha,
         ...(page.done ? {} : { nextCursor: query.cursor }),
       });
     },
@@ -314,7 +266,7 @@ export async function runReviewGoal(
   );
   const repositoryFileTool = tool(
     "read_repository_file",
-    "Read one exact changed repository file at the immutable merge base or head. Binary blobs return metadata only; continue with the returned cursor for long text.",
+    "Read one exact tracked repository file at the immutable merge base or head, including unchanged files. Binary and non-regular objects return metadata only; continue with the returned cursor and repeat the same path and revision for long text.",
     {
       revision: z.enum(["base", "head"]),
       path: z.string().min(1).max(4_096),
@@ -327,20 +279,21 @@ export async function runReviewGoal(
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
         };
       }
-      if (cursor !== undefined) return readQueryPage(cursor);
+      if (cursor !== undefined)
+        return queryReaders.readPage(cursor, "repository_file", { revision, path });
       const snapshot: RepositoryFileSnapshot = await repositorySnapshot.file(revision, path);
       if (snapshot.kind !== "text") return jsonToolResult(snapshot);
       if (snapshot.source === undefined)
         throw new Error("Text repository snapshot did not provide a query source.");
-      const query = createQuerySourceReader(snapshot.source);
+      const metadata = { revision, path, kind: snapshot.kind };
+      const query = queryReaders.createSource(snapshot.source, "repository_file", metadata);
       const page = await query.reader.readNext({
-        revision,
-        path,
+        ...metadata,
         kind: snapshot.kind,
         sizeBytes: snapshot.sizeBytes,
         nextCursor: query.cursor,
       });
-      if (page.done) await finishQueryReader(query.cursor);
+      if (page.done) await queryReaders.finish(query.cursor);
       return jsonToolResult({
         revision,
         path,
@@ -356,7 +309,7 @@ export async function runReviewGoal(
   );
   const discussionThreadTool = tool(
     "read_pr_threads",
-    "Read complete prior discussion for one exact thread ID or changed-file path from the briefing index. Use it before reporting a finding at that location.",
+    "Read prior discussion for one exact thread ID or changed-file path from the briefing index. Continue a paginated read with its cursor and the same ID or path selector.",
     {
       id: z.number().int().positive().optional(),
       path: z.string().min(1).max(4_096).optional(),
@@ -369,7 +322,15 @@ export async function runReviewGoal(
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
         });
       return Promise.resolve().then(async () => {
-        if (cursor !== undefined) return readQueryPage(cursor);
+        const hasOneSelector = (id === undefined) !== (path === undefined);
+        const selector = id === undefined ? (path === undefined ? undefined : { path }) : { id };
+        if (cursor !== undefined) {
+          if (!hasOneSelector || selector === undefined)
+            return queryReaders.invalidCursor(
+              "Continue a discussion read with the same id or path selector.",
+            );
+          return queryReaders.readPage(cursor, "thread", { selector });
+        }
         if ((id === undefined) === (path === undefined)) {
           return {
             content: [{ type: "text", text: "Provide exactly one discussion thread id or path." }],
@@ -377,7 +338,7 @@ export async function runReviewGoal(
           };
         }
         const requestedPathScope = path === undefined ? undefined : discussionPathScope(path);
-        const selector = id === undefined ? { path } : { id };
+        const querySelector = selector as Readonly<Record<string, unknown>>;
         const discussionKey =
           id === undefined ? `path:${requestedPathScope as string}` : `id:${String(id)}`;
         const existingCursor = discussionQueryCursors.get(discussionKey);
@@ -413,8 +374,9 @@ export async function runReviewGoal(
             )
             .map((entry) => entry.path),
         );
-        const query = createQueryReader(
+        const query = queryReaders.createString(
           JSON.stringify({ entries }),
+          { selector: querySelector },
           () => {
             if (id !== undefined) {
               for (const entry of entries)
@@ -424,17 +386,18 @@ export async function runReviewGoal(
             for (const discussionPath of discussionPaths)
               discussionReadPaths.add(discussionPathScope(discussionPath));
           },
-          discussionKey,
         );
+        discussionQueryCursors.set(discussionKey, query.cursor);
+        queryReaderDiscussionKeys.set(query.cursor, discussionKey);
         const pageResult = query.reader.readNext({
-          selector,
+          selector: querySelector,
           nextCursor: query.cursor,
         });
         if (pageResult.done) {
-          await finishQueryReader(query.cursor);
+          await queryReaders.finish(query.cursor);
         }
         return jsonToolResult({
-          selector,
+          selector: querySelector,
           page: pageResult.page,
           content: pageResult.content,
           done: pageResult.done,
@@ -482,7 +445,7 @@ export async function runReviewGoal(
         );
   const outputTool = tool(
     "submit_review",
-    "Submit concise validated findings for this isolated review goal.",
+    "Submit concise findings and a complete evidence-backed assessment for this isolated review goal. Every changed path needs one coverage classification; reviewed and not_applicable paths need completed repository evidence. Supported candidates must cite completed repository evidence and link to a finding.",
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
     (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
@@ -532,7 +495,38 @@ export async function runReviewGoal(
           content: [{ type: "text", text: rejection }],
         });
       }
-      const candidate = toSubmission(submissionSchema.parse(input));
+      const parsed = submissionSchema.safeParse(input);
+      if (!parsed.success) {
+        submissionValidationIssue = "The submission does not match the required schema.";
+        return Promise.resolve({
+          content: [{ type: "text", text: submissionValidationIssue }],
+          isError: true,
+        });
+      }
+      const candidate = toSubmission(parsed.data);
+      const assessmentIssues = findInvalidReviewAssessment(
+        candidate.assessment,
+        candidate.findings,
+        files,
+        evidenceLedger.issued,
+      );
+      if (assessmentIssues.length > 0) {
+        submissionValidationIssue = [
+          ...assessmentIssues.slice(0, 12),
+          ...(assessmentIssues.length > 12
+            ? [`${assessmentIssues.length - 12} additional validation issues`]
+            : []),
+        ].join("; ");
+        return Promise.resolve({
+          content: [
+            {
+              type: "text",
+              text: `Review submission rejected. ${submissionValidationIssue}`,
+            },
+          ],
+          isError: true,
+        });
+      }
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         writeCompleteAgentLog(
           goalIndex,
@@ -547,6 +541,8 @@ export async function runReviewGoal(
       if (config.interactWithPullRequest) {
         const invalidLocations = invalidInteractiveFindingLocations(candidate, files);
         if (invalidLocations.length > 0) {
+          submissionValidationIssue =
+            "Every interactive finding must cite a participating added line in a changed file.";
           return Promise.resolve({
             content: [
               {
@@ -559,6 +555,7 @@ export async function runReviewGoal(
         }
       }
       submission = candidate;
+      submissionValidationIssue = undefined;
       monitor?.acceptSubmission();
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
@@ -588,7 +585,7 @@ export async function runReviewGoal(
   for (const [name, server] of Object.entries(config.mcpServers))
     mcpServers[name] = toSdkMcpServer(server);
   const input = new PromptStream();
-  let turn = deferred<SDKResultMessage>();
+  let turn = createDeferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
   let session: ReturnType<AgentQuery> | undefined;
@@ -596,7 +593,7 @@ export async function runReviewGoal(
   let sessionPhase = "starting";
   const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
   let sessionClosed = false;
-  const stalledSubmission = deferred<undefined>();
+  const stalledSubmission = createDeferred<undefined>();
   const closeSession = (): void => {
     if (session === undefined || sessionClosed) return;
     sessionClosed = true;
@@ -645,6 +642,7 @@ export async function runReviewGoal(
         contextFiles.length > 0,
         abortController,
         effectiveSystemPrompt,
+        evidenceHook,
       ),
     });
     const activeSession = session;
@@ -709,7 +707,7 @@ export async function runReviewGoal(
             tokenUsageState.latestSnapshotValid = snapshot !== undefined;
             if (snapshot !== undefined) tokenUsageState.models = snapshot;
             const completedTurn = turn;
-            turn = deferred<SDKResultMessage>();
+            turn = createDeferred<SDKResultMessage>();
             completedTurn.resolve(message);
           }
         }
@@ -902,7 +900,12 @@ export async function runReviewGoal(
       throwIfAborted(signal);
       sessionPhase = "waiting-for-repair-result";
       const repairMessage = makeUserMessage(
-        repairPrompt(repairAttempts, briefingReader.complete, config.interactWithPullRequest),
+        repairPrompt(
+          repairAttempts,
+          briefingReader.complete,
+          config.interactWithPullRequest,
+          submissionValidationIssue,
+        ),
       );
       input.push(repairMessage);
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
@@ -953,13 +956,10 @@ export async function runReviewGoal(
     );
     await runAgentCleanup(
       [
-        diffReader.close(),
         ...Array.from(contextReaders.values(), ({ reader: contextReader }) =>
           contextReader.close(),
         ),
-        ...Array.from(queryReaders.values(), (entry) =>
-          closeQueryReader(entry).catch(() => undefined),
-        ),
+        ...queryReaders.cleanupOperations(),
         repositorySnapshot.cleanup(),
       ],
       goalIndex,

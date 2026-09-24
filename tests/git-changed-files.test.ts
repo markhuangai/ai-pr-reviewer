@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { githubApiInternals, readPullRequestFilesFromCheckout } from "../src/lib/github-api.js";
+import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import type { PullRequestContext } from "../src/lib/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -16,23 +17,9 @@ async function git(cwd: string, args: readonly string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function commit(cwd: string, message: string): Promise<string> {
+async function snapshotTree(cwd: string): Promise<string> {
   await git(cwd, ["add", "--all"]);
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message",
-      message,
-    ],
-    { cwd },
-  );
-  return git(cwd, ["rev-parse", "HEAD"]);
+  return git(cwd, ["write-tree"]);
 }
 
 test("extracts added line numbers from a unified diff", () => {
@@ -200,12 +187,12 @@ test("reads exact changed-file metadata from the captured checkout", async (t) =
   await writeFile(join(root, "keep.txt"), "base\n");
   await writeFile(join(root, "remove.txt"), "remove\n");
   await writeFile(join(root, "old-name.txt"), "one\ntwo\nthree\n");
-  const baseSha = await commit(root, "base");
+  const baseSha = await snapshotTree(root);
   await writeFile(join(root, "keep.txt"), "head\n");
   await rm(join(root, "remove.txt"));
   await execFileAsync("git", ["mv", "old-name.txt", "new-name.txt"], { cwd: root });
   await writeFile(join(root, "new-name.txt"), "one\ntwo\nthree\nadded\n");
-  const headSha = await commit(root, "head");
+  const headSha = await snapshotTree(root);
   const context: PullRequestContext = {
     repository: "owner/repository",
     owner: "owner",
@@ -219,7 +206,7 @@ test("reads exact changed-file metadata from the captured checkout", async (t) =
     htmlUrl: "https://github.com/owner/repository/pull/1",
   };
 
-  const files = await readPullRequestFilesFromCheckout(context, root);
+  const files = await readPullRequestFilesFromSnapshots(context, root, baseSha);
   assert.deepEqual(
     files.map((file) => ({
       path: file.path,
@@ -261,11 +248,11 @@ test("reads exact changed-file metadata from the captured checkout", async (t) =
     ],
   );
   await assert.rejects(
-    readPullRequestFilesFromCheckout({ ...context, changedFiles: 4 }, root),
+    readPullRequestFilesFromSnapshots({ ...context, changedFiles: 4 }, root, baseSha),
     /incomplete pull request file list/u,
   );
   await assert.rejects(
-    readPullRequestFilesFromCheckout({ ...context, changedFiles: 0 }, root),
+    readPullRequestFilesFromSnapshots({ ...context, changedFiles: 0 }, root, baseSha),
     /more files than the pull request metadata/u,
   );
 });
@@ -281,7 +268,7 @@ test("pins unlimited rename detection for changed-file metadata", async (t) => {
       Array.from({ length: 10 }, (_, line) => `file-${index}-line-${line}\n`).join(""),
     );
   }
-  const baseSha = await commit(root, "rename base");
+  const baseSha = await snapshotTree(root);
   for (let index = 1; index <= 3; index += 1) {
     await execFileAsync("git", ["mv", `old-${index}.txt`, `new-${index}.txt`], { cwd: root });
     await writeFile(
@@ -291,9 +278,9 @@ test("pins unlimited rename detection for changed-file metadata", async (t) => {
       ).join(""),
     );
   }
-  const headSha = await commit(root, "rename head");
+  const headSha = await snapshotTree(root);
 
-  const files = await readPullRequestFilesFromCheckout(
+  const files = await readPullRequestFilesFromSnapshots(
     {
       repository: "owner/repository",
       owner: "owner",
@@ -307,6 +294,7 @@ test("pins unlimited rename detection for changed-file metadata", async (t) => {
       htmlUrl: "https://github.com/owner/repository/pull/1",
     },
     root,
+    baseSha,
   );
   assert.deepEqual(
     files.map((file) => ({
@@ -322,43 +310,46 @@ test("pins unlimited rename detection for changed-file metadata", async (t) => {
   );
 });
 
-test("uses the captured merge base for changed-file metadata", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-merge-base-files-"));
-  t.after(() => rm(root, { force: true, recursive: true }));
-  await git(root, ["init", "--quiet", "--initial-branch=main"]);
-  await writeFile(join(root, "shared.txt"), "shared\n");
-  const mergeBaseSha = await commit(root, "common ancestor");
-  await git(root, ["switch", "--quiet", "--create", "pull-request"]);
-  await writeFile(join(root, "feature.txt"), "feature\n");
-  const headSha = await commit(root, "pull request change");
-  await git(root, ["switch", "--quiet", "main"]);
-  await writeFile(join(root, "base-only.txt"), "base branch change\n");
-  const baseSha = await commit(root, "advance base branch");
-
-  const files = await readPullRequestFilesFromCheckout(
-    {
-      repository: "owner/repository",
-      owner: "owner",
-      name: "repository",
-      number: 1,
-      headSha,
-      baseSha,
-      baseRef: "main",
-      changedFiles: 1,
-      title: "Merge-base metadata",
-      htmlUrl: "https://github.com/owner/repository/pull/1",
-    },
-    root,
+test("uses the captured merge base for changed-file metadata", async () => {
+  const root = process.cwd();
+  const mergeCommits = (await git(root, ["rev-list", "--merges", "HEAD"])).split("\n");
+  let revisions:
+    | { readonly baseSha: string; readonly headSha: string; readonly mergeBaseSha: string }
+    | undefined;
+  for (const mergeCommit of mergeCommits) {
+    const [commitSha, baseSha, headSha] = (
+      await git(root, ["rev-list", "--parents", "-n", "1", mergeCommit])
+    ).split(" ");
+    if (commitSha === undefined || baseSha === undefined || headSha === undefined) continue;
+    const mergeBaseSha = await githubApiInternals.readGitMergeBase(root, baseSha, headSha);
+    if (mergeBaseSha !== baseSha && mergeBaseSha !== headSha) {
+      revisions = { baseSha, headSha, mergeBaseSha };
+      break;
+    }
+  }
+  assert.ok(revisions, "the repository history must contain a diverged merge");
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: revisions.headSha,
+    baseSha: revisions.baseSha,
+    baseRef: "main",
+    title: "Merge-base metadata",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+  const files = await readPullRequestFilesFromCheckout(context, root);
+  const expectedPaths = (
+    await git(root, ["diff", "--name-only", "-z", revisions.mergeBaseSha, revisions.headSha, "--"])
+  )
+    .split("\0")
+    .filter(Boolean);
+  assert.deepEqual(files.map((file) => file.path).sort(), expectedPaths.sort());
+  assert.equal(
+    await githubApiInternals.readGitMergeBase(root, revisions.baseSha, revisions.headSha),
+    revisions.mergeBaseSha,
   );
-  assert.deepEqual(
-    files.map((file) => ({
-      path: file.path,
-      additions: file.additions,
-      deletions: file.deletions,
-    })),
-    [{ path: "feature.txt", additions: 1, deletions: 0 }],
-  );
-  assert.equal(await githubApiInternals.readGitMergeBase(root, baseSha, headSha), mergeBaseSha);
 });
 
 test("uses the captured merge-base attributes for changed-file metadata", async (t) => {
@@ -367,12 +358,12 @@ test("uses the captured merge-base attributes for changed-file metadata", async 
   await git(root, ["init", "--quiet", "--initial-branch=main"]);
   await writeFile(join(root, ".gitattributes"), "");
   await writeFile(join(root, "notes.txt"), "before\n");
-  const baseSha = await commit(root, "base");
+  const baseSha = await snapshotTree(root);
   await writeFile(join(root, ".gitattributes"), "*.txt -diff\n");
   await writeFile(join(root, "notes.txt"), "after\n");
-  const headSha = await commit(root, "head attributes and text change");
+  const headSha = await snapshotTree(root);
 
-  const files = await readPullRequestFilesFromCheckout(
+  const files = await readPullRequestFilesFromSnapshots(
     {
       repository: "owner/repository",
       owner: "owner",
@@ -386,6 +377,7 @@ test("uses the captured merge-base attributes for changed-file metadata", async 
       htmlUrl: "https://github.com/owner/repository/pull/1",
     },
     root,
+    baseSha,
   );
   const notes = files.find((file) => file.path === "notes.txt");
   assert.ok(notes);
@@ -404,11 +396,11 @@ test("decodes quoted UTF-8 paths and pins diff prefixes", async (t) => {
   await git(root, ["config", "diff.noprefix", "true"]);
   const path = "b/ümlaut.txt";
   await writeFile(join(root, path), "before\n");
-  const baseSha = await commit(root, "base");
+  const baseSha = await snapshotTree(root);
   await writeFile(join(root, path), "after\n");
-  const headSha = await commit(root, "quoted path change");
+  const headSha = await snapshotTree(root);
 
-  const files = await readPullRequestFilesFromCheckout(
+  const files = await readPullRequestFilesFromSnapshots(
     {
       repository: "owner/repository",
       owner: "owner",
@@ -422,6 +414,7 @@ test("decodes quoted UTF-8 paths and pins diff prefixes", async (t) => {
       htmlUrl: "https://github.com/owner/repository/pull/1",
     },
     root,
+    baseSha,
   );
   assert.equal(files.length, 1);
   assert.equal(files[0]?.path, path);
@@ -435,11 +428,11 @@ test("does not infer unchanged lines from merged zero-context hunks", async (t) 
   await git(root, ["init", "--quiet", "--initial-branch=main"]);
   await git(root, ["config", "diff.interHunkContext", "1"]);
   await writeFile(join(root, "lines.txt"), "one\ntwo\nthree\nfour\n");
-  const baseSha = await commit(root, "base");
+  const baseSha = await snapshotTree(root);
   await writeFile(join(root, "lines.txt"), "ONE\ntwo\nTHREE\nfour\n");
-  const headSha = await commit(root, "two separated changes");
+  const headSha = await snapshotTree(root);
 
-  const files = await readPullRequestFilesFromCheckout(
+  const files = await readPullRequestFilesFromSnapshots(
     {
       repository: "owner/repository",
       owner: "owner",
@@ -453,6 +446,7 @@ test("does not infer unchanged lines from merged zero-context hunks", async (t) 
       htmlUrl: "https://github.com/owner/repository/pull/1",
     },
     root,
+    baseSha,
   );
   assert.deepEqual([...(files[0]?.addedLines ?? [])], [1, 3]);
 });

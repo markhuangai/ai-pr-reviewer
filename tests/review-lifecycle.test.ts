@@ -846,7 +846,11 @@ test("wires the injected resolution verifier through the interactive action", as
         {
           prompt: "correctness",
           status: "completed",
-          submission: { summary: "clean", findings: [] },
+          submission: {
+            assessment: { coverage: [], candidates: [] },
+            summary: "clean",
+            findings: [],
+          },
         },
       ]),
     runResolutionVerifiers: (_context, threads) => {

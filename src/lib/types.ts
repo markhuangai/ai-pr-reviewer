@@ -110,6 +110,13 @@ export interface LinkedIssueSnapshot {
 export interface ReviewBriefing {
   readonly linkedIssues: readonly LinkedIssueSnapshot[];
   readonly linkedIssueReferencesTruncated: boolean;
+  readonly repositoryGuidance?: readonly RepositoryGuidanceSnapshot[];
+}
+
+export interface RepositoryGuidanceSnapshot {
+  readonly path: string;
+  readonly revision: "base" | "head";
+  readonly content: string;
 }
 
 export interface ChangedFile {
@@ -134,14 +141,77 @@ export interface ReviewFinding {
   readonly confidence?: "high" | "medium" | "low";
 }
 
+export type ReviewCoverageDisposition = "reviewed" | "not_applicable" | "incomplete";
+
+export interface ReviewCoverageEntry {
+  readonly paths: readonly string[];
+  readonly disposition: ReviewCoverageDisposition;
+  readonly rationale: string;
+  readonly evidenceRefs: readonly string[];
+}
+
+export type ReviewCandidateVerdict = "supported" | "disproved" | "unresolved";
+
+export interface ReviewCandidateAssessment {
+  readonly paths: readonly string[];
+  readonly trigger: string;
+  readonly impact: string;
+  readonly evidenceRefs: readonly string[];
+  readonly countercheck: string;
+  readonly counterevidenceRefs: readonly string[];
+  readonly verdict: ReviewCandidateVerdict;
+  readonly findingIndex?: number;
+}
+
+export interface ReviewAssessment {
+  readonly coverage: readonly ReviewCoverageEntry[];
+  readonly candidates: readonly ReviewCandidateAssessment[];
+}
+
+export type ReviewEvidenceKind =
+  | "repository_diff"
+  | "repository_file"
+  | "repository_read"
+  | "repository_search"
+  | "repository_glob"
+  | "context_file"
+  | "conversation"
+  | "briefing"
+  | "external_tool";
+
+export type ReviewEvidenceStatus = "complete" | "partial" | "failed";
+
+export interface ReviewEvidenceBounds {
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly headLimit?: number;
+  readonly pages?: string;
+  readonly truncated?: boolean;
+}
+
+export interface ReviewEvidenceReference {
+  readonly id: string;
+  readonly kind: ReviewEvidenceKind;
+  readonly status: ReviewEvidenceStatus;
+  readonly path?: string;
+  readonly paths?: readonly string[];
+  readonly revision?: "base" | "head";
+  readonly mergeBaseSha?: string;
+  readonly headSha?: string;
+  readonly changedPaths?: boolean;
+  readonly contentKind?: "text" | "binary" | "non_regular" | "missing";
+  readonly bounds?: ReviewEvidenceBounds;
+}
+
 export interface GoalSubmission {
   readonly summary: string;
   readonly findings: readonly ReviewFinding[];
+  readonly assessment: ReviewAssessment;
 }
 
 export interface GoalResult {
   readonly prompt: string;
-  readonly status: "completed" | "failed";
+  readonly status: "completed" | "incomplete" | "failed";
   readonly submission?: GoalSubmission;
   readonly error?: string;
   readonly tokenUsage?: GoalTokenUsage;

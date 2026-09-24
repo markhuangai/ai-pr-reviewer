@@ -29,7 +29,7 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
-import { redact } from "./lib/redaction.js";
+import { redact, redactGoalResults as redactGoals } from "./lib/redaction.js";
 import { DiagnosticLogger, type DiagnosticDescriptor } from "./lib/diagnostics.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
 import type { ReviewLifecycleSnapshot } from "./lib/github-review-lifecycle.js";
@@ -78,45 +78,6 @@ function actionDiagnosticContext(): Readonly<Record<string, unknown>> {
 
 function actionDescriptor(phase: string, operation: string, purpose: string): DiagnosticDescriptor {
   return { component: "action", phase, operation, purpose };
-}
-
-function redactGoals(
-  goals: readonly GoalResult[],
-  secrets: readonly string[],
-): readonly GoalResult[] {
-  return goals.map((goal) => ({
-    ...goal,
-    ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
-    ...(goal.tokenUsage === undefined
-      ? {}
-      : {
-          tokenUsage: {
-            ...goal.tokenUsage,
-            models: goal.tokenUsage.models.map((usage) => ({
-              ...usage,
-              model: redact(usage.model, secrets),
-              ...(usage.canonicalModel === undefined
-                ? {}
-                : { canonicalModel: redact(usage.canonicalModel, secrets) }),
-            })),
-          },
-        }),
-    ...(goal.submission === undefined
-      ? {}
-      : {
-          submission: {
-            summary: redact(goal.submission.summary, secrets),
-            findings: goal.submission.findings.map((finding) => ({
-              ...finding,
-              title: redact(finding.title, secrets),
-              body: redact(finding.body, secrets),
-              ...(finding.agentPrompt === undefined
-                ? {}
-                : { agentPrompt: redact(finding.agentPrompt, secrets) }),
-            })),
-          },
-        }),
-  }));
 }
 
 function redactRequest(
@@ -594,15 +555,12 @@ export async function runAction(
           "aggregate and validate goal review results",
         ),
         () =>
-          aggregateReview(
-            context,
-            config,
-            files,
-            goals,
-            conversation.snapshot.digest,
-            preparedContextFiles.identity,
-            reviewBriefingDigest(context, briefing),
-          ),
+          aggregateReview(context, config, files, goals, {
+            conversationDigest: conversation.snapshot.digest,
+            contextFiles: preparedContextFiles.identity,
+            briefingDigest: reviewBriefingDigest(context, briefing),
+            coverageGoals: rawGoals,
+          }),
       );
       if (config.interactWithPullRequest && review.omittedFindings.length > 0) {
         core.warning(
@@ -633,7 +591,7 @@ export async function runAction(
         }
         if (review.partial) {
           throw new Error(
-            "The review was written as a partial result, but one or more goals failed.",
+            "The review was written as a partial result because one or more goals failed or remain incomplete.",
           );
         }
         successDetails = { outcome: "completed", mode: "summary" };
@@ -762,7 +720,9 @@ export async function runAction(
         logLifecycleResult({ resolvedThreadIds, minimizedReviewIds });
       }
       if (review.partial)
-        throw new Error("The review was posted as a partial result, but one or more goals failed.");
+        throw new Error(
+          "The review was posted as a partial result because one or more goals failed or remain incomplete.",
+        );
       successDetails = { outcome: "completed", mode: "interactive" };
       return { skipped: false, review };
     } finally {

@@ -303,8 +303,8 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - A structured goal may optionally read only its exact authorized workflow context files. Each goal gets independent readers over immutable snapshots, and submitting a review does not require reading optional files.
 - Claude Agent SDK model usage is cumulative within each goal session, so only its latest valid result snapshot is retained before usage is combined across goals. Repair-turn results are never added together.
 - The action includes non-empty PR-level comments and review bodies from human and bot reviewers other than the authenticated PAT identity, plus every inline review thread. Thread context includes this action's prior roots, every reply, resolved and outdated state, the resolving login, and parent-review minimization state. GitHub records who resolved a thread but not why; a reply is required to preserve a false-positive or other semantic disposition.
-- The briefing includes the PR body, same-repository linked issue bodies referenced by `#123`, `owner/repository#123`, or same-origin issue URLs (up to 20), changed-file metadata, and a bounded prior-discussion index. Body, issue, comment, and review text is secret-redacted and treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
-- Each goal must read the briefing to completion. It can then use native `Read`, `Glob`, and repository-wide `Grep` over the pristine head checkout, plus fixed Git readers for the captured merge-base/head revision. `read_pr_diff` reads the complete diff or exact changed paths on demand; `read_repository_file` reads exact changed paths at the merge base or head, while native `Read` handles other head-checkout context. `read_pr_conversation` is optional, and `read_pr_threads` retrieves complete selected threads from the index. A located submission is rejected until prior inline discussion for that path has been read.
+- The briefing includes the PR body, same-repository linked issue bodies referenced by `#123`, `owner/repository#123`, or same-origin issue URLs (up to 20), changed-file metadata, applicable root and ancestor `AGENTS.md` files from both base and head, and a bounded prior-discussion index. PR and issue context is secret-redacted; repository guidance, comments, and review text are treated as untrusted evidence, never as instructions. A prior explanation suppresses a repeated finding only when the current checkout supports it; contradictory or outdated explanations must be addressed in the new finding.
+- Each goal must read the briefing to completion. It can then use native `Read`, `Glob`, and repository-wide `Grep` over the pristine head checkout, plus fixed Git readers for the captured merge-base/head revision. `read_pr_diff` reads the complete diff or exact changed paths on demand; `read_repository_file` reads any exact tracked file at the merge base or head, including unchanged files, while native `Read` handles other head-checkout context. Continuations are bound to their original query and revision. `read_pr_conversation` is optional, and `read_pr_threads` retrieves complete selected threads from the index. A located submission is rejected until prior inline discussion for that path has been read.
 - The fixed Git diff uses merge-base attributes so pull-request changes cannot hide text as binary. Pages are bounded by bytes, tool results are capped before delivery, and each goal retains at most 256 MiB across unfinished fixed Git query snapshots; a goal is not required to consume a monolithic diff or every conversation body. Bash and other write or execution tools remain unavailable.
 - Review analysis uses the captured base, head, files, and conversation. When interactive lifecycle candidates exist, the action refreshes the authoritative GraphQL review/thread snapshot after reconciliation and uses REST only for pull-request issue comments before duplicate detection and review generation; each lifecycle mutation also rereads GraphQL review-thread state immediately before it runs. A workflow consumer can use `concurrency.cancel-in-progress` when it wants newer events to supersede an active run.
 - A first `SIGINT`, `SIGTERM`, or Windows `SIGBREAK` starts graceful cancellation across bootstrap, GitHub API/Git work, context capture, diff generation, and Claude sessions. Cancellation stops new goals and writes, and cleanup still runs. A GitHub write accepted immediately before cancellation cannot be undone.
@@ -313,12 +313,12 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - A stale-thread verifier must successfully read the cited current file before its high-confidence `fixed` verdict is accepted; malformed, duplicate, no-read, failed, or incomplete verifier submissions are rejected or treated as non-mutating outcomes.
 - After the current review is posted, an older action finding review is minimized when every associated inline thread is resolved. Legacy body-only findings do not block minimization; new interactive reviews never publish findings in the review body. The read-only GitHub GraphQL snapshot supplies thread context in both modes; lifecycle verifiers and mutations are skipped when `interact-with-pr: false`.
 - Binary file contents are not reviewed and do not block completion or otherwise-qualified automatic approval. Binary change metadata remains visible in the changed-file list and text diff marker.
-- A goal must submit a schema-validated result through the internal `submit_review` MCP tool. The review prompt can be followed by at most five same-session repair attempts.
+- A goal must submit a schema-validated result and an evidence-backed assessment through the internal `submit_review` MCP tool. Host tool hooks issue evidence references; each changed path must be marked reviewed, not applicable with a reason, or incomplete. Reviewed and not-applicable paths require completed repository evidence. A supported finding must link to a supported candidate whose completed repository evidence covers its affected path. An incomplete result keeps valid findings, is published only as a comment, and cannot approve a pull request. The review prompt can be followed by at most five same-session repair attempts.
 - The action writes the full secret-redacted system prompt, `/goal`, review, continuation, and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, one-minute heartbeats, last SDK activity, goal iterations and reasons, turn results, repairs, five-minute stall detection, interruption and continuation, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews. Context file tool results log an omission marker instead of page contents; hidden model reasoning is not logged.
 - Findings use four severities: Critical for credible immediate compromise, irreversible data loss, or broad outage; High for serious impact on a reachable path; Moderate for bounded impact or a less likely trigger; and Low for a limited-impact but actionable defect. Informational observations, style preferences, and nits are omitted.
 - Interactive findings must cite a participating added line in the pull request diff. A missing or invalid anchor rejects the complete goal submission for same-session repair instead of moving the finding into the review body or attaching it to an unrelated line. Findings are sorted by severity, deduplicated across goals, and limited to the 25 highest-priority inline comments. Additional findings are omitted from the pull request review but retained in the workflow summary and diagnostics. Each published comment includes a severity marker, short impact and fix, and a default-collapsed agent prompt generated from the verified finding location.
 - Public reviews never include review prompts, model summaries, goal errors, or goal provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count and rerun guidance; full secret-redacted diagnostics remain in the GitHub Actions log.
-- If a goal cannot read the briefing or the evidence it selected within its model context, provider limits, or configured `max-turns`, that goal fails instead of claiming complete coverage. GitHub's changed-file API still limits review metadata to 3,000 files.
+- If required evidence cannot be finished within the model context, provider limits, or configured `max-turns`, the affected paths are reported as incomplete instead of being described as reviewed. GitHub's changed-file API still limits review metadata to 3,000 files.
 - When interaction is enabled, a partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - In summary-only mode, every finding is included in the run summary rather than split between body and inline destinations. The summary is capped below GitHub's 1 MiB per-step limit and omits only whole findings when needed.
 - If GitHub rejects an approval, the action retries once as a comment review.
@@ -394,6 +394,46 @@ npm run test:coverage
 npm run build
 npm run bundle:bootstrap
 ```
+
+### Replay a frozen review case
+
+The replay CLI runs the normal review runner against an exact local pull request snapshot and writes redacted JSON results outside the checkout. It requires a pristine checkout whose `HEAD` matches the case's `headSha` and whose Git objects include its `baseSha`. The output path must be new and outside that checkout. It does not switch branches or call GitHub's publication API. Labels live in a top-level `labels` field and are recorded with the result; they are never sent to the reviewer.
+
+Set `AI_PR_REVIEWER_SECRET` (or `ANTHROPIC_API_KEY`) for the model credential. Set `AI_PR_REVIEWER_BASE_URL` to the consumer's configured proxy when needed, or record `aiBaseUrl` in the case. The case's `config.reviewPrompts`, model, budgets, system prompt, and HTTP MCP server configuration are passed to the normal runner.
+
+```json
+{
+  "version": 1,
+  "caseId": "example-001",
+  "labels": { "expectedFindings": ["timeout-not-forwarded"] },
+  "context": {
+    "repository": "owner/repository",
+    "owner": "owner",
+    "name": "repository",
+    "number": 123,
+    "baseSha": "<full-base-sha>",
+    "headSha": "<full-head-sha>",
+    "baseRef": "main",
+    "title": "Example change",
+    "htmlUrl": "https://github.com/owner/repository/pull/123"
+  },
+  "config": {
+    "model": "consumer-model-id",
+    "reviewPrompts": [{ "prompt": "Review for reachable correctness defects." }],
+    "parallelCount": 1,
+    "maxTurns": 40,
+    "mcpServers": {}
+  }
+}
+```
+
+Run it with an existing output directory outside the checkout:
+
+```bash
+npm run replay:review -- --case /data/cases/example-001.json --checkout /tmp/example-001 --output /data/results/example-001.json
+```
+
+Replay cases should preserve production inputs and reviewer-visible context. Do not add expected findings, labels, or evaluation notes to `config.reviewPrompts`, the PR body, conversation, or repository contents. Live accuracy evaluation is deferred until after merge and prerelease publication.
 
 Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
 

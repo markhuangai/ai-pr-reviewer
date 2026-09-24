@@ -407,7 +407,11 @@ test("cancellation prevents new summaries and pull request writes", async (t) =>
               {
                 prompt: "correctness",
                 status: "completed",
-                submission: { summary: "clean", findings: [] },
+                submission: {
+                  assessment: { coverage: [], candidates: [] },
+                  summary: "clean",
+                  findings: [],
+                },
               },
             ]);
           },
@@ -467,7 +471,11 @@ test("correlates full action cleanup failures with the parent failure", async (t
             {
               prompt: "correctness",
               status: "completed",
-              submission: { summary: "clean", findings: [] },
+              submission: {
+                assessment: { coverage: [], candidates: [] },
+                summary: "clean",
+                findings: [],
+              },
             },
           ]),
         writeSummary: () => Promise.resolve(),
@@ -563,7 +571,15 @@ test("writes failed and partial summary-only results before reporting failure", 
       }),
       [],
       dependencies([
-        { prompt: "one", status: "completed", submission: { summary: "clean", findings: [] } },
+        {
+          prompt: "one",
+          status: "completed",
+          submission: {
+            summary: "clean",
+            findings: [],
+            assessment: { coverage: [], candidates: [] },
+          },
+        },
         { prompt: "two", status: "failed", error: "provider failed" },
       ]),
     ),

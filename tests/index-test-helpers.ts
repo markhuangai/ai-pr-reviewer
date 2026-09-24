@@ -70,22 +70,7 @@ export function actionReader(overrides: Readonly<Record<string, string>> = {}): 
 export async function cleanWorkspace(t: TestContext) {
   const workspace = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-index-clean-"));
   t.after(() => rm(workspace, { force: true, recursive: true }));
-  await execFileAsync("git", ["init", "--quiet", "--initial-branch=main"], { cwd: workspace });
-  await writeFile(join(workspace, "review.txt"), "head\n");
-  await execFileAsync("git", ["add", "review.txt"], { cwd: workspace });
-  await execFileAsync(
-    "git",
-    [
-      "-c",
-      "user.name=Test User",
-      "-c",
-      "user.email=test@example.test",
-      "commit",
-      "--quiet",
-      "--message=head",
-    ],
-    { cwd: workspace },
-  );
+  await execFileAsync("git", ["clone", "--quiet", "--shared", process.cwd(), workspace]);
   const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
     cwd: workspace,
     encoding: "utf8",

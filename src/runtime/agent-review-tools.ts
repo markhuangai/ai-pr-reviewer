@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, open, realpath, rm, stat, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import type { ReviewConversationSnapshot } from "../lib/review-context.js";
 import type { ChangedFile, PullRequestContext, ReviewBriefing } from "../lib/types.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
 import { streamGitToFile } from "./git-stream.js";
+import type { RepositoryQuerySource } from "./repository-snapshot.js";
 
 const DIFF_PAGE_BYTES = 4 * 1024;
 const CONVERSATION_PAGE_BYTES = 4 * 1024;
@@ -361,6 +363,14 @@ export class ReviewBriefingReader {
         additions: file.additions,
         deletions: file.deletions,
         changes: file.changes,
+      });
+    }
+    for (const guidance of briefing.repositoryGuidance ?? []) {
+      records.push({
+        kind: "repository_guidance",
+        path: guidance.path,
+        revision: guidance.revision,
+        body: guidance.content,
       });
     }
     for (const entry of conversation.entries) {
@@ -844,5 +854,130 @@ export async function createPullRequestDiff(
   } catch (error) {
     await rm(directory, { force: true, recursive: true });
     throw error;
+  }
+}
+
+export type QueryReaderKind = "diff" | "repository_file" | "thread";
+
+export interface QueryReaderEntry {
+  readonly reader: StringPageReader | RepositoryFilePageReader;
+  readonly kind: QueryReaderKind;
+  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly cleanup?: () => Promise<void>;
+}
+
+export class ReviewQueryReaderStore {
+  private readonly readers = new Map<string, QueryReaderEntry>();
+  private readonly completions = new Map<string, () => void>();
+
+  constructor(
+    private readonly onRemove: (cursor: string) => void,
+    private readonly signal?: AbortSignal,
+  ) {}
+
+  has(cursor: string): boolean {
+    return this.readers.has(cursor);
+  }
+
+  createString(
+    content: string,
+    metadata: Readonly<Record<string, unknown>>,
+    onComplete?: () => void,
+  ): { readonly cursor: string; readonly reader: StringPageReader } {
+    this.makeRoom();
+    const cursor = randomUUID();
+    const reader = new StringPageReader(content);
+    this.readers.set(cursor, { reader, kind: "thread", metadata });
+    if (onComplete !== undefined) this.completions.set(cursor, onComplete);
+    return { cursor, reader };
+  }
+
+  createSource(
+    source: RepositoryQuerySource,
+    kind: QueryReaderKind,
+    metadata: Readonly<Record<string, unknown>>,
+  ): { readonly cursor: string; readonly reader: RepositoryFilePageReader } {
+    this.makeRoom();
+    const cursor = randomUUID();
+    const reader = new RepositoryFilePageReader(source.path, source.sizeBytes, this.signal);
+    this.readers.set(cursor, { reader, kind, metadata, cleanup: source.cleanup });
+    return { cursor, reader };
+  }
+
+  async readPage(
+    cursor: string,
+    kind: QueryReaderKind,
+    selector?: Readonly<Record<string, unknown>>,
+  ): Promise<CallToolResult> {
+    const entry = this.readers.get(cursor);
+    if (entry === undefined)
+      return this.invalidCursor("The cursor is unknown, expired, or already complete.");
+    if (entry.kind !== kind)
+      return this.invalidCursor(`This cursor belongs to ${entry.kind}, not ${kind}.`);
+    if (
+      selector !== undefined &&
+      Object.entries(selector).some(
+        ([key, value]) => JSON.stringify(entry.metadata[key]) !== JSON.stringify(value),
+      )
+    ) {
+      return this.invalidCursor("The cursor does not match the supplied read selection.");
+    }
+    if (
+      kind === "diff" &&
+      (entry.metadata.paths === undefined) !== (selector?.paths === undefined)
+    ) {
+      return this.invalidCursor("Continue this diff read with the same changed-path selection.");
+    }
+    const page = await entry.reader.readNext({ ...entry.metadata, nextCursor: cursor });
+    if (page.done) await this.finish(cursor);
+    return jsonToolResult({
+      ...entry.metadata,
+      ...page,
+      ...(page.done ? {} : { nextCursor: cursor }),
+    });
+  }
+
+  async finish(cursor: string): Promise<void> {
+    const entry = this.readers.get(cursor);
+    if (entry === undefined) return;
+    this.readers.delete(cursor);
+    this.onRemove(cursor);
+    await this.close(entry);
+    const onComplete = this.completions.get(cursor);
+    this.completions.delete(cursor);
+    onComplete?.();
+  }
+
+  cleanupOperations(): readonly Promise<void>[] {
+    return [...this.readers.values()].map((entry) => this.close(entry).catch(() => undefined));
+  }
+
+  private makeRoom(): void {
+    while (this.readers.size >= 32) {
+      const oldest = this.readers.keys().next().value;
+      if (oldest === undefined) break;
+      const entry = this.readers.get(oldest);
+      this.readers.delete(oldest);
+      this.completions.delete(oldest);
+      this.onRemove(oldest);
+      if (entry !== undefined) void this.close(entry).catch(() => undefined);
+    }
+  }
+
+  private async close(entry: QueryReaderEntry): Promise<void> {
+    if (entry.reader instanceof RepositoryFilePageReader) await entry.reader.close();
+    await entry.cleanup?.();
+  }
+
+  invalidCursor(message: string): CallToolResult {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${message} Restart this read and continue with the cursor it returns.`,
+        },
+      ],
+      isError: true,
+    };
   }
 }

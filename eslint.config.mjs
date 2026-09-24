@@ -10,6 +10,7 @@ export default tseslint.config(
       "release/**",
       "node_modules/**",
       "build-test/**",
+      "build-replay/**",
       ".codex/**",
     ],
   },

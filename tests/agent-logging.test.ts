@@ -8,6 +8,60 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "./agent-test-helpers.js";
+import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
+import type { GoalSubmission } from "../src/lib/types.js";
+
+test("retains valid findings while marking explicitly incomplete investigation", () => {
+  const submission: GoalSubmission = {
+    summary: "One supported issue; remaining path could not be read.",
+    findings: [
+      {
+        title: "Supported issue",
+        severity: "HIGH",
+        body: "The changed call drops the error.",
+        path: "src/change.ts",
+        line: 1,
+      },
+    ],
+    assessment: {
+      coverage: [
+        {
+          paths: ["src/change.ts"],
+          disposition: "reviewed",
+          rationale: "Completed the fixed repository read.",
+          evidenceRefs: ["ev-1"],
+        },
+        {
+          paths: ["src/other.ts"],
+          disposition: "incomplete",
+          rationale: "The required read failed before the file could be inspected.",
+          evidenceRefs: ["ev-2"],
+        },
+      ],
+      candidates: [],
+    },
+  };
+  const result = acceptedSubmissionResult(
+    "correctness",
+    submission,
+    { checked: true, failures: "" },
+    [],
+    true,
+  );
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.submission, submission);
+  assert.match(result.error ?? "", /src\/other\.ts/u);
+
+  const mcpFailure = acceptedSubmissionResult(
+    "correctness",
+    submission,
+    { checked: true, failures: "security: unavailable" },
+    [],
+    true,
+  );
+  assert.equal(mcpFailure.status, "failed");
+  assert.match(mcpFailure.error ?? "", /security: unavailable/u);
+});
 
 test("terminates backward secret scans at zero without exposing crossing secrets", async () => {
   const moduleUrl = new URL("../src/runtime/agent-logging.js", import.meta.url).href;
