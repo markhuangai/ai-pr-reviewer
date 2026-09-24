@@ -399,6 +399,7 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   const headSha = await git(process.cwd(), ["rev-parse", "HEAD"]);
   await git(checkout, ["checkout", "--quiet", "--detach", headSha]);
   const baseSha = await git(checkout, ["rev-parse", "HEAD^"]);
+  const mergeBaseSha = await git(checkout, ["merge-base", baseSha, headSha]);
   const changedPath = (await git(checkout, ["diff", "--name-only", "-z", baseSha, headSha]))
     .split("\0")
     .filter((path) => path.length > 0)[0];
@@ -435,6 +436,10 @@ test("replays a frozen case without publishing, switching revisions, or exposing
           headers: {
             "X-MCP-Key": "mcp-replay-credential",
             "X-Path-Secret": changedPath,
+            "X-Repository-Secret": context.repository,
+            "X-Base-Secret": baseSha,
+            "X-Head-Secret": headSha,
+            "X-Merge-Base-Secret": mergeBaseSha,
           },
         },
       },
@@ -567,11 +572,41 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   assert.deepEqual(output.labels, { expected: ["known-defect"], private: "[REDACTED]" });
   assert.equal(output.partial, false);
   assert.equal(output.findings instanceof Array, true);
+  assert.equal(output.repository, "[REDACTED]");
+  assert.equal(output.baseSha, "[REDACTED]");
+  assert.equal(output.mergeBaseSha, "[REDACTED]");
+  assert.equal(output.headSha, "[REDACTED]");
   assert.equal(JSON.stringify(output).includes("replay-secret"), false);
   assert.equal(JSON.stringify(output).includes("mcp-replay-credential"), false);
   assert.equal(JSON.stringify(output).includes(changedPath), false);
+  for (const secret of [context.repository, baseSha, mergeBaseSha, headSha])
+    assert.equal(JSON.stringify(output).includes(secret), false);
   assert.equal("prompt" in (output.goals[0] ?? {}), false);
   assert.equal(serializeReplayOutput(output), serializeReplayOutput(output));
+
+  const nonIdentityInput: ReplayCase = parseReplayCase({
+    ...input,
+    config: {
+      ...input.config,
+      mcpServers: {
+        security: {
+          type: "http",
+          url: "https://mcp.example.test",
+          headers: {
+            "X-MCP-Key": "mcp-replay-credential",
+            "X-Path-Secret": changedPath,
+          },
+        },
+      },
+    },
+  });
+  const ordinaryOutput = await replayCase(nonIdentityInput, checkout, runner);
+  assert.equal(ordinaryOutput.repository, context.repository);
+  assert.equal(ordinaryOutput.baseSha, baseSha);
+  assert.equal(ordinaryOutput.mergeBaseSha, mergeBaseSha);
+  assert.equal(ordinaryOutput.headSha, headSha);
+  assert.equal(observedCalls, 2);
+
   await assert.rejects(
     validateReplayOutputPath(join(checkout, "result.json"), checkout),
     /outside the checkout/u,
