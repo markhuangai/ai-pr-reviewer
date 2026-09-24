@@ -1,3 +1,4 @@
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
@@ -336,6 +337,30 @@ function repositoryRelativePath(cwd: string, value: unknown): string | undefined
   return path.length === 0 ? "." : path;
 }
 
+function isRegularRepositoryReadPath(cwd: string, value: unknown): boolean {
+  const path = repositoryRelativePath(cwd, value);
+  if (path === undefined || path === ".") return false;
+  let current: string;
+  try {
+    current = realpathSync(cwd);
+  } catch {
+    return false;
+  }
+  const components = path.split("/");
+  for (const [index, component] of components.entries()) {
+    current = resolve(current, component);
+    try {
+      const metadata = lstatSync(current);
+      if (metadata.isSymbolicLink()) return false;
+      if (index === components.length - 1 ? !metadata.isFile() : !metadata.isDirectory())
+        return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function lookupReference(
   references: ReadonlyMap<string, ReviewEvidenceReference>,
   value: unknown,
@@ -612,7 +637,9 @@ export class ReviewEvidenceLedger {
     }
     if (name === "Read") {
       const path = repositoryRelativePath(this.cwd, input.file_path);
-      return path === undefined ? undefined : { kind: "repository_read", path, revision: "head" };
+      return path === undefined || !isRegularRepositoryReadPath(this.cwd, input.file_path)
+        ? undefined
+        : { kind: "repository_read", path, revision: "head" };
     }
     if (name === "Grep") {
       const path = repositoryRelativePath(this.cwd, input.path ?? ".");

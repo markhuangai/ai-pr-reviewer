@@ -1,4 +1,7 @@
 import { strict as assert } from "node:assert";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import type {
@@ -274,16 +277,21 @@ test("retains cursor evidence after a recoverable selector error", () => {
   );
 });
 
-test("records native repository reads, searches, context, briefing, discussion, and MCP output", () => {
-  const ledger = new ReviewEvidenceLedger("/repo");
+test("records native repository reads, searches, context, briefing, discussion, and MCP output", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-read-ledger-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = join(root, "src/change.ts");
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(sourcePath, "source\n");
+  const ledger = new ReviewEvidenceLedger(root);
   const observed = ledger.observeBatch([
     call(
       "Read",
-      { file_path: "/repo/src/change.ts" },
+      { file_path: sourcePath },
       {
         type: "text",
         file: {
-          filePath: "/repo/src/change.ts",
+          filePath: sourcePath,
           content: "source",
           numLines: 1,
           startLine: 1,
@@ -360,6 +368,40 @@ test("records native repository reads, searches, context, briefing, discussion, 
   );
 });
 
+test("does not issue native-read evidence for symlink paths", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-read-evidence-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const regularPath = join(root, "target.ts");
+  const symlinkPath = join(root, "linked.ts");
+  const directoryPath = join(root, "real-directory");
+  const linkedDirectoryPath = join(root, "linked-directory");
+  await writeFile(regularPath, "source\n");
+  await symlink(regularPath, symlinkPath);
+  await mkdir(directoryPath);
+  await writeFile(join(directoryPath, "nested.ts"), "nested source\n");
+  await symlink(directoryPath, linkedDirectoryPath, "dir");
+
+  const response = (filePath: string) => ({
+    type: "text",
+    file: { filePath, content: "source", numLines: 1, startLine: 1, totalLines: 1 },
+  });
+  const ledger = new ReviewEvidenceLedger(root);
+  const [regularRead] = ledger.observeBatch([
+    call("Read", { file_path: regularPath }, response(regularPath)),
+  ]);
+  assert.equal(regularRead?.status, "complete");
+  assert.deepEqual(
+    ledger.observeBatch([call("Read", { file_path: symlinkPath }, response(symlinkPath))]),
+    [],
+  );
+  const nestedPath = join(linkedDirectoryPath, "nested.ts");
+  assert.deepEqual(
+    ledger.observeBatch([call("Read", { file_path: nestedPath }, response(nestedPath))]),
+    [],
+  );
+  assert.equal(ledger.issued.size, 1);
+});
+
 test("does not accept an empty native search as changed-path coverage", () => {
   const ledger = new ReviewEvidenceLedger("/repo");
   const [search] = ledger.observeBatch([
@@ -393,16 +435,21 @@ test("does not accept an empty native search as changed-path coverage", () => {
   assert.ok(issues.some((issue) => /no completed repository evidence/u.test(issue)));
 });
 
-test("marks bounded or unverified native repository reads and searches partial", () => {
-  const ledger = new ReviewEvidenceLedger("/repo");
+test("marks bounded or unverified native repository reads and searches partial", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-bounded-read-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = join(root, "src/change.ts");
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(sourcePath, "source\n");
+  const ledger = new ReviewEvidenceLedger(root);
   const observed = ledger.observeBatch([
     call(
       "Read",
-      { file_path: "/repo/src/change.ts", offset: 10, limit: 20 },
+      { file_path: sourcePath, offset: 10, limit: 20 },
       {
         type: "text",
         file: {
-          filePath: "/repo/src/change.ts",
+          filePath: sourcePath,
           content: "limited source",
           numLines: 20,
           startLine: 10,
@@ -470,15 +517,20 @@ test("does not issue evidence for paths outside the checkout or inside Git metad
   );
 });
 
-test("marks tool failures and cursor errors failed and bounds the returned evidence list", () => {
-  const ledger = new ReviewEvidenceLedger("/repo");
+test("marks tool failures and cursor errors failed and bounds the returned evidence list", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-failed-read-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourcePath = join(root, "src/change.ts");
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(sourcePath, "source\n");
+  const ledger = new ReviewEvidenceLedger(root);
   const failed = ledger.observeBatch([
     call(
       "Grep",
       { path: "src/change.ts" },
       { isError: true, content: [{ type: "text", text: "denied" }] },
     ),
-    call("Read", { file_path: "/repo/src/change.ts" }, undefined),
+    call("Read", { file_path: sourcePath }, undefined),
     call("Glob", { path: "src" }, { error: "search failed" }),
     call("mcp__review_output__read_pr_diff", { cursor: "forged" }, jsonResponse({ done: true })),
   ]);
