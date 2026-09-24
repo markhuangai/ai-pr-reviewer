@@ -65,10 +65,11 @@ test("correlates action phases and cleanup outcomes in diagnostics", async (t) =
       runGoals: () =>
         Promise.resolve([
           {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
             prompt: "correctness",
             status: "completed",
             submission: {
-              assessment: { coverage: [], candidates: [] },
+              limitations: [],
               summary: "clean",
               findings: [],
             },
@@ -147,6 +148,7 @@ test("redacts generated AI prompts without dropping them", () => {
   const [goal, failedGoal] = indexInternals.redactGoals(
     [
       {
+        inspection: { observedPaths: ["review.txt"], missingPaths: [...["private-token/path"]] },
         prompt: "private-token security",
         status: "completed",
         tokenUsage: {
@@ -163,27 +165,9 @@ test("redacts generated AI prompts without dropping them", () => {
           ],
         },
         submission: {
-          assessment: {
-            coverage: [
-              {
-                paths: ["private-token/path"],
-                disposition: "incomplete",
-                rationale: "private-token investigation did not finish",
-                evidenceRefs: ["ev-1"],
-              },
-            ],
-            candidates: [
-              {
-                paths: ["src/change.ts"],
-                trigger: "private-token is missing",
-                impact: "private-token is lost",
-                evidenceRefs: ["ev-1"],
-                countercheck: "Checked for private-token guards.",
-                counterevidenceRefs: [],
-                verdict: "unresolved",
-              },
-            ],
-          },
+          limitations: [
+            { paths: ["private-token/path"], reason: "private-token investigation did not finish" },
+          ],
           summary: "finding",
           findings: [
             {
@@ -207,6 +191,7 @@ test("redacts generated AI prompts without dropping them", () => {
         },
       },
       {
+        inspection: { observedPaths: ["review.txt"], missingPaths: [] },
         prompt: "failure",
         status: "failed",
         error: "private-token failed",
@@ -229,12 +214,9 @@ test("redacts generated AI prompts without dropping them", () => {
 
   assert.equal(goal?.submission?.findings[0]?.body, "The value [REDACTED] is exposed.");
   assert.equal(goal?.prompt, "[REDACTED] security");
-  assert.equal(goal?.submission?.assessment.coverage[0]?.paths[0], "[REDACTED]/path");
-  assert.equal(
-    goal?.submission?.assessment.coverage[0]?.rationale,
-    "[REDACTED] investigation did not finish",
-  );
-  assert.equal(goal?.submission?.assessment.candidates[0]?.trigger, "[REDACTED] is missing");
+  assert.equal(goal?.submission?.limitations[0]?.paths[0], "[REDACTED]/path");
+  assert.equal(goal?.submission?.limitations[0]?.reason, "[REDACTED] investigation did not finish");
+  assert.deepEqual(goal?.inspection?.missingPaths, ["[REDACTED]/path"]);
   assert.equal(goal?.tokenUsage?.models[0]?.model, "provider-[REDACTED]");
   assert.equal(goal?.tokenUsage?.models[0]?.canonicalModel, "[REDACTED]-canonical");
   assert.equal(
@@ -275,20 +257,11 @@ test("keeps secret-bearing coverage paths for completeness without publishing th
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: [...[changedPath]], missingPaths: [] },
           prompt: "correctness",
           status: "completed" as const,
           submission: {
-            assessment: {
-              coverage: [
-                {
-                  paths: [changedPath],
-                  disposition: "reviewed" as const,
-                  rationale: "The complete changed file was reviewed.",
-                  evidenceRefs: ["ev-1"],
-                },
-              ],
-              candidates: [],
-            },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -518,10 +491,11 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   };
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: ["review.txt"], missingPaths: [] },
       prompt: "correctness",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "one issue",
         findings: [
           {
@@ -751,10 +725,11 @@ test("passes immutable context snapshots to goals and cleans them after the run"
         assert.equal(await readFile(snapshotPath, "utf8"), originalContent);
         return [
           {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
             prompt: "Review ticket requirements.",
             status: "completed",
             submission: {
-              assessment: { coverage: [], candidates: [] },
+              limitations: [],
               summary: "clean",
               findings: [],
             },
@@ -799,10 +774,11 @@ test("falls back from a rejected approval to a comment review", async (t) => {
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -841,10 +817,11 @@ test("downgrades a stale auto-approval to a captured comment", async (t) => {
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -881,10 +858,11 @@ test("downgrades approval when the captured base changed", async (t) => {
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -917,10 +895,11 @@ test("propagates non-approval review failures", async (t) => {
       runGoals: () =>
         Promise.resolve([
           {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
             prompt: "correctness",
             status: "completed",
             submission: {
-              assessment: { coverage: [], candidates: [] },
+              limitations: [],
               summary: "finding",
               findings: [],
             },
@@ -972,10 +951,11 @@ test("reviews the captured pull request discussion without rechecking it", async
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -1012,10 +992,11 @@ test("reviews the captured event refs without querying their live state", async 
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -1110,10 +1091,11 @@ test("reconciles interactive lifecycle state before and after the current review
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -1169,10 +1151,11 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "clean",
             findings: [],
           },
@@ -1218,10 +1201,11 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
     runGoals: () =>
       Promise.resolve([
         {
+          inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
           prompt: "correctness",
           status: "completed",
           submission: {
-            assessment: { coverage: [], candidates: [] },
+            limitations: [],
             summary: "overflow",
             findings: files.map((file, index) => ({
               title: `Finding ${String(index).padStart(2, "0")}`,

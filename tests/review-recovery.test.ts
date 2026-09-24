@@ -5,6 +5,7 @@ import {
   makeRepository,
   makeDiffFromSnapshots,
   join,
+  chmod,
   writeFile,
   emptyConversation,
   goalContext,
@@ -15,19 +16,23 @@ import {
   tmpdir,
   rm,
   type ChangedFile,
+  type TestContext,
   type SDKMessage,
   type SDKResultMessage,
 } from "./agent-test-helpers.js";
+import { rename } from "node:fs/promises";
+import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import { reviewProtocolQuery, type ReviewProtocol } from "./review-protocol-test-helpers.js";
 import {
   ReviewSubmissionRecovery,
   retainValidReviewFindings,
 } from "../src/runtime/review-submission.js";
 import { aggregateReview, buildReviewBody } from "../src/lib/aggregate.js";
-import type { ReviewAssessment, ReviewEvidenceReference } from "../src/lib/types.js";
+import type { ReviewEvidenceReference } from "../src/lib/types.js";
 import {
   ReviewEvidenceLedger,
-  findInvalidReviewAssessment,
+  reviewFindingGaps,
+  reviewInspection,
 } from "../src/runtime/review-assessment.js";
 const changedFile: ChangedFile = {
   path: "src/change.ts",
@@ -44,13 +49,6 @@ function call(tool_name: string, tool_input: unknown, tool_response: unknown) {
 function jsonResponse(value: unknown): unknown {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
-function coverage(
-  path: string,
-  evidenceRefs: readonly string[],
-  disposition: "reviewed" | "incomplete" = "reviewed",
-): ReviewAssessment["coverage"][number] {
-  return { paths: [path], evidenceRefs, disposition, rationale: "Checked the captured path." };
-}
 interface RecoveryState {
   readonly manifest: readonly { path: string }[];
   readonly evidence: readonly ReviewEvidenceReference[];
@@ -58,6 +56,8 @@ interface RecoveryState {
   readonly remainingCorrections: number;
   readonly submissionAttempts: number;
   readonly headSha: string;
+  readonly inspection: { observed: number; missing: number };
+  readonly calls: readonly { kind: string; tool: string; arguments: Record<string, unknown> }[];
 }
 
 function protocolDocument(response: {
@@ -66,12 +66,25 @@ function protocolDocument(response: {
   return JSON.parse(response.content[0]?.text ?? "{}") as Record<string, unknown>;
 }
 
+function normalizeState(pages: readonly Record<string, unknown>[]): RecoveryState {
+  const records = pages.flatMap((page) => page.records as Record<string, unknown>[]);
+  return {
+    ...pages[0],
+    manifest: records.filter((record) => record.kind === "changed_file"),
+    evidence: records
+      .filter((record) => record.kind === "evidence")
+      .map((record) => record.reference),
+    gaps: records.filter((record) => record.kind === "gap"),
+    calls: records.filter((record) => record.kind === "next_call" || record.kind === "active_read"),
+  } as unknown as RecoveryState;
+}
+
 async function* recoveryState(
   protocol: ReviewProtocol,
   paths?: string[],
 ): AsyncGenerator<SDKMessage, RecoveryState> {
   let cursor: string | undefined;
-  let content = "";
+  const pages: Record<string, unknown>[] = [];
   for (;;) {
     const response = yield* protocol.call("read_review_state", {
       ...(paths === undefined ? {} : { paths }),
@@ -81,8 +94,10 @@ async function* recoveryState(
       Buffer.byteLength(JSON.stringify(response)) <= agentInternals.MODEL_TOOL_RESULT_BYTES,
     );
     const page = protocolDocument(response);
-    content += String(page.content);
-    if (page.done === true) return JSON.parse(content) as RecoveryState;
+    assert.ok(Array.isArray(page.records));
+    assert.equal(page.content, undefined);
+    pages.push(page);
+    if (page.done === true) return normalizeState(pages);
     cursor = String(page.nextCursor);
   }
 }
@@ -123,31 +138,28 @@ function recoverySubmission(evidenceRef: string): Record<string, unknown> {
         fix: "Handle the error.",
         path: "review.txt",
         line: 1,
+        evidenceRefs: [evidenceRef],
+        countercheck: "Checked the caller for handling.",
+        counterevidenceRefs: [],
       },
     ],
-    assessment: {
-      coverage: [
-        {
-          paths: ["review.txt"],
-          disposition: "reviewed",
-          rationale: "Inspected the changed caller.",
-          evidenceRefs: [evidenceRef],
-        },
-      ],
-      candidates: [
-        {
-          paths: ["review.txt"],
-          trigger: "The operation returns an error.",
-          impact: "The caller reports success.",
-          evidenceRefs: [evidenceRef],
-          countercheck: "Checked the caller for handling.",
-          counterevidenceRefs: [],
-          verdict: "supported",
-          findingIndex: 0,
-        },
-      ],
-    },
+    limitations: [],
   };
+}
+
+async function recoveryRepository(t: TestContext) {
+  const repository = await makeRepository(t, async (root) => {
+    await writeFile(join(root, "review.txt"), "changed line\n");
+    await writeFile(join(root, "unread.txt"), "unseen change\n");
+  });
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  return { ...repository, diff };
 }
 
 test("recovers completed query references after compaction without rereading source", async (t) => {
@@ -249,7 +261,7 @@ test("state pages preserve a snapshot and expose rejection overflow without issu
     const rejected = yield* protocol.call("submit_review", {
       summary: "",
       findings: [],
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
     });
     assert.equal(rejected.isError, true);
     const response = protocolDocument(rejected);
@@ -259,15 +271,15 @@ test("state pages preserve a snapshot and expose rejection overflow without issu
       (yield* protocol.call("read_review_state", { cursor, paths: ["src/consumer-1.ts"] })).isError,
       true,
     );
-    let content = String(first.content);
+    const pages = [first];
     let next = cursor;
     for (;;) {
       const page = protocolDocument(yield* protocol.call("read_review_state", { cursor: next }));
-      content += String(page.content);
+      pages.push(page);
       if (page.done === true) break;
       next = String(page.nextCursor);
     }
-    const original = JSON.parse(content) as RecoveryState;
+    const original = normalizeState(pages);
     const current = yield* recoveryState(protocol);
     assert.equal(original.submissionAttempts, 0);
     assert.equal(original.gaps.length, 0);
@@ -301,7 +313,7 @@ test("counts SDK schema rejections by identity and ends after five corrections w
     for (let index = 0; index < 6; index += 1) {
       const rejected = yield* protocol.call(
         "submit_review",
-        { summary: "missing assessment", findings: [] },
+        { summary: "missing limitations", findings: [] },
         false,
       );
       assert.equal(rejected.isError, true);
@@ -342,10 +354,11 @@ for (const replacement of [
   "invalid-anchor",
 ] as const) {
   test(`max-turn finalization retains only valid current findings: ${replacement}`, async (t) => {
+    const repository = await recoveryRepository(t);
     const files = [recoveryFile, { ...recoveryFile, path: "unread.txt", status: "added" }];
     const query = reviewProtocolQuery(async function* (protocol) {
       yield* protocolBriefing(protocol);
-      yield* protocol.call("read_pr_diff", {});
+      yield* protocol.call("read_pr_diff", { paths: ["review.txt"] });
       const state = yield* recoveryState(protocol);
       const evidence = state.evidence.find((reference) => reference.kind === "repository_diff");
       assert.ok(evidence);
@@ -356,7 +369,7 @@ for (const replacement of [
           replacement === "malformed"
             ? { summary: "new invalid payload" }
             : replacement === "withdrawn"
-              ? { ...submission, findings: [], assessment: { coverage: [], candidates: [] } }
+              ? { ...submission, findings: [], limitations: [] }
               : replacement === "unsupported"
                 ? recoverySubmission("ev-99999")
                 : {
@@ -369,6 +382,9 @@ for (const replacement of [
                         fix: "Fix",
                         path: "review.txt",
                         line: 8,
+                        evidenceRefs: [evidence.id],
+                        countercheck: "Checked the caller for handling.",
+                        counterevidenceRefs: [],
                       },
                     ],
                   };
@@ -380,21 +396,18 @@ for (const replacement of [
     const result = await runReviewGoal(
       "PRIVATE GOAL",
       0,
-      goalContext,
+      repository.context,
       files,
       emptyConversation,
       config,
-      await makeReviewDiff(t),
-      "/repo",
+      repository.diff,
+      repository.root,
       query,
     );
     assert.equal(result.status, replacement === "unchanged" ? "incomplete" : "failed");
     assert.equal(result.submission?.findings.length ?? 0, replacement === "unchanged" ? 1 : 0);
     if (replacement === "unchanged") {
-      assert.deepEqual(
-        result.submission?.assessment.coverage.map((entry) => entry.disposition),
-        ["reviewed", "incomplete"],
-      );
+      assert.deepEqual(result.inspection?.missingPaths, ["unread.txt"]);
       const review = aggregateReview(goalContext, config, files, [result]);
       assert.equal(review.event, "COMMENT");
       assert.equal(review.partial, true);
@@ -422,7 +435,7 @@ test("an empty terminal result does not charge a rejected submission twice", asy
       yield* protocol.call("submit_review", {
         summary: "",
         findings: [],
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
       });
       for (let index = 0; index < 6; index += 1) {
         yield protocolResult();
@@ -437,12 +450,13 @@ test("an empty terminal result does not charge a rejected submission twice", asy
   assert.equal(followups, 5);
   assert.equal(result.diagnostics?.submissionAttempts, 1);
   assert.equal(result.diagnostics?.repairAttempts, 5);
-  assert.equal(result.diagnostics?.rejectionCounts.coverage, 1);
+  assert.equal(result.diagnostics?.rejectionCounts.inspection, 1);
   assert.equal(result.diagnostics?.rejectionCounts.empty_turn, 5);
 });
 
 for (const termination of ["exhausted", "provider", "mcp"] as const) {
   test(`preserves safe current findings and failed status when appropriate: ${termination}`, async (t) => {
+    const repository = await recoveryRepository(t);
     const config = reviewConfig({
       interactWithPullRequest: true,
       ...(termination === "mcp"
@@ -452,7 +466,7 @@ for (const termination of ["exhausted", "provider", "mcp"] as const) {
     const query = reviewProtocolQuery(
       async function* (protocol) {
         yield* protocolBriefing(protocol);
-        yield* protocol.call("read_pr_diff", {});
+        yield* protocol.call("read_pr_diff", { paths: ["review.txt"] });
         const state = yield* recoveryState(protocol);
         const evidence = state.evidence.find((reference) => reference.kind === "repository_diff");
         assert.ok(evidence);
@@ -472,12 +486,12 @@ for (const termination of ["exhausted", "provider", "mcp"] as const) {
     const result = await runReviewGoal(
       "check",
       0,
-      goalContext,
+      repository.context,
       [recoveryFile, { ...recoveryFile, path: "unread.txt" }],
       emptyConversation,
       config,
-      await makeReviewDiff(t),
-      "/repo",
+      repository.diff,
+      repository.root,
       query,
     );
     assert.equal(result.status, termination === "exhausted" ? "incomplete" : "failed");
@@ -504,17 +518,7 @@ test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
       const accepted = yield* protocol.call("submit_review", {
         summary: "No complete investigation",
         findings: [],
-        assessment: {
-          coverage: [
-            {
-              paths: ["review.txt"],
-              disposition: "incomplete",
-              rationale: "No repository evidence was read.",
-              evidenceRefs: [],
-            },
-          ],
-          candidates: [],
-        },
+        limitations: [{ paths: ["review.txt"], reason: "No repository evidence was read." }],
       });
       assert.equal(accepted.isError, undefined);
       yield protocolResult();
@@ -526,43 +530,23 @@ test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
   assert.equal(result.tokenUsage?.complete, true);
 });
 
-test("retains valid findings independently of malformed peers and preserves valid coverage", () => {
+test("retains valid current findings independently of malformed peers", () => {
   const evidence = new Map<string, ReviewEvidenceReference>([
     ["ev-1", { id: "ev-1", kind: "repository_diff", status: "complete", changedPaths: true }],
   ]);
   const raw = recoverySubmission("ev-1");
-  const assessment = raw.assessment as { coverage: unknown[]; candidates: unknown[] };
-  const findings = raw.findings as unknown[];
-  const input = {
-    ...raw,
-    findings: [...findings, { title: "invalid peer" }],
-    assessment: {
-      coverage: [...assessment.coverage, { paths: ["unread.txt"], disposition: "invalid" }],
-      candidates: [...assessment.candidates, { verdict: "supported", findingIndex: 1 }],
-    },
-  };
+  const input = { ...raw, findings: [...(raw.findings as unknown[]), { title: "invalid peer" }] };
   const files = [recoveryFile, { ...recoveryFile, path: "unread.txt" }];
   const retained = retainValidReviewFindings(input, files, evidence, () => true);
   assert.equal(retained?.findings.length, 1);
-  assert.equal(retained?.assessment.coverage[0]?.disposition, "reviewed");
-  assert.equal(retained?.assessment.coverage[1]?.disposition, "incomplete");
-  assert.equal(
-    retainValidReviewFindings(input, files, evidence, () => false),
-    undefined,
+  assert.equal(retained?.limitations.length, 1);
+  assert.deepEqual(retained?.limitations[0]?.paths, []);
+  assert.doesNotMatch(
+    JSON.stringify(retained?.findings),
+    /evidenceRefs|countercheck|counterevidenceRefs|ev-/u,
   );
   assert.equal(
-    retainValidReviewFindings(
-      {
-        ...input,
-        assessment: {
-          ...input.assessment,
-          candidates: [...assessment.candidates, ...assessment.candidates],
-        },
-      },
-      files,
-      evidence,
-      () => true,
-    ),
+    retainValidReviewFindings(input, files, evidence, () => false),
     undefined,
   );
   assert.equal(
@@ -612,9 +596,17 @@ test("only completed originating queries make earlier references eligible", () =
     call("read_pr_diff", { paths: [changedFile.path], cursor: "two" }, page("two", 2, true)),
   ]);
   const issues = () =>
-    findInvalidReviewAssessment(
-      { coverage: [coverage(changedFile.path, [first.id])], candidates: [] },
-      [],
+    reviewFindingGaps(
+      {
+        title: "Defect",
+        severity: "HIGH",
+        body: "Impact",
+        path: changedFile.path,
+        line: 1,
+        evidenceRefs: [first.id],
+        countercheck: "Checked the caller.",
+        counterevidenceRefs: [],
+      },
       [changedFile],
       ledger.issued,
     );
@@ -658,21 +650,45 @@ test("uses returned whole-file bounds with explicit native Read limits", async (
         { file_path: join(root, "file.ts"), ...input },
         {
           type: "text",
-          file: { startLine: 1, numLines: 192, totalLines: 192, content: "line\n".repeat(192) },
+          file: {
+            filePath: join(root, "file.ts"),
+            startLine: 1,
+            numLines: 192,
+            totalLines: 192,
+            content: "line\n".repeat(192),
+          },
         },
       ),
     ]);
     assert.equal(reference?.status, "complete");
   }
   for (const file of [
-    { startLine: 1, numLines: 191, totalLines: 192, content: "partial" },
+    {
+      startLine: 1,
+      numLines: 192,
+      totalLines: 192,
+      content: "line\n".repeat(192),
+      truncatedByTokenCap: true,
+    },
+    {
+      startLine: 1,
+      numLines: 192,
+      totalLines: 192,
+      content: "line\n".repeat(192),
+      filePath: join(root, "wrong.ts"),
+    },
+    { startLine: 2, numLines: 191, totalLines: 192, content: "line\n".repeat(191) },
     { startLine: 1, numLines: 193, totalLines: 192, content: "contradictory" },
     { numLines: 192, totalLines: 192, content: "missing start" },
     { startLine: 1, numLines: 192, totalLines: 192 },
     { startLine: 1, numLines: 192, totalLines: 192, content: "[output truncated]" },
   ]) {
     const [reference] = ledger.observeBatch([
-      call("Read", { file_path: join(root, "file.ts"), limit: 2000 }, { type: "text", file }),
+      call(
+        "Read",
+        { file_path: join(root, "file.ts"), limit: 2000 },
+        { type: "text", file: { filePath: join(root, "file.ts"), ...file } },
+      ),
     ]);
     assert.equal(reference?.status, "partial");
   }
@@ -696,27 +712,10 @@ test("requires the appropriate revision for modified, added, deleted, and rename
         ),
       ]);
       assert.ok(reference);
-      const issues = findInvalidReviewAssessment(
-        {
-          coverage: [
-            coverage(path, [reference.id]),
-            ...files
-              .flatMap((file) => [
-                file.path,
-                ...(file.previousPath === undefined ? [] : [file.previousPath]),
-              ])
-              .filter((value) => value !== path)
-              .map((value) => coverage(value, [], "incomplete")),
-          ],
-          candidates: [],
-        },
-        [],
-        files,
-        ledger.issued,
-      );
+      const inspection = reviewInspection(files, new Map([[reference.id, reference]]));
       assert.equal(
-        issues.length,
-        revision === (path === "old.ts" || path === "deleted.ts" ? "base" : "head") ? 0 : 1,
+        inspection.observedPaths.includes(path),
+        revision === (path === "old.ts" || path === "deleted.ts" ? "base" : "head"),
       );
     }
   }
@@ -747,9 +746,10 @@ test("briefing page replay requires all pages before the initial gate opens", ()
 
 for (const denied of ["withdrawal", "replacement"] as const) {
   test(`a denied buffered ${denied} cannot replace the last allowed candidate`, async (t) => {
+    const repository = await recoveryRepository(t);
     const query = reviewProtocolQuery(async function* (protocol) {
       yield* protocolBriefing(protocol);
-      yield* protocol.call("read_pr_diff", {});
+      yield* protocol.call("read_pr_diff", { paths: ["review.txt"] });
       const state = yield* recoveryState(protocol);
       const evidence = state.evidence.find((reference) => reference.kind === "repository_diff");
       assert.ok(evidence);
@@ -764,7 +764,7 @@ for (const denied of ["withdrawal", "replacement"] as const) {
       replacementFinding.title = "Denied replacement";
       const input =
         denied === "withdrawal"
-          ? { summary: "withdrawn", findings: [], assessment: { coverage: [], candidates: [] } }
+          ? { summary: "withdrawn", findings: [], limitations: [] }
           : replacement;
       const id = "denied-buffered-use";
       yield {
@@ -816,12 +816,12 @@ for (const denied of ["withdrawal", "replacement"] as const) {
     const result = await runReviewGoal(
       "check",
       0,
-      goalContext,
+      repository.context,
       [recoveryFile, { ...recoveryFile, path: "unread.txt" }],
       emptyConversation,
       reviewConfig({ interactWithPullRequest: true }),
-      await makeReviewDiff(t),
-      "/repo",
+      repository.diff,
+      repository.root,
       query,
     );
     assert.equal(result.status, "incomplete");
@@ -830,3 +830,84 @@ for (const denied of ["withdrawal", "replacement"] as const) {
     assert.equal(result.diagnostics?.repairAttempts, 5);
   });
 }
+
+test("completes a large Git manifest through selected diffs and a small no-finding submission", async (t) => {
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      for (let index = 0; index < 251; index += 1)
+        await writeFile(join(root, `consumer-${index}.ts`), `export const value = ${index};\n`);
+      await writeFile(join(root, "empty.ts"), "");
+      await writeFile(join(root, "binary.dat"), Buffer.from([0, 2, 3]));
+      await chmod(join(root, "metadata.sh"), 0o755);
+      await rename(join(root, "old.ts"), join(root, "renamed.ts"));
+      await rm(join(root, "deleted.ts"));
+    },
+    async (root) => {
+      await writeFile(join(root, "binary.dat"), Buffer.from([0, 1, 2]));
+      await writeFile(join(root, "metadata.sh"), "echo ready\n", { mode: 0o644 });
+      await writeFile(join(root, "old.ts"), "export const renamed = true;\n");
+      await writeFile(join(root, "deleted.ts"), "export const removed = true;\n");
+      await writeFile(join(root, "optional.ts"), "unchanged context\n".repeat(4_000));
+    },
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  assert.equal(files.length, 256);
+  assert.equal(files.find((file) => file.path === "renamed.ts")?.previousPath, "old.ts");
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const result = await runReviewGoal(
+    "check consumers",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig({ autoApprove: true }),
+    diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      const small = { summary: "No actionable defects.", findings: [], limitations: [] };
+      assert.ok(JSON.stringify(small).length < 100);
+      assert.equal((yield* protocol.call("submit_review", small)).isError, true);
+      const binary = protocolDocument(
+        yield* protocol.call("read_repository_file", { path: "binary.dat", revision: "head" }),
+      );
+      assert.equal(binary.kind, "binary");
+      const initial = yield* recoveryState(protocol);
+      assert.equal(initial.inspection.observed, 0);
+      for (const next of initial.calls.filter((call) => call.tool === "read_pr_diff")) {
+        let args = next.arguments;
+        for (;;) {
+          const page = protocolDocument(yield* protocol.call(next.tool, args));
+          if (page.done === true) break;
+          args = { ...next.arguments, cursor: page.nextCursor };
+        }
+      }
+      const observed = yield* recoveryState(protocol);
+      assert.equal(observed.inspection.missing, 0);
+      const optional = protocolDocument(
+        yield* protocol.call("read_repository_file", { path: "optional.ts", revision: "head" }),
+      );
+      assert.equal(optional.done, false);
+      assert.equal((yield* protocol.call("submit_review", small)).isError, undefined);
+      yield protocolResult();
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.inspection?.missingPaths, []);
+  assert.equal(result.diagnostics?.submissionAttempts, 2);
+  assert.equal(
+    aggregateReview(repository.context, reviewConfig({ autoApprove: true }), files, [result]).event,
+    "APPROVE",
+  );
+});

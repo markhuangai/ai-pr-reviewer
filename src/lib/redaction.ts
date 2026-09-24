@@ -27,6 +27,14 @@ export function redactGoalResults(
     ...goal,
     prompt: redact(goal.prompt, secrets),
     ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
+    ...(goal.inspection === undefined
+      ? {}
+      : {
+          inspection: {
+            observedPaths: goal.inspection.observedPaths.map((path) => redact(path, secrets)),
+            missingPaths: goal.inspection.missingPaths.map((path) => redact(path, secrets)),
+          },
+        }),
     ...(goal.diagnostics === undefined
       ? {}
       : {
@@ -68,20 +76,10 @@ export function redactGoalResults(
                 ? {}
                 : { agentPrompt: redact(finding.agentPrompt, secrets) }),
             })),
-            assessment: {
-              coverage: goal.submission.assessment.coverage.map((entry) => ({
-                ...entry,
-                paths: entry.paths.map((path) => redact(path, secrets)),
-                rationale: redact(entry.rationale, secrets),
-              })),
-              candidates: goal.submission.assessment.candidates.map((candidate) => ({
-                ...candidate,
-                paths: candidate.paths.map((path) => redact(path, secrets)),
-                trigger: redact(candidate.trigger, secrets),
-                impact: redact(candidate.impact, secrets),
-                countercheck: redact(candidate.countercheck, secrets),
-              })),
-            },
+            limitations: goal.submission.limitations.map((limitation) => ({
+              paths: limitation.paths.map((path) => redact(path, secrets)),
+              reason: redact(limitation.reason, secrets),
+            })),
           },
         }),
   }));

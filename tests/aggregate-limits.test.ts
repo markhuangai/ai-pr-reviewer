@@ -29,10 +29,11 @@ test("keeps verified findings at separate locations distinct", () => {
     ],
     [
       {
+        inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
         prompt: "locations",
         status: "completed",
         submission: {
-          assessment: { coverage: [], candidates: [] },
+          limitations: [],
           summary: "two locations",
           findings: [
             {
@@ -60,10 +61,11 @@ test("keeps verified findings at separate locations distinct", () => {
 test("keeps distinct non-Latin findings separate", () => {
   const review = aggregateReview(context, config, files, [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "中文",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "中文",
         findings: [
           { title: "安全问题", severity: "HIGH", body: "这里存在安全缺陷。" },
@@ -78,10 +80,11 @@ test("keeps distinct non-Latin findings separate", () => {
 test("preserves distinct claimed locations for unverified findings", () => {
   const review = aggregateReview(context, config, files, [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "locations",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "locations",
         findings: [
           {
@@ -109,10 +112,11 @@ test("preserves distinct claimed locations for unverified findings", () => {
 
 test("bounds an oversized merged inline comment", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 10 }, (_, index) => ({
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
     prompt: `goal-${index}`,
     status: "completed",
     submission: {
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
       summary: "large",
       findings: [
         {
@@ -143,10 +147,11 @@ test("publishes only the top 25 verified findings and retains overflow in the ru
   }));
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "overflow",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "overflow",
         findings: changedFiles.map((file, index) => ({
           title: `Finding ${String(index).padStart(2, "0")}`,
@@ -177,10 +182,11 @@ test("publishes only the top 25 verified findings and retains overflow in the ru
 
 test("bounds merged evidence while retaining omitted findings in the run summary", () => {
   const duplicateGoals: readonly GoalResult[] = Array.from({ length: 50 }, (_, index) => ({
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
     prompt: `duplicate-${index}`,
     status: "completed",
     submission: {
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
       summary: "duplicate",
       findings: [
         {
@@ -209,10 +215,11 @@ test("bounds merged evidence while retaining omitted findings in the run summary
     [
       ...duplicateGoals,
       {
+        inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
         prompt: "later",
         status: "completed",
         submission: {
-          assessment: { coverage: [], candidates: [] },
+          limitations: [],
           summary: "later",
           findings: [
             {
@@ -235,10 +242,11 @@ test("bounds merged evidence while retaining omitted findings in the run summary
 test("omits unverified findings from the review body while retaining them in the run summary", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "PRIVATE OVERSIZED GOAL ".repeat(30_000),
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "PRIVATE OVERSIZED SUMMARY",
         findings: [
           {
@@ -267,10 +275,11 @@ test("omits unverified findings from the review body while retaining them in the
 test("writes every published and omitted finding to a complete run summary", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "PRIVATE REVIEW GOAL",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "PRIVATE MODEL SUMMARY",
         findings: [
           {
@@ -304,15 +313,21 @@ test("writes every published and omitted finding to a complete run summary", () 
 test("labels partial and all-failed run summaries", () => {
   const partialGoals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "completed",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
     },
-    { prompt: "failed", status: "failed", error: "PRIVATE FAILURE" },
+    {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+      prompt: "failed",
+      status: "failed",
+      error: "PRIVATE FAILURE",
+    },
   ];
   const partialReview = aggregateReview(context, config, files, partialGoals);
   const partialSummary = buildRunSummary(context, partialReview, partialGoals);
@@ -322,8 +337,18 @@ test("labels partial and all-failed run summaries", () => {
   assert.doesNotMatch(partialSummary, /PRIVATE FAILURE/u);
 
   const failedGoals: readonly GoalResult[] = [
-    { prompt: "failed-one", status: "failed", error: "PRIVATE FAILURE ONE" },
-    { prompt: "failed-two", status: "failed", error: "PRIVATE FAILURE TWO" },
+    {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+      prompt: "failed-one",
+      status: "failed",
+      error: "PRIVATE FAILURE ONE",
+    },
+    {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+      prompt: "failed-two",
+      status: "failed",
+      error: "PRIVATE FAILURE TWO",
+    },
   ];
   const failedReview = aggregateReview(context, config, files, failedGoals);
   const failedSummary = buildRunSummary(context, failedReview, failedGoals);
@@ -337,6 +362,7 @@ test("labels partial and all-failed run summaries", () => {
 test("includes failed-goal snapshots and marks crashed accounting incomplete", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "provider failure",
       status: "failed",
       error: "provider failed",
@@ -354,6 +380,7 @@ test("includes failed-goal snapshots and marks crashed accounting incomplete", (
       },
     },
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "reader crash",
       status: "failed",
       error: "reader crashed",
@@ -388,10 +415,11 @@ test("includes failed-goal snapshots and marks crashed accounting incomplete", (
 test("keeps the collapsed token block within review and run-summary limits", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "many models",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "clean",
         findings: [],
       },
@@ -422,10 +450,11 @@ test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 100 }, (_, index) => {
     const identifier = String(index).padStart(3, "0");
     return {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: `goal-${identifier}`,
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "large",
         findings: [
           {
@@ -465,10 +494,11 @@ test("caps the finding index when it alone exceeds the run-summary byte limit", 
   }));
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "large index",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "large index",
         findings: largeFiles.map((file, index) => {
           const identifier = String(index).padStart(4, "0");
@@ -498,10 +528,11 @@ test("caps the finding index when it alone exceeds the run-summary byte limit", 
 
 test("renders the maximum supported finding count with linear byte accounting", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 50 }, (_, goalIndex) => ({
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
     prompt: `goal-${goalIndex}`,
     status: "completed",
     submission: {
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
       summary: "many findings",
       findings: Array.from({ length: 100 }, (_, findingIndex) => {
         const identifier = String(goalIndex * 100 + findingIndex).padStart(4, "0");
@@ -524,10 +555,11 @@ test("renders the maximum supported finding count with linear byte accounting", 
 
 test("retains every non-inline finding in the run summary", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 9 }, (_, index) => ({
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
     prompt: `goal-${index}`,
     status: "completed",
     submission: {
-      assessment: { coverage: [], candidates: [] },
+      limitations: [],
       summary: "large body finding",
       findings: [
         {
@@ -550,10 +582,11 @@ test("retains every non-inline finding in the run summary", () => {
 test("partial goals force a comment and remain actionable", () => {
   const goals: readonly GoalResult[] = [
     {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
       prompt: "PRIVATE COMPLETED GOAL",
       status: "completed",
       submission: {
-        assessment: { coverage: [], candidates: [] },
+        limitations: [],
         summary: "PRIVATE PARTIAL SUMMARY",
         findings: [
           {
@@ -564,7 +597,12 @@ test("partial goals force a comment and remain actionable", () => {
         ],
       },
     },
-    { prompt: "PRIVATE FAILED GOAL", status: "failed", error: "PRIVATE FAILURE ERROR" },
+    {
+      inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+      prompt: "PRIVATE FAILED GOAL",
+      status: "failed",
+      error: "PRIVATE FAILURE ERROR",
+    },
   ];
   const review = aggregateReview(context, config, files, goals);
   const body = buildReviewBody(review, goals);
@@ -597,10 +635,11 @@ test("binary changed-file metadata does not block an otherwise qualified approva
     ],
     [
       {
+        inspection: { observedPaths: ["assets/image.png"], missingPaths: [] },
         prompt: "correctness",
         status: "completed",
         submission: {
-          assessment: { coverage: [], candidates: [] },
+          limitations: [],
           summary: "No text findings.",
           findings: [],
         },

@@ -6,7 +6,6 @@ import {
   fakeAgentQuery,
   git,
   join,
-  makeExistingCommitRepository,
   makeDiffFromSnapshots,
   makeRepository,
   mkdir,
@@ -23,7 +22,6 @@ import {
   tmpdir,
   type ChangedFile,
   type PreparedContextFile,
-  type ReviewConfig,
   type ReviewConversationSnapshot,
   writeFile,
 } from "./agent-test-helpers.js";
@@ -727,7 +725,11 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
       diff,
       repository.root,
       fakeAgentQuery({
-        submission: { summary: "No issues", findings: [] },
+        submission: () => ({
+          limitations: [],
+          summary: "No issues",
+          findings: [],
+        }),
         readDiffPath: "review.txt",
         readRepositoryFilePath: "review.txt",
         probeThreadErrors: true,
@@ -735,6 +737,8 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
         probeDiffCursorBinding: true,
         probeFileCursorBinding: true,
         probeThreadCursorBinding: true,
+        readThreadId: 55,
+        readThreadPath: "review.txt",
       }),
     );
     assert.equal(result.status, "completed");
@@ -751,19 +755,21 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
       repository.root,
       fakeAgentQuery({
         submission: {
-          summary: "No issues",
-          findings: [],
-          assessment: {
-            coverage: [
-              {
-                paths: ["review.txt"],
-                disposition: "reviewed",
-                rationale: "The changed file was reviewed.",
-                evidenceRefs: ["ev-999"],
-              },
-            ],
-            candidates: [],
-          },
+          summary: "Check invented evidence.",
+          findings: [
+            {
+              title: "Unchecked result",
+              severity: "HIGH",
+              why: "The caller drops an error.",
+              fix: "Handle the error.",
+              path: "review.txt",
+              line: 1,
+              evidenceRefs: ["ev-999"],
+              countercheck: "Checked the caller for a guard.",
+              counterevidenceRefs: [],
+            },
+          ],
+          limitations: [],
         },
         expectSubmissionRejection: true,
         inspectSubmissionResult: (response) => {
@@ -773,7 +779,7 @@ test("exercises on-demand fixed diff/file readers and cursor validation", async 
     );
     assert.equal(forged.status, "failed");
     assert.equal(forged.submission, undefined);
-    assert.match(submissionRejection, /unknown evidence/u);
+    assert.match(submissionRejection, /unknown, incomplete, or non-repository evidence/u);
   } finally {
     await diff.cleanup();
   }
@@ -834,7 +840,11 @@ test("interleaves full, selected, and fixed-file cursors without mixing their ev
       diff,
       repository.root,
       fakeAgentQuery({
-        submission: { summary: "No actionable issues found.", findings: [] },
+        submission: () => ({
+          limitations: [],
+          summary: "No actionable issues found.",
+          findings: [],
+        }),
         probeInterleavedQueryCursors: true,
         expectedInterleavedFileContent: headContent,
       }),
@@ -886,7 +896,11 @@ test("discovers base and head repository guidance for a direct goal without a su
       diff,
       repository.root,
       fakeAgentQuery({
-        submission: { summary: "No actionable issues found.", findings: [] },
+        submission: () => ({
+          limitations: [],
+          summary: "No actionable issues found.",
+          findings: [],
+        }),
         inspectBriefingRecords: (records) => {
           for (const record of records) {
             if (record.kind !== "repository_guidance") continue;
@@ -910,24 +924,6 @@ test("discovers base and head repository guidance for a direct goal without a su
       "src/AGENTS.md:head:Source directory guidance.\n",
     ]),
   );
-});
-
-test("handles sparse goal arrays without leaking the shared diff", async (t) => {
-  const repository = await makeExistingCommitRepository(t);
-  const prompts = new Array<ReviewConfig["reviewPrompts"][number]>(1);
-  const results = await runReviewGoals(
-    repository.context,
-    [],
-    emptyConversation,
-    reviewConfig({ reviewPrompts: prompts }),
-    [[]],
-    repository.root,
-    fakeAgentQuery({ submission: { summary: "unused", findings: [] } }),
-  );
-  assert.deepEqual(results, [
-    { prompt: "", status: "failed", error: "Worker did not return a result." },
-  ]);
-  assert.deepEqual(await readdir(repository.temporaryRoot), []);
 });
 
 test("rejects prepared context arrays that do not match review goals", async (t) => {

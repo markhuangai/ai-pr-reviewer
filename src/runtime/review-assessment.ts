@@ -7,7 +7,8 @@ import type {
   ChangedFile,
   GoalResult,
   GoalSubmission,
-  ReviewAssessment,
+  ReviewFindingEvidence,
+  ReviewInspection,
   ReviewEvidenceBounds,
   ReviewEvidenceReference,
   ReviewFinding,
@@ -16,11 +17,9 @@ import type {
 import { isGitMetadataPath, isWithinRepository } from "./agent-review-tools.js";
 import { withTokenUsage, type AcceptedSubmissionMcpStatus } from "./agent-logging.js";
 
-const MAX_ASSESSMENT_PATHS_PER_ENTRY = 100;
-const MAX_ASSESSMENT_REFERENCES = 200;
 const MAX_EVIDENCE_CURSORS = 32;
-const evidenceRefSchema = z.string().regex(/^ev-[1-9][0-9]{0,8}$/u);
-const pathSchema = z
+export const evidenceRefSchema = z.string().regex(/^ev-[1-9][0-9]{0,8}$/u);
+export const pathSchema = z
   .string()
   .min(1)
   .max(4_096)
@@ -39,30 +38,18 @@ export function acceptedSubmissionResult(
         ? undefined
         : `Configured MCP server failure: ${status.failures}`
       : `Configured MCP server status check failed: ${status.error}`;
-  const incompletePaths = [
-    ...new Set(
-      submission.assessment.coverage
-        .filter((entry) => entry.disposition === "incomplete")
-        .flatMap((entry) => entry.paths),
-    ),
-  ];
   const error =
     configuredMcpError ??
-    (incompletePaths.length === 0
+    (submission.limitations.length === 0
       ? undefined
-      : `Required review investigation is incomplete for: ${incompletePaths
-          .slice(0, 20)
-          .map((path) => JSON.stringify(path))
-          .join(
-            ", ",
-          )}${incompletePaths.length > 20 ? ` and ${incompletePaths.length - 20} more path(s)` : ""}.`);
+      : `Required review investigation remains incomplete for: ${[...new Set(submission.limitations.flatMap((limit) => limit.paths))].slice(0, 20).join(", ") || "goal-wide requirements"}.`);
   return withTokenUsage(
     {
       prompt: goal,
       status:
         configuredMcpError !== undefined
           ? "failed"
-          : incompletePaths.length > 0
+          : submission.limitations.length > 0
             ? "incomplete"
             : "completed",
       submission,
@@ -73,48 +60,18 @@ export function acceptedSubmissionResult(
   );
 }
 
-const reviewCoverageSchema = z
+export const reviewLimitationSchema = z
   .object({
-    paths: z.array(pathSchema).min(1).max(MAX_ASSESSMENT_PATHS_PER_ENTRY),
-    disposition: z.enum(["reviewed", "not_applicable", "incomplete"]),
-    rationale: z.string().trim().min(1).max(1_000),
-    evidenceRefs: z.array(evidenceRefSchema).max(MAX_ASSESSMENT_REFERENCES),
+    paths: z.array(pathSchema).max(100),
+    reason: z.string().trim().min(1).max(1_000),
   })
   .strict();
 
-const reviewCandidateSchema = z
-  .object({
-    paths: z.array(pathSchema).min(1).max(MAX_ASSESSMENT_PATHS_PER_ENTRY),
-    trigger: z.string().trim().min(1).max(1_000),
-    impact: z.string().trim().min(1).max(1_000),
-    evidenceRefs: z.array(evidenceRefSchema).max(MAX_ASSESSMENT_REFERENCES),
-    countercheck: z.string().trim().min(1).max(1_000),
-    counterevidenceRefs: z.array(evidenceRefSchema).max(MAX_ASSESSMENT_REFERENCES),
-    verdict: z.enum(["supported", "disproved", "unresolved"]),
-    findingIndex: z
-      .number()
-      .int()
-      .min(0)
-      .max(99)
-      .optional()
-      .describe("Zero-based index of the finding supported by this candidate."),
-  })
-  .strict();
-
-export const reviewAssessmentSchema = z
-  .object({
-    coverage: z
-      .array(reviewCoverageSchema)
-      .max(1_000)
-      .describe(
-        "Classify every changed path exactly once; reviewed and not_applicable require completed repository evidence.",
-      ),
-    candidates: z
-      .array(reviewCandidateSchema)
-      .max(100)
-      .describe("Assess material defect hypotheses and link supported ones to findings."),
-  })
-  .strict();
+export const findingEvidenceShape = {
+  evidenceRefs: z.array(evidenceRefSchema).min(1).max(200),
+  countercheck: z.string().trim().min(1).max(1_000),
+  counterevidenceRefs: z.array(evidenceRefSchema).max(200),
+};
 
 export const reviewEvidenceResultSchema = z
   .object({
@@ -152,6 +109,9 @@ export const reviewEvidenceResultSchema = z
         headLimit: z.number().int().nonnegative().optional(),
         pages: z.string().min(1).max(100).optional(),
         truncated: z.boolean().optional(),
+        startLine: z.number().int().positive().optional(),
+        numLines: z.number().int().nonnegative().optional(),
+        totalLines: z.number().int().nonnegative().optional(),
       })
       .strict()
       .optional(),
@@ -242,7 +202,7 @@ function expiredCursorFailure(result: Readonly<Record<string, unknown>> | undefi
 }
 
 function nonnegativeInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function hasTruncationMarker(value: unknown): boolean {
@@ -259,76 +219,76 @@ function hasTruncationMarker(value: unknown): boolean {
 }
 
 function nativeQueryAssessment(
+  cwd: string,
   name: string,
   inputValue: unknown,
   result: Readonly<Record<string, unknown>> | undefined,
 ): { readonly partial: boolean; readonly bounds?: ReviewEvidenceBounds } {
   if (!isRecord(inputValue) || (name !== "Read" && name !== "Grep")) return { partial: false };
+  if (name === "Read") {
+    const file = result !== undefined && isRecord(result.file) ? result.file : undefined;
+    const startLine = nonnegativeInteger(file?.startLine);
+    const numLines = nonnegativeInteger(file?.numLines);
+    const totalLines = nonnegativeInteger(file?.totalLines);
+    const offset = inputValue.offset === undefined ? 1 : nonnegativeInteger(inputValue.offset);
+    const limit = inputValue.limit === undefined ? undefined : nonnegativeInteger(inputValue.limit);
+    const truncated = hasTruncationMarker(result);
+    const verified =
+      file !== undefined &&
+      result?.type === "text" &&
+      typeof file.content === "string" &&
+      typeof file.filePath === "string" &&
+      typeof inputValue.file_path === "string" &&
+      resolve(cwd, file.filePath) === resolve(cwd, inputValue.file_path) &&
+      startLine !== undefined &&
+      startLine >= 1 &&
+      startLine === offset &&
+      numLines !== undefined &&
+      totalLines !== undefined &&
+      (numLines === 0
+        ? totalLines === 0 && startLine === 1
+        : startLine + numLines - 1 <= totalLines) &&
+      (inputValue.limit === undefined || (limit !== undefined && limit > 0 && numLines <= limit)) &&
+      inputValue.pages === undefined;
+    return {
+      partial: !verified || truncated,
+      bounds: {
+        ...(offset === undefined ? {} : { offset }),
+        ...(limit === undefined ? {} : { limit }),
+        ...(verified ? { startLine, numLines, totalLines } : {}),
+        ...(truncated ? { truncated: true } : {}),
+      },
+    };
+  }
 
-  const inputOffset = nonnegativeInteger(inputValue.offset);
-  const inputLimit = nonnegativeInteger(name === "Read" ? inputValue.limit : inputValue.head_limit);
-  const file = result !== undefined && isRecord(result.file) ? result.file : undefined;
-  const startLine = nonnegativeInteger(file?.startLine);
-  const numLines = nonnegativeInteger(file?.numLines);
-  const totalLines = nonnegativeInteger(file?.totalLines);
-  const appliedOffset = nonnegativeInteger(result?.appliedOffset);
-  const appliedLimit = nonnegativeInteger(result?.appliedLimit);
-  const pages = typeof inputValue.pages === "string" ? inputValue.pages : undefined;
-  const recordedOffset =
-    inputOffset ??
-    (name === "Read" && startLine !== undefined ? Math.max(0, startLine - 1) : appliedOffset);
-  const recordedLimit = inputLimit ?? (name === "Read" ? numLines : appliedLimit);
-  const count =
-    result?.mode === "content"
-      ? nonnegativeInteger(result.numLines)
-      : nonnegativeInteger(result?.numFiles);
-  const total =
-    result?.mode === "content"
-      ? nonnegativeInteger(result.totalLines)
-      : nonnegativeInteger(result?.totalFiles);
-  const hasTruncation =
+  const offset = nonnegativeInteger(inputValue.offset) ?? nonnegativeInteger(result?.appliedOffset);
+  const limit =
+    nonnegativeInteger(inputValue.head_limit) ?? nonnegativeInteger(result?.appliedLimit);
+  const count = nonnegativeInteger(result?.mode === "content" ? result.numLines : result?.numFiles);
+  const total = nonnegativeInteger(
+    result?.mode === "content" ? result.totalLines : result?.totalFiles,
+  );
+  const truncated =
     hasTruncationMarker(result) ||
-    (name === "Read" &&
-      ((startLine !== undefined && startLine > 1) ||
-        (numLines !== undefined && totalLines !== undefined && numLines < totalLines))) ||
-    (name === "Grep" &&
-      ((appliedOffset !== undefined && appliedOffset > 0) ||
-        (total !== undefined && count !== undefined && total > count) ||
-        (appliedLimit !== undefined &&
-          appliedLimit > 0 &&
-          count !== undefined &&
-          count >= appliedLimit &&
-          (total === undefined || total > count))));
-  const bounded =
-    name === "Read"
-      ? pages !== undefined
-      : (inputOffset !== undefined && inputOffset > 0) ||
-        (inputLimit !== undefined && inputLimit > 0);
-  const hostCannotVerify =
-    name === "Read"
-      ? file === undefined ||
-        startLine === undefined ||
-        startLine !== 1 ||
-        numLines === undefined ||
-        totalLines === undefined ||
-        numLines !== totalLines ||
-        typeof file.content !== "string" ||
-        (inputOffset !== undefined && inputOffset > 1) ||
-        (inputLimit !== undefined && inputLimit > 0 && numLines > inputLimit)
-      : recordedOffset === undefined || recordedLimit === undefined || count === undefined;
-  const bounds: ReviewEvidenceBounds = {
-    ...(recordedOffset === undefined ? {} : { offset: recordedOffset }),
-    ...(recordedLimit === undefined
-      ? {}
-      : name === "Read"
-        ? { limit: recordedLimit }
-        : { headLimit: recordedLimit }),
-    ...(pages === undefined ? {} : { pages }),
-    ...(hasTruncation ? { truncated: true } : {}),
-  };
+    (offset !== undefined && offset > 0) ||
+    (total !== undefined && count !== undefined && total > count) ||
+    (limit !== undefined &&
+      limit > 0 &&
+      count !== undefined &&
+      count >= limit &&
+      total === undefined);
   return {
-    partial: bounded || hasTruncation || hostCannotVerify,
-    ...(Object.keys(bounds).length === 0 ? {} : { bounds }),
+    partial:
+      truncated ||
+      offset === undefined ||
+      limit === undefined ||
+      count === undefined ||
+      (typeof inputValue.head_limit === "number" && inputValue.head_limit > 0),
+    bounds: {
+      ...(offset === undefined ? {} : { offset }),
+      ...(limit === undefined ? {} : { headLimit: limit }),
+      ...(truncated ? { truncated: true } : {}),
+    },
   };
 }
 
@@ -392,190 +352,79 @@ function sameEvidenceScope(left: ReviewEvidenceReference, right: ReviewEvidenceR
 }
 
 export interface ReviewValidationGap {
-  readonly category: "coverage" | "candidate" | "schema" | "discussion" | "location" | "briefing";
+  readonly category: "inspection" | "evidence" | "schema" | "discussion" | "location" | "briefing";
   readonly message: string;
   readonly paths: readonly string[];
 }
 
-export function reviewAssessmentGaps(
-  assessment: ReviewAssessment,
-  findings: readonly ReviewFinding[],
+export function reviewFindingGaps(
+  finding: ReviewFinding & ReviewFindingEvidence,
   changedFiles: readonly ChangedFile[],
   references: ReadonlyMap<string, ReviewEvidenceReference>,
 ): readonly ReviewValidationGap[] {
-  return [
-    ...reviewCoverageGaps(assessment.coverage, changedFiles, references),
-    ...reviewCandidateGaps(assessment.candidates, findings, changedFiles, references),
+  const paths = finding.path === undefined ? [] : [finding.path];
+  const gap = (message: string): ReviewValidationGap[] => [
+    { category: "evidence", message, paths },
   ];
-}
-
-export function findInvalidReviewAssessment(
-  assessment: ReviewAssessment,
-  findings: readonly ReviewFinding[],
-  changedFiles: readonly ChangedFile[],
-  references: ReadonlyMap<string, ReviewEvidenceReference>,
-): readonly string[] {
-  return reviewAssessmentGaps(assessment, findings, changedFiles, references).map(
-    (gap) => gap.message,
-  );
-}
-
-export function reviewCoverageGaps(
-  coverageEntries: ReviewAssessment["coverage"],
-  changedFiles: readonly ChangedFile[],
-  references: ReadonlyMap<string, ReviewEvidenceReference>,
-): readonly ReviewValidationGap[] {
-  const validPaths = new Set(
-    changedFiles.flatMap((file) => [
-      file.path,
-      ...(file.previousPath === undefined ? [] : [file.previousPath]),
-    ]),
-  );
-  const issues: ReviewValidationGap[] = [];
-  const add = (message: string, paths: readonly string[]): void => {
-    issues.push({ category: "coverage", message, paths });
-  };
-  const classifiedPaths = new Set<string>();
-  for (let index = 0; index < coverageEntries.length; index += 1) {
-    const coverage = coverageEntries[index];
-    if (coverage === undefined) continue;
-    const pathSet = new Set(coverage.paths);
-    if (pathSet.size !== coverage.paths.length)
-      add(`coverage ${index + 1} repeats a path`, coverage.paths);
-    const resolvedRefs = coverage.evidenceRefs.map((id) => lookupReference(references, id));
-    if (resolvedRefs.some((reference) => reference === undefined)) {
-      add(`coverage ${index + 1} cites unknown evidence`, coverage.paths);
-      continue;
-    }
-    for (const path of coverage.paths) {
-      if (!validPaths.has(path)) {
-        add(`coverage ${index + 1} cites unchanged path ${JSON.stringify(path)}`, [path]);
-        continue;
-      }
-      if (classifiedPaths.has(path)) {
-        add(`changed path ${JSON.stringify(path)} is classified more than once`, [path]);
-        continue;
-      }
-      classifiedPaths.add(path);
-      if (
-        coverage.disposition !== "incomplete" &&
-        !resolvedRefs.some(
-          (reference) =>
-            reference !== undefined &&
-            reference.status === "complete" &&
-            isRepositoryEvidence(reference) &&
-            evidenceCoversChangedPath(reference, path, changedFiles, false),
-        )
-      ) {
-        add(
-          `${coverage.disposition} path ${JSON.stringify(path)} has no completed repository evidence`,
-          [path],
+  const evidence = finding.evidenceRefs.map((id) => lookupReference(references, id));
+  const counterevidence = finding.counterevidenceRefs.map((id) => lookupReference(references, id));
+  if (
+    [...evidence, ...counterevidence].some(
+      (ref) => ref === undefined || ref.status !== "complete" || !isRepositoryEvidence(ref),
+    )
+  )
+    return gap("Finding cites unknown, incomplete, or non-repository evidence.");
+  const targets = finding.path === undefined ? changedFiles.map((file) => file.path) : paths;
+  const supported = evidence.some(
+    (reference) =>
+      reference !== undefined &&
+      targets.some((path) => {
+        if (!evidenceCoversChangedPath(reference, path, changedFiles, true)) return false;
+        if (reference.kind !== "repository_read" || wholeFileRead(reference)) return true;
+        const { startLine, numLines } = reference.bounds ?? {};
+        return (
+          finding.line !== undefined &&
+          startLine !== undefined &&
+          numLines !== undefined &&
+          finding.line >= startLine &&
+          (finding.endLine ?? finding.line) < startLine + numLines
         );
-      }
-    }
-  }
-  for (const path of validPaths) {
-    if (!classifiedPaths.has(path))
-      add(`changed path ${JSON.stringify(path)} has no coverage classification`, [path]);
-  }
-
-  return issues;
+      }),
+  );
+  return supported ? [] : gap("Finding lacks inspected evidence covering its changed location.");
 }
 
-export function reviewCandidateGaps(
-  candidates: ReviewAssessment["candidates"],
-  findings: readonly ReviewFinding[],
+function wholeFileRead(reference: ReviewEvidenceReference): boolean {
+  return (
+    reference.bounds?.startLine === 1 && reference.bounds.numLines === reference.bounds.totalLines
+  );
+}
+
+export function reviewInspection(
   changedFiles: readonly ChangedFile[],
   references: ReadonlyMap<string, ReviewEvidenceReference>,
-): readonly ReviewValidationGap[] {
-  const validPaths = new Set(
-    changedFiles.flatMap((file) => [
-      file.path,
-      ...(file.previousPath === undefined ? [] : [file.previousPath]),
-    ]),
+): ReviewInspection {
+  const paths = [
+    ...new Set(
+      changedFiles.flatMap((file) => [
+        file.path,
+        ...(file.previousPath === undefined ? [] : [file.previousPath]),
+      ]),
+    ),
+  ];
+  const completed = [...references.keys()].flatMap((id) => {
+    const reference = lookupReference(references, id);
+    return reference?.status === "complete" ? [reference] : [];
+  });
+  const observedPaths = paths.filter((path) =>
+    completed.some(
+      (reference) =>
+        evidenceCoversChangedPath(reference, path, changedFiles, false) &&
+        (reference.kind !== "repository_read" || wholeFileRead(reference)),
+    ),
   );
-  const issues: ReviewValidationGap[] = [];
-  const add = (message: string, paths: readonly string[]): void => {
-    issues.push({ category: "candidate", message, paths });
-  };
-  const findingsByIndex = new Map<number, number>();
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
-    if (candidate === undefined) continue;
-    const issue = (message: string): void => {
-      add(message, candidate.paths);
-    };
-    const evidence = candidate.evidenceRefs.map((id) => lookupReference(references, id));
-    const counterevidence = candidate.counterevidenceRefs.map((id) =>
-      lookupReference(references, id),
-    );
-    if (evidence.some((reference) => reference === undefined)) {
-      issue(`candidate ${index + 1} cites unknown evidence`);
-      continue;
-    }
-    if (counterevidence.some((reference) => reference === undefined)) {
-      issue(`candidate ${index + 1} cites unknown counterevidence`);
-      continue;
-    }
-    if (candidate.evidenceRefs.length === 0) {
-      issue(`candidate ${index + 1} has no host-issued evidence`);
-    }
-    if (
-      candidate.verdict === "supported" &&
-      candidate.paths.some(
-        (path) =>
-          !evidence.some(
-            (reference) =>
-              reference !== undefined &&
-              reference.status === "complete" &&
-              isRepositoryEvidence(reference) &&
-              evidenceCoversChangedPath(reference, path, changedFiles),
-          ),
-      )
-    ) {
-      issue(`supported candidate ${index + 1} lacks evidence for an affected path`);
-    }
-    if (candidate.verdict === "disproved" && candidate.counterevidenceRefs.length === 0) {
-      issue(`disproved candidate ${index + 1} has no counterevidence`);
-    }
-    if (
-      candidate.verdict === "disproved" &&
-      !counterevidence.some(
-        (reference) =>
-          reference !== undefined &&
-          reference.status === "complete" &&
-          isRepositoryEvidence(reference),
-      )
-    ) {
-      issue(`disproved candidate ${index + 1} has no completed repository counterevidence`);
-    }
-    for (const path of candidate.paths) {
-      if (!validPaths.has(path))
-        issue(`candidate ${index + 1} cites unchanged path ${JSON.stringify(path)}`);
-    }
-    if (candidate.verdict === "supported") {
-      if (candidate.findingIndex === undefined || candidate.findingIndex >= findings.length) {
-        issue(`supported candidate ${index + 1} does not identify its finding`);
-      } else {
-        findingsByIndex.set(
-          candidate.findingIndex,
-          (findingsByIndex.get(candidate.findingIndex) ?? 0) + 1,
-        );
-        const findingPath = findings[candidate.findingIndex]?.path;
-        if (findingPath !== undefined && !candidate.paths.includes(findingPath)) {
-          issue(`finding ${candidate.findingIndex + 1} is not linked to its changed path`);
-        }
-      }
-    } else if (candidate.findingIndex !== undefined) {
-      issue(`non-supported candidate ${index + 1} identifies a finding`);
-    }
-  }
-  for (let index = 0; index < findings.length; index += 1) {
-    const path = findings[index]?.path;
-    if (findingsByIndex.get(index) !== 1)
-      add(`finding ${index + 1} needs one supported candidate`, path === undefined ? [] : [path]);
-  }
-  return issues;
+  const observed = new Set(observedPaths);
+  return { observedPaths, missingPaths: paths.filter((path) => !observed.has(path)) };
 }
 
 export class ReviewEvidenceLedger {
@@ -609,7 +458,12 @@ export class ReviewEvidenceLedger {
         (source.kind === "repository_file" &&
           (result?.kind === "text" || source.contentKind === "text"));
       const page = nonnegativeInteger(result?.page);
-      const nativeAssessment = nativeQueryAssessment(call.tool_name, call.tool_input, result);
+      const nativeAssessment = nativeQueryAssessment(
+        this.cwd,
+        call.tool_name,
+        call.tool_input,
+        result,
+      );
       const malformedPage =
         fixedPage &&
         (typeof result?.done !== "boolean" ||
@@ -737,7 +591,7 @@ export class ReviewEvidenceLedger {
       return (
         reference !== undefined &&
         reference.status === "complete" &&
-        evidenceCoversChangedPath(reference, path, changedFiles, false)
+        evidenceCoversChangedPath(reference, path, changedFiles, true)
       );
     });
   }

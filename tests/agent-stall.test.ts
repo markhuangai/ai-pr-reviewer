@@ -7,6 +7,7 @@ import {
   makeReviewDiff,
   observedReviewOutputTools,
   reviewConfig,
+  readCompleteReviewDiff,
   runReviewGoalWithEmptyGuidance as runReviewGoal,
   test,
   type AgentQuery,
@@ -27,7 +28,7 @@ function reviewOutputTools(options: Options): Readonly<Record<string, ReviewOutp
   return observedReviewOutputTools(options);
 }
 
-async function completeReviewBriefing(options: Options): Promise<void> {
+async function completeReviewContext(options: Options): Promise<string> {
   const briefing = reviewOutputTools(options).read_review_briefing;
   assert.ok(briefing);
   let done = false;
@@ -36,6 +37,7 @@ async function completeReviewBriefing(options: Options): Promise<void> {
     const page = JSON.parse(result.content[0]?.text ?? "{}") as { readonly done?: unknown };
     done = page.done === true;
   }
+  return readCompleteReviewDiff(options);
 }
 
 function resultMessage(index: number, subtype = "success"): SDKResultMessage {
@@ -96,13 +98,17 @@ test("repairs an interactive finding whose anchor is not an added line", async (
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewBriefing(input.options);
+      const evidenceRef = await completeReviewContext(input.options);
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
       const invalid = await submit.handler({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Wrong anchor",
             severity: "HIGH",
             why: "The failure is reachable.",
@@ -120,9 +126,13 @@ test("repairs an interactive finding whose anchor is not an added line", async (
       assert.equal(repair.done, false);
       prompts.push(userMessageText(repair.value));
       const accepted = await submit.handler({
+        limitations: [],
         summary: "One issue",
         findings: [
           {
+            evidenceRefs: [evidenceRef],
+            countercheck: "Checked the relevant caller for a guard.",
+            counterevidenceRefs: [],
             title: "Correct anchor",
             severity: "HIGH",
             why: "The failure is reachable.",
@@ -168,7 +178,7 @@ test("repairs an interactive finding whose anchor is not an added line", async (
   assert.equal(toolResults[1], "Review submission accepted.");
   assert.match(
     prompts[0] ?? "",
-    /Every interactive finding must cite a participating added line in a changed file/u,
+    /Every finding needs a changed path and participating added line/u,
   );
 });
 
@@ -192,10 +202,14 @@ test("finalizes a silent accepted submission after its completion grace", async 
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewBriefing(input.options);
+      await completeReviewContext(input.options);
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
-      const accepted = await submit.handler({ summary: "No issues", findings: [] });
+      const accepted = await submit.handler({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      });
       assert.equal(accepted.content[0]?.text, "Review submission accepted.");
       ready.resolve(undefined);
       await closed.promise;
@@ -234,7 +248,7 @@ test("finalizes a silent accepted submission after its completion grace", async 
   assert.deepEqual(result.submission, {
     summary: "No issues",
     findings: [],
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
   });
   assert.deepEqual(result.tokenUsage, { models: [], complete: false });
   assert.equal(interrupts, 1);
@@ -265,10 +279,14 @@ test("accepted stalled submissions win an interruption result while MCP status i
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewBriefing(input.options);
+      await completeReviewContext(input.options);
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
-      const accepted = await submit.handler({ summary: "No issues", findings: [] });
+      const accepted = await submit.handler({
+        limitations: [],
+        summary: "No issues",
+        findings: [],
+      });
       assert.equal(accepted.content[0]?.text, "Review submission accepted.");
       ready.resolve(undefined);
       await mcpStarted.promise;
@@ -314,7 +332,7 @@ test("accepted stalled submissions win an interruption result while MCP status i
   assert.deepEqual(result.submission, {
     summary: "No issues",
     findings: [],
-    assessment: { coverage: [], candidates: [] },
+    limitations: [],
   });
   assert.match(result.error ?? "", /MCP status check timed out after 30000 ms/u);
   assert.equal(mcpStatusChecks, 1);
@@ -338,12 +356,16 @@ test("lets an accepted submission win an interrupted turn boundary", async (t) =
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewBriefing(input.options);
+      await completeReviewContext(input.options);
       ready.resolve(undefined);
       await boundary.promise;
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
-      const accepted = await submit.handler({ summary: "Accepted during interrupt", findings: [] });
+      const accepted = await submit.handler({
+        limitations: [],
+        summary: "Accepted during interrupt",
+        findings: [],
+      });
       assert.equal(accepted.content[0]?.text, "Review submission accepted.");
       yield resultMessage(1, "error_during_execution");
       const next = await messages.next();
@@ -407,7 +429,7 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewBriefing(input.options);
+      await completeReviewContext(input.options);
       ready[0]?.resolve(undefined);
       for (let index = 0; index < boundaries.length; index += 1) {
         const boundary = boundaries[index];
@@ -421,7 +443,11 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
       }
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
-      const accepted = await submit.handler({ summary: "Recovered", findings: [] });
+      const accepted = await submit.handler({
+        limitations: [],
+        summary: "Recovered",
+        findings: [],
+      });
       assert.equal(accepted.content[0]?.text, "Review submission accepted.");
       yield resultMessage(3);
       assert.equal((await messages.next()).done, true);
@@ -525,10 +551,14 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
           const messages = input.prompt[Symbol.asyncIterator]();
           await messages.next();
           await messages.next();
-          await completeReviewBriefing(input.options);
+          await completeReviewContext(input.options);
           const submit = reviewOutputTools(input.options).submit_review;
           assert.ok(submit);
-          await submit.handler({ summary: "Accepted evidence", findings: [] });
+          await submit.handler({
+            limitations: [],
+            summary: "Accepted evidence",
+            findings: [],
+          });
           ready.resolve(undefined);
           if (mode === "activity") {
             await activity.promise;
@@ -536,7 +566,11 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
               type: "assistant",
               message: { content: [{ type: "text", text: "Still reading" }] },
             } as SDKMessage;
-            const duplicate = await submit.handler({ summary: "Replacement", findings: [] });
+            const duplicate = await submit.handler({
+              limitations: [],
+              summary: "Replacement",
+              findings: [],
+            });
             assert.match(duplicate.content[0]?.text ?? "", /already been accepted/u);
             observed.resolve(undefined);
           }
@@ -673,12 +707,13 @@ test("closing one accepted goal preserves an unfinished sibling on the shared co
           const messages = input.prompt[Symbol.asyncIterator]();
           await messages.next();
           await messages.next();
-          await completeReviewBriefing(input.options);
+          await completeReviewContext(input.options);
           if (index === 1) {
             ready[index]?.resolve(undefined);
             await siblingMaySubmit.promise;
           }
           await reviewOutputTools(input.options).submit_review?.handler({
+            limitations: [],
             summary: `Goal ${index}`,
             findings: [],
           });

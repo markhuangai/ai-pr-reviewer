@@ -254,8 +254,6 @@ export function observedReviewOutputTools(
     (matcher) => matcher.hooks,
   ) as readonly HookCallback[];
   const controller = new AbortController();
-  const changedPaths = new Set<string>();
-  const repositoryDiffReferences: string[] = [];
   let invocation = 0;
 
   const observe = async (
@@ -280,22 +278,7 @@ export function observedReviewOutputTools(
       ],
     } as HookInput;
     for (const hook of callbacks) {
-      const output = await hook(hookInput, undefined, { signal: controller.signal });
-      const specific = "hookSpecificOutput" in output ? output.hookSpecificOutput : undefined;
-      if (
-        specific === undefined ||
-        !("additionalContext" in specific) ||
-        typeof specific.additionalContext !== "string"
-      )
-        continue;
-      if (name === "read_pr_diff") {
-        for (const match of specific.additionalContext.matchAll(
-          /^(ev-[1-9][0-9]*) complete repository_diff /gmu,
-        )) {
-          const id = match[1];
-          if (id !== undefined) repositoryDiffReferences.push(id);
-        }
-      }
+      await hook(hookInput, undefined, { signal: controller.signal });
     }
   };
 
@@ -304,75 +287,8 @@ export function observedReviewOutputTools(
       name,
       {
         handler: async (input: Record<string, unknown>) => {
-          let toolInput = input;
-          if (name === "submit_review" && !Object.hasOwn(input, "assessment")) {
-            if (repositoryDiffReferences.length === 0) {
-              const diffTool = rawTools.read_pr_diff;
-              if (diffTool !== undefined) {
-                let cursor: string | undefined;
-                let done = false;
-                while (!done) {
-                  const diffInput = cursor === undefined ? {} : { cursor };
-                  const response = await diffTool.handler(diffInput);
-                  await observe("read_pr_diff", diffInput, response);
-                  const page = JSON.parse(response.content[0]?.text ?? "{}") as {
-                    readonly done?: unknown;
-                    readonly nextCursor?: unknown;
-                  };
-                  done = page.done === true;
-                  cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
-                }
-              }
-            }
-            const reference = repositoryDiffReferences.at(-1);
-            const findings = Array.isArray(input.findings) ? input.findings : [];
-            toolInput = {
-              ...input,
-              assessment: {
-                coverage: [...changedPaths].map((path) => ({
-                  paths: [path],
-                  disposition: reference === undefined ? "incomplete" : "reviewed",
-                  rationale:
-                    reference === undefined
-                      ? "No completed fixed diff read was recorded."
-                      : "The changed path was inspected in the fixed diff.",
-                  evidenceRefs: reference === undefined ? [] : [reference],
-                })),
-                candidates: findings.flatMap((finding, findingIndex) => {
-                  if (typeof finding !== "object" || finding === null || Array.isArray(finding))
-                    return [];
-                  const value = finding as Record<string, unknown>;
-                  const path = typeof value.path === "string" ? value.path : [...changedPaths][0];
-                  if (path === undefined) return [];
-                  return [
-                    {
-                      paths: [path],
-                      trigger:
-                        typeof value.title === "string" ? value.title : "Test finding trigger",
-                      impact: typeof value.why === "string" ? value.why : "Test finding impact",
-                      evidenceRefs: reference === undefined ? [] : [reference],
-                      countercheck: "Checked for an existing guard.",
-                      counterevidenceRefs: [],
-                      verdict: "supported",
-                      findingIndex,
-                    },
-                  ];
-                }),
-              },
-            };
-          }
-          const response = await raw.handler(toolInput);
-          if (name === "read_review_briefing") {
-            const page = JSON.parse(response.content[0]?.text ?? "{}") as {
-              readonly records?: readonly Readonly<Record<string, unknown>>[];
-            };
-            for (const record of page.records ?? []) {
-              if (record.kind !== "changed_file" || typeof record.path !== "string") continue;
-              changedPaths.add(record.path);
-              if (typeof record.previousPath === "string") changedPaths.add(record.previousPath);
-            }
-          }
-          await observe(name, toolInput, response);
+          const response = await raw.handler(input);
+          await observe(name, input, response);
           return response;
         },
       },
@@ -382,8 +298,49 @@ export function observedReviewOutputTools(
   return tools;
 }
 
+export async function readCompleteReviewDiff(options: Options): Promise<string> {
+  const tools = observedReviewOutputTools(options);
+  const diffTool = tools.read_pr_diff;
+  const stateTool = tools.read_review_state;
+  assert.ok(diffTool);
+  assert.ok(stateTool);
+  let cursor: string | undefined;
+  for (;;) {
+    const result = await diffTool.handler(cursor === undefined ? {} : { cursor });
+    const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+      done: boolean;
+      nextCursor?: string;
+    };
+    if (page.done) break;
+    cursor = page.nextCursor;
+  }
+  cursor = undefined;
+  for (;;) {
+    const result = await stateTool.handler(cursor === undefined ? {} : { cursor });
+    const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+      done: boolean;
+      nextCursor?: string;
+      records: {
+        kind: string;
+        reference?: { id: string; kind: string; status: string; changedPaths?: boolean };
+      }[];
+    };
+    const evidence = page.records.find(
+      (record) =>
+        record.kind === "evidence" &&
+        record.reference?.kind === "repository_diff" &&
+        record.reference.status === "complete" &&
+        record.reference.changedPaths,
+    );
+    if (evidence?.reference !== undefined) return evidence.reference.id;
+    if (page.done) throw new Error("The explicit diff read did not produce completed evidence.");
+    cursor = page.nextCursor;
+  }
+}
+
 export interface FakeQueryScenario {
-  readonly submission?: Record<string, unknown>;
+  readonly submission?:
+    Record<string, unknown> | ((evidenceRef: string) => Record<string, unknown>);
   readonly resultSubtypes?: readonly string[];
   readonly modelUsages?: readonly Readonly<Record<string, Readonly<Record<string, unknown>>>>[];
   readonly mcpStatuses?: readonly Record<string, unknown>[];
@@ -562,7 +519,6 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           assert.ok(briefingTool);
           assert.ok(submitTool);
           let briefingDone = false;
-          const changedPaths = new Set<string>();
           while (!briefingDone) {
             const result = await briefingTool.handler({});
             const page = JSON.parse(result.content[0]?.text ?? "{}") as {
@@ -570,13 +526,27 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               readonly records?: readonly Readonly<Record<string, unknown>>[];
             };
             scenario.inspectBriefingRecords?.(page.records ?? []);
-            for (const record of page.records ?? []) {
-              if (record.kind !== "changed_file" || typeof record.path !== "string") continue;
-              changedPaths.add(record.path);
-              if (typeof record.previousPath === "string") changedPaths.add(record.previousPath);
-            }
             briefingDone = page.done === true;
           }
+          let diffDone = false;
+          let fullDiffCursor: string | undefined;
+          while (!diffDone) {
+            const result = await diffTool.handler(
+              fullDiffCursor === undefined ? {} : { cursor: fullDiffCursor },
+            );
+            const page = JSON.parse(result.content[0]?.text ?? "{}") as {
+              readonly done?: unknown;
+              readonly nextCursor?: unknown;
+            };
+            diffDone = page.done === true;
+            fullDiffCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+          }
+          const evidenceRef = observedReferences.at(-1);
+          assert.ok(evidenceRef);
+          const submission =
+            typeof scenario.submission === "function"
+              ? scenario.submission(evidenceRef)
+              : scenario.submission;
           if (scenario.probeInterleavedQueryCursors) {
             const decode = (result: RegisteredToolResult) =>
               JSON.parse(result.content[0]?.text ?? "{}") as {
@@ -778,8 +748,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           }
           if (scenario.assertUnreadThreadRejection) {
             const rejected = await submitTool.handler({
-              ...scenario.submission,
-              assessment: { coverage: [], candidates: [] },
+              ...submission,
+              limitations: [],
             });
             assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
           }
@@ -795,6 +765,7 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
               let threadCursor: string | undefined;
               let repeatedSelector = false;
               let selectorBindingProbed = false;
+              let expectedPage = 0;
               while (!threadDone) {
                 const startingCursor = threadCursor;
                 const result = await threadTool.handler(
@@ -802,8 +773,10 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 );
                 const page = JSON.parse(result.content[0]?.text ?? "{}") as {
                   readonly done?: unknown;
+                  readonly page?: number;
                   readonly nextCursor?: unknown;
                 };
+                assert.equal(page.page, ++expectedPage);
                 threadDone = page.done === true;
                 threadCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
                 if (
@@ -815,11 +788,24 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                     "id" in selector
                       ? { id: Number(selector.id) + 1 }
                       : { path: `${String(selector.path)}.other` };
-                  const rejected: RegisteredToolResult = await threadTool.handler({
-                    ...differentSelector,
-                    cursor: threadCursor,
-                  });
-                  assert.equal(rejected.isError, true);
+                  for (const mismatched of [
+                    differentSelector,
+                    {},
+                    { id: 55, path: "review.txt" },
+                  ]) {
+                    const rejected: RegisteredToolResult = await threadTool.handler({
+                      ...mismatched,
+                      cursor: threadCursor,
+                    });
+                    assert.equal(rejected.isError, true);
+                    const error = JSON.parse(rejected.content[0]?.text ?? "{}") as {
+                      nextCall: unknown;
+                    };
+                    assert.deepEqual(error.nextCall, {
+                      tool: "read_pr_threads",
+                      arguments: { ...selector, cursor: threadCursor },
+                    });
+                  }
                   selectorBindingProbed = true;
                 }
                 if (
@@ -840,75 +826,22 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 }
                 if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
                   const rejected = await submitTool.handler({
-                    ...scenario.submission,
-                    assessment: { coverage: [], candidates: [] },
+                    ...submission,
+                    limitations: [],
                   });
                   assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
                 }
               }
               if (scenario.assertUnreadThreadAfterId && "id" in selector) {
                 const rejected = await submitTool.handler({
-                  ...scenario.submission,
-                  assessment: { coverage: [], candidates: [] },
+                  ...submission,
+                  limitations: [],
                 });
                 assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
               }
             }
           }
-          let diffDone = false;
-          let fullDiffCursor: string | undefined;
-          while (!diffDone) {
-            const result = await diffTool.handler(
-              fullDiffCursor === undefined ? {} : { cursor: fullDiffCursor },
-            );
-            const page = JSON.parse(result.content[0]?.text ?? "{}") as {
-              readonly done?: unknown;
-              readonly nextCursor?: unknown;
-            };
-            diffDone = page.done === true;
-            fullDiffCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
-          }
-          const evidenceRef = observedReferences.at(-1);
-          const defaultAssessment = {
-            coverage: [...changedPaths].map((path) => ({
-              paths: [path],
-              disposition: evidenceRef === undefined ? "incomplete" : "reviewed",
-              rationale:
-                evidenceRef === undefined
-                  ? "No completed diff read was recorded."
-                  : "The changed path was inspected in the fixed diff.",
-              evidenceRefs: evidenceRef === undefined ? [] : [evidenceRef],
-            })),
-            candidates: (Array.isArray(scenario.submission.findings)
-              ? scenario.submission.findings
-              : []
-            ).flatMap((finding, findingIndex) => {
-              if (typeof finding !== "object" || finding === null || Array.isArray(finding))
-                return [];
-              const value = finding as Record<string, unknown>;
-              const path = typeof value.path === "string" ? value.path : [...changedPaths][0];
-              if (path === undefined) return [];
-              return [
-                {
-                  paths: [path],
-                  trigger: typeof value.title === "string" ? value.title : "Test finding trigger",
-                  impact: typeof value.why === "string" ? value.why : "Test finding impact",
-                  evidenceRefs: evidenceRef === undefined ? [] : [evidenceRef],
-                  countercheck: "Checked for an existing guard.",
-                  counterevidenceRefs: [],
-                  verdict: "supported",
-                  findingIndex,
-                },
-              ];
-            }),
-          };
-          const preparedSubmission = {
-            ...scenario.submission,
-            assessment: Object.hasOwn(scenario.submission, "assessment")
-              ? scenario.submission.assessment
-              : defaultAssessment,
-          };
-          const result = await submitTool.handler(preparedSubmission);
+          const result = await submitTool.handler(submission);
           scenario.inspectSubmissionResult?.(result);
           if (scenario.expectSubmissionRejection) assert.equal(result.isError, true);
           else assert.equal(result.content[0]?.text, "Review submission accepted.");

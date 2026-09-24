@@ -141,31 +141,20 @@ export interface ReviewFinding {
   readonly confidence?: "high" | "medium" | "low";
 }
 
-export type ReviewCoverageDisposition = "reviewed" | "not_applicable" | "incomplete";
-
-export interface ReviewCoverageEntry {
+export interface ReviewLimitation {
   readonly paths: readonly string[];
-  readonly disposition: ReviewCoverageDisposition;
-  readonly rationale: string;
-  readonly evidenceRefs: readonly string[];
+  readonly reason: string;
 }
 
-export type ReviewCandidateVerdict = "supported" | "disproved" | "unresolved";
-
-export interface ReviewCandidateAssessment {
-  readonly paths: readonly string[];
-  readonly trigger: string;
-  readonly impact: string;
+export interface ReviewFindingEvidence {
   readonly evidenceRefs: readonly string[];
   readonly countercheck: string;
   readonly counterevidenceRefs: readonly string[];
-  readonly verdict: ReviewCandidateVerdict;
-  readonly findingIndex?: number;
 }
 
-export interface ReviewAssessment {
-  readonly coverage: readonly ReviewCoverageEntry[];
-  readonly candidates: readonly ReviewCandidateAssessment[];
+export interface ReviewInspection {
+  readonly observedPaths: readonly string[];
+  readonly missingPaths: readonly string[];
 }
 
 export type ReviewEvidenceKind =
@@ -187,6 +176,9 @@ export interface ReviewEvidenceBounds {
   readonly headLimit?: number;
   readonly pages?: string;
   readonly truncated?: boolean;
+  readonly startLine?: number;
+  readonly numLines?: number;
+  readonly totalLines?: number;
 }
 
 export interface ReviewEvidenceReference {
@@ -207,13 +199,14 @@ export interface ReviewEvidenceReference {
 export interface GoalSubmission {
   readonly summary: string;
   readonly findings: readonly ReviewFinding[];
-  readonly assessment: ReviewAssessment;
+  readonly limitations: readonly ReviewLimitation[];
 }
 
 export interface GoalResult {
   readonly prompt: string;
   readonly status: "completed" | "incomplete" | "failed";
   readonly submission?: GoalSubmission;
+  readonly inspection?: ReviewInspection;
   readonly error?: string;
   readonly tokenUsage?: GoalTokenUsage;
   readonly diagnostics?: {

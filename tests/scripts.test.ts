@@ -524,6 +524,15 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     assert.equal(JSON.stringify(config).includes("known-defect"), false);
     return Promise.resolve([
       {
+        inspection: {
+          observedPaths: [
+            ...files.flatMap((file) => [
+              file.path,
+              ...(file.previousPath === undefined ? [] : [file.previousPath]),
+            ]),
+          ],
+          missingPaths: [],
+        },
         prompt: "Review the changed behavior.",
         status: "completed",
         diagnostics: {
@@ -544,37 +553,14 @@ test("replays a frozen case without publishing, switching revisions, or exposing
               line: replayFindingLine,
             },
           ],
-          assessment: {
-            coverage: [
-              {
-                paths: files.flatMap((file) => [
-                  file.path,
-                  ...(file.previousPath === undefined ? [] : [file.previousPath]),
-                ]),
-                disposition: "reviewed",
-                rationale: "Inspected replay-secret behavior.",
-                evidenceRefs: ["ev-1"],
-              },
-            ],
-            candidates: [
-              {
-                paths: [replayFindingPath],
-                trigger: "The changed branch drops replay-secret.",
-                impact: "The value is lost.",
-                evidenceRefs: ["ev-1"],
-                countercheck: "Checked for a caller guard.",
-                counterevidenceRefs: [],
-                verdict: "supported",
-                findingIndex: 0,
-              },
-            ],
-          },
+          limitations: [],
         },
       },
     ]);
   };
   const output = await replayCase(input, checkout, runner);
   assert.equal(observedCalls, 1);
+  assert.equal(output.version, 2);
   assert.equal(output.caseId, "case-[REDACTED]");
   assert.deepEqual(output.labels, { expected: ["known-defect"], private: "[REDACTED]" });
   assert.equal(output.partial, false);
