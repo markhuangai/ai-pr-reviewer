@@ -777,7 +777,10 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             }
           }
           if (scenario.assertUnreadThreadRejection) {
-            const rejected = await submitTool.handler(scenario.submission);
+            const rejected = await submitTool.handler({
+              ...scenario.submission,
+              assessment: { coverage: [], candidates: [] },
+            });
             assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
           }
           if (scenario.readThreadId !== undefined || scenario.readThreadPath !== undefined) {
@@ -836,12 +839,18 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                   repeatedSelector = true;
                 }
                 if (scenario.readThreadFirstOnly && !threadDone && threadCursor !== undefined) {
-                  const rejected = await submitTool.handler(scenario.submission);
+                  const rejected = await submitTool.handler({
+                    ...scenario.submission,
+                    assessment: { coverage: [], candidates: [] },
+                  });
                   assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
                 }
               }
               if (scenario.assertUnreadThreadAfterId && "id" in selector) {
-                const rejected = await submitTool.handler(scenario.submission);
+                const rejected = await submitTool.handler({
+                  ...scenario.submission,
+                  assessment: { coverage: [], candidates: [] },
+                });
                 assert.match(rejected.content[0]?.text ?? "", /Read prior discussion threads/u);
               }
             }

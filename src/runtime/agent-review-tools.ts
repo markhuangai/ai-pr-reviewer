@@ -206,6 +206,7 @@ export class PullRequestConversationReader {
 
 interface ReviewBriefingPage {
   readonly page: number;
+  readonly totalPages?: number;
   readonly records: readonly Record<string, unknown>[];
   readonly done: boolean;
 }
@@ -317,10 +318,8 @@ function boundBriefingRecords(
 }
 
 export class ReviewBriefingReader {
-  private readonly records: readonly Record<string, unknown>[];
-  private index = 0;
-  private page = 0;
-  private reachedEnd = false;
+  private readonly pages: readonly (readonly Record<string, unknown>[])[];
+  private readonly delivered = new Set<number>();
 
   constructor(
     context: PullRequestContext,
@@ -417,35 +416,44 @@ export class ReviewBriefingReader {
       const body = typeof record.body === "string" ? record.body : undefined;
       return body === undefined ? [record] : briefingBodyRecords(record, body);
     });
-    this.records = boundBriefingRecords(expandedRecords);
-    for (const record of this.records) {
-      if (!briefingPageWithinLimits({ page: 1, records: [record], done: false }))
+    const boundedRecords = boundBriefingRecords(expandedRecords);
+    const pages: Record<string, unknown>[][] = [];
+    let current: Record<string, unknown>[] = [];
+    for (const record of boundedRecords) {
+      const metadata = {
+        page: BRIEFING_MAX_RECORDS,
+        totalPages: BRIEFING_MAX_RECORDS,
+        done: false,
+      };
+      if (!briefingPageWithinLimits({ ...metadata, records: [record] }))
         throw new Error("Review briefing record exceeds the bounded page size.");
+      if (
+        current.length > 0 &&
+        !briefingPageWithinLimits({ ...metadata, records: [...current, record] })
+      ) {
+        pages.push(current);
+        current = [];
+      }
+      current.push(record);
     }
+    pages.push(current);
+    this.pages = pages;
   }
 
   get complete(): boolean {
-    return this.reachedEnd;
+    return this.delivered.size === this.pages.length;
   }
 
-  readNext(): ReviewBriefingPage {
-    if (this.reachedEnd) return { page: this.page, records: [], done: true };
-    this.page += 1;
-    const records: Record<string, unknown>[] = [];
-    while (this.index < this.records.length) {
-      const record = this.records[this.index];
-      if (record === undefined) break;
-      const candidate = { page: this.page, records: [...records, record], done: false };
-      if (records.length > 0 && !briefingPageWithinLimits(candidate)) break;
-      records.push(record);
-      this.index += 1;
-    }
-    const done = this.index === this.records.length;
-    this.reachedEnd = done;
-    const page = { page: this.page, records, done };
-    if (!briefingPageWithinLimits(page))
-      throw new Error("Review briefing page exceeds the bounded page size.");
-    return page;
+  readNext(requestedPage?: number): ReviewBriefingPage {
+    const totalPages = this.pages.length;
+    if (requestedPage === undefined && this.complete)
+      return { page: totalPages, totalPages, records: [], done: true };
+    const page =
+      requestedPage ?? this.pages.findIndex((_, index) => !this.delivered.has(index + 1)) + 1;
+    if (!Number.isInteger(page) || page < 1 || page > totalPages)
+      throw new Error(`Review briefing page must be between 1 and ${totalPages}.`);
+    this.delivered.add(page);
+    return { page, totalPages, records: this.pages[page - 1] ?? [], done: this.complete };
   }
 }
 
@@ -857,7 +865,7 @@ export async function createPullRequestDiff(
   }
 }
 
-export type QueryReaderKind = "diff" | "repository_file" | "thread";
+export type QueryReaderKind = "diff" | "repository_file" | "thread" | "review_state";
 
 export interface QueryReaderEntry {
   readonly reader: StringPageReader | RepositoryFilePageReader;
@@ -883,11 +891,12 @@ export class ReviewQueryReaderStore {
     content: string,
     metadata: Readonly<Record<string, unknown>>,
     onComplete?: () => void,
+    kind: "thread" | "review_state" = "thread",
   ): { readonly cursor: string; readonly reader: StringPageReader } {
     this.makeRoom();
     const cursor = randomUUID();
     const reader = new StringPageReader(content);
-    this.readers.set(cursor, { reader, kind: "thread", metadata });
+    this.readers.set(cursor, { reader, kind, metadata });
     if (onComplete !== undefined) this.completions.set(cursor, onComplete);
     return { cursor, reader };
   }

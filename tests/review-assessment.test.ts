@@ -48,6 +48,8 @@ function coverage(
   };
 }
 
+let nextToolUse = 0;
+
 function call(
   tool_name: string,
   tool_input: unknown,
@@ -58,7 +60,12 @@ function call(
   readonly tool_use_id: string;
   readonly tool_response: unknown;
 } {
-  return { tool_name, tool_input, tool_use_id: `${tool_name}-use`, tool_response: response };
+  return {
+    tool_name,
+    tool_input,
+    tool_use_id: `${tool_name}-${++nextToolUse}`,
+    tool_response: response,
+  };
 }
 
 function jsonResponse(value: unknown): unknown {
@@ -117,6 +124,7 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        page: 1,
         content: "diff page",
         done: false,
         nextCursor: "diff-cursor",
@@ -129,6 +137,8 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
         revision: "base",
         path: "unchanged.ts",
         kind: "text",
+        page: 1,
+        content: "file page",
         done: false,
         nextCursor: "file-cursor",
       }),
@@ -151,6 +161,7 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        page: 2,
         content: "diff tail",
         done: true,
       }),
@@ -158,7 +169,14 @@ test("issues host evidence for complete and partial fixed-revision reads", () =>
     call(
       "mcp__review_output__read_repository_file",
       { revision: "base", path: "unchanged.ts", cursor: "file-cursor" },
-      jsonResponse({ revision: "base", path: "unchanged.ts", kind: "text", done: true }),
+      jsonResponse({
+        revision: "base",
+        path: "unchanged.ts",
+        kind: "text",
+        page: 2,
+        content: "file tail",
+        done: true,
+      }),
     ),
   ]);
   assert.deepEqual(
@@ -195,6 +213,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        page: 1,
         content: "diff page",
         done: false,
         nextCursor: "recoverable-cursor",
@@ -226,6 +245,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
         paths: ["src/change.ts"],
         mergeBaseSha: "a".repeat(40),
         headSha: "b".repeat(40),
+        page: 2,
         content: "diff tail",
         done: true,
       }),
@@ -244,6 +264,7 @@ test("retains cursor evidence after a recoverable selector error", () => {
       { paths: ["src/change.ts"] },
       jsonResponse({
         paths: ["src/change.ts"],
+        page: 1,
         content: "diff page",
         done: false,
         nextCursor: "expired-cursor",
@@ -551,7 +572,12 @@ test("records partial pagination from a top-level MCP content array", () => {
     call("mcp__review_output__read_pr_diff", { paths: ["src/change.ts"] }, [
       {
         type: "text",
-        text: JSON.stringify({ content: "diff page", done: false, nextCursor: "next-page" }),
+        text: JSON.stringify({
+          page: 1,
+          content: "diff page",
+          done: false,
+          nextCursor: "next-page",
+        }),
       },
     ]),
   ]);
@@ -560,7 +586,12 @@ test("records partial pagination from a top-level MCP content array", () => {
     reviewAssessmentInternals.toolResponseDocument([
       {
         type: "text",
-        text: JSON.stringify({ content: "diff page", done: false, nextCursor: "next-page" }),
+        text: JSON.stringify({
+          page: 1,
+          content: "diff page",
+          done: false,
+          nextCursor: "next-page",
+        }),
       },
     ])?.done,
     false,

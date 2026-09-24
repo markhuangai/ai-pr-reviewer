@@ -526,6 +526,13 @@ test("replays a frozen case without publishing, switching revisions, or exposing
       {
         prompt: "Review the changed behavior.",
         status: "completed",
+        diagnostics: {
+          submissionAttempts: 2,
+          repairAttempts: 1,
+          evidenceReferences: 3,
+          rejectionCounts: { "replay-secret": 1 },
+          termination: "replay-secret",
+        },
         submission: {
           summary: "Found a replay-secret example.",
           findings: [
@@ -571,6 +578,13 @@ test("replays a frozen case without publishing, switching revisions, or exposing
   assert.equal(output.caseId, "case-[REDACTED]");
   assert.deepEqual(output.labels, { expected: ["known-defect"], private: "[REDACTED]" });
   assert.equal(output.partial, false);
+  assert.deepEqual(output.goals[0]?.diagnostics, {
+    submissionAttempts: 2,
+    repairAttempts: 1,
+    evidenceReferences: 3,
+    rejectionCounts: { "[REDACTED]": 1 },
+    termination: "[REDACTED]",
+  });
   assert.equal(output.findings instanceof Array, true);
   assert.equal(output.repository, "[REDACTED]");
   assert.equal(output.baseSha, "[REDACTED]");

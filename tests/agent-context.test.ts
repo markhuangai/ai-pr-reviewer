@@ -347,7 +347,12 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
     pages.flatMap((page) => page.records).some((record) => JSON.stringify(record).includes("�")),
     false,
   );
-  assert.deepEqual(reader.readNext(), { page: pages.length, records: [], done: true });
+  assert.deepEqual(reader.readNext(), {
+    page: pages.length,
+    totalPages: pages.length,
+    records: [],
+    done: true,
+  });
 
   const contextWithoutBody = { ...context };
   delete contextWithoutBody.body;
