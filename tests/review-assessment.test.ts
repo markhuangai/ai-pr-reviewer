@@ -339,6 +339,58 @@ test("records native repository reads, searches, context, briefing, discussion, 
   assert.equal(ledger.issued.get("ev-6")?.kind, "conversation");
   assert.equal(ledger.issued.get("ev-7")?.path, undefined);
   assert.equal(ledger.issued.get("ev-8")?.kind, "external_tool");
+  const assessment: ReviewAssessment = {
+    coverage: [coverage("src/change.ts", ["ev-1"])],
+    candidates: [
+      {
+        paths: ["src/change.ts"],
+        trigger: "The result is ignored.",
+        impact: "The caller hides a failure.",
+        evidenceRefs: ["ev-2"],
+        countercheck: "Checked the caller guard.",
+        counterevidenceRefs: [],
+        verdict: "supported",
+        findingIndex: 0,
+      },
+    ],
+  };
+  assert.deepEqual(
+    findInvalidReviewAssessment(assessment, [finding], [changedFile], ledger.issued),
+    [],
+  );
+});
+
+test("does not accept an empty native search as changed-path coverage", () => {
+  const ledger = new ReviewEvidenceLedger("/repo");
+  const [search] = ledger.observeBatch([
+    call(
+      "Grep",
+      { path: "src/change.ts", pattern: "absent-symbol" },
+      jsonResponse({
+        mode: "files_with_matches",
+        numFiles: 0,
+        filenames: [],
+        content: "",
+        numLines: 0,
+        numMatches: 0,
+        totalFiles: 0,
+        totalLines: 0,
+        appliedLimit: 250,
+        appliedOffset: 0,
+      }),
+    ),
+  ]);
+  assert.ok(search);
+  assert.equal(search.kind, "repository_search");
+  assert.equal(search.status, "complete");
+
+  const issues = findInvalidReviewAssessment(
+    { coverage: [coverage(changedFile.path, [search.id])], candidates: [] },
+    [],
+    [changedFile],
+    ledger.issued,
+  );
+  assert.ok(issues.some((issue) => /no completed repository evidence/u.test(issue)));
 });
 
 test("marks bounded or unverified native repository reads and searches partial", () => {

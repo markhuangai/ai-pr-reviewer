@@ -384,7 +384,7 @@ export function findInvalidReviewAssessment(
             reference !== undefined &&
             reference.status === "complete" &&
             isRepositoryEvidence(reference) &&
-            evidenceCoversPath(reference, path),
+            evidenceCoversPathForCoverage(reference, path),
         )
       ) {
         issues.push(
@@ -644,6 +644,10 @@ export function evidenceCoversPath(reference: ReviewEvidenceReference, path: str
   if (reference.changedPaths === true) return true;
   if (reference.paths?.includes(path) === true) return true;
   return reference.path === path;
+}
+
+function evidenceCoversPathForCoverage(reference: ReviewEvidenceReference, path: string): boolean {
+  return reference.kind !== "repository_search" && evidenceCoversPath(reference, path);
 }
 
 function isRepositoryEvidence(reference: ReviewEvidenceReference): boolean {
