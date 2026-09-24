@@ -586,6 +586,7 @@ test("reserves submission identities without exhausting an in-flight last correc
   assert.deepEqual(recovery.latestInput, { index: 6 });
   recovery.observeUse("use-7", "over budget");
   assert.equal(recovery.allows("use-7"), false);
+  assert.deepEqual(recovery.latestInput, { index: 6 });
 });
 
 test("only completed originating queries make earlier references eligible", () => {
@@ -743,3 +744,89 @@ test("briefing page replay requires all pages before the initial gate opens", ()
   assert.throws(() => reader.readNext(0), /between/u);
   assert.throws(() => reader.readNext((first.totalPages ?? 0) + 1), /between/u);
 });
+
+for (const denied of ["withdrawal", "replacement"] as const) {
+  test(`a denied buffered ${denied} cannot replace the last allowed candidate`, async (t) => {
+    const query = reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      yield* protocol.call("read_pr_diff", {});
+      const state = yield* recoveryState(protocol);
+      const evidence = state.evidence.find((reference) => reference.kind === "repository_diff");
+      assert.ok(evidence);
+      for (let index = 0; index < 6; index += 1)
+        assert.equal(
+          (yield* protocol.call("submit_review", recoverySubmission(evidence.id))).isError,
+          true,
+        );
+      const replacement = recoverySubmission(evidence.id);
+      const replacementFinding = (replacement.findings as { title: string }[])[0];
+      assert.ok(replacementFinding);
+      replacementFinding.title = "Denied replacement";
+      const input =
+        denied === "withdrawal"
+          ? { summary: "withdrawn", findings: [], assessment: { coverage: [], candidates: [] } }
+          : replacement;
+      const id = "denied-buffered-use";
+      yield {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id, name: "mcp__review_output__submit_review", input }],
+        },
+      } as SDKMessage;
+      const hook = protocol.options.hooks?.PreToolUse?.find((matcher) =>
+        matcher.matcher?.includes("submit_review"),
+      )?.hooks[0];
+      assert.ok(hook);
+      const decision = await hook(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: "protocol",
+          transcript_path: "",
+          cwd: "/repo",
+          tool_name: "mcp__review_output__submit_review",
+          tool_use_id: id,
+          tool_input: input,
+        },
+        id,
+        { signal: new AbortController().signal },
+      );
+      assert.ok(
+        "hookSpecificOutput" in decision &&
+          decision.hookSpecificOutput?.hookEventName === "PreToolUse",
+      );
+      assert.equal(decision.hookSpecificOutput.permissionDecision, "deny");
+      yield {
+        type: "user",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: id,
+              is_error: true,
+              content: "Denied by the submission recovery allowance.",
+            },
+          ],
+        },
+      };
+      await protocol.closed;
+    });
+    const result = await runReviewGoal(
+      "check",
+      0,
+      goalContext,
+      [recoveryFile, { ...recoveryFile, path: "unread.txt" }],
+      emptyConversation,
+      reviewConfig({ interactWithPullRequest: true }),
+      await makeReviewDiff(t),
+      "/repo",
+      query,
+    );
+    assert.equal(result.status, "incomplete");
+    assert.equal(result.submission?.findings.length, 1);
+    assert.equal(result.submission?.findings[0]?.title, "Unchecked result");
+    assert.equal(result.diagnostics?.repairAttempts, 5);
+  });
+}

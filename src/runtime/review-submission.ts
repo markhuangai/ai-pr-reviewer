@@ -67,7 +67,7 @@ export class ReviewSubmissionRecovery {
     if (this.uses.has(id)) return;
     this.uses.set(id, { allowed: !this.exhausted, input });
     this.activitySinceResult = true;
-    this.latestInput = input;
+    if (this.allows(id)) this.latestInput = input;
   }
 
   reject(id: string, categories: readonly string[]): void {
