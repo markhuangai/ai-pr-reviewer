@@ -39,6 +39,13 @@ test("retains supported findings while suppressing approval for incomplete cover
       prompt: "correctness",
       status: "incomplete",
       error: "required evidence read did not finish",
+      diagnostics: {
+        submissionAttempts: 6,
+        repairAttempts: 5,
+        evidenceReferences: 3,
+        rejectionCounts: { "PRIVATE REJECTION": 6 },
+        termination: "PRIVATE TERMINATION",
+      },
       submission: {
         summary: "One supported issue; another path was not inspected.",
         findings: [
@@ -90,6 +97,7 @@ test("retains supported findings while suppressing approval for incomplete cover
   assert.equal(review.event, "COMMENT");
   assert.equal(review.findings.length, 1);
   assert.match(body, /Review incomplete/u);
+  assert.doesNotMatch(body, /PRIVATE REJECTION|PRIVATE TERMINATION|submissionAttempts/u);
   assert.match(summary, /Required evidence gathering could not finish/u);
   assert.match(summary, /src\/other\.ts/u);
 });

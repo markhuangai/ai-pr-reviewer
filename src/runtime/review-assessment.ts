@@ -131,6 +131,7 @@ export const reviewEvidenceResultSchema = z
       "external_tool",
     ]),
     status: z.enum(["complete", "partial", "failed"]),
+    completedBy: evidenceRefSchema.optional(),
     path: pathSchema.optional(),
     paths: z.array(pathSchema).max(50).optional(),
     revision: z.enum(["base", "head"]).optional(),
@@ -300,17 +301,20 @@ function nativeQueryAssessment(
           (total === undefined || total > count))));
   const bounded =
     name === "Read"
-      ? (inputOffset !== undefined && inputOffset > 0) ||
-        inputValue.limit !== undefined ||
-        pages !== undefined
+      ? pages !== undefined
       : (inputOffset !== undefined && inputOffset > 0) ||
         (inputLimit !== undefined && inputLimit > 0);
   const hostCannotVerify =
     name === "Read"
       ? file === undefined ||
         startLine === undefined ||
+        startLine !== 1 ||
         numLines === undefined ||
-        totalLines === undefined
+        totalLines === undefined ||
+        numLines !== totalLines ||
+        typeof file.content !== "string" ||
+        (inputOffset !== undefined && inputOffset > 1) ||
+        (inputLimit !== undefined && inputLimit > 0 && numLines > inputLimit)
       : recordedOffset === undefined || recordedLimit === undefined || count === undefined;
   const bounds: ReviewEvidenceBounds = {
     ...(recordedOffset === undefined ? {} : { offset: recordedOffset }),
@@ -365,7 +369,44 @@ function lookupReference(
   references: ReadonlyMap<string, ReviewEvidenceReference>,
   value: unknown,
 ): ReviewEvidenceReference | undefined {
-  return isText(value) ? references.get(value) : undefined;
+  if (!isText(value)) return undefined;
+  const reference = references.get(value);
+  if (reference?.status !== "partial" || reference.completedBy === undefined) return reference;
+  const completed = references.get(reference.completedBy);
+  return completed?.status === "complete" && sameEvidenceScope(reference, completed)
+    ? completed
+    : reference;
+}
+
+function sameEvidenceScope(left: ReviewEvidenceReference, right: ReviewEvidenceReference): boolean {
+  return (
+    left.kind === right.kind &&
+    left.path === right.path &&
+    JSON.stringify(left.paths) === JSON.stringify(right.paths) &&
+    left.revision === right.revision &&
+    left.mergeBaseSha === right.mergeBaseSha &&
+    left.headSha === right.headSha &&
+    left.changedPaths === right.changedPaths &&
+    left.contentKind === right.contentKind
+  );
+}
+
+export interface ReviewValidationGap {
+  readonly category: "coverage" | "candidate" | "schema" | "discussion" | "location" | "briefing";
+  readonly message: string;
+  readonly paths: readonly string[];
+}
+
+export function reviewAssessmentGaps(
+  assessment: ReviewAssessment,
+  findings: readonly ReviewFinding[],
+  changedFiles: readonly ChangedFile[],
+  references: ReadonlyMap<string, ReviewEvidenceReference>,
+): readonly ReviewValidationGap[] {
+  return [
+    ...reviewCoverageGaps(assessment.coverage, changedFiles, references),
+    ...reviewCandidateGaps(assessment.candidates, findings, changedFiles, references),
+  ];
 }
 
 export function findInvalidReviewAssessment(
@@ -374,31 +415,45 @@ export function findInvalidReviewAssessment(
   changedFiles: readonly ChangedFile[],
   references: ReadonlyMap<string, ReviewEvidenceReference>,
 ): readonly string[] {
+  return reviewAssessmentGaps(assessment, findings, changedFiles, references).map(
+    (gap) => gap.message,
+  );
+}
+
+export function reviewCoverageGaps(
+  coverageEntries: ReviewAssessment["coverage"],
+  changedFiles: readonly ChangedFile[],
+  references: ReadonlyMap<string, ReviewEvidenceReference>,
+): readonly ReviewValidationGap[] {
   const validPaths = new Set(
     changedFiles.flatMap((file) => [
       file.path,
       ...(file.previousPath === undefined ? [] : [file.previousPath]),
     ]),
   );
-  const issues: string[] = [];
+  const issues: ReviewValidationGap[] = [];
+  const add = (message: string, paths: readonly string[]): void => {
+    issues.push({ category: "coverage", message, paths });
+  };
   const classifiedPaths = new Set<string>();
-  for (let index = 0; index < assessment.coverage.length; index += 1) {
-    const coverage = assessment.coverage[index];
+  for (let index = 0; index < coverageEntries.length; index += 1) {
+    const coverage = coverageEntries[index];
     if (coverage === undefined) continue;
     const pathSet = new Set(coverage.paths);
-    if (pathSet.size !== coverage.paths.length) issues.push(`coverage ${index + 1} repeats a path`);
+    if (pathSet.size !== coverage.paths.length)
+      add(`coverage ${index + 1} repeats a path`, coverage.paths);
     const resolvedRefs = coverage.evidenceRefs.map((id) => lookupReference(references, id));
     if (resolvedRefs.some((reference) => reference === undefined)) {
-      issues.push(`coverage ${index + 1} cites unknown evidence`);
+      add(`coverage ${index + 1} cites unknown evidence`, coverage.paths);
       continue;
     }
     for (const path of coverage.paths) {
       if (!validPaths.has(path)) {
-        issues.push(`coverage ${index + 1} cites unchanged path ${JSON.stringify(path)}`);
+        add(`coverage ${index + 1} cites unchanged path ${JSON.stringify(path)}`, [path]);
         continue;
       }
       if (classifiedPaths.has(path)) {
-        issues.push(`changed path ${JSON.stringify(path)} is classified more than once`);
+        add(`changed path ${JSON.stringify(path)} is classified more than once`, [path]);
         continue;
       }
       classifiedPaths.add(path);
@@ -409,38 +464,61 @@ export function findInvalidReviewAssessment(
             reference !== undefined &&
             reference.status === "complete" &&
             isRepositoryEvidence(reference) &&
-            evidenceCoversPathForCoverage(reference, path),
+            evidenceCoversChangedPath(reference, path, changedFiles, false),
         )
       ) {
-        issues.push(
+        add(
           `${coverage.disposition} path ${JSON.stringify(path)} has no completed repository evidence`,
+          [path],
         );
       }
     }
   }
   for (const path of validPaths) {
     if (!classifiedPaths.has(path))
-      issues.push(`changed path ${JSON.stringify(path)} has no coverage classification`);
+      add(`changed path ${JSON.stringify(path)} has no coverage classification`, [path]);
   }
 
+  return issues;
+}
+
+export function reviewCandidateGaps(
+  candidates: ReviewAssessment["candidates"],
+  findings: readonly ReviewFinding[],
+  changedFiles: readonly ChangedFile[],
+  references: ReadonlyMap<string, ReviewEvidenceReference>,
+): readonly ReviewValidationGap[] {
+  const validPaths = new Set(
+    changedFiles.flatMap((file) => [
+      file.path,
+      ...(file.previousPath === undefined ? [] : [file.previousPath]),
+    ]),
+  );
+  const issues: ReviewValidationGap[] = [];
+  const add = (message: string, paths: readonly string[]): void => {
+    issues.push({ category: "candidate", message, paths });
+  };
   const findingsByIndex = new Map<number, number>();
-  for (let index = 0; index < assessment.candidates.length; index += 1) {
-    const candidate = assessment.candidates[index];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
     if (candidate === undefined) continue;
+    const issue = (message: string): void => {
+      add(message, candidate.paths);
+    };
     const evidence = candidate.evidenceRefs.map((id) => lookupReference(references, id));
     const counterevidence = candidate.counterevidenceRefs.map((id) =>
       lookupReference(references, id),
     );
     if (evidence.some((reference) => reference === undefined)) {
-      issues.push(`candidate ${index + 1} cites unknown evidence`);
+      issue(`candidate ${index + 1} cites unknown evidence`);
       continue;
     }
     if (counterevidence.some((reference) => reference === undefined)) {
-      issues.push(`candidate ${index + 1} cites unknown counterevidence`);
+      issue(`candidate ${index + 1} cites unknown counterevidence`);
       continue;
     }
     if (candidate.evidenceRefs.length === 0) {
-      issues.push(`candidate ${index + 1} has no host-issued evidence`);
+      issue(`candidate ${index + 1} has no host-issued evidence`);
     }
     if (
       candidate.verdict === "supported" &&
@@ -451,14 +529,14 @@ export function findInvalidReviewAssessment(
               reference !== undefined &&
               reference.status === "complete" &&
               isRepositoryEvidence(reference) &&
-              evidenceCoversPath(reference, path),
+              evidenceCoversChangedPath(reference, path, changedFiles),
           ),
       )
     ) {
-      issues.push(`supported candidate ${index + 1} lacks evidence for an affected path`);
+      issue(`supported candidate ${index + 1} lacks evidence for an affected path`);
     }
     if (candidate.verdict === "disproved" && candidate.counterevidenceRefs.length === 0) {
-      issues.push(`disproved candidate ${index + 1} has no counterevidence`);
+      issue(`disproved candidate ${index + 1} has no counterevidence`);
     }
     if (
       candidate.verdict === "disproved" &&
@@ -469,15 +547,15 @@ export function findInvalidReviewAssessment(
           isRepositoryEvidence(reference),
       )
     ) {
-      issues.push(`disproved candidate ${index + 1} has no completed repository counterevidence`);
+      issue(`disproved candidate ${index + 1} has no completed repository counterevidence`);
     }
     for (const path of candidate.paths) {
       if (!validPaths.has(path))
-        issues.push(`candidate ${index + 1} cites unchanged path ${JSON.stringify(path)}`);
+        issue(`candidate ${index + 1} cites unchanged path ${JSON.stringify(path)}`);
     }
     if (candidate.verdict === "supported") {
       if (candidate.findingIndex === undefined || candidate.findingIndex >= findings.length) {
-        issues.push(`supported candidate ${index + 1} does not identify its finding`);
+        issue(`supported candidate ${index + 1} does not identify its finding`);
       } else {
         findingsByIndex.set(
           candidate.findingIndex,
@@ -485,16 +563,17 @@ export function findInvalidReviewAssessment(
         );
         const findingPath = findings[candidate.findingIndex]?.path;
         if (findingPath !== undefined && !candidate.paths.includes(findingPath)) {
-          issues.push(`finding ${candidate.findingIndex + 1} is not linked to its changed path`);
+          issue(`finding ${candidate.findingIndex + 1} is not linked to its changed path`);
         }
       }
     } else if (candidate.findingIndex !== undefined) {
-      issues.push(`non-supported candidate ${index + 1} identifies a finding`);
+      issue(`non-supported candidate ${index + 1} identifies a finding`);
     }
   }
   for (let index = 0; index < findings.length; index += 1) {
+    const path = findings[index]?.path;
     if (findingsByIndex.get(index) !== 1)
-      issues.push(`finding ${index + 1} needs one supported candidate`);
+      add(`finding ${index + 1} needs one supported candidate`, path === undefined ? [] : [path]);
   }
   return issues;
 }
@@ -503,6 +582,8 @@ export class ReviewEvidenceLedger {
   private sequence = 0;
   private readonly references = new Map<string, ReviewEvidenceReference>();
   private readonly cursors = new Map<string, EvidenceCursorContext>();
+  private readonly queries = new Map<string, { pages: Map<number, string>; finalPage?: number }>();
+  private readonly observedCalls = new Set<string>();
 
   constructor(private readonly cwd: string) {}
 
@@ -512,21 +593,41 @@ export class ReviewEvidenceLedger {
 
   observeBatch(calls: readonly RepositoryReviewToolCall[]): readonly ReviewEvidenceReference[] {
     const observed: ReviewEvidenceReference[] = [];
+    const expired = new Set<string>();
     for (const call of calls) {
+      if (this.observedCalls.has(call.tool_use_id)) continue;
+      this.observedCalls.add(call.tool_use_id);
       const source = this.source(call);
       if (source === undefined) continue;
       const result = toolResponseDocument(call.tool_response);
+      const input = isRecord(call.tool_input) ? call.tool_input : {};
+      const inputCursor = typeof input.cursor === "string" ? input.cursor : undefined;
+      const nextCursor = typeof result?.nextCursor === "string" ? result.nextCursor : undefined;
+      const cursor = inputCursor ?? nextCursor;
+      const fixedPage =
+        source.kind === "repository_diff" ||
+        (source.kind === "repository_file" &&
+          (result?.kind === "text" || source.contentKind === "text"));
+      const page = nonnegativeInteger(result?.page);
       const nativeAssessment = nativeQueryAssessment(call.tool_name, call.tool_input, result);
-      const missingDiffPageMetadata =
-        source.kind === "repository_diff" &&
-        (typeof result?.done !== "boolean" || typeof result.content !== "string");
+      const malformedPage =
+        fixedPage &&
+        (typeof result?.done !== "boolean" ||
+          typeof result.content !== "string" ||
+          page === undefined ||
+          page < 1 ||
+          (inputCursor === undefined && page !== 1) ||
+          (!result.done && nextCursor === undefined) ||
+          (inputCursor !== undefined && nextCursor !== undefined && inputCursor !== nextCursor));
       const status =
         call.tool_response === undefined ||
-        missingDiffPageMetadata ||
+        malformedPage ||
         explicitToolFailure(call.tool_response) ||
         (result !== undefined && explicitToolFailure(result))
           ? "failed"
-          : result?.done === false || nativeAssessment.partial
+          : result?.done === false ||
+              nativeAssessment.partial ||
+              (fixedPage && cursor !== undefined)
             ? "partial"
             : "complete";
       const reference = reviewEvidenceResultSchema.parse({
@@ -552,8 +653,7 @@ export class ReviewEvidenceLedger {
       }) as ReviewEvidenceReference;
       this.references.set(reference.id, reference);
       observed.push(reference);
-      const cursor = result?.nextCursor;
-      if (typeof cursor === "string") {
+      if (nextCursor !== undefined && status !== "failed") {
         const cursorSource: EvidenceCursorContext = {
           kind: reference.kind,
           ...(reference.path === undefined ? {} : { path: reference.path }),
@@ -564,20 +664,82 @@ export class ReviewEvidenceLedger {
           ...(reference.changedPaths === undefined ? {} : { changedPaths: reference.changedPaths }),
           ...(reference.contentKind === undefined ? {} : { contentKind: reference.contentKind }),
         };
-        if (!this.cursors.has(cursor) && this.cursors.size >= MAX_EVIDENCE_CURSORS) {
+        if (!this.cursors.has(nextCursor) && this.cursors.size >= MAX_EVIDENCE_CURSORS) {
           const oldest = this.cursors.keys().next().value;
-          if (oldest !== undefined) this.cursors.delete(oldest);
+          if (oldest !== undefined) {
+            this.cursors.delete(oldest);
+            this.queries.delete(oldest);
+          }
         }
-        this.cursors.set(cursor, cursorSource);
+        this.cursors.set(nextCursor, cursorSource);
+      }
+      if (cursor !== undefined && fixedPage && status !== "failed" && page !== undefined) {
+        const query: { pages: Map<number, string>; finalPage?: number } = this.queries.get(
+          cursor,
+        ) ?? { pages: new Map<number, string>() };
+        query.pages.set(page, reference.id);
+        if (result?.done === true) query.finalPage = page;
+        this.queries.set(cursor, query);
       } else if (
-        isRecord(call.tool_input) &&
-        typeof call.tool_input.cursor === "string" &&
-        (status !== "failed" || expiredCursorFailure(result))
+        inputCursor !== undefined &&
+        ((!fixedPage && status !== "failed" && nextCursor === undefined) ||
+          expiredCursorFailure(result))
       ) {
-        this.cursors.delete(call.tool_input.cursor);
+        expired.add(inputCursor);
       }
     }
-    return observed;
+    for (const [cursor, query] of this.queries) {
+      const finalPage = query.finalPage;
+      if (finalPage === undefined || query.pages.size !== finalPage) continue;
+      const finalId = query.pages.get(finalPage);
+      const last = finalId === undefined ? undefined : this.references.get(finalId);
+      if (last === undefined || last.status === "failed") continue;
+      const members = Array.from({ length: finalPage }, (_, index) =>
+        this.references.get(query.pages.get(index + 1) ?? ""),
+      );
+      if (
+        members.some(
+          (reference) =>
+            reference === undefined ||
+            reference.status === "failed" ||
+            !sameEvidenceScope(reference, last),
+        )
+      )
+        continue;
+      this.references.set(last.id, { ...last, status: "complete" });
+      for (const reference of members) {
+        if (reference !== undefined && reference.id !== last.id)
+          this.references.set(reference.id, { ...reference, completedBy: last.id });
+      }
+      expired.add(cursor);
+    }
+    for (const cursor of expired) {
+      this.cursors.delete(cursor);
+      this.queries.delete(cursor);
+    }
+    return observed.map((reference) => this.references.get(reference.id) ?? reference);
+  }
+
+  referencesForPaths(paths: readonly string[]): readonly ReviewEvidenceReference[] {
+    return [...this.references.values()].filter((reference) =>
+      paths.some(
+        (path) =>
+          reference.changedPaths === true ||
+          reference.path === path ||
+          reference.paths?.includes(path) === true,
+      ),
+    );
+  }
+
+  eligibleReferences(path: string, changedFiles: readonly ChangedFile[]): readonly string[] {
+    return [...this.references.keys()].filter((id) => {
+      const reference = lookupReference(this.references, id);
+      return (
+        reference !== undefined &&
+        reference.status === "complete" &&
+        evidenceCoversChangedPath(reference, path, changedFiles, false)
+      );
+    });
   }
 
   renderReferences(references: readonly ReviewEvidenceReference[], limit = 1_400): string {
@@ -594,13 +756,13 @@ export class ReviewEvidenceLedger {
         location.length <= 220
           ? location
           : `${location.slice(0, 160)}…${location.slice(-40)} (${location.length} chars)`;
-      const line = `${reference.id} ${reference.status} ${reference.kind} ${JSON.stringify(boundedLocation)}${reference.revision === undefined ? "" : ` ${reference.revision}`}${reference.bounds === undefined ? "" : ` ${JSON.stringify(reference.bounds)}`}`;
+      const line = `${reference.id} ${reference.status} ${reference.kind} ${JSON.stringify(boundedLocation)}${reference.revision === undefined ? "" : ` ${reference.revision}`}${reference.bounds === undefined ? "" : ` ${JSON.stringify(reference.bounds)}`}${reference.completedBy === undefined ? "" : ` completed_query=${reference.completedBy}`}`;
       if (used + line.length + 1 > limit) break;
       lines.push(line);
       used += line.length + 1;
     }
     const omitted = references.length - lines.length;
-    return `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}${omitted > 0 ? `\n${omitted} additional references are omitted; use a fresh read to receive more references.` : ""}`;
+    return `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}${omitted > 0 ? `\n${omitted} additional references are omitted; call read_review_state to retrieve existing evidence without rereading source.` : ""}`;
   }
 
   private source(
@@ -613,7 +775,7 @@ export class ReviewEvidenceLedger {
     const name = call.tool_name.startsWith(internalMcpToolPrefix)
       ? call.tool_name.slice(internalMcpToolPrefix.length)
       : call.tool_name;
-    if (name === "submit_review") return undefined;
+    if (name === "submit_review" || name === "read_review_state") return undefined;
     const input = isRecord(call.tool_input) ? call.tool_input : {};
     if (name === "read_pr_diff") {
       const cursor = input.cursor;
@@ -673,8 +835,25 @@ export function evidenceCoversPath(reference: ReviewEvidenceReference, path: str
   return reference.path === path;
 }
 
-function evidenceCoversPathForCoverage(reference: ReviewEvidenceReference, path: string): boolean {
-  return reference.kind !== "repository_search" && evidenceCoversPath(reference, path);
+export function evidenceCoversChangedPath(
+  reference: ReviewEvidenceReference,
+  path: string,
+  changedFiles: readonly ChangedFile[],
+  allowSearch = true,
+): boolean {
+  if (
+    (!allowSearch && reference.kind === "repository_search") ||
+    !evidenceCoversPath(reference, path)
+  )
+    return false;
+  const file = changedFiles.find((file) => file.path === path || file.previousPath === path);
+  if (file === undefined) return false;
+  if (reference.kind === "repository_diff") return true;
+  const revision =
+    file.status === "removed" || (file.previousPath === path && file.path !== path)
+      ? "base"
+      : "head";
+  return reference.revision === revision;
 }
 
 function isRepositoryEvidence(reference: ReviewEvidenceReference): boolean {

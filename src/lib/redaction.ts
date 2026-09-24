@@ -27,6 +27,20 @@ export function redactGoalResults(
     ...goal,
     prompt: redact(goal.prompt, secrets),
     ...(goal.error === undefined ? {} : { error: redact(goal.error, secrets) }),
+    ...(goal.diagnostics === undefined
+      ? {}
+      : {
+          diagnostics: {
+            ...goal.diagnostics,
+            termination: redact(goal.diagnostics.termination, secrets),
+            rejectionCounts: Object.fromEntries(
+              Object.entries(goal.diagnostics.rejectionCounts).map(([category, count]) => [
+                redact(category, secrets),
+                count,
+              ]),
+            ),
+          },
+        }),
     ...(goal.tokenUsage === undefined
       ? {}
       : {

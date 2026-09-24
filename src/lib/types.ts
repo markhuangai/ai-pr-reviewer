@@ -193,6 +193,7 @@ export interface ReviewEvidenceReference {
   readonly id: string;
   readonly kind: ReviewEvidenceKind;
   readonly status: ReviewEvidenceStatus;
+  readonly completedBy?: string;
   readonly path?: string;
   readonly paths?: readonly string[];
   readonly revision?: "base" | "head";
@@ -215,6 +216,13 @@ export interface GoalResult {
   readonly submission?: GoalSubmission;
   readonly error?: string;
   readonly tokenUsage?: GoalTokenUsage;
+  readonly diagnostics?: {
+    readonly submissionAttempts: number;
+    readonly repairAttempts: number;
+    readonly evidenceReferences: number;
+    readonly rejectionCounts: Readonly<Record<string, number>>;
+    readonly termination: string;
+  };
 }
 
 export interface TokenCounts {
