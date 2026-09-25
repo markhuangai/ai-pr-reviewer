@@ -9,20 +9,26 @@ import {
   writeFile,
   emptyConversation,
   goalContext,
-  reviewConfig,
   runReviewGoalWithEmptyGuidance as runReviewGoal,
   test,
   mkdtemp,
   tmpdir,
   rm,
   type ChangedFile,
-  type TestContext,
   type SDKMessage,
-  type SDKResultMessage,
 } from "./agent-test-helpers.js";
 import { rename } from "node:fs/promises";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
-import { reviewProtocolQuery, type ReviewProtocol } from "./review-protocol-test-helpers.js";
+import {
+  reviewProtocolQuery,
+  protocolDocument,
+  normalizeState,
+  recoveryState,
+  protocolBriefing,
+  protocolResult,
+  recoveryRepository,
+  recoveryConfig as reviewConfig,
+} from "./review-protocol-test-helpers.js";
 import {
   ReviewSubmissionRecovery,
   retainValidReviewFindings,
@@ -49,75 +55,6 @@ function call(tool_name: string, tool_input: unknown, tool_response: unknown) {
 function jsonResponse(value: unknown): unknown {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
-interface RecoveryState {
-  readonly manifest: readonly { path: string }[];
-  readonly evidence: readonly ReviewEvidenceReference[];
-  readonly gaps: readonly { category: string; paths: readonly string[] }[];
-  readonly remainingCorrections: number;
-  readonly submissionAttempts: number;
-  readonly headSha: string;
-  readonly inspection: { observed: number; missing: number };
-  readonly calls: readonly { kind: string; tool: string; arguments: Record<string, unknown> }[];
-}
-
-function protocolDocument(response: {
-  readonly content: readonly { readonly text?: string }[];
-}): Record<string, unknown> {
-  return JSON.parse(response.content[0]?.text ?? "{}") as Record<string, unknown>;
-}
-
-function normalizeState(pages: readonly Record<string, unknown>[]): RecoveryState {
-  const records = pages.flatMap((page) => page.records as Record<string, unknown>[]);
-  return {
-    ...pages[0],
-    manifest: records.filter((record) => record.kind === "changed_file"),
-    evidence: records
-      .filter((record) => record.kind === "evidence")
-      .map((record) => record.reference),
-    gaps: records.filter((record) => record.kind === "gap"),
-    calls: records.filter((record) => record.kind === "next_call" || record.kind === "active_read"),
-  } as unknown as RecoveryState;
-}
-
-async function* recoveryState(
-  protocol: ReviewProtocol,
-  paths?: string[],
-): AsyncGenerator<SDKMessage, RecoveryState> {
-  let cursor: string | undefined;
-  const pages: Record<string, unknown>[] = [];
-  for (;;) {
-    const response = yield* protocol.call("read_review_state", {
-      ...(paths === undefined ? {} : { paths }),
-      ...(cursor === undefined ? {} : { cursor }),
-    });
-    assert.ok(
-      Buffer.byteLength(JSON.stringify(response)) <= agentInternals.MODEL_TOOL_RESULT_BYTES,
-    );
-    const page = protocolDocument(response);
-    assert.ok(Array.isArray(page.records));
-    assert.equal(page.content, undefined);
-    pages.push(page);
-    if (page.done === true) return normalizeState(pages);
-    cursor = String(page.nextCursor);
-  }
-}
-
-async function* protocolBriefing(protocol: ReviewProtocol): AsyncGenerator<SDKMessage> {
-  let done = false;
-  while (!done)
-    done = protocolDocument(yield* protocol.call("read_review_briefing", {})).done === true;
-}
-
-function protocolResult(subtype = "success"): SDKResultMessage {
-  return {
-    type: "result",
-    subtype,
-    errors: subtype === "success" ? [] : [subtype],
-    num_turns: 2,
-    modelUsage: {},
-  } as SDKResultMessage;
-}
-
 const recoveryFile: ChangedFile = {
   path: "review.txt",
   status: "modified",
@@ -145,21 +82,6 @@ function recoverySubmission(evidenceRef: string): Record<string, unknown> {
     ],
     limitations: [],
   };
-}
-
-async function recoveryRepository(t: TestContext) {
-  const repository = await makeRepository(t, async (root) => {
-    await writeFile(join(root, "review.txt"), "changed line\n");
-    await writeFile(join(root, "unread.txt"), "unseen change\n");
-  });
-  const diff = await makeDiffFromSnapshots(
-    repository.root,
-    repository.baseSha,
-    repository.headSha,
-    repository.temporaryRoot,
-  );
-  t.after(() => diff.cleanup());
-  return { ...repository, diff };
 }
 
 test("recovers completed query references after compaction without rereading source", async (t) => {
@@ -302,7 +224,8 @@ test("state pages preserve a snapshot and expose rejection overflow without issu
     "/repo",
     query,
   );
-  assert.equal(result.status, "failed");
+  assert.equal(result.status, "incomplete");
+  assert.deepEqual(result.submission?.findings, []);
   assert.equal(result.diagnostics?.submissionAttempts, 1);
 });
 
@@ -404,7 +327,10 @@ for (const replacement of [
       repository.root,
       query,
     );
-    assert.equal(result.status, replacement === "unchanged" ? "incomplete" : "failed");
+    assert.equal(
+      result.status,
+      replacement === "unchanged" || replacement === "withdrawn" ? "incomplete" : "failed",
+    );
     assert.equal(result.submission?.findings.length ?? 0, replacement === "unchanged" ? 1 : 0);
     if (replacement === "unchanged") {
       assert.deepEqual(result.inspection?.missingPaths, ["unread.txt"]);
@@ -418,6 +344,91 @@ for (const replacement of [
     }
   });
 }
+
+test("labels inspection, validation, and empty-turn recovery with the active budget", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const clean = { summary: "Checked the changes.", findings: [], limitations: [] };
+  const result = await runReviewGoal(
+    "check",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig({ maxTurns: 6 }),
+    repository.diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      const steps = [
+        {
+          input: undefined,
+          label: "inspection continuation (4 inspection recovery cycles remaining)",
+          failures: 0,
+          inspections: 1,
+        },
+        {
+          input: { summary: "malformed" },
+          label: "validation correction 1 of 5",
+          failures: 1,
+          inspections: 1,
+        },
+        {
+          input: undefined,
+          label: "inspection continuation (3 inspection recovery cycles remaining)",
+          failures: 1,
+          inspections: 2,
+        },
+        {
+          input: { ...clean, limitations: [{ paths: ["not-changed.ts"], reason: "Unavailable." }] },
+          label: "validation correction 2 of 5",
+          failures: 2,
+          inspections: 2,
+        },
+        {
+          input: clean,
+          label: "inspection continuation (1 inspection recovery cycles remaining)",
+          failures: 2,
+          inspections: 3,
+        },
+      ];
+      for (const step of steps) {
+        if (step.input !== undefined)
+          assert.equal((yield* protocol.call("submit_review", step.input)).isError, true);
+        yield protocolResult();
+        const next = await protocol.messages.next();
+        assert.equal(next.done, false);
+        const prompt = next.value?.message.content;
+        assert.ok(typeof prompt === "string");
+        assert.ok(prompt.startsWith(`Review recovery; ${step.label}:`), prompt);
+        const state = yield* recoveryState(protocol);
+        assert.equal(state.validationFailures, step.failures);
+        assert.equal(state.inspectionContinuations, step.inspections);
+        assert.equal(state.remainingCorrections, step.failures === 0 ? 5 : 6 - step.failures);
+        if (step.label.startsWith("inspection")) {
+          assert.doesNotMatch(prompt, /validation correction/u);
+          assert.ok(
+            prompt.includes(
+              `${state.remainingInspectionCycles} inspection recovery cycles remaining`,
+            ),
+          );
+        }
+      }
+      yield* protocol.call("read_pr_diff", {});
+      assert.equal((yield* protocol.call("submit_review", clean)).isError, undefined);
+      yield protocolResult();
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.equal(result.diagnostics?.validationFailures, 2);
+  assert.equal(result.diagnostics?.repairAttempts, 1);
+  assert.equal(result.diagnostics?.inspectionContinuations, 3);
+  assert.equal(result.diagnostics?.recoveryCycles, 6);
+});
 
 test("an empty terminal result does not charge a rejected submission twice", async (t) => {
   let followups = 0;
@@ -437,21 +448,21 @@ test("an empty terminal result does not charge a rejected submission twice", asy
         findings: [],
         limitations: [],
       });
-      for (let index = 0; index < 6; index += 1) {
+      for (let index = 0; index < 5; index += 1) {
         yield protocolResult();
         const next = await protocol.messages.next();
-        if (index < 5) {
+        if (index < 4) {
           assert.equal(next.done, false);
           followups += 1;
         } else assert.equal(next.done, true);
       }
     }),
   );
-  assert.equal(followups, 5);
+  assert.equal(followups, 4);
   assert.equal(result.diagnostics?.submissionAttempts, 1);
-  assert.equal(result.diagnostics?.repairAttempts, 5);
+  assert.equal(result.diagnostics?.repairAttempts, 0);
   assert.equal(result.diagnostics?.rejectionCounts.inspection, 1);
-  assert.equal(result.diagnostics?.rejectionCounts.empty_turn, 5);
+  assert.equal(result.diagnostics?.rejectionCounts.empty_turn, 4);
 });
 
 for (const termination of ["exhausted", "provider", "mcp"] as const) {
@@ -503,22 +514,31 @@ for (const termination of ["exhausted", "provider", "mcp"] as const) {
 }
 
 test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
   const result = await runReviewGoal(
     "check",
     0,
-    goalContext,
-    [recoveryFile],
+    repository.context,
+    files,
     emptyConversation,
-    reviewConfig(),
-    await makeReviewDiff(t),
-    "/repo",
+    reviewConfig({ maxTurns: 6 }),
+    repository.diff,
+    repository.root,
     reviewProtocolQuery(async function* (protocol) {
       yield* protocolBriefing(protocol);
       for (let index = 0; index < 5; index += 1) yield* protocol.call("submit_review", {});
+      yield* protocol.call("read_pr_diff", {});
       const accepted = yield* protocol.call("submit_review", {
         summary: "No complete investigation",
         findings: [],
-        limitations: [{ paths: ["review.txt"], reason: "No repository evidence was read." }],
+        limitations: [
+          { paths: ["review.txt"], reason: "A required external behavior remains unavailable." },
+        ],
       });
       assert.equal(accepted.isError, undefined);
       yield protocolResult();
@@ -556,7 +576,7 @@ test("retains valid current findings independently of malformed peers", () => {
 });
 
 test("reserves submission identities without exhausting an in-flight last correction", () => {
-  const recovery = new ReviewSubmissionRecovery();
+  const recovery = new ReviewSubmissionRecovery(6);
   for (let index = 1; index <= 6; index += 1) recovery.observeUse(`use-${index}`, { index });
   for (let index = 1; index <= 5; index += 1) {
     recovery.reject(`use-${index}`, ["schema"]);
@@ -827,7 +847,8 @@ for (const denied of ["withdrawal", "replacement"] as const) {
     assert.equal(result.status, "incomplete");
     assert.equal(result.submission?.findings.length, 1);
     assert.equal(result.submission?.findings[0]?.title, "Unchecked result");
-    assert.equal(result.diagnostics?.repairAttempts, 5);
+    assert.equal(result.diagnostics?.repairAttempts, 0);
+    assert.equal(result.diagnostics?.consecutiveNoProgress, 5);
   });
 }
 

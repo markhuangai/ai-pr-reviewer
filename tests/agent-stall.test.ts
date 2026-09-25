@@ -472,7 +472,7 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
     goalContext,
     [],
     emptyConversation,
-    reviewConfig(),
+    reviewConfig({ maxTurns: 3 }),
     await makeReviewDiff(t),
     "/workspace/repository",
     query,

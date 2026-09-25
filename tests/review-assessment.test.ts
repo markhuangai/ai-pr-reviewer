@@ -647,20 +647,20 @@ test("validates repository counterevidence directly on the finding", () => {
     );
 });
 
-test("accepts explicit limitations but rejects unseen completion and invalid summary locations", () => {
+test("requires inspection despite declared limitations and validates summary locations", () => {
   const ledger = new ReviewEvidenceLedger("/repo");
   const small = { summary: "done", findings: [], limitations: [] };
   const gaps = (input: unknown) =>
     reviewSubmissionGaps(input, [changedFile], ledger, false, true, () => []);
   assert.equal(gaps(small)[0]?.category, "inspection");
-  assert.deepEqual(
+  assert.equal(
     gaps({
       ...small,
       limitations: [
         { paths: [], reason: "The provider stopped before required investigation finished." },
       ],
-    }),
-    [],
+    }).some((gap) => gap.category === "inspection"),
+    true,
   );
   assert.equal(
     gaps({ ...small, limitations: [{ paths: ["unrelated.ts"], reason: "unavailable" }] })[0]
@@ -813,16 +813,12 @@ test("keeps four structured state snapshots without advancing or evicting source
     tool?: string;
     arguments?: Record<string, unknown>;
   }[];
-  assert.deepEqual(records[0], {
-    kind: "next_call",
-    tool: "read_repository_file",
-    arguments: { revision: "head", path: changedFile.path, cursor: query.cursor },
-  });
-  assert.ok(
-    !JSON.stringify(records.filter((record) => record.tool === "read_pr_diff")).includes(
-      changedFile.path,
-    ),
-  );
+  assert.equal(records[0]?.kind, "next_call");
+  assert.equal(records[0]?.tool, "read_pr_diff");
+  const restartedPaths = records[0]?.arguments?.paths;
+  assert.ok(Array.isArray(restartedPaths));
+  assert.ok(restartedPaths.includes(changedFile.path));
+  assert.ok(restartedPaths.includes("old.ts"));
   const cursor = String(first.nextCursor);
   const original = document(await state.handler({ paths: undefined, cursor }, {}));
   ledger.observeBatch([
@@ -920,7 +916,9 @@ test("reports both rename sides consistently for base, head, diff, and filtered 
         ...(expected.previousObserved ? [] : ["old.ts"]),
       ].filter((path) => paths === undefined || paths.includes(path));
       assert.deepEqual(
-        records.filter((record) => record.kind === "next_call"),
+        records
+          .filter((record) => record.kind === "next_call")
+          .map(({ kind, tool, arguments: args }) => ({ kind, tool, arguments: args })),
         unread.length === 0
           ? []
           : [{ kind: "next_call", tool: "read_pr_diff", arguments: { paths: unread } }],

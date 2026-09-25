@@ -28,28 +28,85 @@ export const MAX_REPAIR_ATTEMPTS = 5;
 export class ReviewSubmissionRecovery {
   private readonly uses = new Map<string, { allowed: boolean; input: unknown }>();
   private readonly rejections = new Set<string>();
-  private emptyTurns = 0;
   private activitySinceResult = false;
+  private recoveryKind: "inspection" | "validation" = "inspection";
+  private progress = 0;
+  private previousProgress = 0;
+  validationFailures = 0;
+  inspectionContinuations = 0;
+  consecutiveNoProgress = 0;
+  recoveryCycles = 0;
   readonly rejectionCounts: Record<string, number> = {};
   latestInput: unknown;
+
+  constructor(readonly maxCycles = 100) {}
+
+  observeProgress(value: number): void {
+    this.progress = Math.max(this.progress, value);
+  }
+
+  private inspectionCycle(): void {
+    this.recoveryKind = "inspection";
+    this.inspectionContinuations += 1;
+    this.consecutiveNoProgress =
+      this.progress > this.previousProgress ? 0 : this.consecutiveNoProgress + 1;
+    this.previousProgress = this.progress;
+  }
 
   get submissionAttempts(): number {
     return this.uses.size;
   }
   get repairAttempts(): number {
-    return Math.min(MAX_REPAIR_ATTEMPTS, Math.max(0, this.uses.size + this.emptyTurns - 1));
+    return Math.min(MAX_REPAIR_ATTEMPTS, Math.max(0, this.validationFailures - 1));
   }
   get remainingCorrections(): number {
     return Math.min(
       MAX_REPAIR_ATTEMPTS,
-      Math.max(0, MAX_REPAIR_ATTEMPTS + 1 - this.uses.size - this.emptyTurns),
+      Math.max(0, MAX_REPAIR_ATTEMPTS + 1 - this.validationFailures),
     );
   }
   get exhausted(): boolean {
-    return this.uses.size + this.emptyTurns >= MAX_REPAIR_ATTEMPTS + 1;
+    return this.exhaustionReason !== undefined;
+  }
+  get remainingInspectionCycles(): number {
+    return Math.max(
+      0,
+      Math.min(
+        MAX_REPAIR_ATTEMPTS - this.consecutiveNoProgress,
+        this.maxCycles - this.recoveryCycles,
+      ),
+    );
+  }
+  rejectionBudget(categories: readonly string[]): {
+    remainingCorrections: number;
+    remainingInspectionCycles: number;
+  } {
+    const inspectionOnly =
+      categories.length > 0 && categories.every((category) => category === "inspection");
+    const noProgress = inspectionOnly
+      ? this.progress > this.previousProgress
+        ? 0
+        : this.consecutiveNoProgress + 1
+      : this.consecutiveNoProgress;
+    return {
+      remainingCorrections: Math.min(
+        MAX_REPAIR_ATTEMPTS,
+        Math.max(0, MAX_REPAIR_ATTEMPTS + 1 - this.validationFailures - (inspectionOnly ? 0 : 1)),
+      ),
+      remainingInspectionCycles: Math.max(
+        0,
+        Math.min(MAX_REPAIR_ATTEMPTS - noProgress, this.maxCycles - this.recoveryCycles),
+      ),
+    };
+  }
+  get exhaustionReason(): string | undefined {
+    if (this.validationFailures >= MAX_REPAIR_ATTEMPTS + 1) return "validation-exhausted";
+    if (this.consecutiveNoProgress >= MAX_REPAIR_ATTEMPTS) return "inspection-stalled";
+    if (this.recoveryCycles >= this.maxCycles) return "recovery-limit";
+    return undefined;
   }
   get allRejected(): boolean {
-    return this.rejections.size === this.uses.size;
+    return [...this.uses].every(([id, use]) => !use.allowed || this.rejections.has(id));
   }
 
   hasUse(id: string): boolean {
@@ -66,19 +123,29 @@ export class ReviewSubmissionRecovery {
     if (this.uses.has(id)) return;
     this.uses.set(id, { allowed: !this.exhausted, input });
     this.activitySinceResult = true;
-    if (this.allows(id)) this.latestInput = input;
+    if (this.allows(id)) {
+      this.latestInput = input;
+      this.recoveryCycles += 1;
+    }
   }
 
-  reject(id: string, categories: readonly string[]): void {
-    if (!this.uses.has(id) || this.rejections.has(id)) return;
+  reject(id: string, categories: readonly string[]): boolean {
+    if (!this.allows(id) || this.rejections.has(id)) return false;
     this.rejections.add(id);
     for (const category of new Set(categories))
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
+    if (categories.length > 0 && categories.every((category) => category === "inspection"))
+      this.inspectionCycle();
+    else {
+      this.recoveryKind = "validation";
+      this.validationFailures += 1;
+    }
+    return true;
   }
 
   observeMessage(
     message: SDKMessage | SDKActiveGoalMessage,
-    observeRejection: (id: string) => void,
+    observeRejection: (id: string, response?: unknown) => void,
   ): void {
     if (message.type === "assistant" || message.type === "user") {
       const content = isRecord(message.message) ? message.message.content : undefined;
@@ -99,22 +166,24 @@ export class ReviewSubmissionRecovery {
             (block.type === "tool_result" || block.type === "mcp_tool_result") &&
             typeof block.tool_use_id === "string"
           )
-            observeRejection(block.tool_use_id);
+            observeRejection(block.tool_use_id, block);
         }
       if (
         message.type === "user" &&
         typeof message.parent_tool_use_id === "string" &&
         message.tool_use_result !== undefined
       )
-        observeRejection(message.parent_tool_use_id);
+        observeRejection(message.parent_tool_use_id, message.tool_use_result);
     }
   }
-  finishTurn(): void {
+  finishTurn(): "inspection" | "validation" {
     if (!this.activitySinceResult) {
-      this.emptyTurns += 1;
+      this.recoveryCycles += 1;
+      this.inspectionCycle();
       this.rejectionCounts.empty_turn = (this.rejectionCounts.empty_turn ?? 0) + 1;
     }
     this.activitySinceResult = false;
+    return this.recoveryKind;
   }
 
   diagnostics(
@@ -127,6 +196,10 @@ export class ReviewSubmissionRecovery {
       evidenceReferences,
       rejectionCounts: { ...this.rejectionCounts },
       termination,
+      validationFailures: this.validationFailures,
+      inspectionContinuations: this.inspectionContinuations,
+      consecutiveNoProgress: this.consecutiveNoProgress,
+      recoveryCycles: this.recoveryCycles,
     };
   }
 }
@@ -385,12 +458,12 @@ export function reviewSubmissionGaps(
         paths: limitation.paths,
       });
   const missing = reviewInspection(files, evidenceLedger.issued).missingPaths;
-  if (missing.length > 0 && candidate.limitations.length === 0)
+  if (missing.length > 0)
     for (const path of missing)
       gaps.push({
         category: "inspection",
         message:
-          "Changed code has not been delivered; read its selected diff or declare the required investigation incomplete.",
+          "Changed code has not been delivered; continue its selected diff. A declared limitation does not replace the required scan.",
         paths: [path],
       });
   if (!briefingComplete)
@@ -423,6 +496,7 @@ export function reviewSubmissionRejectionResult(
   evidenceLedger: ReviewEvidenceLedger,
   files: readonly ChangedFile[],
   remainingCorrections: number,
+  remainingInspectionCycles?: number,
 ): CallToolResult {
   const gaps: unknown[] = [];
   for (const gap of validationGaps) {
@@ -438,11 +512,14 @@ export function reviewSubmissionRejectionResult(
   }
   return {
     ...jsonToolResult({
-      message:
-        "Review submission rejected. Call read_review_state for inspection progress, existing evidence, and exact next calls; correct only the reported gaps.",
+      message: validationGaps.every((gap) => gap.category === "inspection")
+        ? "Continue required inspection with read_review_state's exact next calls. New required source delivery does not spend validation corrections."
+        : "Review submission rejected. Call read_review_state for inspection progress, existing evidence, and exact next calls; correct only the reported gaps.",
       gaps,
       omittedGaps: validationGaps.length - gaps.length,
+      categories: [...new Set(validationGaps.map((gap) => gap.category))],
       remainingCorrections,
+      ...(remainingInspectionCycles === undefined ? {} : { remainingInspectionCycles }),
     }),
     isError: true,
   };

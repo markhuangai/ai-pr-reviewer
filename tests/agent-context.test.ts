@@ -584,8 +584,9 @@ test("handles sparse goal arrays without leaking the shared diff", async (t) => 
 
 test("bounds selected-diff metadata before creating a query and resumes the largest accepted selection", async (t) => {
   const prefix = `${"p".repeat(220)}/${"q".repeat(200)}`;
-  const paths = Array.from({ length: 49 }, (_, index) => `${prefix}/file-${index}.ts`);
+  const paths = Array.from({ length: 24 }, (_, index) => `${prefix}/file-${index}.ts`);
   const metadataBytes = (selection: string[]) =>
+    2 *
     toolResultSerializedBytes(
       JSON.stringify({
         mergeBaseSha: "a".repeat(40),
@@ -641,7 +642,9 @@ test("bounds selected-diff metadata before creating a query and resumes the larg
       assert.match(JSON.stringify(rejected), /request fewer paths/u);
       const rejectedState = document(yield* protocol.call("read_review_state", {}));
       assert.doesNotMatch(JSON.stringify(rejectedState.records), /"cursor":/u);
-      const first = document(yield* protocol.call("read_pr_diff", { paths }));
+      const firstResult = yield* protocol.call("read_pr_diff", { paths });
+      assert.equal(firstResult.isError, undefined);
+      const first = document(firstResult);
       assert.equal(first.done, false);
       const stateResult = yield* protocol.call("read_review_state", {});
       assert.ok(Buffer.byteLength(JSON.stringify(stateResult)) <= MODEL_TOOL_RESULT_BYTES);
@@ -659,14 +662,15 @@ test("bounds selected-diff metadata before creating a query and resumes the larg
         findings: [],
         limitations: [{ paths: [], reason: "The remaining changes were not inspected." }],
       });
-      assert.equal(accepted.isError, undefined);
+      assert.equal(accepted.isError, true);
       yield {
         type: "result",
-        subtype: "success",
+        subtype: "error_max_turns",
+        errors: ["error_max_turns"],
         num_turns: 2,
         modelUsage: {},
       } as SDKResultMessage;
     }),
   );
-  assert.equal(result.status, "incomplete");
+  assert.equal(result.status, "incomplete", result.error ?? "");
 });

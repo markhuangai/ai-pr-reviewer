@@ -119,6 +119,7 @@ test("fails closed when local Git metadata commands fail", async () => {
   assert.equal(githubApiInternals.diffPath("+++ odd-path.txt"), "odd-path.txt");
   assert.equal(githubApiInternals.diffPath("+++ /dev/null"), undefined);
   assert.equal(githubApiInternals.diffPath('+++ "b/quoted.txt"'), "quoted.txt");
+  assert.equal(githubApiInternals.diffPath('+++ "b/quoted.txt"\t'), "quoted.txt");
   assert.equal(githubApiInternals.diffPath("not a file header"), undefined);
   assert.equal(githubApiInternals.decodeGitPath('"a\\tb\\n\\"c\\\\d"'), 'a\tb\n"c\\d');
   assert.throws(

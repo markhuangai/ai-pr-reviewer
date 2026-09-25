@@ -10,6 +10,59 @@ import {
 } from "./agent-test-helpers.js";
 import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
 import type { GoalSubmission } from "../src/lib/types.js";
+import { writeReviewDiagnostic } from "../src/runtime/review-diagnostics.js";
+
+test("review diagnostics preserve complete host records while redacting secrets and excluding source bodies", () => {
+  const secret = "SYNTHETIC-REVIEW-SECRET";
+  const lines: string[] = [];
+  const paths = Array.from(
+    { length: 100 },
+    (_, index) => `src/${index}-${"x".repeat(150)}-${secret}\n::warning::path.ts`,
+  );
+  writeReviewDiagnostic(
+    0,
+    "review-result",
+    {
+      elapsedMs: 500,
+      status: "incomplete",
+      reviewComplete: false,
+      tokenAccountingComplete: true,
+      missingPaths: paths,
+      limitations: [{ paths: [], reason: `Cannot finish ${secret}` }],
+      content: "UNLOGGED_SOURCE_BODY",
+      headers: { Authorization: "UNLOGGED_AUTHORIZATION" },
+    },
+    [secret],
+    (line) => {
+      lines.push(line);
+    },
+  );
+  assert.ok(lines.length > 1);
+  assert.ok(
+    lines.every(
+      (line) =>
+        line.length < 8_200 &&
+        !line.includes(secret) &&
+        !line.includes("UNLOGGED") &&
+        !line.includes("\n"),
+    ),
+  );
+  const record = JSON.parse(lines.map((line) => line.slice(line.indexOf(": ") + 2)).join("")) as {
+    missingPaths: string[];
+    limitations: { reason: string }[];
+    reviewComplete: boolean;
+    tokenAccountingComplete: boolean;
+    content?: unknown;
+    headers?: unknown;
+  };
+  assert.equal(record.missingPaths.length, paths.length);
+  assert.ok(record.missingPaths.every((path) => path.includes("[REDACTED]")));
+  assert.equal(record.limitations[0]?.reason, "Cannot finish [REDACTED]");
+  assert.equal(record.content, undefined);
+  assert.equal(record.headers, undefined);
+  assert.equal(record.reviewComplete, false);
+  assert.equal(record.tokenAccountingComplete, true);
+});
 
 test("retains valid findings while marking explicitly incomplete investigation", () => {
   const submission: GoalSubmission = {

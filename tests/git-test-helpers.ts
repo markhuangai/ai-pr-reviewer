@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import type { PullRequestContext } from "../src/lib/types.js";
-import { PullRequestDiffArtifact } from "../src/runtime/agent-review-tools.js";
-import { streamGitToFile } from "../src/runtime/git-stream.js";
+import {
+  captureSnapshotDiff,
+  type PullRequestDiffArtifact,
+} from "../src/runtime/agent-review-tools.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -93,29 +95,20 @@ export async function makeDiffFromSnapshots(
   headSha: string,
   temporaryRoot: string,
 ): Promise<PullRequestDiffArtifact> {
-  const directory = await mkdtemp(join(temporaryRoot, "ai-pr-reviewer-diff-test-"));
-  const path = join(directory, "pull-request.diff");
-  try {
-    await streamGitToFile(
-      cwd,
-      [
-        `--attr-source=${mergeBaseSha}`,
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "--full-index",
-        mergeBaseSha,
-        headSha,
-        "--",
-      ],
-      path,
-      "Git diff",
-    );
-    const { size } = await stat(path);
-    return new PullRequestDiffArtifact(mergeBaseSha, path, size, directory);
-  } catch (error) {
-    await rm(directory, { force: true, recursive: true });
-    throw error;
-  }
+  return captureSnapshotDiff(
+    {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      baseSha: mergeBaseSha,
+      headSha,
+      baseRef: "main",
+      title: "Fixture",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    cwd,
+    temporaryRoot,
+    mergeBaseSha,
+  );
 }

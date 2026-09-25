@@ -38,6 +38,7 @@ import {
 import type { PreparedContextFile } from "../src/lib/context-files.js";
 import type { ConversationMessage, ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import { streamGitToFile } from "../src/runtime/git-stream.js";
+import { PullRequestDiffArtifact } from "../src/runtime/agent-review-tools.js";
 import {
   RepositorySnapshot,
   repositorySnapshotInternals,
@@ -298,7 +299,10 @@ export function observedReviewOutputTools(
   return tools;
 }
 
-export async function readCompleteReviewDiff(options: Options): Promise<string> {
+export async function readCompleteReviewDiff(
+  options: Options,
+  path = "src/change.ts",
+): Promise<string> {
   const tools = observedReviewOutputTools(options);
   const diffTool = tools.read_pr_diff;
   const stateTool = tools.read_review_state;
@@ -322,7 +326,7 @@ export async function readCompleteReviewDiff(options: Options): Promise<string> 
       nextCursor?: string;
       records: {
         kind: string;
-        reference?: { id: string; kind: string; status: string; changedPaths?: boolean };
+        reference?: { id: string; kind: string; status: string; paths?: readonly string[] };
       }[];
     };
     const evidence = page.records.find(
@@ -330,7 +334,7 @@ export async function readCompleteReviewDiff(options: Options): Promise<string> 
         record.kind === "evidence" &&
         record.reference?.kind === "repository_diff" &&
         record.reference.status === "complete" &&
-        record.reference.changedPaths,
+        record.reference.paths?.includes(path),
     );
     if (evidence?.reference !== undefined) return evidence.reference.id;
     if (page.done) throw new Error("The explicit diff read did not produce completed evidence.");
@@ -542,10 +546,9 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
             fullDiffCursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
           }
           const evidenceRef = observedReferences.at(-1);
-          assert.ok(evidenceRef);
           const submission =
             typeof scenario.submission === "function"
-              ? scenario.submission(evidenceRef)
+              ? scenario.submission(evidenceRef ?? "")
               : scenario.submission;
           if (scenario.probeInterleavedQueryCursors) {
             const decode = (result: RegisteredToolResult) =>
@@ -900,18 +903,20 @@ export function reviewConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfi
 export async function makeReviewDiff(
   t: TestContext,
   content = "diff --git a/src/change.ts b/src/change.ts\n+changed\n",
+  paths = ["src/change.ts"],
 ): Promise<Parameters<typeof runReviewGoal>[6]> {
   const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-goal-diff-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "pull-request.diff");
   await writeFile(path, content);
-  return {
-    mergeBaseSha: "a".repeat(40),
+  return new PullRequestDiffArtifact(
+    "a".repeat(40),
     path,
-    size: Buffer.byteLength(content),
-    createReader: () => new agentInternals.PullRequestDiffReader(path, Buffer.byteLength(content)),
-    cleanup: () => rm(root, { recursive: true, force: true }),
-  } as Parameters<typeof runReviewGoal>[6];
+    Buffer.byteLength(content),
+    root,
+    undefined,
+    content.length === 0 ? [] : [{ paths, offset: 0, size: Buffer.byteLength(content) }],
+  );
 }
 
 export const goalContext: PullRequestContext = {

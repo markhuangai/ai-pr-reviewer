@@ -2,7 +2,6 @@ import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
-
 import type {
   ChangedFile,
   GoalResult,
@@ -13,8 +12,13 @@ import type {
   ReviewEvidenceReference,
   ReviewFinding,
   ReviewModelUsage,
+  ReviewSourceRange,
 } from "../lib/types.js";
-import { isGitMetadataPath, isWithinRepository } from "./agent-review-tools.js";
+import {
+  isGitMetadataPath,
+  isWithinRepository,
+  mergeDeliveredRanges,
+} from "./agent-review-tools.js";
 import { withTokenUsage, type AcceptedSubmissionMcpStatus } from "./agent-logging.js";
 
 const MAX_EVIDENCE_CURSORS = 32;
@@ -104,6 +108,9 @@ export const reviewEvidenceResultSchema = z
     contentKind: z.enum(["text", "binary", "non_regular", "missing"]).optional(),
     bounds: z
       .object({
+        byteStart: z.number().int().nonnegative().optional(),
+        byteEnd: z.number().int().nonnegative().optional(),
+        totalBytes: z.number().int().nonnegative().optional(),
         offset: z.number().int().nonnegative().optional(),
         limit: z.number().int().nonnegative().optional(),
         headLimit: z.number().int().nonnegative().optional(),
@@ -145,7 +152,9 @@ function isText(value: unknown): value is string {
   return typeof value === "string";
 }
 
-function toolResponseDocument(value: unknown): Readonly<Record<string, unknown>> | undefined {
+export function toolResponseDocument(
+  value: unknown,
+): Readonly<Record<string, unknown>> | undefined {
   if (Array.isArray(value)) {
     for (const block of value) {
       const parsed = toolResponseDocument(block);
@@ -204,6 +213,17 @@ function expiredCursorFailure(result: Readonly<Record<string, unknown>> | undefi
 function nonnegativeInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
+
+const sourceRangeSchema = z
+  .object({
+    paths: z.array(pathSchema).min(1).max(2),
+    start: z.number().int().nonnegative(),
+    end: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative(),
+  })
+  .strict()
+  .refine((range) => range.start <= range.end && range.end <= range.totalBytes);
+const sourceRangesSchema = z.array(sourceRangeSchema).max(3_000);
 
 function hasTruncationMarker(value: unknown): boolean {
   if (typeof value === "string") return /\[output truncated(?: at [^\]]+)?\]/iu.test(value);
@@ -433,14 +453,130 @@ export class ReviewEvidenceLedger {
   private readonly cursors = new Map<string, EvidenceCursorContext>();
   private readonly queries = new Map<string, { pages: Map<number, string>; finalPage?: number }>();
   private readonly observedCalls = new Set<string>();
+  private readonly delivered = new Map<
+    string,
+    {
+      source: EvidenceCursorContext;
+      range: ReviewSourceRange;
+      intervals: [number, number][];
+      references: string[];
+    }
+  >();
+  private readonly nativeDelivered = new Map<string, [number, number][]>();
+  private requiredBytes = 0;
+  uniqueSourceBytes = 0;
+  repeatedSourceBytes = 0;
+  deliveries: Readonly<Record<string, unknown>>[] = [];
 
-  constructor(private readonly cwd: string) {}
+  constructor(
+    private readonly cwd: string,
+    private readonly files: readonly ChangedFile[] = [],
+    private readonly snapshot?: { mergeBaseSha: string; headSha: string },
+  ) {}
+
+  get inspectionProgress(): number {
+    return this.requiredBytes + reviewInspection(this.files, this.references).observedPaths.length;
+  }
+
+  hasPrefix(paths: readonly string[], start: number, revision?: "base" | "head"): boolean {
+    if (start === 0) return true;
+    return [...this.delivered.values()].some(
+      (item) =>
+        item.source.kind === (revision === undefined ? "repository_diff" : "repository_file") &&
+        item.source.revision === revision &&
+        JSON.stringify(item.range.paths) === JSON.stringify(paths) &&
+        item.intervals[0]?.[0] === 0 &&
+        item.intervals[0][1] >= start,
+    );
+  }
+
+  private observeRanges(
+    source: EvidenceCursorContext,
+    ranges: readonly ReviewSourceRange[],
+    callId: string,
+    cursor: string | undefined,
+    page: number,
+  ): readonly ReviewEvidenceReference[] {
+    const observed: ReviewEvidenceReference[] = [];
+    const missing = new Set(reviewInspection(this.files, this.references).missingPaths);
+    for (const range of ranges) {
+      const scope: EvidenceCursorContext =
+        source.kind === "repository_diff"
+          ? {
+              ...source,
+              changedPaths: false,
+              paths: range.paths,
+            }
+          : source;
+      const key = JSON.stringify([
+        scope.kind,
+        scope.revision,
+        scope.mergeBaseSha,
+        scope.headSha,
+        range.paths,
+      ]);
+      const previous = this.delivered.get(key);
+      if (previous !== undefined && previous.range.totalBytes !== range.totalBytes)
+        throw new Error("Source delivery changed size within an immutable snapshot.");
+      const {
+        intervals: merged,
+        before,
+        total,
+      } = mergeDeliveredRanges(previous?.intervals ?? [], range.start, range.end);
+      const added = total - before;
+      const repeated = range.end - range.start - added;
+      this.uniqueSourceBytes += added;
+      this.repeatedSourceBytes += repeated;
+      const complete = merged[0]?.[0] === 0 && merged[0][1] === range.totalBytes;
+      const reference: ReviewEvidenceReference = {
+        id: `ev-${++this.sequence}`,
+        ...scope,
+        status: complete ? "complete" : "partial",
+        bounds: { byteStart: range.start, byteEnd: range.end, totalBytes: range.totalBytes },
+      };
+      if (
+        range.paths.some(
+          (path) =>
+            missing.has(path) && evidenceCoversChangedPath(reference, path, this.files, false),
+        )
+      )
+        this.requiredBytes += added;
+      this.references.set(reference.id, reference);
+      observed.push(reference);
+      const ids = [...(previous?.references ?? []), reference.id];
+      if (complete && before !== range.totalBytes)
+        for (const id of ids) {
+          const member = this.references.get(id);
+          if (member !== undefined && id !== reference.id && member.status !== "complete")
+            this.references.set(id, { ...member, completedBy: reference.id });
+        }
+      this.delivered.set(key, {
+        source: scope,
+        range,
+        intervals: merged,
+        references: complete ? [] : ids,
+      });
+      this.deliveries.push({
+        toolCallId: callId,
+        query: cursor ?? callId,
+        page,
+        ...scope,
+        range,
+        newBytes: added,
+        repeatedBytes: repeated,
+        fileComplete: complete,
+        newlyCompletedPaths: complete && before !== range.totalBytes ? range.paths : [],
+        evidenceRef: reference.id,
+      });
+    }
+    return observed;
+  }
 
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;
   }
-
   observeBatch(calls: readonly RepositoryReviewToolCall[]): readonly ReviewEvidenceReference[] {
+    this.deliveries = [];
     const observed: ReviewEvidenceReference[] = [];
     const expired = new Set<string>();
     for (const call of calls) {
@@ -484,6 +620,99 @@ export class ReviewEvidenceLedger {
               (fixedPage && cursor !== undefined)
             ? "partial"
             : "complete";
+      if (
+        fixedPage &&
+        status !== "failed" &&
+        (result?.ranges !== undefined || result?.byteOffset !== undefined)
+      ) {
+        const byteLength = nonnegativeInteger(result.byteLength);
+        const rangeInput =
+          source.kind === "repository_diff"
+            ? result.ranges
+            : [
+                {
+                  paths: [source.path],
+                  start: result.byteOffset,
+                  end:
+                    typeof result.byteOffset === "number" && byteLength !== undefined
+                      ? result.byteOffset + byteLength
+                      : undefined,
+                  totalBytes: result.sizeBytes,
+                },
+              ];
+        const parsed = sourceRangesSchema.safeParse(rangeInput);
+        const scope = {
+          ...source,
+          ...(source.kind === "repository_file" ? { contentKind: "text" as const } : {}),
+          mergeBaseSha: result.mergeBaseSha as string,
+          headSha: result.headSha as string,
+        };
+        const matchesSnapshot =
+          this.snapshot === undefined ||
+          (scope.mergeBaseSha === this.snapshot.mergeBaseSha &&
+            scope.headSha === this.snapshot.headSha);
+        const matchesCursor =
+          inputCursor === undefined ||
+          ((source.headSha === undefined || source.headSha === scope.headSha) &&
+            (source.mergeBaseSha === undefined || source.mergeBaseSha === scope.mergeBaseSha));
+        const valid =
+          parsed.success &&
+          byteLength !== undefined &&
+          byteLength <= Buffer.byteLength(String(result.content), "utf8") &&
+          matchesSnapshot &&
+          matchesCursor &&
+          parsed.data.reduce((sum, range) => sum + range.end - range.start, 0) === byteLength &&
+          parsed.data.every(
+            (range) =>
+              source.kind !== "repository_diff" ||
+              source.paths === undefined ||
+              range.paths.some((path) => source.paths?.includes(path)),
+          ) &&
+          parsed.data.every(
+            (range) =>
+              this.files.length === 0 ||
+              source.kind !== "repository_diff" ||
+              this.files.some(
+                (file) =>
+                  JSON.stringify(range.paths) ===
+                  JSON.stringify([
+                    file.path,
+                    ...(file.previousPath === undefined ? [] : [file.previousPath]),
+                  ]),
+              ),
+          );
+        if (valid) {
+          observed.push(
+            ...this.observeRanges(scope, parsed.data, call.tool_use_id, cursor, page as number),
+          );
+          if (nextCursor !== undefined) {
+            if (!this.cursors.has(nextCursor) && this.cursors.size >= MAX_EVIDENCE_CURSORS) {
+              const oldest = this.cursors.keys().next().value;
+              if (oldest !== undefined) {
+                this.cursors.delete(oldest);
+                this.queries.delete(oldest);
+              }
+            }
+            this.cursors.set(nextCursor, scope);
+          }
+          if (result.done === true && cursor !== undefined) this.cursors.delete(cursor);
+        } else {
+          const reference: ReviewEvidenceReference = {
+            id: `ev-${++this.sequence}`,
+            ...source,
+            status: "failed",
+          };
+          this.references.set(reference.id, reference);
+          observed.push(reference);
+          this.deliveries.push({
+            toolCallId: call.tool_use_id,
+            query: cursor ?? call.tool_use_id,
+            status: "failed",
+            reason: "Invalid source ranges or snapshot identity.",
+          });
+        }
+        continue;
+      }
       const reference = reviewEvidenceResultSchema.parse({
         id: `ev-${++this.sequence}`,
         ...source,
@@ -505,6 +734,50 @@ export class ReviewEvidenceLedger {
           : {}),
         status,
       }) as ReviewEvidenceReference;
+      if (isRepositoryEvidence(reference) && reference.kind !== "repository_search") {
+        let newLines: number | undefined;
+        let repeatedLines: number | undefined;
+        const bounds = reference.bounds;
+        if (
+          reference.kind === "repository_read" &&
+          reference.status === "complete" &&
+          reference.path !== undefined &&
+          bounds?.startLine !== undefined &&
+          bounds.numLines !== undefined
+        ) {
+          const key = JSON.stringify([reference.path, reference.revision, bounds.totalLines]);
+          const update = mergeDeliveredRanges(
+            this.nativeDelivered.get(key) ?? [],
+            bounds.startLine,
+            bounds.startLine + bounds.numLines,
+          );
+          newLines = update.total - update.before;
+          repeatedLines = bounds.numLines - newLines;
+          if (
+            reviewInspection(this.files, this.references).missingPaths.includes(reference.path) &&
+            evidenceCoversChangedPath(reference, reference.path, this.files, false)
+          )
+            this.requiredBytes += newLines;
+          this.nativeDelivered.set(key, update.intervals);
+        }
+        this.deliveries.push({
+          toolCallId: call.tool_use_id,
+          query: cursor ?? call.tool_use_id,
+          page,
+          kind: reference.kind,
+          path: reference.path,
+          paths: reference.paths,
+          revision: reference.revision,
+          status: reference.status,
+          range: reference.bounds,
+          newLines,
+          repeatedLines,
+          ...(reference.status === "failed"
+            ? { reason: "Source tool failed or returned an invalid page." }
+            : {}),
+          evidenceRef: reference.id,
+        });
+      }
       this.references.set(reference.id, reference);
       observed.push(reference);
       if (nextCursor !== undefined && status !== "failed") {
@@ -573,7 +846,6 @@ export class ReviewEvidenceLedger {
     }
     return observed.map((reference) => this.references.get(reference.id) ?? reference);
   }
-
   referencesForPaths(paths: readonly string[]): readonly ReviewEvidenceReference[] {
     return [...this.references.values()].filter((reference) =>
       paths.some(

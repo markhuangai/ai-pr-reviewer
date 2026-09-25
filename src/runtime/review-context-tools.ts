@@ -14,6 +14,7 @@ import {
   type ReviewBriefingReader,
   type PullRequestConversationReader,
   type PullRequestDiffReader,
+  type PullRequestDiffArtifact,
 } from "./agent-review-tools.js";
 import {
   reviewInspection,
@@ -21,7 +22,11 @@ import {
   type ReviewValidationGap,
 } from "./review-assessment.js";
 import type { ReviewSubmissionRecovery } from "./review-submission.js";
-import type { RepositoryQuerySource } from "./repository-snapshot.js";
+import type {
+  RepositoryQuerySource,
+  RepositorySnapshot,
+  RepositoryFileSnapshot,
+} from "./repository-snapshot.js";
 
 export type QueryReaderKind = "diff" | "repository_file" | "thread";
 
@@ -60,7 +65,8 @@ export class ReviewQueryReaderStore {
   }
 
   assertResumableSelection(metadata: Readonly<Record<string, unknown>>): void {
-    if (toolResultSerializedBytes(JSON.stringify(metadata)) > MODEL_TOOL_RESULT_BYTES - 1_024)
+    // Source ranges and recovery assignments repeat selected paths inside the same bounded result.
+    if (2 * toolResultSerializedBytes(JSON.stringify(metadata)) > MODEL_TOOL_RESULT_BYTES - 1_024)
       throw new Error(
         "The selected paths exceed the bounded continuation size; request fewer paths.",
       );
@@ -74,7 +80,30 @@ export class ReviewQueryReaderStore {
     this.makeRoom();
     const cursor = randomUUID();
     const reader = new RepositoryFilePageReader(source.path, source.sizeBytes, this.signal);
-    this.readers.set(cursor, { reader, kind, metadata, cleanup: source.cleanup });
+    this.readers.set(cursor, {
+      reader,
+      kind,
+      metadata: { ...metadata, sizeBytes: source.sizeBytes },
+      cleanup: source.cleanup,
+    });
+    return { cursor, reader };
+  }
+
+  createDiff(
+    diff: PullRequestDiffArtifact,
+    paths: readonly string[],
+    metadata: Readonly<Record<string, unknown>>,
+  ): { readonly cursor: string; readonly reader: RepositoryFilePageReader } {
+    const spans = diff.selectedFiles(paths);
+    this.makeRoom();
+    const cursor = randomUUID();
+    const reader = new RepositoryFilePageReader(
+      diff.path,
+      spans.reduce((sum, span) => sum + span.size, 0),
+      this.signal,
+      spans,
+    );
+    this.readers.set(cursor, { reader, kind: "diff", metadata });
     return { cursor, reader };
   }
 
@@ -166,6 +195,37 @@ export class ReviewQueryReaderStore {
     };
   }
 
+  inspectionCost(
+    cursor: string,
+    path: string,
+    revision: "base" | "head",
+    ledger: ReviewEvidenceLedger,
+  ): number | undefined {
+    const entry = this.readers.get(cursor);
+    if (entry === undefined || !(entry.reader instanceof RepositoryFilePageReader))
+      return undefined;
+    if (entry.kind === "diff") {
+      const remaining = entry.reader.remainingFile(path);
+      return remaining !== undefined && ledger.hasPrefix(remaining.paths, remaining.start)
+        ? remaining.bytes
+        : undefined;
+    }
+    if (
+      entry.kind !== "repository_file" ||
+      entry.metadata.path !== path ||
+      entry.metadata.revision !== revision ||
+      typeof entry.metadata.sizeBytes !== "number"
+    )
+      return undefined;
+    return ledger.hasPrefix(
+      [path],
+      entry.metadata.sizeBytes - entry.reader.remainingBytes,
+      revision,
+    )
+      ? entry.reader.remainingBytes
+      : undefined;
+  }
+
   continuations(
     paths: readonly string[] = [],
   ): readonly { tool: string; arguments: Record<string, unknown> }[] {
@@ -178,7 +238,10 @@ export class ReviewQueryReaderStore {
         !paths.some(
           (path) =>
             metadata.path === path ||
-            (Array.isArray(metadata.paths) && metadata.paths.includes(path)),
+            (Array.isArray(metadata.paths) && metadata.paths.includes(path)) ||
+            (entry.kind === "diff" &&
+              entry.reader instanceof RepositoryFilePageReader &&
+              entry.reader.remainingFile(path) !== undefined),
         )
       )
         return [];
@@ -203,6 +266,106 @@ export class ReviewQueryReaderStore {
   }
 }
 
+export function createReviewSourceTools({
+  signal,
+  isActive,
+  diff,
+  headSha,
+  queryReaders,
+  repositorySnapshot,
+}: {
+  signal: AbortSignal | undefined;
+  isActive: () => boolean;
+  diff: PullRequestDiffArtifact;
+  headSha: string;
+  queryReaders: ReviewQueryReaderStore;
+  repositorySnapshot: RepositorySnapshot;
+}) {
+  const diffTool = tool(
+    "read_pr_diff",
+    "Read a bounded page of the immutable base-to-head diff. Omit paths for the complete diff or provide exact changed paths. Continue with the returned cursor and repeat the same paths when you selected paths.",
+    {
+      paths: z.array(z.string().min(1).max(4_096)).max(50).optional(),
+      cursor: z.string().min(1).max(100).optional(),
+    },
+    async ({ paths, cursor }): Promise<CallToolResult> => {
+      throwIfAborted(signal);
+      if (!isActive()) {
+        return {
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        };
+      }
+      const selectedPaths = paths === undefined || paths.length === 0 ? undefined : paths;
+      if (cursor !== undefined)
+        return queryReaders.readPage(
+          cursor,
+          "diff",
+          selectedPaths === undefined ? undefined : { paths: selectedPaths },
+        );
+      const metadata = {
+        mergeBaseSha: diff.mergeBaseSha,
+        headSha: headSha,
+        ...(selectedPaths === undefined ? { changedPaths: true } : { paths: selectedPaths }),
+      };
+      queryReaders.assertResumableSelection(metadata);
+      const query = queryReaders.createDiff(diff, selectedPaths ?? [], metadata);
+      const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
+      if (page.done) await queryReaders.finish(query.cursor);
+      return jsonToolResult({
+        ...metadata,
+        ...page,
+        ...(page.done ? {} : { nextCursor: query.cursor }),
+      });
+    },
+    { alwaysLoad: true },
+  );
+  const repositoryFileTool = tool(
+    "read_repository_file",
+    "Read one exact tracked repository file at the immutable merge base or head, including unchanged files. Binary and non-regular objects return metadata only; continue with the returned cursor and repeat the same path and revision for long text.",
+    {
+      revision: z.enum(["base", "head"]),
+      path: z.string().min(1).max(4_096),
+      cursor: z.string().min(1).max(100).optional(),
+    },
+    async ({ revision, path, cursor }): Promise<CallToolResult> => {
+      throwIfAborted(signal);
+      if (!isActive()) {
+        return {
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        };
+      }
+      if (cursor !== undefined)
+        return queryReaders.readPage(cursor, "repository_file", { revision, path });
+      const snapshot: RepositoryFileSnapshot = await repositorySnapshot.file(revision, path);
+      if (snapshot.kind !== "text") return jsonToolResult(snapshot);
+      if (snapshot.source === undefined)
+        throw new Error("Text repository snapshot did not provide a query source.");
+      const metadata = {
+        revision,
+        path,
+        kind: snapshot.kind,
+        headSha: headSha,
+        mergeBaseSha: diff.mergeBaseSha,
+      };
+      const query = queryReaders.createSource(snapshot.source, "repository_file", metadata);
+      const page = await query.reader.readNext({
+        ...metadata,
+        kind: snapshot.kind,
+        sizeBytes: snapshot.sizeBytes,
+        nextCursor: query.cursor,
+      });
+      if (page.done) await queryReaders.finish(query.cursor);
+      return jsonToolResult({
+        ...metadata,
+        ...page,
+        ...(page.done ? {} : { nextCursor: query.cursor }),
+      });
+    },
+    { alwaysLoad: true },
+  );
+  return { diffTool, repositoryFileTool };
+}
+
 export function createReviewStateTool({
   signal,
   isActive,
@@ -214,6 +377,8 @@ export function createReviewStateTool({
   readers,
   recovery,
   gaps,
+  diff,
+  onSnapshot,
 }: {
   signal: AbortSignal | undefined;
   isActive: () => boolean;
@@ -225,6 +390,8 @@ export function createReviewStateTool({
   readers: ReviewQueryReaderStore;
   recovery: ReviewSubmissionRecovery;
   gaps: () => readonly ReviewValidationGap[];
+  diff?: PullRequestDiffArtifact;
+  onSnapshot?: (details: Readonly<Record<string, unknown>>) => void;
 }) {
   const snapshots = new Map<
     string,
@@ -280,40 +447,114 @@ export function createReviewStateTool({
           submissionAttempts: recovery.submissionAttempts,
           repairAttempts: recovery.repairAttempts,
           remainingCorrections: recovery.remainingCorrections,
+          remainingInspectionCycles: recovery.remainingInspectionCycles,
+          validationFailures: recovery.validationFailures,
+          inspectionContinuations: recovery.inspectionContinuations,
+          consecutiveNoProgress: recovery.consecutiveNoProgress,
+          recoveryCycles: recovery.recoveryCycles,
+          maxRecoveryCycles: recovery.maxCycles,
+          uniqueSourceBytes: ledger.uniqueSourceBytes,
+          repeatedSourceBytes: ledger.repeatedSourceBytes,
         };
         const records: Record<string, unknown>[] = [];
         if (!header.briefingComplete)
           records.push({ kind: "next_call", tool: "read_review_briefing", arguments: {} });
         const continuing = new Set<string>();
-        const optionalCalls: Record<string, unknown>[] = [];
-        for (const call of readers.continuations(selection)) {
-          const covered = missing.filter((path) => {
-            if (call.tool === "read_pr_diff")
-              return (
-                call.arguments.paths === undefined ||
-                (Array.isArray(call.arguments.paths) && call.arguments.paths.includes(path))
-              );
-            if (call.tool !== "read_repository_file" || call.arguments.path !== path) return false;
-            const file = files.find((file) => file.path === path || file.previousPath === path);
-            const revision =
-              file?.status === "removed" || (file?.previousPath === path && file.path !== path)
-                ? "base"
-                : "head";
-            return call.arguments.revision === revision;
+        const calls = readers.continuations(selection);
+        type Continuation = { call: (typeof calls)[number]; paths: string[]; bytes: number };
+        const chosen = new Map<string, Continuation>();
+        const spans =
+          diff?.files ??
+          files.map((file) => ({
+            paths: [file.path, ...(file.previousPath === undefined ? [] : [file.previousPath])],
+            size: Infinity,
+          }));
+        let planBytes = 0;
+        const assign = (operation: Continuation): void => {
+          const cursor = String(operation.call.arguments.cursor);
+          const previous = chosen.get(cursor);
+          chosen.set(cursor, {
+            ...operation,
+            paths: [...(previous?.paths ?? []), ...operation.paths],
           });
-          if (covered.length === 0) optionalCalls.push({ kind: "active_read", ...call });
-          else {
-            records.push({ kind: "next_call", ...call });
-            for (const path of covered) continuing.add(path);
+          for (const path of operation.paths) continuing.add(path);
+        };
+        // Only the first remaining diff span can be discounted; later spans cost at least a fresh selection.
+        for (const span of spans) {
+          const paths = span.paths.filter((path) => missing.includes(path));
+          if (paths.length === 0) continue;
+          let best: Continuation[] = [];
+          let cost = span.size;
+          const fileReads = new Map<string, Continuation>();
+          for (const call of calls) {
+            const costs = paths.map((path) => {
+              const file = files.find((file) => file.path === path || file.previousPath === path);
+              const revision =
+                file?.status === "removed" || file?.previousPath === path ? "base" : "head";
+              return readers.inspectionCost(String(call.arguments.cursor), path, revision, ledger);
+            });
+            if (call.tool === "read_pr_diff" && costs.every((bytes) => bytes !== undefined)) {
+              const bytes = Math.max(...costs);
+              const added = bytes - (chosen.get(String(call.arguments.cursor))?.bytes ?? 0);
+              if (added < cost || (added === cost && best.length === 0)) {
+                best = [{ call, paths, bytes }];
+                cost = added;
+              }
+            } else if (call.tool === "read_repository_file") {
+              for (const [index, path] of paths.entries()) {
+                const bytes = costs[index];
+                if (bytes !== undefined && bytes < (fileReads.get(path)?.bytes ?? Infinity))
+                  fileReads.set(path, { call, paths: [path], bytes });
+              }
+            }
           }
+          const native = [...fileReads.values()];
+          const nativeCost = native.reduce((sum, operation) => sum + operation.bytes, 0);
+          if (
+            fileReads.size === paths.length &&
+            (nativeCost < cost || (nativeCost === cost && best.length === 0))
+          ) {
+            best = native;
+            cost = nativeCost;
+          }
+          for (const operation of best) assign(operation);
+          planBytes += cost;
         }
+        for (const candidate of chosen.values()) {
+          records.push({
+            kind: "next_call",
+            ...candidate.call,
+            paths: candidate.paths,
+            reason:
+              "Least remaining delivery through the assigned missing files; refresh state after each page.",
+            remainingBytes: candidate.bytes,
+            planBytes: Number.isFinite(planBytes) ? planBytes : undefined,
+          });
+        }
+        const optionalCalls = calls
+          .filter((call) => !chosen.has(String(call.arguments.cursor)))
+          .map((call) => ({ kind: "active_read", ...call }));
         let batch: string[] = [];
         const addBatch = (): void => {
           if (batch.length > 0)
-            records.push({ kind: "next_call", tool: "read_pr_diff", arguments: { paths: batch } });
+            records.push({
+              kind: "next_call",
+              tool: "read_pr_diff",
+              arguments: { paths: batch },
+              reason: "Selected missing files avoid unavailable or more expensive continuations.",
+            });
           batch = [];
         };
-        for (const path of missing.filter((path) => !continuing.has(path))) {
+        const pending = new Set(missing.filter((path) => !continuing.has(path)));
+        const freshPaths: string[] = [];
+        for (const file of diff?.files ?? []) {
+          const path = file.paths.find((path) => pending.has(path));
+          if (path === undefined) continue;
+          freshPaths.push(path);
+          for (const path of file.paths) pending.delete(path);
+        }
+        freshPaths.push(...pending);
+        for (const path of freshPaths) {
           if (
             batch.length >= 50 ||
             toolResultSerializedBytes(JSON.stringify({ paths: [...batch, path] })) > 8_000
@@ -390,6 +631,13 @@ export function createReviewStateTool({
           snapshots.delete(oldest);
         }
         snapshots.set(id, { paths: selection, pages });
+        onSnapshot?.({
+          snapshotId: id,
+          ...header,
+          missingPaths: missing,
+          nextCalls: records.filter((record) => record.kind === "next_call"),
+          optionalCalls,
+        });
         return jsonToolResult(pages[0]);
       }),
     { alwaysLoad: true },
