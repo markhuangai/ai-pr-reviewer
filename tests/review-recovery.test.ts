@@ -345,6 +345,91 @@ for (const replacement of [
   });
 }
 
+test("labels inspection, validation, and empty-turn recovery with the active budget", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const clean = { summary: "Checked the changes.", findings: [], limitations: [] };
+  const result = await runReviewGoal(
+    "check",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig({ maxTurns: 6 }),
+    repository.diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      const steps = [
+        {
+          input: undefined,
+          label: "inspection continuation (4 inspection recovery cycles remaining)",
+          failures: 0,
+          inspections: 1,
+        },
+        {
+          input: { summary: "malformed" },
+          label: "validation correction 1 of 5",
+          failures: 1,
+          inspections: 1,
+        },
+        {
+          input: undefined,
+          label: "inspection continuation (3 inspection recovery cycles remaining)",
+          failures: 1,
+          inspections: 2,
+        },
+        {
+          input: { ...clean, limitations: [{ paths: ["not-changed.ts"], reason: "Unavailable." }] },
+          label: "validation correction 2 of 5",
+          failures: 2,
+          inspections: 2,
+        },
+        {
+          input: clean,
+          label: "inspection continuation (1 inspection recovery cycles remaining)",
+          failures: 2,
+          inspections: 3,
+        },
+      ];
+      for (const step of steps) {
+        if (step.input !== undefined)
+          assert.equal((yield* protocol.call("submit_review", step.input)).isError, true);
+        yield protocolResult();
+        const next = await protocol.messages.next();
+        assert.equal(next.done, false);
+        const prompt = next.value?.message.content;
+        assert.ok(typeof prompt === "string");
+        assert.ok(prompt.startsWith(`Review recovery; ${step.label}:`), prompt);
+        const state = yield* recoveryState(protocol);
+        assert.equal(state.validationFailures, step.failures);
+        assert.equal(state.inspectionContinuations, step.inspections);
+        assert.equal(state.remainingCorrections, step.failures === 0 ? 5 : 6 - step.failures);
+        if (step.label.startsWith("inspection")) {
+          assert.doesNotMatch(prompt, /validation correction/u);
+          assert.ok(
+            prompt.includes(
+              `${state.remainingInspectionCycles} inspection recovery cycles remaining`,
+            ),
+          );
+        }
+      }
+      yield* protocol.call("read_pr_diff", {});
+      assert.equal((yield* protocol.call("submit_review", clean)).isError, undefined);
+      yield protocolResult();
+    }),
+  );
+  assert.equal(result.status, "completed");
+  assert.equal(result.diagnostics?.validationFailures, 2);
+  assert.equal(result.diagnostics?.repairAttempts, 1);
+  assert.equal(result.diagnostics?.inspectionContinuations, 3);
+  assert.equal(result.diagnostics?.recoveryCycles, 6);
+});
+
 test("an empty terminal result does not charge a rejected submission twice", async (t) => {
   let followups = 0;
   const result = await runReviewGoal(

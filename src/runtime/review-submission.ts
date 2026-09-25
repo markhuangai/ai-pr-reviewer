@@ -29,6 +29,7 @@ export class ReviewSubmissionRecovery {
   private readonly uses = new Map<string, { allowed: boolean; input: unknown }>();
   private readonly rejections = new Set<string>();
   private activitySinceResult = false;
+  private recoveryKind: "inspection" | "validation" = "inspection";
   private progress = 0;
   private previousProgress = 0;
   validationFailures = 0;
@@ -45,6 +46,7 @@ export class ReviewSubmissionRecovery {
   }
 
   private inspectionCycle(): void {
+    this.recoveryKind = "inspection";
     this.inspectionContinuations += 1;
     this.consecutiveNoProgress =
       this.progress > this.previousProgress ? 0 : this.consecutiveNoProgress + 1;
@@ -134,7 +136,10 @@ export class ReviewSubmissionRecovery {
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
     if (categories.length > 0 && categories.every((category) => category === "inspection"))
       this.inspectionCycle();
-    else this.validationFailures += 1;
+    else {
+      this.recoveryKind = "validation";
+      this.validationFailures += 1;
+    }
     return true;
   }
 
@@ -171,13 +176,14 @@ export class ReviewSubmissionRecovery {
         observeRejection(message.parent_tool_use_id, message.tool_use_result);
     }
   }
-  finishTurn(): void {
+  finishTurn(): "inspection" | "validation" {
     if (!this.activitySinceResult) {
       this.recoveryCycles += 1;
       this.inspectionCycle();
       this.rejectionCounts.empty_turn = (this.rejectionCounts.empty_turn ?? 0) + 1;
     }
     this.activitySinceResult = false;
+    return this.recoveryKind;
   }
 
   diagnostics(

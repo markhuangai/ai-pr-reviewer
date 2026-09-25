@@ -803,15 +803,29 @@ test("teaches the four severity definitions before review submission", () => {
   assert.doesNotMatch(prompt, /- MEDIUM:|- INFO:/u);
   assert.match(prompt, /Set endLine only when the finding spans a contiguous range/u);
   assert.doesNotMatch(prompt, /raw replacement text|apply suggestions/u);
-  assert.match(agentInternals.repairPrompt(1), /Severity must be CRITICAL, HIGH, MODERATE, LOW/u);
+  const correction = { kind: "validation", attempt: 1 } as const;
+  assert.match(agentInternals.repairPrompt(correction), /validation correction 1 of 5/u);
   assert.match(
-    agentInternals.repairPrompt(1),
+    agentInternals.repairPrompt(correction),
+    /Severity must be CRITICAL, HIGH, MODERATE, LOW/u,
+  );
+  assert.match(
+    agentInternals.repairPrompt(correction),
     /Every finding needs a changed path and participating added line/u,
   );
-  assert.match(agentInternals.repairPrompt(1, true, false), /Publication locations are optional/u);
-  assert.doesNotMatch(agentInternals.repairPrompt(1), /suggestion/u);
-  assert.doesNotMatch(agentInternals.repairPrompt(1), /read_pr_conversation|read_pr_diff/u);
-  assert.match(agentInternals.repairPrompt(1, false), /read_review_briefing/u);
+  assert.match(
+    agentInternals.repairPrompt(correction, true, false),
+    /Publication locations are optional/u,
+  );
+  assert.doesNotMatch(agentInternals.repairPrompt(correction), /suggestion/u);
+  assert.doesNotMatch(
+    agentInternals.repairPrompt(correction),
+    /read_pr_conversation|read_pr_diff/u,
+  );
+  assert.match(agentInternals.repairPrompt(correction, false), /read_review_briefing/u);
+  const inspection = agentInternals.repairPrompt({ kind: "inspection", remainingCycles: 3 });
+  assert.match(inspection, /inspection continuation \(3 inspection recovery cycles remaining\)/u);
+  assert.doesNotMatch(inspection, /validation correction/u);
 });
 
 test("starts each review with a bounded Claude goal command", () => {

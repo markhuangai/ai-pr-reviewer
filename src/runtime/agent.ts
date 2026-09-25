@@ -872,7 +872,7 @@ export async function runReviewGoal(
         );
       }
       recovery.observeProgress(evidenceLedger.inspectionProgress);
-      recovery.finishTurn();
+      const recoveryKind = recovery.finishTurn();
       if (recovery.exhausted) {
         sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
         return await finalizeUnaccepted(
@@ -884,7 +884,9 @@ export async function runReviewGoal(
       sessionPhase = "waiting-for-repair-result";
       const repairMessage = makeUserMessage(
         repairPrompt(
-          recovery.repairAttempts + 1,
+          recoveryKind === "inspection"
+            ? { kind: "inspection", remainingCycles: recovery.remainingInspectionCycles }
+            : { kind: "validation", attempt: recovery.repairAttempts + 1 },
           briefingReader.complete,
           config.interactWithPullRequest,
           validationGaps[0]?.message.slice(0, 1_000),
@@ -894,7 +896,9 @@ export async function runReviewGoal(
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         logQueuedUserMessage(
           repairMessage,
-          `repair-${recovery.repairAttempts + 1}`,
+          recoveryKind === "inspection"
+            ? `inspection-continuation-${recovery.inspectionContinuations}`
+            : `repair-${recovery.repairAttempts + 1}`,
           goalIndex,
           logSecrets,
           write,

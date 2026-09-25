@@ -570,7 +570,8 @@ export function reviewSubmissionRejection(
 }
 
 export function repairPrompt(
-  attempt: number,
+  recovery:
+    { kind: "validation"; attempt: number } | { kind: "inspection"; remainingCycles: number },
   briefingComplete = true,
   interactWithPullRequest = true,
   validationIssue?: string,
@@ -582,7 +583,11 @@ export function repairPrompt(
   const nextAction = briefingComplete
     ? "Call read_review_state for existing evidence, inspection gaps, and exact next calls; repair only those gaps. Inspection continuations have a separate no-progress limit; read the returned budgets and stop repeating delivered ranges."
     : "Finish read_review_briefing first, then recover inspection progress with read_review_state.";
-  return `Review recovery; validation correction ${attempt} of ${MAX_REPAIR_ATTEMPTS}: ${issue} ${nextAction} Submit a schema-valid object with summary, findings, and limitations. Each finding has title, severity, why, fix, evidenceRefs, countercheck, and counterevidenceRefs. ${interactWithPullRequest ? "Every finding needs a changed path and participating added line." : "Publication locations are optional; supplied locations must be valid."} Do not recreate a coverage table or invent evidence. If required investigation cannot finish, declare limitations with paths and reason. Severity must be ${SEVERITY_VALUES.join(", ")}.`;
+  const label =
+    recovery.kind === "inspection"
+      ? `inspection continuation (${recovery.remainingCycles} inspection recovery cycles remaining)`
+      : `validation correction ${recovery.attempt} of ${MAX_REPAIR_ATTEMPTS}`;
+  return `Review recovery; ${label}: ${issue} ${nextAction} Submit a schema-valid object with summary, findings, and limitations. Each finding has title, severity, why, fix, evidenceRefs, countercheck, and counterevidenceRefs. ${interactWithPullRequest ? "Every finding needs a changed path and participating added line." : "Publication locations are optional; supplied locations must be valid."} Do not recreate a coverage table or invent evidence. If required investigation cannot finish, declare limitations with paths and reason. Severity must be ${SEVERITY_VALUES.join(", ")}.`;
 }
 
 export function makeUserMessage(text: string): SDKUserMessage {
