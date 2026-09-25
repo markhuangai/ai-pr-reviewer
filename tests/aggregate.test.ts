@@ -180,7 +180,8 @@ test("renders bounded, escaped goal-wide reasons after redaction with complete i
   assert.match(summary, /### Goal-wide limitations/u);
   assert.match(summary, /REDACTED/u);
   assert.match(summary, /&lt;script&gt;/u);
-  assert.doesNotMatch(summary, /private-token|<script>|\[unavailable\]\(/u);
+  for (const raw of ["private-token", "<script>", "[unavailable]("])
+    assert.equal(summary.includes(raw), false);
   assert.equal(summary.split("&lt;script&gt;").length, 2);
   const manyGoals = redactGoalResults(
     Array.from({ length: 50 }, (_, goalIndex) => ({
