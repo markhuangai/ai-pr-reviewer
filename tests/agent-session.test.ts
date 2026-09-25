@@ -385,7 +385,10 @@ test("matches discussion coverage across renamed paths", async (t) => {
     ],
     conversation,
     reviewConfig(),
-    await makeReviewDiff(t),
+    await makeReviewDiff(t, "diff --git a/src/old.ts b/src/new.ts\n+changed\n", [
+      "src/new.ts",
+      "src/old.ts",
+    ]),
     "/workspace/repository",
     fakeAgentQuery({
       submission: (evidenceRef) => ({

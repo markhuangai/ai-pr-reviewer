@@ -181,7 +181,7 @@ export function parseGitNumstat(
 
 export function diffPath(line: string): string | undefined {
   if (!line.startsWith("+++ ")) return undefined;
-  const path = decodeGitPath(line.slice(4));
+  const path = decodeGitPath(line.slice(4).split("\t", 1)[0] ?? "");
   if (path === "/dev/null") return undefined;
   return path.startsWith("b/") ? path.slice(2) : path;
 }

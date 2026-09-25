@@ -76,8 +76,8 @@ import {
 } from "./agent-session.js";
 import {
   ReviewEvidenceLedger,
-  reviewInspection,
   acceptedSubmissionResult,
+  toolResponseDocument,
   type ReviewValidationGap,
 } from "./review-assessment.js";
 import {
@@ -91,12 +91,10 @@ import {
   ReviewQueryReaderStore,
   createReviewStateTool,
   createReviewContextTools,
+  createReviewSourceTools,
 } from "./review-context-tools.js";
-import {
-  RepositorySnapshot,
-  repositoryGuidanceForRun,
-  type RepositoryFileSnapshot,
-} from "./repository-snapshot.js";
+import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
+import { createReviewDiagnostics } from "./review-diagnostics.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
 
 export async function runReviewGoal(
@@ -119,18 +117,51 @@ export async function runReviewGoal(
   const signal = abortController?.signal;
   throwIfAborted(signal);
   let submission: GoalSubmission | undefined;
-  const recovery = new ReviewSubmissionRecovery();
+  const startedAt = Date.now();
+  const recovery = new ReviewSubmissionRecovery(config.maxTurns);
   const recoveryExhausted = createDeferred<undefined>();
   const submissionName = "mcp__review_output__submit_review";
   let validationGaps: readonly ReviewValidationGap[] = [];
-  const observeRejection = (id: string): void => {
+  const observeRejection = (id: string, response?: unknown): void => {
     if (submission !== undefined || !recovery.hasUse(id)) return;
     validationGaps = submissionGaps(recovery.latestInput);
     const rejectedGaps = submissionGaps(recovery.inputFor(id));
-    recovery.reject(
+    const document = toolResponseDocument(response);
+    const recordedCategories = Array.isArray(document?.categories)
+      ? document.categories.filter((category): category is string => typeof category === "string")
+      : Array.isArray(document?.gaps)
+        ? document.gaps.flatMap((gap: unknown) =>
+            typeof gap === "object" &&
+            gap !== null &&
+            "category" in gap &&
+            typeof gap.category === "string"
+              ? [gap.category]
+              : [],
+          )
+        : [];
+    recovery.observeProgress(evidenceLedger.inspectionProgress);
+    const changed = recovery.reject(
       id,
-      rejectedGaps.length === 0 ? ["submission"] : rejectedGaps.map((gap) => gap.category),
+      recordedCategories.length > 0
+        ? recordedCategories
+        : rejectedGaps.length === 0
+          ? ["submission"]
+          : rejectedGaps.map((gap) => gap.category),
     );
+    if (changed)
+      logDiagnostic("submission-decision", {
+        toolCallId: id,
+        decision:
+          recordedCategories.length > 0 &&
+          recordedCategories.every((category) => category === "inspection")
+            ? "continued"
+            : "rejected",
+        categories:
+          recordedCategories.length > 0
+            ? recordedCategories
+            : rejectedGaps.map((gap) => gap.category),
+        ...recoveryDetails(),
+      });
     if (recovery.exhausted && recovery.allRejected) recoveryExhausted.resolve(undefined);
   };
   let reviewPromptActive = false;
@@ -140,14 +171,34 @@ export async function runReviewGoal(
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
   const conversationReader = new PullRequestConversationReader(conversation);
-  const evidenceLedger = new ReviewEvidenceLedger(cwd);
+  const evidenceLedger = new ReviewEvidenceLedger(cwd, files, {
+    mergeBaseSha: diff.mergeBaseSha,
+    headSha: context.headSha,
+  });
+  const {
+    inspectionDetails,
+    recoveryDetails,
+    logDiagnostic,
+    withDiagnostics: finalizeDiagnostics,
+  } = createReviewDiagnostics({
+    goalIndex,
+    files,
+    evidenceLedger,
+    recovery,
+    startedAt,
+    logSecrets,
+  });
   const evidenceHook: HookCallback = (input) => {
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
     const references = evidenceLedger.observeBatch(input.tool_calls);
+    recovery.observeProgress(evidenceLedger.inspectionProgress);
+    const deliveredInspection = inspectionDetails();
+    for (const delivery of evidenceLedger.deliveries)
+      logDiagnostic("source-delivery", { ...delivery, ...deliveredInspection });
     for (const call of input.tool_calls) {
       if (call.tool_name !== submissionName || !reviewPromptActive) continue;
       recovery.observeUse(call.tool_use_id, call.tool_input);
-      observeRejection(call.tool_use_id);
+      observeRejection(call.tool_use_id, call.tool_response);
     }
     if (references.length === 0) return Promise.resolve({ continue: true });
     return Promise.resolve({
@@ -238,111 +289,20 @@ export async function runReviewGoal(
     ledger: evidenceLedger,
     readers: queryReaders,
     recovery,
+    diff,
+    onSnapshot: (details) => {
+      logDiagnostic("recovery-decision", details);
+    },
     gaps: () => (recovery.submissionAttempts === 0 ? [] : submissionGaps(recovery.latestInput)),
   });
-  const diffTool = tool(
-    "read_pr_diff",
-    "Read a bounded page of the immutable base-to-head diff. Omit paths for the complete diff or provide exact changed paths. Continue with the returned cursor and repeat the same paths when you selected paths.",
-    {
-      paths: z.array(z.string().min(1).max(4_096)).max(50).optional(),
-      cursor: z.string().min(1).max(100).optional(),
-    },
-    async ({ paths, cursor }): Promise<CallToolResult> => {
-      throwIfAborted(signal);
-      if (!reviewPromptActive) {
-        return {
-          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
-        };
-      }
-      const selectedPaths = paths === undefined || paths.length === 0 ? undefined : paths;
-      if (cursor !== undefined)
-        return queryReaders.readPage(
-          cursor,
-          "diff",
-          selectedPaths === undefined ? undefined : { paths: selectedPaths },
-        );
-      const metadata = {
-        mergeBaseSha: diff.mergeBaseSha,
-        headSha: context.headSha,
-        ...(selectedPaths === undefined ? { changedPaths: true } : { paths: selectedPaths }),
-      };
-      queryReaders.assertResumableSelection(metadata);
-      if (selectedPaths === undefined) {
-        const query = queryReaders.createSource(
-          {
-            path: diff.path,
-            sizeBytes: diff.size,
-            cleanup: () => Promise.resolve(),
-          },
-          "diff",
-          metadata,
-        );
-        const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
-        if (page.done) await queryReaders.finish(query.cursor);
-        return jsonToolResult({
-          ...metadata,
-          ...page,
-          ...(page.done ? {} : { nextCursor: query.cursor }),
-        });
-      }
-      const query = queryReaders.createSource(
-        await repositorySnapshot.diff(selectedPaths),
-        "diff",
-        metadata,
-      );
-      const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
-      if (page.done) await queryReaders.finish(query.cursor);
-      return jsonToolResult({
-        ...metadata,
-        ...page,
-        ...(page.done ? {} : { nextCursor: query.cursor }),
-      });
-    },
-    { alwaysLoad: true },
-  );
-  const repositoryFileTool = tool(
-    "read_repository_file",
-    "Read one exact tracked repository file at the immutable merge base or head, including unchanged files. Binary and non-regular objects return metadata only; continue with the returned cursor and repeat the same path and revision for long text.",
-    {
-      revision: z.enum(["base", "head"]),
-      path: z.string().min(1).max(4_096),
-      cursor: z.string().min(1).max(100).optional(),
-    },
-    async ({ revision, path, cursor }): Promise<CallToolResult> => {
-      throwIfAborted(signal);
-      if (!reviewPromptActive) {
-        return {
-          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
-        };
-      }
-      if (cursor !== undefined)
-        return queryReaders.readPage(cursor, "repository_file", { revision, path });
-      const snapshot: RepositoryFileSnapshot = await repositorySnapshot.file(revision, path);
-      if (snapshot.kind !== "text") return jsonToolResult(snapshot);
-      if (snapshot.source === undefined)
-        throw new Error("Text repository snapshot did not provide a query source.");
-      const metadata = { revision, path, kind: snapshot.kind };
-      const query = queryReaders.createSource(snapshot.source, "repository_file", metadata);
-      const page = await query.reader.readNext({
-        ...metadata,
-        kind: snapshot.kind,
-        sizeBytes: snapshot.sizeBytes,
-        nextCursor: query.cursor,
-      });
-      if (page.done) await queryReaders.finish(query.cursor);
-      return jsonToolResult({
-        revision,
-        path,
-        kind: snapshot.kind,
-        sizeBytes: snapshot.sizeBytes,
-        page: page.page,
-        content: page.content,
-        done: page.done,
-        ...(page.done ? {} : { nextCursor: query.cursor }),
-      });
-    },
-    { alwaysLoad: true },
-  );
+  const { diffTool, repositoryFileTool } = createReviewSourceTools({
+    signal,
+    isActive: isReviewActive,
+    diff,
+    headSha: context.headSha,
+    queryReaders,
+    repositorySnapshot,
+  });
   const discussionThreadTool = tool(
     "read_pr_threads",
     "Read prior discussion for one exact thread ID or changed-file path from the briefing index. Continue a paginated read with its cursor and the same ID or path selector.",
@@ -464,7 +424,7 @@ export async function runReviewGoal(
   }
   const outputTool = tool(
     "submit_review",
-    "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host tracks changed-code inspection. Empty limitations declares completed investigation. One initial submission plus five corrections are allowed.",
+    "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host requires a changed-code scan. Validation allows one initial failure plus five corrections; inspection has separate bounded recovery.",
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
     (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
@@ -482,15 +442,18 @@ export async function runReviewGoal(
         });
       }
       validationGaps = submissionGaps(input);
-      if (validationGaps.length > 0)
+      if (validationGaps.length > 0) {
+        const budget = recovery.rejectionBudget(validationGaps.map((gap) => gap.category));
         return Promise.resolve(
           reviewSubmissionRejectionResult(
             validationGaps,
             evidenceLedger,
             files,
-            recovery.remainingCorrections,
+            budget.remainingCorrections,
+            budget.remainingInspectionCycles,
           ),
         );
+      }
       const candidate = toSubmission(submissionSchema.parse(input));
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         writeCompleteAgentLog(
@@ -504,6 +467,12 @@ export async function runReviewGoal(
         );
       });
       submission = candidate;
+      logDiagnostic("submission-decision", {
+        decision: "accepted",
+        ...inspectionDetails(),
+        ...recoveryDetails(),
+        limitations: candidate.limitations,
+      });
       monitor?.acceptSubmission();
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
@@ -516,8 +485,8 @@ export async function runReviewGoal(
       version: "2.0.0",
       instructions:
         contextFileTool === undefined
-          ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; at most five corrections are allowed."
-          : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; at most five corrections are allowed.",
+          ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads."
+          : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads.",
       tools: [
         briefingTool,
         reviewStateTool,
@@ -560,19 +529,26 @@ export async function runReviewGoal(
     models: readonly ReviewModelUsage[];
     latestSnapshotValid: boolean;
   } = { models: [], latestSnapshotValid: false };
-  const withDiagnostics = (result: GoalResult): GoalResult => {
-    const diagnostics = recovery.diagnostics(evidenceLedger.issued.size, sessionPhase);
-    writeAgentMonitorEvent(goalIndex, "review-recovery", diagnostics, logSecrets);
-    return { ...result, inspection: reviewInspection(files, evidenceLedger.issued), diagnostics };
-  };
-  const retainedSubmission = (): GoalSubmission | undefined =>
-    retainValidReviewFindings(
+  const withDiagnostics = (result: GoalResult): GoalResult =>
+    finalizeDiagnostics(result, sessionPhase, validationGaps);
+  const retainedSubmission = (): GoalSubmission | undefined => {
+    const input = recovery.latestInput;
+    const parsed = (
+      config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema
+    ).safeParse(input);
+    if (parsed.success && submissionGaps(input).every((gap) => gap.category === "inspection")) {
+      const candidate = toSubmission(parsed.data);
+      const reason = `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`;
+      return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };
+    }
+    return retainValidReviewFindings(
       recovery.latestInput,
       files,
       evidenceLedger.issued,
       (finding) => briefingReader.complete && unreadFindingPaths([finding]).length === 0,
       config.interactWithPullRequest,
     );
+  };
   const abortTurn = (): void => {
     input.finish();
     turn.reject(signal?.reason ?? new Error("The pull request review was cancelled."));
@@ -646,14 +622,17 @@ export async function runReviewGoal(
     let stalledMcpStatus = { checked: false, failures: "" };
     let stalledSubmissionFinalization: Promise<void> | undefined;
     const activeMonitor = createReviewSessionRecoveryMonitor({
-      snapshot: () =>
-        reviewSessionSnapshot(
+      snapshot: () => ({
+        ...reviewSessionSnapshot(
           sessionPhase,
           lifecycle,
           recovery.repairAttempts,
           submission !== undefined,
           sessionState.stallBoundaryPending,
         ),
+        ...inspectionDetails(),
+        ...recoveryDetails(),
+      }),
       write: (event, details) => {
         writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
       },
@@ -784,11 +763,8 @@ export async function runReviewGoal(
         );
       }
       if (outcome.kind === "recovery-exhausted") {
-        sessionPhase = "repair-exhausted";
-        return await finalizeUnaccepted(
-          "Claude did not submit a valid review after five repair attempts.",
-          false,
-        );
+        sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
+        return await finalizeUnaccepted(`Review recovery stopped: ${sessionPhase}.`, false);
       }
       const { result } = outcome;
       if (sessionState.stallBoundaryPending) {
@@ -835,7 +811,9 @@ export async function runReviewGoal(
         }
         if (result.subtype === "error_max_turns" || recovery.exhausted) {
           sessionPhase =
-            result.subtype === "error_max_turns" ? "max-turns-exhausted" : "repair-exhausted";
+            result.subtype === "error_max_turns"
+              ? "max-turns-exhausted"
+              : (recovery.exhaustionReason ?? "repair-exhausted");
           return await finalizeUnaccepted(
             "Review recovery stopped at the configured limit.",
             tokenUsageState.latestSnapshotValid,
@@ -893,11 +871,12 @@ export async function runReviewGoal(
           ),
         );
       }
+      recovery.observeProgress(evidenceLedger.inspectionProgress);
       recovery.finishTurn();
       if (recovery.exhausted) {
-        sessionPhase = "repair-exhausted";
+        sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
         return await finalizeUnaccepted(
-          "Claude did not submit a valid review after five repair attempts.",
+          `Review recovery stopped: ${sessionPhase}.`,
           tokenUsageState.latestSnapshotValid,
         );
       }

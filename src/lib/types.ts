@@ -157,6 +157,13 @@ export interface ReviewInspection {
   readonly missingPaths: readonly string[];
 }
 
+export interface ReviewSourceRange {
+  readonly paths: readonly string[];
+  readonly start: number;
+  readonly end: number;
+  readonly totalBytes: number;
+}
+
 export type ReviewEvidenceKind =
   | "repository_diff"
   | "repository_file"
@@ -171,6 +178,9 @@ export type ReviewEvidenceKind =
 export type ReviewEvidenceStatus = "complete" | "partial" | "failed";
 
 export interface ReviewEvidenceBounds {
+  readonly byteStart?: number;
+  readonly byteEnd?: number;
+  readonly totalBytes?: number;
   readonly offset?: number;
   readonly limit?: number;
   readonly headLimit?: number;
@@ -215,6 +225,12 @@ export interface GoalResult {
     readonly evidenceReferences: number;
     readonly rejectionCounts: Readonly<Record<string, number>>;
     readonly termination: string;
+    readonly validationFailures?: number;
+    readonly inspectionContinuations?: number;
+    readonly consecutiveNoProgress?: number;
+    readonly recoveryCycles?: number;
+    readonly uniqueSourceBytes?: number;
+    readonly repeatedSourceBytes?: number;
   };
 }
 

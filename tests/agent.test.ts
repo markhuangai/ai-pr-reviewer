@@ -28,7 +28,9 @@ import {
 } from "./agent-test-helpers.js";
 
 test("runs a complete SDK review turn through the real diff and submission tools", async (t) => {
-  const diff = await makeReviewDiff(t);
+  const diff = await makeReviewDiff(t, "diff --git a/credential.go b/credential.go\n+changed\n", [
+    "credential.go",
+  ]);
   const config = reviewConfig({
     effort: "xhigh",
     mcpServers: {
@@ -464,15 +466,15 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
     goalContext,
     [],
     emptyConversation,
-    config,
+    reviewConfig({ maxTurns: 100 }),
     await makeReviewDiff(t),
     "/workspace/repository",
-    fakeAgentQuery({ resultSubtypes: Array.from({ length: 6 }, () => "success") }),
+    fakeAgentQuery({ resultSubtypes: Array.from({ length: 5 }, () => "success") }),
   );
   assert.equal(repairFailure.status, "failed");
-  assert.match(repairFailure.error ?? "", /five repair attempts/u);
+  assert.match(repairFailure.error ?? "", /inspection-stalled/u);
   assert.equal(repairFailure.tokenUsage?.complete, true);
-  assert.equal(repairFailure.tokenUsage?.models[0]?.inputTokens, 60);
+  assert.equal(repairFailure.tokenUsage?.models[0]?.inputTokens, 50);
 
   const readerFailure = await runReviewGoal(
     "Reader failure.",

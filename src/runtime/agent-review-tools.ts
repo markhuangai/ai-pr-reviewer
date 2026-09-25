@@ -10,9 +10,15 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
-import type { ChangedFile, PullRequestContext, ReviewBriefing } from "../lib/types.js";
+import type {
+  ChangedFile,
+  PullRequestContext,
+  ReviewBriefing,
+  ReviewSourceRange,
+} from "../lib/types.js";
+import { readPullRequestFilesFromSnapshots } from "../lib/git-changed-files.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
-import { streamGitToFile } from "./git-stream.js";
+import { streamGitToFile, diffArguments, indexDiff } from "./git-stream.js";
 
 const DIFF_PAGE_BYTES = 4 * 1024;
 const CONVERSATION_PAGE_BYTES = 4 * 1024;
@@ -459,6 +465,15 @@ interface TextPage {
   readonly page: number;
   readonly content: string;
   readonly done: boolean;
+  readonly byteOffset?: number;
+  readonly sizeBytes?: number;
+  readonly ranges?: readonly ReviewSourceRange[];
+}
+
+export interface DiffFileSpan {
+  readonly paths: readonly string[];
+  readonly offset: number;
+  readonly size: number;
 }
 
 function utf8PageEnd(bytes: Buffer, start: number, proposedEnd: number, hasMore = false): number {
@@ -530,6 +545,27 @@ export class StringPageReader {
   }
 }
 
+export function mergeDeliveredRanges(
+  previous: readonly [number, number][],
+  start: number,
+  end: number,
+): { intervals: [number, number][]; before: number; total: number } {
+  const ordered: [number, number][] = [...previous, [start, end] as [number, number]].sort(
+    (left, right) => left[0] - right[0],
+  );
+  const intervals: [number, number][] = [];
+  for (const interval of ordered) {
+    const last = intervals.at(-1);
+    if (last !== undefined && interval[0] <= last[1]) last[1] = Math.max(last[1], interval[1]);
+    else intervals.push([...interval]);
+  }
+  return {
+    intervals,
+    before: previous.reduce((sum, [left, right]) => sum + right - left, 0),
+    total: intervals.reduce((sum, [left, right]) => sum + right - left, 0),
+  };
+}
+
 export class RepositoryFilePageReader {
   private file: FileHandle | undefined;
   private offset = 0;
@@ -542,7 +578,77 @@ export class RepositoryFilePageReader {
     private readonly path: string,
     private readonly sizeBytes: number,
     private readonly signal?: AbortSignal,
+    private readonly spans?: readonly DiffFileSpan[],
   ) {}
+
+  get remainingBytes(): number {
+    return this.sizeBytes - this.offset;
+  }
+
+  remainingFile(
+    path: string,
+  ): { bytes: number; start: number; paths: readonly string[]; totalBytes: number } | undefined {
+    let offset = 0;
+    for (const span of this.spans ?? []) {
+      const end = offset + span.size;
+      if (span.paths.includes(path) && end > this.offset)
+        return {
+          bytes: end - this.offset,
+          start: Math.max(0, this.offset - offset),
+          paths: span.paths,
+          totalBytes: span.size,
+        };
+      offset = end;
+    }
+    return undefined;
+  }
+
+  private ranges(start: number, end: number): readonly ReviewSourceRange[] {
+    const ranges: ReviewSourceRange[] = [];
+    let offset = 0;
+    for (const span of this.spans ?? []) {
+      const finish = offset + span.size;
+      if (start < finish && end > offset)
+        ranges.push({
+          paths: span.paths,
+          start: Math.max(start, offset) - offset,
+          end: Math.min(end, finish) - offset,
+          totalBytes: span.size,
+        });
+      offset = finish;
+    }
+    return ranges;
+  }
+
+  private async readBytes(start: number, buffer: Buffer): Promise<number> {
+    if (this.file === undefined) throw new Error("Repository query is not open.");
+    const spans = this.spans ?? [{ paths: [], offset: 0, size: this.sizeBytes }];
+    let offset = 0;
+    let written = 0;
+    for (const span of spans) {
+      const end = offset + span.size;
+      if (start < end && written < buffer.length) {
+        const relative = Math.max(0, start - offset);
+        const requested = Math.min(span.size - relative, buffer.length - written);
+        let consumed = 0;
+        while (consumed < requested) {
+          throwIfAborted(this.signal);
+          const { bytesRead } = await this.file.read(
+            buffer,
+            written + consumed,
+            requested - consumed,
+            span.offset + relative + consumed,
+          );
+          if (bytesRead === 0) throw new Error("Repository query ended before its recorded size.");
+          consumed += bytesRead;
+        }
+        written += consumed;
+        start += consumed;
+      }
+      offset = end;
+    }
+    return written;
+  }
 
   get complete(): boolean {
     return this.reachedEnd;
@@ -573,7 +679,14 @@ export class RepositoryFilePageReader {
     throwIfAborted(this.signal);
     const start = this.offset;
     if (this.sizeBytes === 0) {
-      const page = { page: this.page + 1, content: "", done: true };
+      const page = {
+        page: this.page + 1,
+        content: "",
+        done: true,
+        byteOffset: start,
+        sizeBytes: this.sizeBytes,
+        ...(this.spans === undefined ? {} : { ranges: [] }),
+      };
       if (!serializedQueryPageWithinLimit(page, extra))
         throw new Error("Repository query page exceeds the bounded result size.");
       this.page = page.page;
@@ -582,36 +695,26 @@ export class RepositoryFilePageReader {
     }
     const requestedBytes = Math.min(REPOSITORY_PAGE_BYTES + 4, this.sizeBytes - start);
     const buffer = Buffer.allocUnsafe(requestedBytes);
-    let bytesRead = 0;
-    while (bytesRead < requestedBytes) {
-      const result = await this.file.read(
-        buffer,
-        bytesRead,
-        requestedBytes - bytesRead,
-        start + bytesRead,
-      );
-      if (result.bytesRead === 0) break;
-      bytesRead += result.bytesRead;
-    }
+    const bytesRead = await this.readBytes(start, buffer);
     throwIfAborted(this.signal);
     if (bytesRead === 0) throw new Error("Repository query ended before its recorded size.");
     const hasMore = start + bytesRead < this.sizeBytes;
     const available = buffer.subarray(0, bytesRead);
     let end = utf8PageEnd(available, 0, Math.min(REPOSITORY_PAGE_BYTES, bytesRead), hasMore);
-    let page: TextPage = {
+    const pageAt = (end: number): TextPage => ({
       page: this.page + 1,
       content: available.subarray(0, end).toString("utf8"),
       done: start + end === this.sizeBytes,
-    };
+      byteOffset: start,
+      sizeBytes: this.sizeBytes,
+      ...(this.spans === undefined ? {} : { ranges: this.ranges(start, start + end) }),
+    });
+    let page = pageAt(end);
     while (!serializedQueryPageWithinLimit(page, extra) && end > 0) {
       const reducedEnd = utf8PageEnd(available, 0, Math.floor(end / 2), hasMore);
       if (reducedEnd === end) break;
       end = reducedEnd;
-      page = {
-        page: this.page + 1,
-        content: available.subarray(0, end).toString("utf8"),
-        done: start + end === this.sizeBytes,
-      };
+      page = pageAt(end);
     }
     if (!serializedQueryPageWithinLimit(page, extra))
       throw new Error("Repository query page exceeds the bounded result size.");
@@ -728,7 +831,16 @@ export class PullRequestDiffArtifact {
     readonly size: number,
     private readonly directory: string,
     private readonly signal?: AbortSignal,
+    readonly files: readonly DiffFileSpan[] = [],
   ) {}
+
+  selectedFiles(paths: readonly string[] = []): readonly DiffFileSpan[] {
+    if (paths.some((path) => !this.files.some((file) => file.paths.includes(path))))
+      throw new Error("Selected diff paths must belong to the captured change.");
+    return paths.length === 0
+      ? this.files
+      : this.files.filter((file) => file.paths.some((path) => paths.includes(path)));
+  }
 
   createReader(): PullRequestDiffReader {
     return new PullRequestDiffReader(this.path, this.size, this.signal);
@@ -806,17 +918,7 @@ async function streamGitDiff(
 ): Promise<void> {
   await streamGitToFile(
     cwd,
-    [
-      `--attr-source=${mergeBaseSha}`,
-      "diff",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--no-color",
-      "--full-index",
-      mergeBaseSha,
-      headSha,
-      "--",
-    ],
+    [...diffArguments(mergeBaseSha), mergeBaseSha, headSha, "--"],
     path,
     "Git diff",
     signal,
@@ -849,14 +951,47 @@ export async function createPullRequestDiff(
     signal,
   );
   const mergeBaseSha = await resolveMergeBase(repositoryRoot, baseSha, headSha, signal);
+  return captureSnapshotDiff(context, repositoryRoot, temporaryRoot, mergeBaseSha, signal);
+}
+
+export async function captureSnapshotDiff(
+  context: PullRequestContext,
+  repositoryRoot: string,
+  temporaryRoot: string,
+  mergeBaseSha: string,
+  signal?: AbortSignal,
+): Promise<PullRequestDiffArtifact> {
   const directory = await mkdtemp(join(temporaryRoot, "ai-pr-reviewer-diff-"));
   const path = join(directory, "pull-request.diff");
   try {
     throwIfAborted(signal);
-    await streamGitDiff(repositoryRoot, mergeBaseSha, headSha, path, signal);
+    await streamGitDiff(repositoryRoot, mergeBaseSha, context.headSha, path, signal);
     const { size } = await stat(path);
     throwIfAborted(signal);
-    return new PullRequestDiffArtifact(mergeBaseSha, path, size, directory, signal);
+    const files = await indexDiff(
+      repositoryRoot,
+      mergeBaseSha,
+      context.headSha,
+      path,
+      size,
+      signal,
+    );
+    const manifest = await readPullRequestFilesFromSnapshots(
+      context,
+      repositoryRoot,
+      mergeBaseSha,
+      signal,
+    );
+    const indexed = files.flatMap((file) => file.paths).sort();
+    const expected = manifest
+      .flatMap((file) => [
+        file.path,
+        ...(file.previousPath === undefined ? [] : [file.previousPath]),
+      ])
+      .sort();
+    if (JSON.stringify(indexed) !== JSON.stringify(expected))
+      throw new Error("Captured diff does not match the canonical change manifest.");
+    return new PullRequestDiffArtifact(mergeBaseSha, path, size, directory, signal, files);
   } catch (error) {
     await rm(directory, { force: true, recursive: true });
     throw error;

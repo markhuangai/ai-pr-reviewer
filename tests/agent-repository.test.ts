@@ -555,6 +555,8 @@ test("pages spooled repository sources and rejects in-checkout query roots", asy
     page: 1,
     content: "",
     done: true,
+    byteOffset: 0,
+    sizeBytes: 0,
   });
   await emptyReader.close();
   await emptyReader.close();

@@ -1,7 +1,12 @@
-import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { createReadStream, createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { promisify } from "node:util";
+import { parseGitNameStatus } from "../lib/git-changed-files.js";
+import type { DiffFileSpan } from "./agent-review-tools.js";
+
+const execFileAsync = promisify(execFile);
 
 import { cancellationReason, throwIfAborted } from "../lib/bootstrap/cancellation.js";
 
@@ -93,4 +98,90 @@ export async function streamGitToFile(
     );
   }
   if (failures.length > 0) throw new Error([...new Set(failures)].join("; "));
+}
+
+export function diffArguments(mergeBaseSha: string): string[] {
+  return [
+    `--attr-source=${mergeBaseSha}`,
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--full-index",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--find-renames=50%",
+    "-l0",
+    "--submodule=short",
+  ];
+}
+
+export async function indexDiff(
+  cwd: string,
+  mergeBaseSha: string,
+  headSha: string,
+  path: string,
+  size: number,
+  signal?: AbortSignal,
+): Promise<readonly DiffFileSpan[]> {
+  const { stdout } = await execFileAsync(
+    "git",
+    [...diffArguments(mergeBaseSha), "--raw", "--no-abbrev", "-z", mergeBaseSha, headSha, "--"],
+    {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+      ...(signal === undefined ? {} : { signal }),
+    },
+  );
+  const tokens = stdout.split("\0");
+  if (tokens.at(-1) === "") tokens.pop();
+  const names: string[] = [];
+  for (let index = 0; index < tokens.length;) {
+    const record = /^:[0-7]{6} [0-7]{6} [0-9a-f]{40,64} [0-9a-f]{40,64} ([A-Z][0-9]*)$/u.exec(
+      tokens[index++] ?? "",
+    );
+    if (record?.[1] === undefined) throw new Error("Git returned invalid diff path metadata.");
+    const count = /^[RC]/u.test(record[1]) ? 2 : 1;
+    names.push(record[1]);
+    for (let item = 0; item < count; item += 1) {
+      const name = tokens[index++];
+      if (name === undefined || name.length === 0)
+        throw new Error("Git returned incomplete diff path metadata.");
+      names.push(name);
+    }
+  }
+  const files = parseGitNameStatus(names.join("\0") + (names.length === 0 ? "" : "\0"));
+  const boundaries: number[] = [];
+  const marker = Buffer.from("diff --git ");
+  let offset = 0;
+  let lineStart = 0;
+  let prefix = Buffer.alloc(0);
+  for await (const chunk of createReadStream(path)) {
+    throwIfAborted(signal);
+    const buffer = chunk as Buffer;
+    for (let start = 0; start < buffer.length;) {
+      const newline = buffer.indexOf(10, start);
+      const end = newline < 0 ? buffer.length : newline;
+      if (prefix.length < marker.length) {
+        prefix = Buffer.concat([
+          prefix,
+          buffer.subarray(start, Math.min(end, start + marker.length - prefix.length)),
+        ]);
+        if (prefix.length === marker.length && prefix.equals(marker)) boundaries.push(lineStart);
+      }
+      if (newline < 0) break;
+      prefix = Buffer.alloc(0);
+      lineStart = offset + newline + 1;
+      start = newline + 1;
+    }
+    offset += buffer.length;
+  }
+  if (boundaries.length !== files.length || (size > 0 && boundaries[0] !== 0))
+    throw new Error("Captured diff boundaries do not match Git path metadata.");
+  return files.map((file, index) => ({
+    paths: [file.path, ...(file.previousPath === undefined ? [] : [file.previousPath])],
+    offset: boundaries[index] as number,
+    size: (boundaries[index + 1] ?? size) - (boundaries[index] as number),
+  }));
 }

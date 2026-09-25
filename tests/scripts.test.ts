@@ -884,6 +884,40 @@ test("rejects missing replay checkout arguments before building", async () => {
     await assert.rejects(runReplay(args), /Usage: npm run replay:review/u);
 });
 
+test("direct canonical and symlinked replay launchers execute while imports stay inert", async (t) => {
+  const directory = await temporaryDirectory("ai-pr-reviewer-entry-");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const entry = join(process.cwd(), "scripts/run-replay.ts");
+  const alias = join(directory, "replay-link.ts");
+  await symlink(entry, alias, "file");
+  for (const path of [entry, alias]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [path], { encoding: "utf8", timeout: 10_000 }),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof Error && "code" in error && error.code === 1 && "stderr" in error,
+        );
+        assert.match(String(error.stderr), /Usage: npm run replay:review/u);
+        return true;
+      },
+    );
+  }
+  for (const args of [[], [join(directory, "nonexistent-entry")], [directory]]) {
+    const { stdout, stderr } = await execFileAsync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `await import(${JSON.stringify(pathToFileURL(alias).href)}); console.log("imported");`,
+        ...args,
+      ],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(stdout.trim(), "imported");
+    assert.doesNotMatch(stderr, /Usage: npm run replay:review/u);
+  }
+});
+
 test("runs the guarded runtime entry worker", async () => {
   let calls = 0;
   await runRuntimeEntry(() => {
