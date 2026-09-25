@@ -902,7 +902,7 @@ test("direct canonical and symlinked replay launchers execute while imports stay
       },
     );
   }
-  for (const args of [[], [join(directory, "nonexistent-entry")], [directory]]) {
+  for (const args of [[], [join(directory, "nonexistent-entry")], [directory], [entry], [alias]]) {
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
       [

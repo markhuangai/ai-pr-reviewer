@@ -137,11 +137,14 @@ export async function indexDiff(
   const tokens = stdout.split("\0");
   if (tokens.at(-1) === "") tokens.pop();
   const names: string[] = [];
+  const patchCounts: number[] = [];
   for (let index = 0; index < tokens.length;) {
     const record = /^:[0-7]{6} [0-7]{6} [0-9a-f]{40,64} [0-9a-f]{40,64} ([A-Z][0-9]*)$/u.exec(
       tokens[index++] ?? "",
     );
     if (record?.[1] === undefined) throw new Error("Git returned invalid diff path metadata.");
+    // Git emits deletion and creation patches for a single raw type-change record.
+    patchCounts.push(record[1] === "T" ? 2 : 1);
     const count = /^[RC]/u.test(record[1]) ? 2 : 1;
     names.push(record[1]);
     for (let item = 0; item < count; item += 1) {
@@ -177,11 +180,17 @@ export async function indexDiff(
     }
     offset += buffer.length;
   }
-  if (boundaries.length !== files.length || (size > 0 && boundaries[0] !== 0))
+  let boundaryIndex = 0;
+  const starts = patchCounts.map((count) => {
+    const start = boundaries[boundaryIndex];
+    boundaryIndex += count;
+    return start;
+  });
+  if (boundaries.length !== boundaryIndex || (size > 0 && starts[0] !== 0))
     throw new Error("Captured diff boundaries do not match Git path metadata.");
   return files.map((file, index) => ({
     paths: [file.path, ...(file.previousPath === undefined ? [] : [file.previousPath])],
-    offset: boundaries[index] as number,
-    size: (boundaries[index + 1] ?? size) - (boundaries[index] as number),
+    offset: starts[index] as number,
+    size: (starts[index + 1] ?? size) - (starts[index] as number),
   }));
 }

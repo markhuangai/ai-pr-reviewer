@@ -466,6 +466,7 @@ interface TextPage {
   readonly content: string;
   readonly done: boolean;
   readonly byteOffset?: number;
+  readonly byteLength?: number;
   readonly sizeBytes?: number;
   readonly ranges?: readonly ReviewSourceRange[];
 }
@@ -678,26 +679,12 @@ export class RepositoryFilePageReader {
     this.file ??= await open(this.path, "r");
     throwIfAborted(this.signal);
     const start = this.offset;
-    if (this.sizeBytes === 0) {
-      const page = {
-        page: this.page + 1,
-        content: "",
-        done: true,
-        byteOffset: start,
-        sizeBytes: this.sizeBytes,
-        ...(this.spans === undefined ? {} : { ranges: [] }),
-      };
-      if (!serializedQueryPageWithinLimit(page, extra))
-        throw new Error("Repository query page exceeds the bounded result size.");
-      this.page = page.page;
-      this.reachedEnd = true;
-      return page;
-    }
     const requestedBytes = Math.min(REPOSITORY_PAGE_BYTES + 4, this.sizeBytes - start);
     const buffer = Buffer.allocUnsafe(requestedBytes);
     const bytesRead = await this.readBytes(start, buffer);
     throwIfAborted(this.signal);
-    if (bytesRead === 0) throw new Error("Repository query ended before its recorded size.");
+    if (bytesRead === 0 && requestedBytes > 0)
+      throw new Error("Repository query ended before its recorded size.");
     const hasMore = start + bytesRead < this.sizeBytes;
     const available = buffer.subarray(0, bytesRead);
     let end = utf8PageEnd(available, 0, Math.min(REPOSITORY_PAGE_BYTES, bytesRead), hasMore);
@@ -706,6 +693,7 @@ export class RepositoryFilePageReader {
       content: available.subarray(0, end).toString("utf8"),
       done: start + end === this.sizeBytes,
       byteOffset: start,
+      byteLength: end,
       sizeBytes: this.sizeBytes,
       ...(this.spans === undefined ? {} : { ranges: this.ranges(start, start + end) }),
     });

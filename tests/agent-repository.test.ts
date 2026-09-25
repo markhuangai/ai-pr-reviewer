@@ -556,6 +556,7 @@ test("pages spooled repository sources and rejects in-checkout query roots", asy
     content: "",
     done: true,
     byteOffset: 0,
+    byteLength: 0,
     sizeBytes: 0,
   });
   await emptyReader.close();
@@ -614,7 +615,11 @@ test("pages spooled repository sources and rejects in-checkout query roots", asy
     Buffer.byteLength(utf8Content, "utf8"),
   );
   let utf8Read = "";
-  while (!utf8Reader.complete) utf8Read += (await utf8Reader.readNext()).content;
+  while (!utf8Reader.complete) {
+    const page = await utf8Reader.readNext();
+    assert.equal(page.byteLength, Buffer.byteLength(page.content));
+    utf8Read += page.content;
+  }
   assert.equal(utf8Read, utf8Content);
   assert.equal((await utf8Reader.readNext()).done, true);
   await utf8Reader.close();

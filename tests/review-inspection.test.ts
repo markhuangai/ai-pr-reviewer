@@ -9,7 +9,7 @@ import {
   test,
   type SDKMessage,
 } from "./agent-test-helpers.js";
-import { rename } from "node:fs/promises";
+import { rename, rm, symlink } from "node:fs/promises";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import {
   reviewProtocolQuery,
@@ -612,3 +612,143 @@ test("filtered recovery resumes a modified rename through either canonical alias
   );
   assert.equal(result.status, "completed");
 });
+
+test("non-UTF-8 text completes diff inspection without crediting binary file metadata", async (t) => {
+  const content = Buffer.alloc(40_000, Buffer.from([0xe9, 0x0a]));
+  const repository = await makeRepository(t, (root) =>
+    writeFile(join(root, "legacy.txt"), content),
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  let delivered = 0;
+  const result = await runReviewGoal(
+    "check",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig(),
+    diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      const metadata = protocolDocument(
+        yield* protocol.call("read_repository_file", { path: "legacy.txt", revision: "head" }),
+      );
+      assert.equal(metadata.kind, "binary");
+      assert.equal((yield* recoveryState(protocol)).inspection.missing, 1);
+      let cursor: unknown;
+      let pages = 0;
+      for (;;) {
+        const response = yield* protocol.call("read_pr_diff", {
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        assert.equal(response.isError, undefined);
+        const page = protocolDocument(response);
+        assert.equal(typeof page.byteLength, "number");
+        assert.ok(Number(page.byteLength) < Buffer.byteLength(String(page.content)));
+        assert.ok(String(page.content).includes("\ufffd"));
+        delivered += Number(page.byteLength);
+        pages += 1;
+        if (pages === 1) assert.equal((yield* recoveryState(protocol)).inspection.missing, 1);
+        if (page.done === true) break;
+        cursor = page.nextCursor;
+      }
+      assert.ok(pages > 1);
+      const state = yield* recoveryState(protocol);
+      assert.equal(state.inspection.missing, 0);
+      assert.equal(state.uniqueSourceBytes, delivered);
+      assert.equal(
+        (yield* protocol.call("submit_review", {
+          summary: "Complete",
+          findings: [],
+          limitations: [],
+        })).isError,
+        undefined,
+      );
+      yield protocolResult();
+    }),
+  );
+  assert.equal(delivered, diff.size);
+  assert.equal(result.status, "completed", result.error ?? "");
+  assert.equal(result.diagnostics?.uniqueSourceBytes, delivered);
+});
+
+for (const direction of ["file-to-symlink", "symlink-to-file"] as const) {
+  test(`type changes preserve both patches in one inspected span: ${direction}`, async (t) => {
+    const repository = await makeRepository(
+      t,
+      async (root) => {
+        await rm(join(root, "review.txt"));
+        if (direction === "file-to-symlink") await symlink("target.txt", join(root, "review.txt"));
+        else await writeFile(join(root, "review.txt"), "ordinary file\n");
+        await writeFile(join(root, "z-after.txt"), "another change\n");
+      },
+      async (root) => {
+        await writeFile(join(root, "target.txt"), "unchanged target\n");
+        if (direction === "symlink-to-file") {
+          await rm(join(root, "review.txt"));
+          await symlink("target.txt", join(root, "review.txt"));
+        }
+      },
+    );
+    const files = await readPullRequestFilesFromSnapshots(
+      repository.context,
+      repository.root,
+      repository.baseSha,
+    );
+    const diff = await makeDiffFromSnapshots(
+      repository.root,
+      repository.baseSha,
+      repository.headSha,
+      repository.temporaryRoot,
+    );
+    t.after(() => diff.cleanup());
+    assert.equal(diff.files.length, 2);
+    const result = await runReviewGoal(
+      "check",
+      0,
+      repository.context,
+      files,
+      emptyConversation,
+      reviewConfig(),
+      diff,
+      repository.root,
+      reviewProtocolQuery(async function* (protocol) {
+        yield* protocolBriefing(protocol);
+        const page = protocolDocument(
+          yield* protocol.call("read_pr_diff", { paths: ["review.txt"] }),
+        );
+        assert.equal(page.done, true);
+        assert.equal((String(page.content).match(/^diff --git /gmu) ?? []).length, 2);
+        assert.match(String(page.content), /deleted file mode/u);
+        assert.match(String(page.content), /new file mode/u);
+        const state = yield* recoveryState(protocol);
+        assert.equal(state.inspection.observed, 1);
+        assert.equal(state.inspection.missing, 1);
+        yield* protocol.call("read_pr_diff", { paths: ["z-after.txt"] });
+        assert.equal((yield* recoveryState(protocol)).inspection.missing, 0);
+        assert.equal(
+          (yield* protocol.call("submit_review", {
+            summary: "Complete",
+            findings: [],
+            limitations: [],
+          })).isError,
+          undefined,
+        );
+        yield protocolResult();
+      }),
+    );
+    assert.equal(result.status, "completed", result.error ?? "");
+  });
+}

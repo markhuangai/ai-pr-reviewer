@@ -575,7 +575,6 @@ export class ReviewEvidenceLedger {
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;
   }
-
   observeBatch(calls: readonly RepositoryReviewToolCall[]): readonly ReviewEvidenceReference[] {
     this.deliveries = [];
     const observed: ReviewEvidenceReference[] = [];
@@ -626,6 +625,7 @@ export class ReviewEvidenceLedger {
         status !== "failed" &&
         (result?.ranges !== undefined || result?.byteOffset !== undefined)
       ) {
+        const byteLength = nonnegativeInteger(result.byteLength);
         const rangeInput =
           source.kind === "repository_diff"
             ? result.ranges
@@ -634,8 +634,8 @@ export class ReviewEvidenceLedger {
                   paths: [source.path],
                   start: result.byteOffset,
                   end:
-                    typeof result.byteOffset === "number"
-                      ? result.byteOffset + Buffer.byteLength(String(result.content), "utf8")
+                    typeof result.byteOffset === "number" && byteLength !== undefined
+                      ? result.byteOffset + byteLength
                       : undefined,
                   totalBytes: result.sizeBytes,
                 },
@@ -657,10 +657,11 @@ export class ReviewEvidenceLedger {
             (source.mergeBaseSha === undefined || source.mergeBaseSha === scope.mergeBaseSha));
         const valid =
           parsed.success &&
+          byteLength !== undefined &&
+          byteLength <= Buffer.byteLength(String(result.content), "utf8") &&
           matchesSnapshot &&
           matchesCursor &&
-          parsed.data.reduce((sum, range) => sum + range.end - range.start, 0) ===
-            Buffer.byteLength(String(result.content), "utf8") &&
+          parsed.data.reduce((sum, range) => sum + range.end - range.start, 0) === byteLength &&
           parsed.data.every(
             (range) =>
               source.kind !== "repository_diff" ||
@@ -845,7 +846,6 @@ export class ReviewEvidenceLedger {
     }
     return observed.map((reference) => this.references.get(reference.id) ?? reference);
   }
-
   referencesForPaths(paths: readonly string[]): readonly ReviewEvidenceReference[] {
     return [...this.references.values()].filter((reference) =>
       paths.some(

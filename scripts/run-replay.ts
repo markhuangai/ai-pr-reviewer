@@ -61,8 +61,12 @@ export async function runReplay(args = process.argv.slice(2)): Promise<void> {
 }
 
 const entry = process.argv[1];
+// Node 24.0 supports the launcher but predates import.meta.main.
+const main = (import.meta as { main?: boolean }).main;
+const directEntry =
+  main ?? !process.execArgv.some((arg) => /^-(?:[ep]|-(?:eval|print)(?:=|$))/u.test(arg));
 let entryPath: string | undefined;
-if (entry !== undefined) {
+if (directEntry && entry !== undefined) {
   try {
     entryPath = await realpath(entry);
   } catch (error) {
