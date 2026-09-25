@@ -805,11 +805,14 @@ export function buildRunSummary(
   ];
   if (review.partial) {
     const incompleteCoverage = new Map<string, string>();
+    const goalWideReasons = new Set<string>();
     for (const goal of goals) {
       for (const path of goal.inspection?.missingPaths ?? [])
         incompleteCoverage.set(path, "The changed code was not fully delivered to this goal.");
-      for (const limitation of goal.submission?.limitations ?? [])
+      for (const limitation of goal.submission?.limitations ?? []) {
+        if (limitation.paths.length === 0) goalWideReasons.add(limitation.reason);
         for (const path of limitation.paths) incompleteCoverage.set(path, limitation.reason);
+      }
     }
     if (incompleteCoverage.size > 0) {
       const shown = [...incompleteCoverage].slice(0, 20);
@@ -824,6 +827,18 @@ export function buildRunSummary(
         ),
         ...(incompleteCoverage.size > shown.length
           ? [`- ${incompleteCoverage.size - shown.length} additional path(s) omitted.`]
+          : []),
+      );
+    }
+    if (goalWideReasons.size > 0) {
+      const shown = [...goalWideReasons].slice(0, 20);
+      lines.push(
+        "",
+        "### Goal-wide limitations",
+        "",
+        ...shown.map((reason) => `- ${escapeMarkdownText(reason)}`),
+        ...(goalWideReasons.size > shown.length
+          ? [`- ${goalWideReasons.size - shown.length} additional reason(s) omitted.`]
           : []),
       );
     }

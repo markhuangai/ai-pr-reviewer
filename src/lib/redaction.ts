@@ -19,6 +19,18 @@ export function redact(value: string, secrets: readonly string[]): string {
     .reduce((result, secret) => redactSecret(result, secret), value);
 }
 
+function redactCounts(
+  counts: Readonly<Record<string, number>>,
+  secrets: readonly string[],
+): Record<string, number> {
+  const totals = new Map<string, number>();
+  for (const [category, count] of Object.entries(counts)) {
+    const key = redact(category, secrets);
+    totals.set(key, (totals.get(key) ?? 0) + count);
+  }
+  return Object.fromEntries(totals);
+}
+
 export function redactGoalResults(
   goals: readonly GoalResult[],
   secrets: readonly string[],
@@ -41,12 +53,7 @@ export function redactGoalResults(
           diagnostics: {
             ...goal.diagnostics,
             termination: redact(goal.diagnostics.termination, secrets),
-            rejectionCounts: Object.fromEntries(
-              Object.entries(goal.diagnostics.rejectionCounts).map(([category, count]) => [
-                redact(category, secrets),
-                count,
-              ]),
-            ),
+            rejectionCounts: redactCounts(goal.diagnostics.rejectionCounts, secrets),
           },
         }),
     ...(goal.tokenUsage === undefined

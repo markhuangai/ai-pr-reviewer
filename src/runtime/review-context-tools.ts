@@ -337,6 +337,9 @@ export function createReviewStateTool({
             previousPath: file.previousPath,
             status: file.status,
             observed: inspection.observedPaths.includes(file.path),
+            ...(file.previousPath === undefined
+              ? {}
+              : { previousObserved: inspection.observedPaths.includes(file.previousPath) }),
           });
         for (const reference of selection.length === 0
           ? ledger.issued.values()

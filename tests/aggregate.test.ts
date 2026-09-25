@@ -10,6 +10,8 @@ import {
 } from "../src/lib/aggregate.js";
 import type { GoalResult, ReviewConfig } from "../src/lib/types.js";
 import { config, context, files } from "./aggregate-test-fixtures.js";
+import { redactGoalResults } from "../src/lib/redaction.js";
+import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
 
 test("renders a clean review without exposing goal internals", () => {
   const goals: readonly GoalResult[] = [
@@ -148,6 +150,64 @@ test("retains supported findings while suppressing approval for incomplete cover
   assert.doesNotMatch(body, /PRIVATE REJECTION|PRIVATE TERMINATION|submissionAttempts/u);
   assert.match(summary, /Required evidence gathering could not finish/u);
   assert.match(summary, /src\/other\.ts/u);
+});
+
+test("renders bounded, escaped goal-wide reasons after redaction with complete inspection", () => {
+  const reason = "private-token <script> & [unavailable](https://example.test)";
+  const goal: GoalResult = {
+    ...acceptedSubmissionResult(
+      "check",
+      {
+        summary: "No findings",
+        findings: [],
+        limitations: [
+          { paths: [], reason },
+          { paths: [], reason },
+        ],
+      },
+      { checked: true, failures: "" },
+      [],
+      true,
+    ),
+    inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+  };
+  const redacted = redactGoalResults([goal], ["private-token"]);
+  const review = aggregateReview(context, config, files, redacted);
+  const summary = buildRunSummary(context, review, redacted);
+  assert.equal(goal.status, "incomplete");
+  assert.equal(review.event, "COMMENT");
+  assert.equal(review.partial, true);
+  assert.match(summary, /### Goal-wide limitations/u);
+  assert.match(summary, /REDACTED/u);
+  assert.match(summary, /&lt;script&gt;/u);
+  for (const raw of ["private-token", "<script>", "[unavailable]("])
+    assert.equal(summary.includes(raw), false);
+  assert.equal(summary.split("&lt;script&gt;").length, 2);
+  const manyGoals = redactGoalResults(
+    Array.from({ length: 50 }, (_, goalIndex) => ({
+      ...goal,
+      submission: {
+        summary: "partial",
+        findings: [],
+        limitations: [
+          { paths: [files[0]?.path ?? ""], reason: "Path specific reason." },
+          ...Array.from({ length: 99 }, (_, index) => ({
+            paths: [],
+            reason: `${goalIndex}:${index} ${"🙂".repeat(490)}`,
+          })),
+        ],
+      },
+    })),
+    [],
+  );
+  const bounded = buildRunSummary(
+    context,
+    aggregateReview(context, config, files, manyGoals),
+    manyGoals,
+  );
+  assert.match(bounded, /Path specific reason/u);
+  assert.match(bounded, /4930 additional reason\(s\) omitted/u);
+  assert.ok(Buffer.byteLength(bounded) < 1_000_000);
 });
 
 test("combines token usage across every goal without showing cost when pricing is absent", () => {

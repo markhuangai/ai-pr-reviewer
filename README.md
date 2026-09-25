@@ -401,6 +401,8 @@ npm run bundle:bootstrap
 
 The replay CLI runs the normal review runner against an exact local pull request snapshot and writes redacted JSON results outside the checkout. It requires a pristine checkout whose `HEAD` matches the case's `headSha` and whose Git objects include its `baseSha`. The output path must be new and outside that checkout. It does not switch branches or call GitHub's publication API. Labels live in a top-level `labels` field and are recorded with the result; they are never sent to the reviewer.
 
+`replay:review` compiles its runtime in the system temporary directory and removes that build when it finishes or fails. The temporary directory must resolve outside the selected checkout. The pristine check still rejects every unrelated ignored or untracked file, including `node_modules` and existing `build-replay` output. For self-replay, keep dependencies in a parent directory outside the checkout so Node and TypeScript can resolve them without dirtying it. The standalone `build:replay` command still writes to `build-replay` for development.
+
 Replay output uses **version 2**: goals include host-owned `inspection` and submissions include `limitations` instead of the old assessment. Case input remains **version 1**.
 
 Set `AI_PR_REVIEWER_SECRET` (or `ANTHROPIC_API_KEY`) for the model credential. Set `AI_PR_REVIEWER_BASE_URL` to the consumer's configured proxy when needed, or record `aiBaseUrl` in the case. The case's `config.reviewPrompts`, model, budgets, system prompt, and HTTP MCP server configuration are passed to the normal runner.
