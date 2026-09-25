@@ -4,10 +4,13 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
   chmod,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  realpath,
   rm,
   stat,
   symlink,
@@ -16,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { checkPackageAge, checkPackageAgeFile } from "../scripts/check-package-age.js";
@@ -30,6 +34,7 @@ import { prepareRuntime } from "../scripts/prepare-runtime.js";
 import { selectReleaseAliasCli } from "../scripts/select-release-alias.js";
 import { validateReleaseCli } from "../scripts/validate-release.js";
 import { writeChecksum } from "../scripts/write-checksum.js";
+import { prepareReplayRuntime, runReplay } from "../scripts/run-replay.js";
 import {
   parseReplayCase,
   replayCase,
@@ -41,6 +46,7 @@ import {
 } from "../scripts/replay-review.js";
 import { runRuntimeEntry } from "../src/runtime/index.js";
 import type { GoalResult } from "../src/lib/types.js";
+import { commitFixtureSnapshot, makeReplayRepository } from "./git-test-helpers.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -390,20 +396,15 @@ test("runs release CLI workers with real files and output records", async (t) =>
 });
 
 test("replays a frozen case without publishing, switching revisions, or exposing labels", async (t) => {
-  const temporary = await temporaryDirectory("ai-pr-reviewer-replay-");
-  t.after(() => rm(temporary, { recursive: true, force: true }));
-  const checkout = join(temporary, "checkout");
-  const results = join(temporary, "results");
-  await mkdir(results);
-  await git(temporary, ["clone", "--quiet", "--shared", process.cwd(), checkout]);
-  const headSha = await git(process.cwd(), ["rev-parse", "HEAD"]);
-  await git(checkout, ["checkout", "--quiet", "--detach", headSha]);
-  const baseSha = await git(checkout, ["rev-parse", "HEAD^"]);
-  const mergeBaseSha = await git(checkout, ["merge-base", baseSha, headSha]);
-  const changedPath = (await git(checkout, ["diff", "--name-only", "-z", baseSha, headSha]))
-    .split("\0")
-    .filter((path) => path.length > 0)[0];
-  assert.ok(changedPath);
+  const {
+    root: checkout,
+    temporaryRoot: results,
+    baseSha,
+    headSha,
+  } = await makeReplayRepository(t);
+  const canonicalCheckout = await realpath(checkout);
+  const mergeBaseSha = baseSha;
+  const changedPath = "review.txt";
   const context = {
     repository: "owner/repository",
     owner: "owner",
@@ -510,15 +511,18 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     assert.equal(replayContext.headSha, headSha);
     assert.equal(replayContext.title, "Example [REDACTED]");
     assert.equal(replayContext.body, "PR body [REDACTED]");
-    assert.equal(replayCheckout, checkout);
+    assert.equal(replayCheckout, canonicalCheckout);
     assert.doesNotMatch(JSON.stringify(conversation), /mcp-replay-credential|replay-secret/u);
     assert.ok(briefing);
     assert.equal(briefing.linkedIssues[0]?.title, "Issue [REDACTED]");
     assert.equal(briefing.linkedIssues[0]?.body, "Issue body [REDACTED]");
     const changedFile = files[0];
     assert.ok(changedFile);
+    assert.equal(files.length, 1);
+    assert.equal(changedFile.path, changedPath);
+    assert.deepEqual([...changedFile.addedLines], [2]);
     replayFindingPath = changedFile.path;
-    replayFindingLine = changedFile.addedLines.values().next().value ?? 1;
+    replayFindingLine = 2;
     assert.equal(contextFiles[0]?.length, 0);
     assert.equal(config.reviewPrompts[0]?.prompt, "Review the changed behavior.");
     assert.equal(JSON.stringify(config).includes("known-defect"), false);
@@ -717,17 +721,167 @@ test("accepts Action-supported replay limits and reserves the internal MCP serve
   );
 });
 
-test("replay package command loads the compiled entrypoint", async () => {
+test("keeps replay independent of shallow, deletion-only, and symlinked callers", async (t) => {
+  const { root, temporaryRoot, headSha } = await makeReplayRepository(t);
+  const shallow = join(temporaryRoot, "shallow");
+  await git(root, ["clone", "--quiet", "--depth=1", pathToFileURL(root).href, shallow]);
+  assert.equal(await git(shallow, ["rev-parse", "--is-shallow-repository"]), "true");
+  await assert.rejects(git(shallow, ["rev-parse", "--verify", "HEAD^"]));
+  await rm(join(root, "review.txt"));
+  const deletedHead = await commitFixtureSnapshot(root, temporaryRoot, headSha);
+  assert.equal(await git(root, ["diff", "--numstat", headSha, deletedHead]), "0\t2\treview.txt");
+  const linkedTemporary = join(temporaryRoot, "linked-temp");
+  const actualTemporary = join(temporaryRoot, "actual-temp");
+  await mkdir(actualTemporary);
+  await symlink(
+    actualTemporary,
+    linkedTemporary,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.NODE_TEST_CONTEXT;
+  for (const [name, cwd, temporary] of [
+    ["shallow", shallow, actualTemporary],
+    ["deletion-only", root, actualTemporary],
+    ["symlinked temp", root, linkedTemporary],
+  ] as const) {
+    await t.test(name, async () => {
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [
+          "--test",
+          "--test-reporter=spec",
+          "--test-name-pattern=^replays a frozen case ",
+          fileURLToPath(import.meta.url),
+        ],
+        {
+          cwd,
+          encoding: "utf8",
+          env: { ...childEnvironment, TMPDIR: temporary, TEMP: temporary, TMP: temporary },
+        },
+      );
+      assert.match(stdout, /replays a frozen case/u);
+      assert.match(stdout, /pass 1/u);
+    });
+  }
+});
+
+test("builds replay outside its pristine package checkout and cleans success and failure", async (t) => {
+  const source = fileURLToPath(new URL("../../", import.meta.url));
+  const { root, temporaryRoot, context } = await makeReplayRepository(t, async (checkout) => {
+    for (const path of ["src", "scripts", "package.json", "tsconfig.json", "tsconfig.replay.json"])
+      await cp(join(source, path), join(checkout, path), { recursive: true });
+  });
+  await symlink(
+    join(source, "node_modules"),
+    join(root, "../node_modules"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const initialTemporary = await readdir(temporaryRoot);
+  const canonicalRoot = await realpath(root);
+  const status = () =>
+    git(root, ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"]);
+  assert.equal(await status(), "");
+  const input = parseReplayCase({
+    version: 1,
+    caseId: "self-replay",
+    context,
+    config: { model: "consumer-model-id", reviewPrompts: [{ prompt: "Review" }] },
+  });
+  const previousSecret = process.env.AI_PR_REVIEWER_SECRET;
+  process.env.AI_PR_REVIEWER_SECRET = "replay-secret";
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.AI_PR_REVIEWER_SECRET;
+    else process.env.AI_PR_REVIEWER_SECRET = previousSecret;
+  });
+  const runtime = await prepareReplayRuntime(root, root, temporaryRoot);
+  t.after(runtime.cleanup);
+  assert.ok(runtime.entry.startsWith(await realpath(temporaryRoot)));
+  const replay = (await import(pathToFileURL(runtime.entry).href)) as {
+    replayCase: typeof replayCase;
+  };
+  let calls = 0;
+  const runner: ReplayRunner = (_context, files, _conversation, _config, _files, checkout) => {
+    calls += 1;
+    assert.equal(checkout, canonicalRoot);
+    assert.deepEqual(
+      files.map((file) => file.path),
+      ["review.txt"],
+    );
+    return Promise.resolve([
+      {
+        prompt: "Review",
+        status: "completed",
+        inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+        submission: { summary: "Complete", findings: [], limitations: [] },
+      },
+    ]);
+  };
+  const output = await replay.replayCase(input, root, runner);
+  assert.equal(calls, 1);
+  assert.equal(output.partial, false);
+  assert.equal(await status(), "");
+  await writeFile(join(root, "ignored.tmp"), "unrelated ignored artifact\n");
+  assert.match(await status(), /!! ignored\.tmp/u);
+  await assert.rejects(replay.replayCase(input, root, runner), /must be pristine/u);
+  assert.equal(calls, 1);
+  await rm(join(root, "ignored.tmp"));
+  await runtime.cleanup();
+  assert.deepEqual(await readdir(temporaryRoot), initialTemporary);
+
+  const casePath = join(temporaryRoot, "case.json");
+  await writeFile(casePath, JSON.stringify(input));
+  const beforeCli = await readdir(temporaryRoot);
   await assert.rejects(
-    execFileAsync("npm", ["run", "replay:review"], { encoding: "utf8" }),
+    execFileAsync(
+      "npm",
+      [
+        "run",
+        "replay:review",
+        "--",
+        "--case",
+        casePath,
+        "--checkout",
+        root,
+        "--output",
+        join(temporaryRoot, "result.json"),
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          TMPDIR: temporaryRoot,
+          TEMP: temporaryRoot,
+          TMP: temporaryRoot,
+          AI_PR_REVIEWER_SECRET: "",
+          ANTHROPIC_API_KEY: "",
+          NODE_DISABLE_COMPILE_CACHE: "1",
+        },
+      },
+    ),
     (error: unknown) => {
-      if (!(error instanceof Error) || !("stderr" in error) || typeof error.stderr !== "string")
-        return false;
-      assert.match(error.stderr, /Usage: npm run replay:review/u);
-      assert.doesNotMatch(error.stderr, /ERR_MODULE_NOT_FOUND/u);
+      assert.ok(error instanceof Error && "stderr" in error && typeof error.stderr === "string");
+      assert.match(error.stderr, /Set AI_PR_REVIEWER_SECRET or ANTHROPIC_API_KEY/u);
+      assert.doesNotMatch(error.stderr, /must be pristine|ERR_MODULE_NOT_FOUND/u);
       return true;
     },
   );
+  assert.equal(await status(), "");
+  assert.deepEqual(await readdir(temporaryRoot), beforeCli);
+  await assert.rejects(prepareReplayRuntime(root, root, root), /must be outside/u);
+  const link = join(temporaryRoot, "checkout-link");
+  await symlink(root, link, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(prepareReplayRuntime(root, root, link), /must be outside/u);
+  await writeFile(join(root, "tsconfig.replay.json"), "invalid json");
+  const beforeFailure = await readdir(temporaryRoot);
+  await assert.rejects(prepareReplayRuntime(root, root, temporaryRoot), /Command failed/u);
+  assert.deepEqual(await readdir(temporaryRoot), beforeFailure);
+});
+
+test("rejects missing replay checkout arguments before building", async () => {
+  for (const args of [[], ["--checkout"], ["--checkout", "--output", "result.json"]])
+    await assert.rejects(runReplay(args), /Usage: npm run replay:review/u);
 });
 
 test("runs the guarded runtime entry worker", async () => {

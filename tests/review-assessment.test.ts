@@ -788,7 +788,7 @@ test("keeps four structured state snapshots without advancing or evicting source
     signal: undefined,
     isActive: () => true,
     files: [
-      changedFile,
+      { ...changedFile, previousPath: "old.ts", status: "renamed" },
       ...Array.from({ length: 600 }, (_, index) => ({ ...changedFile, path: `other-${index}.ts` })),
     ],
     headSha: "b".repeat(40),
@@ -825,6 +825,17 @@ test("keeps four structured state snapshots without advancing or evicting source
   );
   const cursor = String(first.nextCursor);
   const original = document(await state.handler({ paths: undefined, cursor }, {}));
+  ledger.observeBatch([
+    call(
+      "read_repository_file",
+      { path: "old.ts", revision: "base" },
+      jsonResponse({ kind: "text", page: 1, content: "old source", done: true }),
+    ),
+  ]);
+  const originalFirst = document(
+    await state.handler({ paths: undefined, cursor: cursor.replace(/:2$/u, ":1") }, {}),
+  );
+  assert.deepEqual(originalFirst, first);
   recovery.observeUse("rejected", {});
   for (let index = 0; index < 3; index += 1)
     await state.handler({ paths: undefined, cursor: undefined }, {});
@@ -834,7 +845,7 @@ test("keeps four structured state snapshots without advancing or evicting source
   assert.equal(expired.isError, true);
   assert.match(JSON.stringify(expired), /expired/u);
   assert.equal(readers.has(query.cursor), true);
-  assert.equal(ledger.issued.size, 0);
+  assert.equal(ledger.issued.size, 1);
   const mismatch = document(
     await readers.readPage(query.cursor, "repository_file", { revision: "base", path: "wrong.ts" }),
   );
@@ -849,4 +860,71 @@ test("keeps four structured state snapshots without advancing or evicting source
     }),
   );
   assert.equal(resumed.page, 2);
+});
+
+test("reports both rename sides consistently for base, head, diff, and filtered recovery", async () => {
+  const renamed = { ...changedFile, path: "new.ts", previousPath: "old.ts", status: "renamed" };
+  for (const mode of ["none", "base", "head", "diff"] as const) {
+    const ledger = new ReviewEvidenceLedger("/repo");
+    if (mode === "diff")
+      ledger.observeBatch([
+        call(
+          "read_pr_diff",
+          { paths: ["new.ts", "old.ts"] },
+          jsonResponse({ page: 1, content: "rename diff", done: true }),
+        ),
+      ]);
+    else if (mode !== "none")
+      ledger.observeBatch([
+        call(
+          "read_repository_file",
+          {
+            path: mode === "base" ? "old.ts" : "new.ts",
+            revision: mode,
+          },
+          jsonResponse({ kind: "text", page: 1, content: "source", done: true }),
+        ),
+      ]);
+    const state = createReviewStateTool({
+      signal: undefined,
+      isActive: () => true,
+      files: [renamed],
+      headSha: "b".repeat(40),
+      mergeBaseSha: "a".repeat(40),
+      briefingComplete: () => true,
+      ledger,
+      readers: new ReviewQueryReaderStore(() => undefined),
+      recovery: new ReviewSubmissionRecovery(),
+      gaps: () => [],
+    });
+    const expected = {
+      kind: "changed_file",
+      path: "new.ts",
+      previousPath: "old.ts",
+      status: "renamed",
+      observed: mode === "head" || mode === "diff",
+      previousObserved: mode === "base" || mode === "diff",
+    };
+    for (const paths of [undefined, ["old.ts"], ["new.ts"]]) {
+      const response = await state.handler({ paths, cursor: undefined }, {});
+      assert.ok(Buffer.byteLength(JSON.stringify(response)) <= MODEL_TOOL_RESULT_BYTES);
+      const document = reviewAssessmentInternals.toolResponseDocument(response);
+      assert.ok(document);
+      const records = document.records as Record<string, unknown>[];
+      assert.deepEqual(
+        records.find((record) => record.kind === "changed_file"),
+        expected,
+      );
+      const unread = [
+        ...(expected.observed ? [] : ["new.ts"]),
+        ...(expected.previousObserved ? [] : ["old.ts"]),
+      ].filter((path) => paths === undefined || paths.includes(path));
+      assert.deepEqual(
+        records.filter((record) => record.kind === "next_call"),
+        unread.length === 0
+          ? []
+          : [{ kind: "next_call", tool: "read_pr_diff", arguments: { paths: unread } }],
+      );
+    }
+  }
 });

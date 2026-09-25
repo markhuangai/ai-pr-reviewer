@@ -232,6 +232,40 @@ test("redacts generated AI prompts without dropping them", () => {
   assert.equal(failedGoal?.submission, undefined);
 });
 
+test("preserves diagnostic totals when supported opaque secrets redact category keys alike", () => {
+  const collisionConfig = readReviewConfig(
+    actionReader({
+      "ai-secret": "schema",
+      "mcp-servers": JSON.stringify({
+        memory: {
+          type: "http",
+          url: "https://example.test/mcp",
+          headers: { "X-Token": "coverage" },
+        },
+      }),
+    }),
+  );
+  const original: GoalResult = {
+    prompt: "check",
+    status: "failed",
+    diagnostics: {
+      submissionAttempts: 6,
+      repairAttempts: 5,
+      evidenceReferences: 1,
+      termination: "schema",
+      rejectionCounts: { schema: 2, coverage: 3, location: 1 },
+    },
+  };
+  const [redacted] = indexInternals.redactGoals(
+    [original],
+    indexInternals.reviewSecrets(collisionConfig),
+  );
+  assert.deepEqual(redacted?.diagnostics?.rejectionCounts, { "[REDACTED]": 5, location: 1 });
+  assert.equal(redacted?.diagnostics?.submissionAttempts, 6);
+  assert.equal(redacted?.diagnostics?.termination, "[REDACTED]");
+  assert.deepEqual(original.diagnostics?.rejectionCounts, { schema: 2, coverage: 3, location: 1 });
+});
+
 test("keeps secret-bearing coverage paths for completeness without publishing them", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
