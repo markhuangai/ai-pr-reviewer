@@ -1184,8 +1184,8 @@ export class GitHubApi {
         cursor = page.endCursor;
       }
     }
-    const { commentsCursor: ignoredCursor, ...threadWithoutCursor } = thread;
-    void ignoredCursor;
+    const threadWithoutCursor = { ...thread };
+    delete threadWithoutCursor.commentsCursor;
     const root = comments.find((comment) => comment.replyToId === undefined) ?? comments[0];
     return {
       ...threadWithoutCursor,
