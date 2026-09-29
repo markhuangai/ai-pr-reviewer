@@ -449,11 +449,14 @@ test("handles provider failures, repair exhaustion, reader failures, and query f
         summary: "One issue",
         findings: [],
       }),
-      resultSubtypes: ["error_max_turns"],
+      resultSubtypes: ["error_during_execution"],
     }),
   );
   assert.equal(acceptedThenProviderFailure.status, "failed");
-  assert.match(acceptedThenProviderFailure.error ?? "", /provider returned error_max_turns/u);
+  assert.match(
+    acceptedThenProviderFailure.error ?? "",
+    /provider returned error_during_execution/u,
+  );
   assert.deepEqual(acceptedThenProviderFailure.submission, {
     summary: "One issue",
     findings: [],
