@@ -168,6 +168,7 @@ test("recovers completed query references after compaction without rereading sou
     }),
   );
   assert.equal(isolated.status, "failed");
+  assert.deepEqual(isolated.inspection?.missingPaths, ["review.txt"]);
 });
 
 test("state pages preserve a snapshot and expose rejection overflow without issuing evidence", async (t) => {
@@ -548,6 +549,63 @@ test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
   assert.equal(result.diagnostics?.submissionAttempts, 6);
   assert.equal(result.diagnostics?.rejectionCounts.schema, 5);
   assert.equal(result.tokenUsage?.complete, true);
+});
+
+test("accepted reviews at the SDK turn limit keep their normal completion gates", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const scenarios = [
+    { kind: "complete", expected: "completed" },
+    { kind: "limited", expected: "incomplete" },
+    { kind: "MCP failed", expected: "failed" },
+    { kind: "MCP unavailable", expected: "failed" },
+    { kind: "provider", expected: "failed" },
+  ] as const;
+  for (const scenario of scenarios) {
+    const terminal = scenario.kind === "provider" ? "error_during_execution" : "error_max_turns";
+    const limitations =
+      scenario.kind === "limited" ? [{ paths: ["review.txt"], reason: "Unavailable." }] : [];
+    const mcp = scenario.kind === "MCP failed" || scenario.kind === "MCP unavailable";
+    const config = reviewConfig({
+      autoApprove: true,
+      interactWithPullRequest: true,
+      ...(!mcp
+        ? {}
+        : { mcpServers: { knowledge: { type: "http" as const, url: "https://example.test" } } }),
+    });
+    const result = await runReviewGoal(
+      scenario.kind,
+      0,
+      repository.context,
+      files,
+      emptyConversation,
+      config,
+      repository.diff,
+      repository.root,
+      reviewProtocolQuery(
+        async function* (protocol) {
+          yield* protocolBriefing(protocol);
+          assert.equal(protocolDocument(yield* protocol.call("read_pr_diff", {})).done, true);
+          const submission = { summary: "Inspected changes.", findings: [], limitations };
+          assert.equal((yield* protocol.call("submit_review", submission)).isError, undefined);
+          yield { ...protocolResult(terminal), num_turns: 101 };
+        },
+        scenario.kind === "MCP failed" ? [{ name: "knowledge", status: "failed" }] : [],
+      ),
+    );
+    assert.equal(result.status, scenario.expected, scenario.kind);
+    assert.deepEqual(result.inspection?.missingPaths, [], scenario.kind);
+    assert.deepEqual(result.submission?.limitations, limitations, scenario.kind);
+    const review = aggregateReview(repository.context, config, files, [result]);
+    assert.equal(review.partial, scenario.expected !== "completed", scenario.kind);
+    assert.equal(review.event, scenario.expected === "completed" ? "APPROVE" : "COMMENT");
+    if (scenario.expected === "completed") assert.equal(result.error, undefined);
+    if (mcp) assert.match(result.error ?? "", /knowledge/u);
+  }
 });
 
 test("retains valid current findings independently of malformed peers", () => {

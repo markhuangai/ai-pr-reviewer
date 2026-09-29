@@ -851,7 +851,7 @@ export async function runReviewGoal(
         return await finalizeUnaccepted(
           result.errors.join("; ") || `Claude returned ${result.subtype}.`,
           tokenUsageState.latestSnapshotValid,
-          result.subtype !== "error_max_turns" || submission !== undefined,
+          result.subtype !== "error_max_turns",
         );
       }
       if (submission !== undefined) {
