@@ -345,6 +345,9 @@ export class ReviewBriefingReader {
         kind: "linked_issue_index",
         count: briefing.linkedIssues.length,
         referencesTruncated: briefing.linkedIssueReferencesTruncated,
+        ...((briefing.unavailableLinkedIssues?.length ?? 0) === 0
+          ? {}
+          : { unavailableLinkedIssues: briefing.unavailableLinkedIssues }),
       },
     ];
     for (const issue of briefing.linkedIssues) {

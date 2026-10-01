@@ -664,6 +664,7 @@ export class GitHubApi {
   async getLinkedIssues(context: PullRequestContext): Promise<ReviewBriefing> {
     const references = discoverLinkedIssueNumbers(context);
     const linkedIssues: LinkedIssueSnapshot[] = [];
+    const unavailableLinkedIssues: { number: number; status: 403 }[] = [];
     for (const number of references.numbers) {
       if (number === context.number) continue;
       const operation = githubOperation(
@@ -672,7 +673,7 @@ export class GitHubApi {
         "load a same-repository issue referenced by the pull request",
         "GET",
         "issues:read",
-        [404],
+        [403, 404],
       );
       let payload: unknown;
       try {
@@ -684,6 +685,10 @@ export class GitHubApi {
         );
       } catch (error) {
         if (error instanceof GitHubApiError && error.status === 404) continue;
+        if (error instanceof GitHubApiError && error.status === 403) {
+          unavailableLinkedIssues.push({ number, status: 403 });
+          continue;
+        }
         throw error;
       }
       if (!isRecord(payload) || Object.hasOwn(payload, "pull_request")) continue;
@@ -694,6 +699,7 @@ export class GitHubApi {
     return {
       linkedIssues,
       linkedIssueReferencesTruncated: references.truncated,
+      ...(unavailableLinkedIssues.length === 0 ? {} : { unavailableLinkedIssues }),
     };
   }
 

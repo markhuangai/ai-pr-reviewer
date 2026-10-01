@@ -411,6 +411,17 @@ export async function runAction(
             )
           : emptyReviewBriefing();
       throwIfAborted(signal);
+      if (briefing.unavailableLinkedIssues?.length) {
+        const issues = briefing.unavailableLinkedIssues
+          .map((issue) => `#${issue.number}`)
+          .join(", ");
+        core.warning(
+          redact(
+            `Could not read optional linked issues ${issues} (HTTP 403). Continuing the review without that issue context; check the request diagnostics and the PAT's Issues: read access.`,
+            [...secrets, ...discoveredInputSecrets],
+          ),
+        );
+      }
       let resolvedThreadIds: readonly string[] = [];
       if (lifecycleApi !== undefined && lifecyclePreparation !== undefined) {
         resolvedThreadIds = await diagnostics.withSpan(
@@ -514,6 +525,9 @@ export async function runAction(
       };
       const redactedBriefing: ReviewBriefing = {
         linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
+        ...(briefing.unavailableLinkedIssues === undefined
+          ? {}
+          : { unavailableLinkedIssues: briefing.unavailableLinkedIssues }),
         linkedIssues: briefing.linkedIssues.map((issue) => ({
           ...issue,
           title: redact(issue.title, secrets),

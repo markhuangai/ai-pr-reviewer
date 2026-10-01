@@ -85,10 +85,12 @@ export function reviewBriefingDigest(
   context: PullRequestContext,
   briefing: ReviewBriefing,
 ): string {
+  const unavailableLinkedIssues = briefing.unavailableLinkedIssues ?? [];
   if (
     (context.body ?? "").length === 0 &&
     briefing.linkedIssues.length === 0 &&
     !briefing.linkedIssueReferencesTruncated &&
+    unavailableLinkedIssues.length === 0 &&
     (briefing.repositoryGuidance?.length ?? 0) === 0
   )
     return "";
@@ -99,6 +101,7 @@ export function reviewBriefingDigest(
         linkedIssues: briefing.linkedIssues,
         linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
         repositoryGuidance: briefing.repositoryGuidance ?? [],
+        ...(unavailableLinkedIssues.length === 0 ? {} : { unavailableLinkedIssues }),
       }),
     )
     .digest("hex");
