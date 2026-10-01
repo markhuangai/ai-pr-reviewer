@@ -210,6 +210,10 @@ const caseSchema = z
           )
           .default([]),
         linkedIssueReferencesTruncated: z.boolean().default(false),
+        unavailableLinkedIssues: z
+          .array(z.object({ number: z.number().int().positive(), status: z.literal(403) }).strict())
+          .max(20)
+          .optional(),
       })
       .strict()
       .optional(),
@@ -403,6 +407,9 @@ export async function replayCase(
     const briefing = { ...emptyReviewBriefing(), ...input.briefing };
     const redactedBriefing: ReviewBriefing = {
       linkedIssueReferencesTruncated: briefing.linkedIssueReferencesTruncated,
+      ...(briefing.unavailableLinkedIssues === undefined
+        ? {}
+        : { unavailableLinkedIssues: briefing.unavailableLinkedIssues }),
       linkedIssues: briefing.linkedIssues.map((issue) => ({
         ...issue,
         title: redact(issue.title, secrets),

@@ -256,6 +256,7 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
   const issueBody = `ISSUE-${"界".repeat(8_000)}-END`;
   const briefing: ReviewBriefing = {
     linkedIssueReferencesTruncated: false,
+    unavailableLinkedIssues: [{ number: 8, status: 403 }],
     linkedIssues: [
       {
         number: 7,
@@ -344,6 +345,12 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
     .filter((record) => record.kind === "linked_issue")
     .sort((left, right) => Number(left.bodyPart ?? 0) - Number(right.bodyPart ?? 0));
   assert.equal(issueParts.map((record) => record.body).join(""), issueBody);
+  const issueIndex = pages
+    .flatMap((page) => page.records)
+    .find((record) => record.kind === "linked_issue_index");
+  assert.ok(issueIndex);
+  assert.equal(issueIndex.count, 1);
+  assert.deepEqual(issueIndex.unavailableLinkedIssues, [{ number: 8, status: 403 }]);
   const discussion = pages
     .flatMap((page) => page.records)
     .find((record) => record.kind === "discussion_index" && record.id === 4);
@@ -373,7 +380,9 @@ test("pages the review briefing on UTF-8 boundaries and bounds serialized output
     emptyConversation,
     { linkedIssues: [], linkedIssueReferencesTruncated: false },
   );
-  assert.equal(missingBodyReader.readNext().records[0]?.body, "");
+  const missingBodyPage = missingBodyReader.readNext();
+  assert.equal(missingBodyPage.records[0]?.body, "");
+  assert.equal(Object.hasOwn(missingBodyPage.records[1] ?? {}, "unavailableLinkedIssues"), false);
 
   const quotedReader = new agentInternals.ReviewBriefingReader(
     { ...context, body: `QUOTE-${'"\\'.repeat(5_000)}-END` },

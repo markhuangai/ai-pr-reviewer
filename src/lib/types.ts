@@ -110,6 +110,7 @@ export interface LinkedIssueSnapshot {
 export interface ReviewBriefing {
   readonly linkedIssues: readonly LinkedIssueSnapshot[];
   readonly linkedIssueReferencesTruncated: boolean;
+  readonly unavailableLinkedIssues?: readonly { readonly number: number; readonly status: 403 }[];
   readonly repositoryGuidance?: readonly RepositoryGuidanceSnapshot[];
 }
 

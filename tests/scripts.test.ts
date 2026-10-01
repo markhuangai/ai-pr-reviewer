@@ -473,8 +473,15 @@ test("replays a frozen case without publishing, switching revisions, or exposing
         },
       ],
       linkedIssueReferencesTruncated: false,
+      unavailableLinkedIssues: [{ number: 322, status: 403 }],
     },
   });
+  assert.throws(() =>
+    parseReplayCase({
+      ...input,
+      briefing: { ...input.briefing, unavailableLinkedIssues: [{ number: 322, status: 500 }] },
+    }),
+  );
   assert.throws(() =>
     parseReplayCase({
       ...input,
@@ -516,6 +523,7 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     assert.ok(briefing);
     assert.equal(briefing.linkedIssues[0]?.title, "Issue [REDACTED]");
     assert.equal(briefing.linkedIssues[0]?.body, "Issue body [REDACTED]");
+    assert.deepEqual(briefing.unavailableLinkedIssues, [{ number: 322, status: 403 }]);
     const changedFile = files[0];
     assert.ok(changedFile);
     assert.equal(files.length, 1);

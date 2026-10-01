@@ -99,6 +99,24 @@ test("handles empty briefing inputs and malformed linked issue payloads", () => 
   assert.deepEqual(discoverLinkedIssueNumbers(context), { numbers: [], truncated: false });
   const empty = { linkedIssues: [], linkedIssueReferencesTruncated: false } as const;
   assert.equal(reviewBriefingDigest(context, empty), "");
+  assert.equal(reviewBriefingDigest(context, { ...empty, unavailableLinkedIssues: [] }), "");
+  const withBody = { ...context, body: "context" };
+  const legacyDigest = "2472ea0e8a67917138fd89793fd1c68571ea4ec893d668324976396226d5148f";
+  assert.equal(reviewBriefingDigest(withBody, empty), legacyDigest);
+  assert.equal(
+    reviewBriefingDigest(withBody, { ...empty, unavailableLinkedIssues: [] }),
+    legacyDigest,
+  );
+  const denied = { ...empty, unavailableLinkedIssues: [{ number: 2, status: 403 as const }] };
+  assert.notEqual(reviewBriefingDigest(withBody, denied), legacyDigest);
+  assert.notEqual(reviewBriefingDigest(context, denied), "");
+  assert.notEqual(
+    reviewBriefingDigest(context, denied),
+    reviewBriefingDigest(context, {
+      ...empty,
+      unavailableLinkedIssues: [{ number: 3, status: 403 }],
+    }),
+  );
   assert.match(
     reviewBriefingDigest(
       { ...context, body: "context" },
@@ -795,11 +813,18 @@ test("retains GraphQL response metadata when the response body read fails", asyn
   assert.equal(JSON.stringify(primitiveRecords).includes(primitiveBodyError), false);
 });
 
-test("loads linked issue bodies and excludes linked pull requests", async (t) => {
+test("keeps readable linked issues while skipping forbidden, missing, and pull request references", async (t) => {
   const requests: string[] = [];
+  const lines: string[] = [];
   const server = createServer((request, response) => {
     requests.push(request.url ?? "");
     response.setHeader("Content-Type", "application/json");
+    if (request.url?.endsWith("/issues/16") || request.url?.endsWith("/issues/17")) {
+      response.statusCode = 403;
+      response.setHeader("x-github-request-id", "denied-request");
+      response.end(JSON.stringify({ message: "private denied response" }));
+      return;
+    }
     if (request.url?.endsWith("/issues/12")) {
       response.end(
         JSON.stringify({
@@ -855,7 +880,13 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
   );
   const address = server.address();
   assert.ok(address !== null && typeof address === "object");
-  const api = new GitHubApi("test-token", `http://127.0.0.1:${address.port}`);
+  const api = new GitHubApi(
+    "test-token",
+    `http://127.0.0.1:${address.port}`,
+    undefined,
+    undefined,
+    new DiagnosticLogger({ component: "github", write: (line) => lines.push(line) }),
+  );
   const context: PullRequestContext = {
     repository: "owner/repository",
     owner: "owner",
@@ -865,11 +896,15 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
     baseSha: "a".repeat(40),
     baseRef: "main",
     title: "Linked issue context",
-    body: "Fixes #12 and #13 and #14 and #15.",
+    body: "Fixes #12 and #16 and #13 and #14 and #17 and #15.",
     htmlUrl: "https://github.com/owner/repository/pull/11",
   };
   assert.deepEqual(await api.getLinkedIssues(context), {
     linkedIssueReferencesTruncated: false,
+    unavailableLinkedIssues: [
+      { number: 16, status: 403 },
+      { number: 17, status: 403 },
+    ],
     linkedIssues: [
       {
         number: 12,
@@ -889,10 +924,108 @@ test("loads linked issue bodies and excludes linked pull requests", async (t) =>
   });
   assert.deepEqual(requests, [
     "/repos/owner/repository/issues/12",
+    "/repos/owner/repository/issues/16",
     "/repos/owner/repository/issues/13",
     "/repos/owner/repository/issues/14",
+    "/repos/owner/repository/issues/17",
     "/repos/owner/repository/issues/15",
   ]);
+  assert.deepEqual(await api.getLinkedIssues({ ...context, body: "#16 #17" }), {
+    linkedIssues: [],
+    linkedIssueReferencesTruncated: false,
+    unavailableLinkedIssues: [
+      { number: 16, status: 403 },
+      { number: 17, status: 403 },
+    ],
+  });
+  const records = lines.map(
+    (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+  );
+  const denied = records.filter(
+    (record) => (record.details as Record<string, unknown> | undefined)?.status === 403,
+  );
+  assert.equal(denied.length, 4);
+  assert.ok(
+    denied.every(
+      (record) => record.operation === "rest.issue.lookup" && record.outcome === "skipped",
+    ),
+  );
+  assert.equal((denied[0]?.details as Record<string, unknown>).request_id, "denied-request");
+  assert.equal((denied[0]?.details as Record<string, unknown>).required_permission, "issues:read");
+  assert.equal(
+    records.some((record) => record.outcome === "failure"),
+    false,
+  );
+  assert.doesNotMatch(JSON.stringify(records), /private denied response|test-token/u);
+});
+
+test("linked issue recovery preserves other HTTP, required-operation, network, and cancellation failures", async (t) => {
+  let status = 401;
+  let disconnect = false;
+  const server = createServer((request, response) => {
+    if (disconnect) {
+      request.socket.destroy();
+      return;
+    }
+    response.writeHead(status, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ message: "API failure" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        }),
+      ),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const apiUrl = `http://127.0.0.1:${address.port}`;
+  const api = new GitHubApi("test-token", apiUrl);
+  const context: PullRequestContext = {
+    repository: "owner/repository",
+    owner: "owner",
+    name: "repository",
+    number: 1,
+    headSha: "b".repeat(40),
+    baseSha: "a".repeat(40),
+    baseRef: "main",
+    title: "Optional issues",
+    body: "Fixes #2",
+    htmlUrl: "https://github.com/owner/repository/pull/1",
+  };
+  for (const failureStatus of [401, 429, 500]) {
+    status = failureStatus;
+    await assert.rejects(
+      api.getLinkedIssues(context),
+      (error: unknown) => error instanceof GitHubApiError && error.status === failureStatus,
+    );
+  }
+  status = 403;
+  await assert.rejects(
+    api.getPullRequestContext(context),
+    (error: unknown) => error instanceof GitHubApiError && error.status === 403,
+  );
+  await assert.rejects(
+    api.createReview(context, {
+      commit_id: context.headSha,
+      event: "COMMENT",
+      body: "review",
+      comments: [],
+    }),
+    (error: unknown) => error instanceof GitHubApiError && error.status === 403,
+  );
+  disconnect = true;
+  await assert.rejects(api.getLinkedIssues(context), /fetch failed/u);
+  const controller = new AbortController();
+  const reason = new CancellationError("SIGTERM");
+  controller.abort(reason);
+  await assert.rejects(
+    new GitHubApi("test-token", apiUrl, controller.signal).getLinkedIssues(context),
+    (error: unknown) => error === reason,
+  );
 });
 
 test("aborts in-flight GitHub requests and blocks later writes", async (t) => {

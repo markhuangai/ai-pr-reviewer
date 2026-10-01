@@ -49,6 +49,8 @@ jobs:
 
 The workflow-level `permissions` block configures only `GITHUB_TOKEN`. Configure the PAT supplied through `github-pat` separately; changing the block does not change the PAT's grants. If the organization requires approval for fine-grained PATs, an organization owner must approve a new token or permission change before the grants take effect.
 
+Linked issue context is optional and needs `Issues: Read-only` on the PAT. If a linked issue lookup returns HTTP 403, the action warns, identifies the unavailable issue context in each goal's briefing, and continues with readable issues and repository evidence. This warning alone does not prevent otherwise-qualified automatic approval. Required API failures still fail the action; missing required investigation still produces an incomplete review.
+
 The workflow owns whether a newer event cancels an older review. For example, a pull-request workflow can keep only the newest run for each target:
 
 ```yaml

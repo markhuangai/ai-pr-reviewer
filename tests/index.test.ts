@@ -657,6 +657,173 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
   );
 });
 
+test("denied optional issues warn once while summary and interactive reviews keep existing completeness rules", async (t) => {
+  const { context: originalContext, workspace } = await cleanWorkspace(t);
+  const context = { ...originalContext, body: "Fixes #12 and #13" };
+  useWorkspace(t, workspace);
+  const published: PullRequestReviewRequest[] = [];
+  const server = createServer((request, response) => {
+    response.setHeader("Content-Type", "application/json");
+    if (request.url === "/graphql") {
+      const connection = { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
+      response.end(
+        JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviews: connection,
+                reviewThreads: connection,
+              },
+            },
+          },
+        }),
+      );
+    } else if (request.url === "/user") {
+      response.end(JSON.stringify({ login: "review-owner" }));
+    } else if (request.url?.endsWith("/issues/12") || request.url?.endsWith("/issues/13")) {
+      response.statusCode = 403;
+      response.end(JSON.stringify({ message: "denied-body-secret test-token" }));
+    } else if (request.method === "POST" && request.url?.endsWith("/reviews")) {
+      let body = "";
+      request.on("data", (chunk: Buffer) => {
+        body += chunk.toString("utf8");
+      });
+      request.on("end", () => {
+        published.push(JSON.parse(body) as PullRequestReviewRequest);
+        response.end("{}");
+      });
+    } else if (request.url?.includes("/comments?") || request.url?.includes("/reviews?")) {
+      response.end("[]");
+    } else if (request.url?.endsWith("/pulls/9")) {
+      response.end(
+        JSON.stringify({
+          title: context.title,
+          body: "Fixes #12 and #13",
+          head: { sha: context.headSha },
+          base: { sha: context.baseSha, ref: context.baseRef },
+        }),
+      );
+    } else {
+      response.statusCode = 404;
+      response.end(JSON.stringify({ message: "Unexpected test route" }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        }),
+      ),
+  );
+  const address = server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const apiUrl = `http://127.0.0.1:${address.port}`;
+  for (const interact of [false, true]) {
+    for (const incomplete of [false, true]) {
+      await t.test(
+        `${interact ? "interactive" : "summary"}, ${incomplete ? "incomplete" : "complete"}`,
+        async (scenario) => {
+          const output: string[] = [];
+          const diagnosticLines: string[] = [];
+          const diagnostics = new DiagnosticLogger({
+            component: "action",
+            write: (line) => diagnosticLines.push(line),
+          });
+          scenario.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+            output.push(chunk.toString());
+            return true;
+          });
+          published.length = 0;
+          let goalRuns = 0;
+          let summaryWrites = 0;
+          const pending = runAction(
+            actionReader({ "interact-with-pr": String(interact), "auto-approve": "true" }),
+            ["#12", "denied-body-secret"],
+            {
+              createApi: (token, signal, logger) =>
+                new GitHubApi(token, apiUrl, signal, `${apiUrl}/graphql`, logger),
+              readEventContext: () => Promise.resolve(context),
+              createWorkspace: () => Promise.reject(new Error("Unexpected temporary workspace")),
+              runGoals: (
+                _context,
+                _files,
+                _conversation,
+                _config,
+                _contextFiles,
+                _cwd,
+                _queryAgent,
+                _controller,
+                briefing,
+              ) => {
+                goalRuns += 1;
+                assert.deepEqual(briefing?.linkedIssues, []);
+                assert.deepEqual(briefing?.unavailableLinkedIssues, [
+                  { number: 12, status: 403 },
+                  { number: 13, status: 403 },
+                ]);
+                return Promise.resolve([
+                  {
+                    prompt: "correctness",
+                    status: incomplete ? "incomplete" : "completed",
+                    inspection: { observedPaths: [], missingPaths: [] },
+                    submission: {
+                      summary: "Reviewed code",
+                      findings: [],
+                      limitations: incomplete
+                        ? [{ paths: [], reason: "Required investigation could not finish." }]
+                        : [],
+                    },
+                  },
+                ]);
+              },
+              writeSummary: () => {
+                summaryWrites += 1;
+                return Promise.resolve();
+              },
+            },
+            new AbortController(),
+            diagnostics,
+          );
+          if (incomplete) {
+            await assert.rejects(pending, /partial result/u);
+          } else {
+            const result = await pending;
+            assert.equal(result.skipped, false);
+            assert.equal(result.review?.partial, false);
+            assert.equal(result.review?.allGoalsFailed, false);
+          }
+          assert.equal(goalRuns, 1);
+          assert.equal(summaryWrites, interact ? 0 : 1);
+          assert.deepEqual(
+            published.map((review) => review.event),
+            interact ? [incomplete ? "COMMENT" : "APPROVE"] : [],
+          );
+          const warnings = output.filter((line) => line.startsWith("::warning::"));
+          assert.equal(warnings.length, 1);
+          assert.match(warnings[0] ?? "", /\[REDACTED\], #13 \(HTTP 403\)/u);
+          assert.doesNotMatch(warnings[0] ?? "", /#12|denied-body-secret|test-token/u);
+          const records = diagnosticLines.map(
+            (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
+          );
+          const denied = records.filter(
+            (record) => (record.details as Record<string, unknown> | undefined)?.status === 403,
+          );
+          assert.equal(denied.length, 2);
+          assert.ok(
+            denied.every(
+              (record) => record.operation === "rest.issue.lookup" && record.outcome === "skipped",
+            ),
+          );
+          assert.doesNotMatch(diagnosticLines.join(""), /denied-body-secret|test-token/u);
+        },
+      );
+    }
+  }
+});
+
 test("skips an identical current-head review by the authenticated user", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
