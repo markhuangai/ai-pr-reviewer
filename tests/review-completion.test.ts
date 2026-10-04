@@ -331,7 +331,8 @@ test("limitations are reconsidered once without erasing findings or genuine bloc
     assert.equal(result.diagnostics?.rejectionCounts.limitation, 1);
     assert.equal(result.diagnostics?.validationFailures, 1);
     if (scenario === "scope") assert.deepEqual(result.submission?.limitations, []);
-    else assert.deepEqual(result.submission?.limitations[0], limitation);
+    else assert.deepEqual(result.submission?.limitations, [limitation]);
+    assert.deepEqual(result.inspection?.missingPaths, []);
     if (scenario === "exhausted")
       assert.equal(result.diagnostics?.termination, "max-turns-exhausted");
     assert.equal(

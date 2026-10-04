@@ -545,16 +545,15 @@ export async function runReviewGoal(
     finalizeDiagnostics(result, sessionPhase, validationGaps);
   const retainedSubmission = (): GoalSubmission | undefined => {
     const input = recovery.latestInput;
-    const parsed = (
-      config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema
-    ).safeParse(input);
+    const schema = config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema;
+    const parsed = schema.safeParse(input);
+    const gaps = submissionGaps(input);
     if (
       parsed.success &&
-      submissionGaps(input).every(
-        (gap) => gap.category === "inspection" || gap.category === "limitation",
-      )
+      gaps.every((gap) => gap.category === "inspection" || gap.category === "limitation")
     ) {
       const candidate = toSubmission(parsed.data);
+      if (gaps.length > 0 && gaps.every((gap) => gap.category === "limitation")) return candidate;
       const reason = `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`;
       return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };
     }
