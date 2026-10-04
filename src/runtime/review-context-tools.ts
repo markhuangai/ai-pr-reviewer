@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { PreparedContextFile } from "../lib/context-files.js";
-import type { ChangedFile } from "../lib/types.js";
+import type { ChangedFile, ReviewSourceRange } from "../lib/types.js";
 import {
   jsonToolResult,
   toolResultSerializedBytes,
@@ -273,6 +273,7 @@ export function createReviewSourceTools({
   headSha,
   queryReaders,
   repositorySnapshot,
+  ledger,
 }: {
   signal: AbortSignal | undefined;
   isActive: () => boolean;
@@ -280,20 +281,71 @@ export function createReviewSourceTools({
   headSha: string;
   queryReaders: ReviewQueryReaderStore;
   repositorySnapshot: RepositorySnapshot;
+  ledger: ReviewEvidenceLedger;
 }) {
+  const emitted: ReviewSourceRange[] = [];
+  let automaticRead: Promise<void> = Promise.resolve();
+  const readRemaining = async (): Promise<CallToolResult> => {
+    throwIfAborted(signal);
+    const missing = ledger.inspection.missingPaths;
+    const spans = diff.files.flatMap((span) =>
+      ledger.remainingDiffRanges(span, emitted, missing).map((range) => ({
+        paths: span.paths,
+        offset: span.offset + range.start,
+        size: range.end - range.start,
+        sourceStart: range.start,
+        sourceSize: span.size,
+      })),
+    );
+    const reader = new RepositoryFilePageReader(
+      diff.path,
+      spans.reduce((sum, span) => sum + span.size, 0),
+      signal,
+      spans,
+    );
+    const metadata = {
+      mergeBaseSha: diff.mergeBaseSha,
+      headSha,
+      remaining: true,
+      nextCall: { tool: "read_pr_diff", arguments: { remaining: true } },
+    };
+    let page: Awaited<ReturnType<typeof reader.readNext>>;
+    try {
+      page = await reader.readNext(metadata);
+    } finally {
+      await reader.close();
+    }
+    const result = jsonToolResult({ ...metadata, ...page });
+    if (!result.isError) emitted.push(...(page.ranges ?? []));
+    return result;
+  };
   const diffTool = tool(
     "read_pr_diff",
-    "Read a bounded page of the immutable base-to-head diff. Omit paths for the complete diff or provide exact changed paths. Continue with the returned cursor and repeat the same paths when you selected paths.",
+    "Read a bounded page of the immutable base-to-head diff. Use remaining=true repeatedly until done=true to deliver unread required ranges without choosing paths or cursors. For explicit reads, omit paths for the complete diff or provide exact changed paths; continue with the returned cursor and repeat the same paths.",
     {
       paths: z.array(z.string().min(1).max(4_096)).max(50).optional(),
       cursor: z.string().min(1).max(100).optional(),
+      remaining: z.boolean().optional(),
     },
-    async ({ paths, cursor }): Promise<CallToolResult> => {
+    async ({ paths, cursor, remaining }): Promise<CallToolResult> => {
       throwIfAborted(signal);
       if (!isActive()) {
         return {
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
         };
+      }
+      if (remaining === true) {
+        if (paths !== undefined || cursor !== undefined)
+          return {
+            ...jsonToolResult({ error: "remaining=true cannot be combined with paths or cursor." }),
+            isError: true,
+          };
+        const result = automaticRead.then(readRemaining);
+        automaticRead = result.then(
+          () => undefined,
+          () => undefined,
+        );
+        return result;
       }
       const selectedPaths = paths === undefined || paths.length === 0 ? undefined : paths;
       if (cursor !== undefined)
@@ -455,6 +507,9 @@ export function createReviewStateTool({
           maxRecoveryCycles: recovery.maxCycles,
           uniqueSourceBytes: ledger.uniqueSourceBytes,
           repeatedSourceBytes: ledger.repeatedSourceBytes,
+          ...(selection.length === 0 && missing.length > 0 && diff !== undefined
+            ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
+            : {}),
         };
         const records: Record<string, unknown>[] = [];
         if (!header.briefingComplete)

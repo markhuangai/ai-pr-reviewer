@@ -18,17 +18,20 @@ import {
   isGitMetadataPath,
   isWithinRepository,
   mergeDeliveredRanges,
+  type DiffFileSpan,
 } from "./agent-review-tools.js";
 import { withTokenUsage, type AcceptedSubmissionMcpStatus } from "./agent-logging.js";
 
-const MAX_EVIDENCE_CURSORS = 32;
-export const evidenceRefSchema = z.string().regex(/^ev-[1-9][0-9]{0,8}$/u);
-export const pathSchema = z
-  .string()
-  .min(1)
-  .max(4_096)
-  .refine((path) => path.trim().length > 0);
+import { pathSchema, reviewEvidenceResultSchema } from "./review-evidence-schema.js";
+export {
+  evidenceRefSchema,
+  pathSchema,
+  findingEvidenceShape,
+  reviewLimitationSchema,
+  reviewEvidenceResultSchema,
+} from "./review-evidence-schema.js";
 
+const MAX_EVIDENCE_CURSORS = 32;
 export function acceptedSubmissionResult(
   goal: string,
   submission: GoalSubmission,
@@ -63,67 +66,6 @@ export function acceptedSubmissionResult(
     tokenAccountingComplete,
   );
 }
-
-export const reviewLimitationSchema = z
-  .object({
-    paths: z.array(pathSchema).max(100),
-    reason: z.string().trim().min(1).max(1_000),
-  })
-  .strict();
-
-export const findingEvidenceShape = {
-  evidenceRefs: z.array(evidenceRefSchema).min(1).max(200),
-  countercheck: z.string().trim().min(1).max(1_000),
-  counterevidenceRefs: z.array(evidenceRefSchema).max(200),
-};
-
-export const reviewEvidenceResultSchema = z
-  .object({
-    id: evidenceRefSchema,
-    kind: z.enum([
-      "repository_diff",
-      "repository_file",
-      "repository_read",
-      "repository_search",
-      "repository_glob",
-      "context_file",
-      "conversation",
-      "briefing",
-      "external_tool",
-    ]),
-    status: z.enum(["complete", "partial", "failed"]),
-    completedBy: evidenceRefSchema.optional(),
-    path: pathSchema.optional(),
-    paths: z.array(pathSchema).max(50).optional(),
-    revision: z.enum(["base", "head"]).optional(),
-    mergeBaseSha: z
-      .string()
-      .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu)
-      .optional(),
-    headSha: z
-      .string()
-      .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu)
-      .optional(),
-    changedPaths: z.boolean().optional(),
-    contentKind: z.enum(["text", "binary", "non_regular", "missing"]).optional(),
-    bounds: z
-      .object({
-        byteStart: z.number().int().nonnegative().optional(),
-        byteEnd: z.number().int().nonnegative().optional(),
-        totalBytes: z.number().int().nonnegative().optional(),
-        offset: z.number().int().nonnegative().optional(),
-        limit: z.number().int().nonnegative().optional(),
-        headLimit: z.number().int().nonnegative().optional(),
-        pages: z.string().min(1).max(100).optional(),
-        truncated: z.boolean().optional(),
-        startLine: z.number().int().positive().optional(),
-        numLines: z.number().int().nonnegative().optional(),
-        totalLines: z.number().int().nonnegative().optional(),
-      })
-      .strict()
-      .optional(),
-  })
-  .strict();
 
 export interface RepositoryReviewToolCall {
   readonly tool_name: string;
@@ -372,7 +314,8 @@ function sameEvidenceScope(left: ReviewEvidenceReference, right: ReviewEvidenceR
 }
 
 export interface ReviewValidationGap {
-  readonly category: "inspection" | "evidence" | "schema" | "discussion" | "location" | "briefing";
+  readonly category:
+    "inspection" | "evidence" | "schema" | "discussion" | "location" | "briefing" | "limitation";
   readonly message: string;
   readonly paths: readonly string[];
 }
@@ -478,6 +421,10 @@ export class ReviewEvidenceLedger {
     return this.requiredBytes + reviewInspection(this.files, this.references).observedPaths.length;
   }
 
+  get inspection(): ReviewInspection {
+    return reviewInspection(this.files, this.references);
+  }
+
   hasPrefix(paths: readonly string[], start: number, revision?: "base" | "head"): boolean {
     if (start === 0) return true;
     return [...this.delivered.values()].some(
@@ -488,6 +435,37 @@ export class ReviewEvidenceLedger {
         item.intervals[0]?.[0] === 0 &&
         item.intervals[0][1] >= start,
     );
+  }
+
+  remainingDiffRanges(
+    span: DiffFileSpan,
+    emitted: readonly ReviewSourceRange[] = [],
+    missing: readonly string[] = this.inspection.missingPaths,
+  ): readonly ReviewSourceRange[] {
+    if (span.paths.every((path) => !missing.includes(path))) return [];
+    const matchesPaths = (paths: readonly string[]): boolean =>
+      JSON.stringify(paths) === JSON.stringify(span.paths);
+    const delivered = [...this.delivered.values()].filter(
+      (item) => item.source.kind === "repository_diff" && matchesPaths(item.range.paths),
+    );
+    if (delivered.some((item) => item.range.totalBytes !== span.size))
+      throw new Error("Source delivery changed size within an immutable snapshot.");
+    let intervals: [number, number][] = delivered.flatMap((item) => item.intervals);
+    for (const range of emitted.filter((range) => matchesPaths(range.paths))) {
+      if (range.totalBytes !== span.size)
+        throw new Error("Source delivery changed size within an immutable snapshot.");
+      intervals = mergeDeliveredRanges(intervals, range.start, range.end).intervals;
+    }
+    const ranges: ReviewSourceRange[] = [];
+    let position = 0;
+    for (const [start, end] of intervals) {
+      if (start > position)
+        ranges.push({ paths: span.paths, start: position, end: start, totalBytes: span.size });
+      position = Math.max(position, end);
+    }
+    if (position < span.size)
+      ranges.push({ paths: span.paths, start: position, end: span.size, totalBytes: span.size });
+    return ranges;
   }
 
   private observeRanges(
@@ -586,6 +564,7 @@ export class ReviewEvidenceLedger {
       if (source === undefined) continue;
       const result = toolResponseDocument(call.tool_response);
       const input = isRecord(call.tool_input) ? call.tool_input : {};
+      const automaticDiff = source.kind === "repository_diff" && input.remaining === true;
       const inputCursor = typeof input.cursor === "string" ? input.cursor : undefined;
       const nextCursor = typeof result?.nextCursor === "string" ? result.nextCursor : undefined;
       const cursor = inputCursor ?? nextCursor;
@@ -607,7 +586,13 @@ export class ReviewEvidenceLedger {
           page === undefined ||
           page < 1 ||
           (inputCursor === undefined && page !== 1) ||
-          (!result.done && nextCursor === undefined) ||
+          (!result.done && nextCursor === undefined && !automaticDiff) ||
+          (automaticDiff &&
+            (result.remaining !== true ||
+              !Array.isArray(result.ranges) ||
+              input.paths !== undefined ||
+              input.cursor !== undefined ||
+              nextCursor !== undefined)) ||
           (inputCursor !== undefined && nextCursor !== undefined && inputCursor !== nextCursor));
       const status =
         call.tool_response === undefined ||
@@ -904,6 +889,7 @@ export class ReviewEvidenceLedger {
     if (name === "submit_review" || name === "read_review_state") return undefined;
     const input = isRecord(call.tool_input) ? call.tool_input : {};
     if (name === "read_pr_diff") {
+      if (input.remaining === true) return { kind: "repository_diff", changedPaths: false };
       const cursor = input.cursor;
       if (typeof cursor === "string") return this.cursors.get(cursor);
       const selected = Array.isArray(input.paths)

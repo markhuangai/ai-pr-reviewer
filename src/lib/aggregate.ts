@@ -728,6 +728,34 @@ function buildTokenUsageDetails(usage: AggregatedTokenUsage): string {
   return rendered;
 }
 
+function incompleteGoalDetails(goals: readonly GoalResult[]): string {
+  const rows = goals.flatMap((goal, index) => {
+    const missing = goal.inspection?.missingPaths.length ?? 0;
+    const limitations = goal.submission?.limitations.length ?? 0;
+    if (goal.status === "completed" && missing === 0 && limitations === 0) return [];
+    const terminationReasons: Readonly<Record<string, string>> = {
+      "max-turns-exhausted": "Configured SDK turn limit reached",
+      "validation-exhausted": "Submission correction budget exhausted",
+      "inspection-stalled": "Required inspection stopped making progress",
+      "recovery-limit": "Configured recovery limit reached",
+    };
+    const termination = terminationReasons[goal.diagnostics?.termination ?? ""];
+    const reasons: string[] = termination === undefined ? [] : [termination];
+    if (missing > 0) reasons.push(`${missing} changed path${missing === 1 ? "" : "s"} unread`);
+    if (limitations > 0)
+      reasons.push(`${limitations} declared limitation${limitations === 1 ? "" : "s"}`);
+    if (goal.status === "failed") reasons.push("Goal failed; inspect the workflow logs");
+    if (reasons.length === 0) reasons.push("Required investigation did not finish");
+    return [
+      `| ${index + 1} | ${goal.status === "failed" ? "Failed" : "Incomplete"} | ${escapeMarkdownText(reasons.join("; "))} |`,
+    ];
+  });
+  if (rows.length === 0) return "";
+  const header = "### Incomplete checks\n\n| Check | Result | Reason |\n|:--|:--|:--|";
+  const omitted = rows.length > 20 ? `\n\n${rows.length - 20} more incomplete checks omitted.` : "";
+  return `${header}\n${rows.slice(0, 20).join("\n")}${omitted}`;
+}
+
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
   const tokenUsage = buildTokenUsageDetails(review.tokenUsage);
@@ -739,6 +767,8 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
         "## ⚠️ Review incomplete",
         "",
         `${completed} of ${goals.length} checks completed. Findings may not cover the full change. Rerun the workflow.`,
+        "",
+        incompleteGoalDetails(goals),
       ]
     : [review.marker, "## 🔎 AI review"];
 
@@ -804,6 +834,7 @@ export function buildRunSummary(
     tokenUsage,
   ];
   if (review.partial) {
+    lines.push("", incompleteGoalDetails(goals));
     const incompleteCoverage = new Map<string, string>();
     const goalWideReasons = new Set<string>();
     for (const goal of goals) {

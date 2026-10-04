@@ -13,6 +13,79 @@ import { config, context, files } from "./aggregate-test-fixtures.js";
 import { redactGoalResults } from "../src/lib/redaction.js";
 import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
 
+test("partial review summaries identify incomplete checks without publishing raw goal errors", () => {
+  const diagnostics = (termination: string) => ({
+    submissionAttempts: 1,
+    repairAttempts: 0,
+    evidenceReferences: 0,
+    rejectionCounts: {},
+    termination,
+  });
+  const changed = files[0];
+  assert.ok(changed);
+  const goals: readonly GoalResult[] = [
+    {
+      prompt: "PRIVATE GOAL",
+      status: "completed",
+      inspection: { observedPaths: [changed.path], missingPaths: [] },
+      submission: { summary: "PRIVATE SUMMARY", findings: [], limitations: [] },
+    },
+    {
+      prompt: "PRIVATE GOAL",
+      status: "incomplete",
+      error: "PRIVATE RAW ERROR",
+      inspection: { observedPaths: [], missingPaths: [changed.path] },
+      diagnostics: diagnostics("max-turns-exhausted"),
+    },
+    {
+      prompt: "PRIVATE GOAL",
+      status: "incomplete",
+      submission: {
+        summary: "PRIVATE SUMMARY",
+        findings: [],
+        limitations: [{ paths: [], reason: "<script> private-token [why](https://example.test)" }],
+      },
+    },
+    { prompt: "PRIVATE GOAL", status: "failed", error: "<script> PRIVATE RAW ERROR" },
+    ...["validation-exhausted", "inspection-stalled", "recovery-limit", "unknown"].map(
+      (termination) => ({
+        prompt: "PRIVATE GOAL",
+        status: "incomplete" as const,
+        diagnostics: diagnostics(termination),
+      }),
+    ),
+  ];
+  const redacted = redactGoalResults(goals, ["private-token"]);
+  const review = aggregateReview(context, config, files, redacted);
+  const body = buildReviewBody(review, redacted);
+  const summary = buildRunSummary(context, review, redacted);
+  for (const output of [body, summary]) {
+    assert.match(output, /Check \| Result \| Reason/u);
+    assert.match(
+      output,
+      /\| 2 \| Incomplete \| Configured SDK turn limit reached; 1 changed path unread/u,
+    );
+    assert.match(output, /\| 3 \| Incomplete \| 1 declared limitation/u);
+    assert.match(output, /\| 4 \| Failed \| Goal failed/u);
+    assert.match(output, /Submission correction budget exhausted/u);
+    assert.match(output, /Required inspection stopped making progress/u);
+    assert.match(output, /Configured recovery limit reached/u);
+    assert.match(output, /Required investigation did not finish/u);
+    assert.doesNotMatch(
+      output,
+      /PRIVATE GOAL|PRIVATE SUMMARY|PRIVATE RAW ERROR|private-token|<script>/u,
+    );
+  }
+  assert.doesNotMatch(body, /\[why\]|example\.test/u);
+  assert.match(summary, /&lt;script&gt;/u);
+  const failed = goals[3];
+  assert.ok(failed);
+  const many = Array.from({ length: 50 }, () => failed);
+  const bounded = buildReviewBody(aggregateReview(context, config, files, many), many);
+  assert.match(bounded, /30 more incomplete checks omitted/u);
+  assert.ok(bounded.length < 60_000);
+});
+
 test("renders a clean review without exposing goal internals", () => {
   const goals: readonly GoalResult[] = [
     {

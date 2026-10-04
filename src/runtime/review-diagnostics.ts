@@ -50,6 +50,7 @@ export function writeReviewDiagnostic(
     "snapshotId",
     "briefingComplete",
     "nextCalls",
+    "nextCall",
     "optionalCalls",
     "decision",
     "categories",

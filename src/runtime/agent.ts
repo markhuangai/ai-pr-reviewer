@@ -205,7 +205,14 @@ export async function runReviewGoal(
       continue: true,
       hookSpecificOutput: {
         hookEventName: "PostToolBatch",
-        additionalContext: evidenceLedger.renderReferences(references),
+        additionalContext: `${evidenceLedger.renderReferences(references)}\n${JSON.stringify({
+          ...deliveredInspection,
+          ...(!briefingReader.complete
+            ? { nextCall: { tool: "read_review_briefing", arguments: {} } }
+            : evidenceLedger.inspection.missingPaths.length > 0
+              ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
+              : {}),
+        })}`,
       },
     });
   };
@@ -302,6 +309,7 @@ export async function runReviewGoal(
     headSha: context.headSha,
     queryReaders,
     repositorySnapshot,
+    ledger: evidenceLedger,
   });
   const discussionThreadTool = tool(
     "read_pr_threads",
@@ -420,6 +428,7 @@ export async function runReviewGoal(
       config.interactWithPullRequest,
       briefingReader.complete,
       unreadFindingPaths,
+      recovery.limitationReconsiderationPending,
     );
   }
   const outputTool = tool(
@@ -441,7 +450,10 @@ export async function runReviewGoal(
           ],
         });
       }
-      validationGaps = submissionGaps(input);
+      validationGaps = recovery.reconsiderLimitations(
+        submissionGaps(input),
+        input.limitations.length > 0,
+      );
       if (validationGaps.length > 0) {
         const budget = recovery.rejectionBudget(validationGaps.map((gap) => gap.category));
         return Promise.resolve(
@@ -536,7 +548,12 @@ export async function runReviewGoal(
     const parsed = (
       config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema
     ).safeParse(input);
-    if (parsed.success && submissionGaps(input).every((gap) => gap.category === "inspection")) {
+    if (
+      parsed.success &&
+      submissionGaps(input).every(
+        (gap) => gap.category === "inspection" || gap.category === "limitation",
+      )
+    ) {
       const candidate = toSubmission(parsed.data);
       const reason = `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`;
       return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };

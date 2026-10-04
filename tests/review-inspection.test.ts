@@ -4,6 +4,9 @@ import {
   makeDiffFromSnapshots,
   join,
   writeFile,
+  readFile,
+  RepositorySnapshot,
+  agentInternals,
   emptyConversation,
   runReviewGoalWithEmptyGuidance as runReviewGoal,
   test,
@@ -21,7 +24,141 @@ import {
   recoveryConfig as reviewConfig,
 } from "./review-protocol-test-helpers.js";
 import { ReviewSubmissionRecovery } from "../src/runtime/review-submission.js";
+import { ReviewEvidenceLedger, toolResponseDocument } from "../src/runtime/review-assessment.js";
+import {
+  createReviewSourceTools,
+  ReviewQueryReaderStore,
+} from "../src/runtime/review-context-tools.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
+import type { ReviewSourceRange } from "../src/lib/types.js";
+
+test("automatic reads serialize undelivered pages and preserve deletion and rename ranges", async (t) => {
+  const original = "stable source line\n".repeat(2_000);
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await rm(join(root, "a-retired.txt"));
+      await rename(join(root, "old.ts"), join(root, "new.ts"));
+      await writeFile(join(root, "new.ts"), original + "added line\n".repeat(200));
+      await writeFile(join(root, "control.txt"), "\u0001漢🙂\n".repeat(3_000));
+    },
+    async (root) => {
+      await writeFile(join(root, "a-retired.txt"), "deleted 漢字🙂\n".repeat(4_000));
+      await writeFile(join(root, "old.ts"), original);
+    },
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  assert.ok(files.some((file) => file.previousPath === "old.ts"));
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const controller = new AbortController();
+  const ledger = new ReviewEvidenceLedger(repository.root, files, {
+    mergeBaseSha: diff.mergeBaseSha,
+    headSha: repository.headSha,
+  });
+  const readers = new ReviewQueryReaderStore(() => undefined);
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    diff.mergeBaseSha,
+    files,
+  );
+  t.after(() => snapshot.cleanup());
+  t.after(() => Promise.all(readers.cleanupOperations()));
+  const { diffTool, repositoryFileTool } = createReviewSourceTools({
+    signal: controller.signal,
+    isActive: () => true,
+    diff,
+    headSha: repository.headSha,
+    queryReaders: readers,
+    repositorySnapshot: snapshot,
+    ledger,
+  });
+  const readDiff = (input: { remaining?: boolean; paths?: string[]; cursor?: string }) =>
+    diffTool.handler({ paths: undefined, cursor: undefined, remaining: undefined, ...input }, {});
+  const document = (response: Awaited<ReturnType<typeof diffTool.handler>>) => {
+    const value = toolResponseDocument(response);
+    assert.ok(value);
+    return value;
+  };
+  let sequence = 0;
+  const record = (
+    input: Record<string, unknown>,
+    response: Awaited<ReturnType<typeof diffTool.handler>>,
+  ) =>
+    ledger.observeBatch([
+      {
+        tool_name: "mcp__review_output__read_pr_diff",
+        tool_use_id: `automatic-${++sequence}`,
+        tool_input: input,
+        tool_response: response,
+      },
+    ]);
+  const selected = await readDiff({ paths: ["a-retired.txt"] });
+  record({ paths: ["a-retired.txt"] }, selected);
+  const firstRange = (document(selected).ranges as ReviewSourceRange[])[0];
+  assert.ok(firstRange);
+  const missing = await repositoryFileTool.handler(
+    { revision: "head", path: "a-retired.txt", cursor: undefined },
+    {},
+  );
+  ledger.observeBatch([
+    {
+      tool_name: "mcp__review_output__read_repository_file",
+      tool_use_id: "missing-head",
+      tool_input: { revision: "head", path: "a-retired.txt" },
+      tool_response: missing,
+    },
+  ]);
+  assert.ok(ledger.inspection.missingPaths.includes("a-retired.txt"));
+  for (const input of [
+    { remaining: true, paths: [] },
+    { remaining: true, cursor: "wrong" },
+  ])
+    assert.equal((await readDiff(input)).isError, true);
+  const bytes = await readFile(diff.path);
+  await writeFile(diff.path, "");
+  await assert.rejects(readDiff({ remaining: true }), /ended before its recorded size/u);
+  await writeFile(diff.path, bytes);
+  const pair = await Promise.all([readDiff({ remaining: true }), readDiff({ remaining: true })]);
+  assert.ok(ledger.inspection.missingPaths.includes("a-retired.txt"));
+  const ranges = pair.flatMap((response) => document(response).ranges as ReviewSourceRange[]);
+  assert.ok(ranges.every((range) => range.start >= firstRange.end));
+  assert.equal(ranges[0]?.end, ranges[1]?.start);
+  for (const response of pair) {
+    assert.equal(response.isError, undefined);
+    record({ remaining: true }, response);
+  }
+  let done = false;
+  while (!done) {
+    const response = await readDiff({ remaining: true });
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(response)) <= agentInternals.MODEL_TOOL_RESULT_BYTES,
+    );
+    record({ remaining: true }, response);
+    done = document(response).done === true;
+  }
+  assert.deepEqual(ledger.inspection.missingPaths, []);
+  assert.ok(ledger.inspection.observedPaths.includes("old.ts"));
+  assert.ok(ledger.inspection.observedPaths.includes("new.ts"));
+  assert.equal(ledger.repeatedSourceBytes, 0);
+  const empty = await readDiff({ remaining: true });
+  record({ remaining: true }, empty);
+  assert.equal(document(empty).content, "");
+  assert.equal(document(empty).done, true);
+  controller.abort(new Error("cancelled"));
+  await assert.rejects(readDiff({ remaining: true }), /cancelled/u);
+});
 
 test("completes production-shaped inspection after more than six submissions and a schema error", async (t) => {
   const repository = await makeRepository(t, async (root) => {
