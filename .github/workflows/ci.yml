@@ -13,7 +13,7 @@ permissions:
 jobs:
   quality:
     name: Node 24 quality
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -58,7 +58,7 @@ jobs:
 
   codeql:
     name: CodeQL
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write

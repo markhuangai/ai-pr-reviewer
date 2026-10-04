@@ -26,7 +26,7 @@ permissions:
 jobs:
   validate:
     name: Validate release request
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
       release_tag: ${{ steps.version.outputs.release_tag }}
@@ -82,7 +82,7 @@ jobs:
   security:
     name: Release checks
     needs: validate
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -125,7 +125,7 @@ jobs:
     name: Build ${{ matrix.asset }}
     needs: [validate, security]
     if: needs.validate.outputs.prerelease == 'true'
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -232,7 +232,7 @@ jobs:
   publish-prerelease:
     name: Publish prerelease
     needs: [validate, security, build-runtime]
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -313,7 +313,7 @@ jobs:
     name: Update prerelease alias
     needs: [validate, publish-prerelease]
     if: needs.validate.outputs.prerelease == 'true'
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -376,7 +376,7 @@ jobs:
     name: Promote stable release
     needs: [validate, security]
     if: needs.validate.outputs.prerelease == 'false'
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -481,7 +481,7 @@ jobs:
     name: Update stable alias
     needs: [validate, publish-stable]
     if: needs.validate.outputs.prerelease == 'false'
-    runs-on: docker-runner
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

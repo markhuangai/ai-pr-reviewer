@@ -25,6 +25,13 @@ export const SEVERITY_VALUES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
 
 export const MAX_REPAIR_ATTEMPTS = 5;
 
+export const LIMITATION_RECONSIDERATION_GAP: ReviewValidationGap = {
+  category: "limitation",
+  message:
+    "Required source inspection is complete. Reconsider the declared limitations once: paths outside this goal's scope belong in the summary, not limitations. Remove only scope exclusions; preserve genuine unfinished investigation and resubmit to confirm it.",
+  paths: [],
+};
+
 export class ReviewSubmissionRecovery {
   private readonly uses = new Map<string, { allowed: boolean; input: unknown }>();
   private readonly rejections = new Set<string>();
@@ -32,6 +39,10 @@ export class ReviewSubmissionRecovery {
   private recoveryKind: "inspection" | "validation" = "inspection";
   private progress = 0;
   private previousProgress = 0;
+  private limitationReconsiderationRequested = false;
+  private limitationReconsiderationId: string | undefined;
+  private readonly limitationReconsiderationUses = new Set<string>();
+  private latestUseId: string | undefined;
   validationFailures = 0;
   inspectionContinuations = 0;
   consecutiveNoProgress = 0;
@@ -112,6 +123,23 @@ export class ReviewSubmissionRecovery {
   hasUse(id: string): boolean {
     return this.uses.has(id);
   }
+
+  reconsiderLimitations(
+    gaps: readonly ReviewValidationGap[],
+    hasLimitations: boolean,
+  ): readonly ReviewValidationGap[] {
+    if (gaps.length > 0 || !hasLimitations || this.limitationReconsiderationRequested) return gaps;
+    this.limitationReconsiderationRequested = true;
+    return [LIMITATION_RECONSIDERATION_GAP];
+  }
+
+  get limitationReconsiderationPending(): boolean {
+    return (
+      this.limitationReconsiderationRequested &&
+      (this.limitationReconsiderationId === undefined ||
+        this.limitationReconsiderationUses.has(this.latestUseId ?? ""))
+    );
+  }
   allows(id: string): boolean {
     return this.uses.get(id)?.allowed === true;
   }
@@ -125,6 +153,7 @@ export class ReviewSubmissionRecovery {
     this.activitySinceResult = true;
     if (this.allows(id)) {
       this.latestInput = input;
+      this.latestUseId = id;
       this.recoveryCycles += 1;
     }
   }
@@ -132,6 +161,11 @@ export class ReviewSubmissionRecovery {
   reject(id: string, categories: readonly string[]): boolean {
     if (!this.allows(id) || this.rejections.has(id)) return false;
     this.rejections.add(id);
+    if (categories.includes("limitation")) {
+      if (this.limitationReconsiderationId === undefined)
+        for (const useId of this.uses.keys()) this.limitationReconsiderationUses.add(useId);
+      this.limitationReconsiderationId = id;
+    }
     for (const category of new Set(categories))
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
     if (categories.length > 0 && categories.every((category) => category === "inspection"))
@@ -419,6 +453,7 @@ export function reviewSubmissionGaps(
   interactive: boolean,
   briefingComplete: boolean,
   unreadFindingPaths: (findings: readonly unknown[]) => readonly string[],
+  limitationReconsiderationPending = false,
 ): readonly ReviewValidationGap[] {
   const parsed = (interactive ? interactiveSubmissionSchema : submissionSchema).safeParse(input);
   if (!parsed.success)
@@ -488,7 +523,9 @@ export function reviewSubmissionGaps(
         finding.path === undefined ? [] : [finding.path],
       ),
     });
-  return gaps;
+  return gaps.length === 0 && limitationReconsiderationPending && parsed.data.limitations.length > 0
+    ? [LIMITATION_RECONSIDERATION_GAP]
+    : gaps;
 }
 
 export function reviewSubmissionRejectionResult(
@@ -519,6 +556,11 @@ export function reviewSubmissionRejectionResult(
       omittedGaps: validationGaps.length - gaps.length,
       categories: [...new Set(validationGaps.map((gap) => gap.category))],
       remainingCorrections,
+      nextCall: validationGaps.some((gap) => gap.category === "briefing")
+        ? { tool: "read_review_briefing", arguments: {} }
+        : validationGaps.some((gap) => gap.category === "inspection")
+          ? { tool: "read_pr_diff", arguments: { remaining: true } }
+          : { tool: "read_review_state", arguments: {} },
       ...(remainingInspectionCycles === undefined ? {} : { remainingInspectionCycles }),
     }),
     isError: true,

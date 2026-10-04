@@ -27,6 +27,7 @@ import {
   protocolBriefing,
   protocolResult,
   recoveryRepository,
+  recoverySubmission,
   recoveryConfig as reviewConfig,
 } from "./review-protocol-test-helpers.js";
 import {
@@ -63,26 +64,6 @@ const recoveryFile: ChangedFile = {
   changes: 2,
   addedLines: new Set([1]),
 };
-
-function recoverySubmission(evidenceRef: string): Record<string, unknown> {
-  return {
-    summary: "PRIVATE SUMMARY",
-    findings: [
-      {
-        title: "Unchecked result",
-        severity: "HIGH",
-        why: "The caller drops the error.",
-        fix: "Handle the error.",
-        path: "review.txt",
-        line: 1,
-        evidenceRefs: [evidenceRef],
-        countercheck: "Checked the caller for handling.",
-        counterevidenceRefs: [],
-      },
-    ],
-    limitations: [],
-  };
-}
 
 test("recovers completed query references after compaction without rereading source", async (t) => {
   const repository = await makeRepository(t, (root) =>
@@ -532,22 +513,25 @@ test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
     repository.root,
     reviewProtocolQuery(async function* (protocol) {
       yield* protocolBriefing(protocol);
-      for (let index = 0; index < 5; index += 1) yield* protocol.call("submit_review", {});
       yield* protocol.call("read_pr_diff", {});
-      const accepted = yield* protocol.call("submit_review", {
+      const limited = {
         summary: "No complete investigation",
         findings: [],
         limitations: [
           { paths: ["review.txt"], reason: "A required external behavior remains unavailable." },
         ],
-      });
+      };
+      assert.equal((yield* protocol.call("submit_review", limited)).isError, true);
+      for (let index = 0; index < 4; index += 1) yield* protocol.call("submit_review", {});
+      const accepted = yield* protocol.call("submit_review", limited);
       assert.equal(accepted.isError, undefined);
       yield protocolResult();
     }),
   );
   assert.equal(result.status, "incomplete");
   assert.equal(result.diagnostics?.submissionAttempts, 6);
-  assert.equal(result.diagnostics?.rejectionCounts.schema, 5);
+  assert.equal(result.diagnostics?.rejectionCounts.schema, 4);
+  assert.equal(result.diagnostics?.rejectionCounts.limitation, 1);
   assert.equal(result.tokenUsage?.complete, true);
 });
 
@@ -591,6 +575,8 @@ test("accepted reviews at the SDK turn limit keep their normal completion gates"
           yield* protocolBriefing(protocol);
           assert.equal(protocolDocument(yield* protocol.call("read_pr_diff", {})).done, true);
           const submission = { summary: "Inspected changes.", findings: [], limitations };
+          if (limitations.length > 0)
+            assert.equal((yield* protocol.call("submit_review", submission)).isError, true);
           assert.equal((yield* protocol.call("submit_review", submission)).isError, undefined);
           yield { ...protocolResult(terminal), num_turns: 101 };
         },

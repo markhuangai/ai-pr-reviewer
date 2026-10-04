@@ -480,6 +480,11 @@ export interface DiffFileSpan {
   readonly size: number;
 }
 
+interface DiffReadSpan extends DiffFileSpan {
+  readonly sourceStart?: number;
+  readonly sourceSize?: number;
+}
+
 function utf8PageEnd(bytes: Buffer, start: number, proposedEnd: number, hasMore = false): number {
   let end = Math.min(proposedEnd, bytes.length);
   if (!hasMore && end === bytes.length) return end;
@@ -582,7 +587,7 @@ export class RepositoryFilePageReader {
     private readonly path: string,
     private readonly sizeBytes: number,
     private readonly signal?: AbortSignal,
-    private readonly spans?: readonly DiffFileSpan[],
+    private readonly spans?: readonly DiffReadSpan[],
   ) {}
 
   get remainingBytes(): number {
@@ -598,9 +603,9 @@ export class RepositoryFilePageReader {
       if (span.paths.includes(path) && end > this.offset)
         return {
           bytes: end - this.offset,
-          start: Math.max(0, this.offset - offset),
+          start: (span.sourceStart ?? 0) + Math.max(0, this.offset - offset),
           paths: span.paths,
-          totalBytes: span.size,
+          totalBytes: span.sourceSize ?? span.size,
         };
       offset = end;
     }
@@ -615,9 +620,9 @@ export class RepositoryFilePageReader {
       if (start < finish && end > offset)
         ranges.push({
           paths: span.paths,
-          start: Math.max(start, offset) - offset,
-          end: Math.min(end, finish) - offset,
-          totalBytes: span.size,
+          start: (span.sourceStart ?? 0) + Math.max(start, offset) - offset,
+          end: (span.sourceStart ?? 0) + Math.min(end, finish) - offset,
+          totalBytes: span.sourceSize ?? span.size,
         });
       offset = finish;
     }

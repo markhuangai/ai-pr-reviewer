@@ -230,3 +230,23 @@ export async function recoveryRepository(t: TestContext) {
   t.after(() => diff.cleanup());
   return { ...repository, diff };
 }
+
+export function recoverySubmission(evidenceRef: string): Record<string, unknown> {
+  return {
+    summary: "PRIVATE SUMMARY",
+    findings: [
+      {
+        title: "Unchecked result",
+        severity: "HIGH",
+        why: "The caller drops the error.",
+        fix: "Handle the error.",
+        path: "review.txt",
+        line: 1,
+        evidenceRefs: [evidenceRef],
+        countercheck: "Checked the caller for handling.",
+        counterevidenceRefs: [],
+      },
+    ],
+    limitations: [],
+  };
+}
