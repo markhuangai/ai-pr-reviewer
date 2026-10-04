@@ -41,6 +41,7 @@ export class ReviewSubmissionRecovery {
   private previousProgress = 0;
   private limitationReconsiderationRequested = false;
   private limitationReconsiderationId: string | undefined;
+  private readonly limitationReconsiderationUses = new Set<string>();
   private latestUseId: string | undefined;
   validationFailures = 0;
   inspectionContinuations = 0;
@@ -134,8 +135,9 @@ export class ReviewSubmissionRecovery {
 
   get limitationReconsiderationPending(): boolean {
     return (
-      this.limitationReconsiderationId !== undefined &&
-      this.limitationReconsiderationId === this.latestUseId
+      this.limitationReconsiderationRequested &&
+      (this.limitationReconsiderationId === undefined ||
+        this.limitationReconsiderationUses.has(this.latestUseId ?? ""))
     );
   }
   allows(id: string): boolean {
@@ -159,7 +161,11 @@ export class ReviewSubmissionRecovery {
   reject(id: string, categories: readonly string[]): boolean {
     if (!this.allows(id) || this.rejections.has(id)) return false;
     this.rejections.add(id);
-    if (categories.includes("limitation")) this.limitationReconsiderationId = id;
+    if (categories.includes("limitation")) {
+      if (this.limitationReconsiderationId === undefined)
+        for (const useId of this.uses.keys()) this.limitationReconsiderationUses.add(useId);
+      this.limitationReconsiderationId = id;
+    }
     for (const category of new Set(categories))
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
     if (categories.length > 0 && categories.every((category) => category === "inspection"))
@@ -517,7 +523,7 @@ export function reviewSubmissionGaps(
         finding.path === undefined ? [] : [finding.path],
       ),
     });
-  return gaps.length === 0 && limitationReconsiderationPending
+  return gaps.length === 0 && limitationReconsiderationPending && parsed.data.limitations.length > 0
     ? [LIMITATION_RECONSIDERATION_GAP]
     : gaps;
 }

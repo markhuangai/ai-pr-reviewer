@@ -16,6 +16,10 @@ import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.
 import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
 import {
+  ReviewSubmissionRecovery,
+  reviewSubmissionGaps,
+} from "../src/runtime/review-submission.js";
+import {
   reviewProtocolQuery,
   protocolDocument,
   recoveryState,
@@ -41,6 +45,46 @@ function call(tool_name: string, tool_input: unknown, tool_response: unknown) {
 function jsonResponse(value: unknown): unknown {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
+
+test("batched limited submissions wait for reconsideration while clean and later uses can proceed", () => {
+  const recovery = new ReviewSubmissionRecovery(100);
+  const ledger = new ReviewEvidenceLedger("/repo");
+  const limited = {
+    summary: "Inspected goal",
+    findings: [],
+    limitations: [{ paths: [], reason: "Required evidence remains unavailable." }],
+  };
+  const gaps = (input: unknown) =>
+    reviewSubmissionGaps(
+      input,
+      [],
+      ledger,
+      false,
+      true,
+      () => [],
+      recovery.limitationReconsiderationPending,
+    );
+  recovery.observeUse("batch-a", limited);
+  recovery.observeUse("batch-b", limited);
+  const first = recovery.reconsiderLimitations(gaps(limited), true);
+  assert.deepEqual(
+    first.map((gap) => gap.category),
+    ["limitation"],
+  );
+  assert.equal(recovery.limitationReconsiderationPending, true);
+  assert.deepEqual(recovery.reconsiderLimitations(gaps(limited), true), first);
+  const clean = { ...limited, limitations: [] };
+  assert.deepEqual(recovery.reconsiderLimitations(gaps(clean), false), []);
+  recovery.reject("batch-a", ["limitation"]);
+  assert.equal(recovery.limitationReconsiderationPending, true);
+  recovery.reject("batch-b", ["limitation"]);
+  recovery.observeUse("batch-a", limited);
+  assert.equal(recovery.limitationReconsiderationPending, true);
+  recovery.observeUse("later", limited);
+  assert.equal(recovery.limitationReconsiderationPending, false);
+  assert.deepEqual(recovery.reconsiderLimitations(gaps(limited), true), []);
+  assert.equal(recovery.validationFailures, 2);
+});
 
 test("automatic diff pages require valid ranges and cannot claim inspection from done alone", () => {
   const snapshot = { mergeBaseSha: "1".repeat(40), headSha: "2".repeat(40) };
