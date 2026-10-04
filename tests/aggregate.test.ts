@@ -43,7 +43,7 @@ test("partial review summaries identify incomplete checks without publishing raw
       submission: {
         summary: "PRIVATE SUMMARY",
         findings: [],
-        limitations: [{ paths: [], reason: "<script> private-token [why](https://example.test)" }],
+        limitations: [{ paths: [], reason: "<SCRIPT> private-token [why](https://example.test)" }],
       },
     },
     { prompt: "PRIVATE GOAL", status: "failed", error: "<script> PRIVATE RAW ERROR" },
@@ -73,11 +73,11 @@ test("partial review summaries identify incomplete checks without publishing raw
     assert.match(output, /Required investigation did not finish/u);
     assert.doesNotMatch(
       output,
-      /PRIVATE GOAL|PRIVATE SUMMARY|PRIVATE RAW ERROR|private-token|<script>/u,
+      /PRIVATE GOAL|PRIVATE SUMMARY|PRIVATE RAW ERROR|private-token|<script>/iu,
     );
   }
   assert.doesNotMatch(body, /\[why\]|example\.test/u);
-  assert.match(summary, /&lt;script&gt;/u);
+  assert.match(summary, /&lt;SCRIPT&gt;/u);
   const failed = goals[3];
   assert.ok(failed);
   const many = Array.from({ length: 50 }, () => failed);
