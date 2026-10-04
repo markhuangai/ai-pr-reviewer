@@ -361,7 +361,7 @@ The immutable-snapshot and graceful-cancellation changes are targeted for `v1.1.
 
 Releases are started manually from `main` through the `Release runtime bundles` workflow. Choose the `prerelease` channel with an `X.Y.Z-rc.N` version to create a GitHub prerelease, or choose the `stable` channel with an `X.Y.Z` version to promote the latest matching RC. Stable promotion requires that RC tag to be an ancestor with an identical Git tree and reuses its exact verified assets without rebuilding them. Published versions are never replaced, RC numbers cannot be skipped, each stable version requires an RC, and a new patch, minor, or major line advances exactly one component while resetting lower components.
 
-Intermediate GitHub Actions artifacts used to assemble a prerelease are retained for one day. They are separate from the assets attached to a published GitHub Release, which remain available under the release. Self-hosted runners avoid GitHub-hosted runner minutes, but Actions artifact storage is still subject to the repository owner's GitHub plan and billing, so it should not be assumed to have zero cost.
+Intermediate GitHub Actions artifacts used to assemble a prerelease are retained for one day. They are separate from the assets attached to a published GitHub Release, which remain available under the release. Standard GitHub-hosted runner minutes are free for public repositories, but Actions artifact storage is still subject to the repository owner's GitHub plan and billing, so it should not be assumed to have zero cost.
 
 The workflow creates and verifies the exact Git tag before publishing its release, so it cannot attach built assets to a racing tag at another commit. After the exact release is published, a separate idempotent job updates `vN` for stable releases or `vN-prerelease` for prereleases to an annotated tag that records the exact release tag. If alias publication fails, the exact release remains usable and the alias job can be rerun. If exact publication fails after tag creation, the orphan tag deliberately blocks retries until an administrator inspects and removes it.
 
@@ -454,7 +454,7 @@ npm run replay:review -- --case /data/cases/example-001.json --checkout /tmp/exa
 
 Replay cases should preserve production inputs and reviewer-visible context. Do not add expected findings, labels, or evaluation notes to `config.reviewPrompts`, the PR body, conversation, or repository contents. Live accuracy evaluation is deferred until after merge and prerelease publication.
 
-Repository CI and release jobs run on the ephemeral self-hosted `docker-runner` label without Docker access. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
+Repository CI and release jobs run on GitHub-hosted `ubuntu-latest` runners. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
 
 ## License
 
