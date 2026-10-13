@@ -189,9 +189,21 @@ export class CodexSession implements ReviewSession {
       "TMPDIR",
       "SSL_CERT_FILE",
       "SSL_CERT_DIR",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "no_proxy",
     ]) {
       if (process.env[name] !== undefined) env[name] = process.env[name];
     }
+    // Keep the authenticated local MCP bridge off the runner's outbound proxy.
+    env.NO_PROXY = env.no_proxy = [env.NO_PROXY ?? env.no_proxy, "localhost", "127.0.0.1", "::1"]
+      .filter(Boolean)
+      .join(",");
     env.CODEX_HOME = this.home;
     env.AI_PR_REVIEWER_CODEX_API_KEY = this.input.config.aiSecret;
     env.AI_PR_REVIEWER_INTERNAL_MCP_TOKEN = this.bridge.token;
