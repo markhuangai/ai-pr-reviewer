@@ -1,8 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { createServer, request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -39,42 +37,6 @@ test("native reviews use runner proxies while local MCP bypasses them", async (t
     await t.test(name, { timeout: 30_000 }, async (subtest) => {
       await isolatedTemporaryRoot(subtest);
       const fixture = await modelFixture(subtest, completeReviewScript());
-      const destinations: string[] = [];
-      const proxy = createServer((incoming, response) => {
-        const destination = new URL(incoming.url ?? "", "http://invalid.test");
-        destinations.push(destination.hostname);
-        if (destination.hostname !== "native-model.invalid") {
-          response.writeHead(502);
-          response.end("Only model requests may use the outbound proxy.");
-          return;
-        }
-        const upstream = httpRequest(
-          new URL(destination.pathname + destination.search, fixture.url),
-          {
-            method: incoming.method,
-            headers: { ...incoming.headers, host: new URL(fixture.url).host },
-          },
-          (result) => {
-            response.writeHead(result.statusCode ?? 502, result.headers);
-            result.pipe(response);
-          },
-        );
-        upstream.on("error", (error) => {
-          response.writeHead(502);
-          response.end(error.message);
-        });
-        incoming.pipe(upstream);
-      });
-      await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
-      subtest.after(async () => {
-        proxy.closeAllConnections();
-        await new Promise<void>((resolve, reject) =>
-          proxy.close((error) => {
-            if (error) reject(error);
-            else resolve();
-          }),
-        );
-      });
       for (const key of [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -92,15 +54,17 @@ test("native reviews use runner proxies while local MCP bypasses them", async (t
           else process.env[key] = previous;
         });
       }
-      process.env[name] = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+      process.env[name] = new URL(fixture.url).origin;
       const result = await nativeReview(
         subtest,
         "http://native-model.invalid/v1",
         fixture.catalogUrl,
       );
       assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
-      assert.ok(destinations.length > 0);
-      assert.ok(destinations.every((host) => host === "native-model.invalid"));
+      assert.ok(fixture.requests.length > 0);
+      assert.ok(
+        fixture.requests.every(({ path }) => new URL(path).hostname === "native-model.invalid"),
+      );
       assert.ok(
         fixture.requests.some(({ body }) =>
           historyText(body).includes("Review submission accepted."),
