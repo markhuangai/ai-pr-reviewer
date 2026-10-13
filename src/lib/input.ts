@@ -202,7 +202,11 @@ function jsonSecretCandidate(value: string): string {
 
 export function reviewSecretCandidates(config: ReviewConfig): readonly string[] {
   const servers = Object.values(config.mcpServers);
-  const endpoints = [config.aiBaseUrl, ...servers.map((server) => server.url)];
+  const endpoints = [
+    config.aiBaseUrl,
+    ...(config.codexModelCatalogUrl === undefined ? [] : [config.codexModelCatalogUrl]),
+    ...servers.map((server) => server.url),
+  ];
   const candidates = [
     config.githubToken,
     config.aiSecret,
@@ -470,10 +474,24 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     throw new Error("Input 'ai-auth-mode' is no longer supported; API-key authentication is used.");
   }
   const pullRequestUrl = reader.get("pull-request-url").trim();
+  const executor = reader.get("executor").trim() || "claude";
+  if (executor !== "claude" && executor !== "codex") {
+    throw new Error("Input 'executor' must be 'claude' or 'codex'.");
+  }
+  const codexWebsockets = parseBoolean(reader.get("codex-websockets"), "codex-websockets", false);
+  const codexModelCatalogUrl = reader.get("codex-model-catalog-url").trim();
+  if (executor !== "codex" && (codexWebsockets || codexModelCatalogUrl.length > 0)) {
+    throw new Error("Codex settings require executor 'codex'.");
+  }
   const modelPricing = parseModelPricing(reader.get("model-pricing"));
   const effort = readEffort(reader.get("effort"));
   const systemPrompt = reader.get("system-prompt").trim();
   return {
+    executor,
+    ...(executor === "codex" ? { codexWebsockets } : {}),
+    ...(codexModelCatalogUrl.length === 0
+      ? {}
+      : { codexModelCatalogUrl: readUrl(codexModelCatalogUrl, "codex-model-catalog-url") }),
     githubToken: required(reader.get("github-pat"), "github-pat"),
     aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
     aiSecret: required(reader.get("ai-secret"), "ai-secret"),

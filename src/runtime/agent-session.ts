@@ -169,14 +169,14 @@ export const SDK_SUBMISSION_GRACE_MS = 30_000;
 export const SDK_SESSION_CLOSE_MS = 5_000;
 
 export async function closeSdkSession(
-  close: () => void,
+  close: () => void | Promise<void>,
   reader: Promise<void> | undefined,
 ): Promise<void> {
-  close();
+  const closed = close();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      reader,
+      Promise.all([reader, closed]),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           reject(
@@ -864,3 +864,30 @@ export const agentInternals = {
   SDK_SESSION_CLOSE_MS,
   toSdkMcpServer,
 };
+
+export function createReviewGoalsRunner(runGoal: ReviewGoalRunner, defaultQuery: AgentQuery) {
+  return function runReviewGoals(
+    context: PullRequestContext,
+    files: readonly ChangedFile[],
+    conversation: ReviewConversationSnapshot,
+    config: ReviewConfig,
+    contextFilesByGoal: readonly (readonly PreparedContextFile[])[],
+    cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
+    queryAgent: AgentQuery = defaultQuery,
+    abortController?: AbortController,
+    briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
+  ): Promise<readonly GoalResult[]> {
+    return runReviewGoalsWithRunner(
+      runGoal,
+      context,
+      files,
+      conversation,
+      config,
+      contextFilesByGoal,
+      cwd,
+      queryAgent,
+      abortController,
+      briefing,
+    );
+  };
+}

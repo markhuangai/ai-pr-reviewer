@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { tool } from "@anthropic-ai/claude-agent-sdk";
+import { tool } from "./review-tool.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
@@ -28,7 +28,7 @@ import type {
   RepositoryFileSnapshot,
 } from "./repository-snapshot.js";
 
-export type QueryReaderKind = "diff" | "repository_file" | "thread";
+export type QueryReaderKind = "diff" | "repository_file" | "thread" | "discovery";
 
 export interface QueryReaderEntry {
   readonly reader: StringPageReader | RepositoryFilePageReader;

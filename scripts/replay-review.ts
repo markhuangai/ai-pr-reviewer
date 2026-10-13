@@ -154,6 +154,9 @@ const caseSchema = z
     context: contextSchema,
     config: z
       .object({
+        executor: z.enum(["claude", "codex"]).default("claude"),
+        codexWebsockets: z.boolean().optional(),
+        codexModelCatalogUrl: httpUrlSchema.optional(),
         aiBaseUrl: httpUrlSchema.optional(),
         model: z.string().trim().min(1),
         effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
@@ -345,14 +348,35 @@ function replayMcpServers(servers: ReplayCase["config"]["mcpServers"]): ReviewCo
 }
 
 function replayConfig(input: ReplayCase["config"]): ReviewConfig {
-  const aiSecret = process.env.AI_PR_REVIEWER_SECRET ?? process.env.ANTHROPIC_API_KEY;
+  const aiSecret =
+    process.env.AI_PR_REVIEWER_SECRET ??
+    (input.executor === "claude" ? process.env.ANTHROPIC_API_KEY : undefined);
   if (aiSecret === undefined || aiSecret.length === 0) {
-    throw new Error("Set AI_PR_REVIEWER_SECRET or ANTHROPIC_API_KEY before running a replay.");
+    throw new Error(
+      input.executor === "codex"
+        ? "Set AI_PR_REVIEWER_SECRET before running a Codex replay."
+        : "Set AI_PR_REVIEWER_SECRET or ANTHROPIC_API_KEY before running a replay.",
+    );
+  }
+  const aiBaseUrl =
+    input.aiBaseUrl ??
+    process.env.AI_PR_REVIEWER_BASE_URL ??
+    (input.executor === "claude" ? "https://api.anthropic.com" : undefined);
+  if (aiBaseUrl === undefined) throw new Error("Codex replay requires an explicit proxy base URL.");
+  if (
+    input.executor !== "codex" &&
+    (input.codexWebsockets || input.codexModelCatalogUrl !== undefined)
+  ) {
+    throw new Error("Codex replay settings require executor codex.");
   }
   return {
+    executor: input.executor,
+    ...(input.codexWebsockets === undefined ? {} : { codexWebsockets: input.codexWebsockets }),
+    ...(input.codexModelCatalogUrl === undefined
+      ? {}
+      : { codexModelCatalogUrl: input.codexModelCatalogUrl }),
     githubToken: "",
-    aiBaseUrl:
-      input.aiBaseUrl ?? process.env.AI_PR_REVIEWER_BASE_URL ?? "https://api.anthropic.com",
+    aiBaseUrl,
     aiSecret,
     model: input.model,
     ...(input.effort === undefined ? {} : { effort: input.effort }),

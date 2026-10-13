@@ -50,6 +50,46 @@ import { commitFixtureSnapshot, makeReplayRepository } from "./git-test-helpers.
 
 const execFileAsync = promisify(execFile);
 
+test("old replay cases default to Claude and Codex cases retain explicit settings", () => {
+  const input = {
+    version: 1,
+    caseId: "executor",
+    context: {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      baseRef: "main",
+      title: "fixture",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    config: {
+      model: "literal-route",
+      reviewPrompts: [{ prompt: "Review" }],
+      parallelCount: 1,
+      maxTurns: 5,
+    },
+  };
+  assert.equal(parseReplayCase(input).config.executor, "claude");
+  const selected = parseReplayCase({
+    ...input,
+    config: {
+      ...input.config,
+      executor: "codex",
+      effort: "max",
+      aiBaseUrl: "https://proxy.example/v1",
+      codexWebsockets: false,
+      codexModelCatalogUrl: "https://proxy.example/catalog",
+    },
+  });
+  assert.equal(selected.config.executor, "codex");
+  assert.equal(selected.config.model, "literal-route");
+  assert.equal(selected.config.effort, "max");
+  assert.equal(selected.config.codexWebsockets, false);
+});
+
 async function temporaryDirectory(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
 }
@@ -241,6 +281,23 @@ async function createRuntimeFixture(root: string): Promise<void> {
     join(root, "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json"),
     JSON.stringify({ version: "1.2.3", os: ["linux"], cpu: ["x64"], libc: ["glibc"] }),
   );
+  await mkdir(join(root, "node_modules/@openai/codex"), { recursive: true });
+  await mkdir(
+    join(root, "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin"),
+    { recursive: true },
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex/package.json"),
+    JSON.stringify({ version: "0.160.1" }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-linux-x64/package.json"),
+    JSON.stringify({ version: "0.160.1-linux-x64", os: ["linux"], cpu: ["x64"] }),
+  );
+  await writeFile(
+    join(root, "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"),
+    "native fixture",
+  );
 }
 
 test("prepares a validated runtime bundle from real files", async (t) => {
@@ -268,6 +325,7 @@ test("prepares a validated runtime bundle from real files", async (t) => {
   assert.equal(manifest.stableTag, "v1.1.1");
   assert.equal(manifest.sdkVersion, "1.2.3");
   assert.equal(manifest.cliVersion, "4.5.6");
+  assert.equal(manifest.codexCliVersion, "0.160.1");
   assert.equal(
     await readFile(join(result.bundle, "lib/value.js"), "utf8"),
     "export const value = 1;\n",

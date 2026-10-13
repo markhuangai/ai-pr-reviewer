@@ -12,6 +12,8 @@ export function markdownFenceLength(value: string): number {
 
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
+export type ReviewExecutor = "claude" | "codex";
+
 export type ReviewEvent = "APPROVE" | "COMMENT";
 
 export interface McpToolPolicy {
@@ -61,6 +63,9 @@ export interface ReviewGoal {
 }
 
 export interface ReviewConfig {
+  readonly executor?: ReviewExecutor;
+  readonly codexWebsockets?: boolean;
+  readonly codexModelCatalogUrl?: string;
   readonly githubToken: string;
   readonly aiBaseUrl: string;
   readonly aiSecret: string;

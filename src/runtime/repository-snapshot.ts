@@ -322,6 +322,42 @@ export class RepositorySnapshot {
     return { revision, path: selected, kind: "binary", sizeBytes: source.sizeBytes };
   }
 
+  async list(revision: "base" | "head", path?: string): Promise<RepositoryQuerySource> {
+    return this.query([
+      "ls-tree",
+      "--full-tree",
+      "-r",
+      "--name-only",
+      this.sha(revision),
+      "--",
+      ...(path === undefined ? [] : [":(literal)" + this.path(path)]),
+    ]);
+  }
+
+  async search(
+    revision: "base" | "head",
+    pattern: string,
+    paths: readonly string[] = [],
+  ): Promise<RepositoryQuerySource> {
+    return this.query(
+      [
+        "grep",
+        "--no-ext-grep",
+        "--no-textconv",
+        "--no-color",
+        "-n",
+        "-I",
+        "-E",
+        "-e",
+        pattern,
+        this.sha(revision),
+        "--",
+        ...paths.map((path) => ":(literal)" + this.path(path)),
+      ],
+      true,
+    );
+  }
+
   async guidance(files: readonly ChangedFile[]): Promise<readonly RepositoryGuidanceSnapshot[]> {
     const candidates = guidanceCandidates(files);
     if (candidates?.length === 0) return [];

@@ -1,16 +1,12 @@
 import {
-  createSdkMcpServer,
   query as sdkQuery,
-  tool,
   type HookCallback,
-  type McpServerConfig,
   type SDKActiveGoalMessage,
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { PreparedContextFile } from "../lib/context-files.js";
 import { reviewSecretCandidates } from "../lib/input.js";
@@ -68,11 +64,10 @@ import {
   reviewSubmissionRejection,
   startReviewPrompt,
   submissionSchema,
-  toSdkMcpServer,
   toSubmission,
   type AgentQuery,
   type SdkSessionMonitor,
-  runReviewGoalsWithRunner,
+  createReviewGoalsRunner,
 } from "./agent-session.js";
 import {
   ReviewEvidenceLedger,
@@ -95,8 +90,14 @@ import {
 } from "./review-context-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
+import { tool } from "./review-tool.js";
+import {
+  createReviewSession,
+  createReviewMcpServers,
+  type ReviewSession,
+} from "./review-session.js";
+import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
-
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -491,43 +492,40 @@ export async function runReviewGoal(
     { alwaysLoad: true },
   );
   const outputServerName = "review_output";
-  const mcpServers: Record<string, McpServerConfig> = {
-    [outputServerName]: createSdkMcpServer({
-      name: outputServerName,
-      version: "2.0.0",
-      instructions:
-        contextFileTool === undefined
-          ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads."
-          : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads.",
-      tools: [
-        briefingTool,
-        reviewStateTool,
-        conversationTool,
-        diffTool,
-        repositoryFileTool,
-        discussionThreadTool,
-        ...(contextFileTool === undefined ? [] : [contextFileTool]),
-        outputTool,
-      ],
-      alwaysLoad: true,
-    }),
-  };
-  for (const [name, server] of Object.entries(config.mcpServers))
-    mcpServers[name] = toSdkMcpServer(server);
+  const reviewTools = [
+    briefingTool,
+    reviewStateTool,
+    conversationTool,
+    diffTool,
+    repositoryFileTool,
+    discussionThreadTool,
+    ...(contextFileTool === undefined ? [] : [contextFileTool]),
+    outputTool,
+    ...(config.executor !== "codex"
+      ? []
+      : createRepositoryDiscoveryTools({
+          snapshot: repositorySnapshot,
+          readers: queryReaders,
+          isActive: isReviewActive,
+          signal,
+        })),
+  ];
+  const mcpServers = createReviewMcpServers(config, reviewTools, contextFileTool !== undefined);
   const input = new PromptStream();
   let turn = createDeferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
-  let session: ReturnType<AgentQuery> | undefined;
+  let session: ReviewSession | undefined;
   let monitor: SdkSessionMonitor | undefined;
   let sessionPhase = "starting";
   const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
   let sessionClosed = false;
+  let closedOperation: void | Promise<void>;
   const stalledSubmission = createDeferred<undefined>();
-  const closeSession = (): void => {
-    if (session === undefined || sessionClosed) return;
+  const closeSession = (): void | Promise<void> => {
+    if (session === undefined || sessionClosed) return closedOperation;
     sessionClosed = true;
-    session.close();
+    return (closedOperation = session.close());
   };
   let shutdown: Promise<void> | undefined;
   const finishSession = async (): Promise<void> => {
@@ -585,7 +583,12 @@ export async function runReviewGoal(
         write,
       );
     });
-    session = queryAgent({
+    session = createReviewSession(queryAgent, {
+      config,
+      cwd,
+      tools: reviewTools,
+      outputServerName,
+      isAccepted: () => submission !== undefined,
       prompt: input,
       options: makeOptions(
         config,
@@ -707,7 +710,13 @@ export async function runReviewGoal(
       } finally {
         if (signal?.aborted) turn.reject(signal.reason);
         else if (!sessionState.expectedSessionClose && readerFailure === undefined) {
-          turn.reject(new Error("The Claude SDK message stream ended before a terminal result."));
+          turn.reject(
+            new Error(
+              "The " +
+                (config.executor ?? "claude") +
+                " message stream ended before a terminal result.",
+            ),
+          );
         }
       }
     })();
@@ -865,7 +874,7 @@ export async function runReviewGoal(
         sessionPhase =
           result.subtype === "error_max_turns" ? "max-turns-exhausted" : "finalizing-failed-turn";
         return await finalizeUnaccepted(
-          result.errors.join("; ") || `Claude returned ${result.subtype}.`,
+          result.errors.join("; ") || `${config.executor ?? "claude"} returned ${result.subtype}.`,
           tokenUsageState.latestSnapshotValid,
           result.subtype !== "error_max_turns",
         );
@@ -949,7 +958,7 @@ export async function runReviewGoal(
     );
   } finally {
     monitor?.stop();
-    closeSession();
+    void closeSession();
     signal?.removeEventListener("abort", abortTurn);
     writeAgentSessionEndLog(
       goalIndex,
@@ -973,27 +982,4 @@ export async function runReviewGoal(
     );
   }
 }
-export function runReviewGoals(
-  context: PullRequestContext,
-  files: readonly ChangedFile[],
-  conversation: ReviewConversationSnapshot,
-  config: ReviewConfig,
-  contextFilesByGoal: readonly (readonly PreparedContextFile[])[],
-  cwd = process.env.GITHUB_WORKSPACE ?? process.cwd(),
-  queryAgent: AgentQuery = sdkQuery,
-  abortController?: AbortController,
-  briefing: ReviewBriefing = { linkedIssues: [], linkedIssueReferencesTruncated: false },
-): Promise<readonly GoalResult[]> {
-  return runReviewGoalsWithRunner(
-    runReviewGoal,
-    context,
-    files,
-    conversation,
-    config,
-    contextFilesByGoal,
-    cwd,
-    queryAgent,
-    abortController,
-    briefing,
-  );
-}
+export const runReviewGoals = createReviewGoalsRunner(runReviewGoal, sdkQuery);

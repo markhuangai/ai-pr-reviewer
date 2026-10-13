@@ -2,7 +2,7 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session. Sessions use automatic compaction, native read-only repository tools (`Read`, `Glob`, and `Grep`) over the pristine head checkout, an immutable pull-request briefing and fixed-revision Git readers, optional exact workflow-provided context files, and any explicitly configured HTTP MCP servers. Bash and other write or execution tools are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Claude Agent SDK token usage is combined across every goal and included in a default-collapsed section in both destinations.
+Each review prompt runs one isolated Claude Agent SDK session by default, or an opt-in native Codex app-server session for GPT models. Both backends use native goals, automatic compaction, an immutable pull-request briefing, fixed-revision Git readers, optional exact workflow-provided context files, and explicitly configured HTTP MCP servers. Claude also provides `Read`, `Glob`, and `Grep` over the pristine head checkout; Codex uses bounded Git-based file discovery and source readers through authenticated loopback MCP. Shell, writes, web access, and agents are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Token usage is combined across every goal and included in a default-collapsed section in both destinations.
 
 ## Consumer workflow
 
@@ -74,24 +74,50 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 
 ## Inputs
 
-| Input              | Required | Default | Notes                                                                                                                              |
-| ------------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `github-pat`       | yes      |         | Fine-grained PAT for each target: Contents and Pull requests read-only for summaries; both Read and write for interactive reviews. |
-| `ai-base-url`      | yes      |         | HTTP(S) Anthropic Messages API-compatible endpoint.                                                                                |
-| `ai-secret`        | yes      |         | API key for that endpoint.                                                                                                         |
-| `model`            | yes      |         | Model name understood by the endpoint.                                                                                             |
-| `effort`           | no       |         | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                                      |
-| `system-prompt`    | no       |         | Full replacement; written to the redacted action log.                                                                              |
-| `model-pricing`    | no       |         | Strict JSON with a currency prefix and per-model rates per one million tokens.                                                     |
-| `review-prompts`   | yes      |         | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                                     |
-| `parallel-count`   | no       | `5`     | Integer from 1 to 10; limits concurrently running goal sessions.                                                                   |
-| `max-turns`        | no       | `50`    | Integer from 2 to 500 per goal session, including `/goal`, briefing and selected evidence reads, and output repair.                |
-| `auto-approve`     | no       | `false` | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.                             |
-| `interact-with-pr` | no       | `true`  | When `false`, do not create a review; write all findings only to the workflow run summary.                                         |
-| `pull-request-url` | no       |         | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.                                |
-| `mcp-servers`      | no       | empty   | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                                                    |
+| Input                     | Required | Default  | Notes                                                                                                                                                                                                     |
+| ------------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `github-pat`              | yes      |          | Fine-grained PAT for each target: Contents and Pull requests read-only for summaries; both Read and write for interactive reviews.                                                                        |
+| `ai-base-url`             | yes      |          | HTTP(S) Messages-compatible endpoint for Claude, or Responses-compatible endpoint for Codex.                                                                                                              |
+| `ai-secret`               | yes      |          | API key for that endpoint.                                                                                                                                                                                |
+| `model`                   | yes      |          | Model name understood by the endpoint.                                                                                                                                                                    |
+| `executor`                | no       | `claude` | `claude` or `codex`; selects the same backend for reviews and resolution verification.                                                                                                                    |
+| `codex-websockets`        | no       | `false`  | Codex only: permit native WebSocket requests and HTTP fallback.                                                                                                                                           |
+| `codex-model-catalog-url` | no       |          | Codex only: optional HTTP(S) URL serving Codex-compatible model metadata.                                                                                                                                 |
+| `effort`                  | no       |          | `low`, `medium`, `high`, `xhigh`, or `max`; omit it to use the model default.                                                                                                                             |
+| `system-prompt`           | no       |          | Full replacement; written to the redacted action log.                                                                                                                                                     |
+| `model-pricing`           | no       |          | Strict JSON with a currency prefix and per-model rates per one million tokens.                                                                                                                            |
+| `review-prompts`          | yes      |          | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                                                                                                            |
+| `parallel-count`          | no       | `5`      | Integer from 1 to 10; limits concurrently running goal sessions.                                                                                                                                          |
+| `max-turns`               | no       | `50`     | Integer from 2 to 500 per goal. Claude counts SDK turns; Codex counts app-server turns, including native continuations and host repairs. Each Codex turn can make multiple model requests and tool calls. |
+| `auto-approve`            | no       | `false`  | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.                                                                                                    |
+| `interact-with-pr`        | no       | `true`   | When `false`, do not create a review; write all findings only to the workflow run summary.                                                                                                                |
+| `pull-request-url`        | no       |          | Same-GitHub-host PR URL to review. It may identify a repository other than the workflow repository.                                                                                                       |
+| `mcp-servers`             | no       | empty    | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                                                                                                                           |
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
+
+### GPT models through a proxy
+
+Use a Responses-compatible proxy with the native Codex backend. The endpoint can be CLIProxyAPI, LiteLLM, or another compatible implementation; no proxy-specific routing is built into the action.
+
+```yaml
+- uses: markhuangai/ai-pr-reviewer@v1-prerelease
+  with:
+    github-pat: ${{ secrets.PR_REVIEW_PAT }}
+    executor: codex
+    ai-base-url: ${{ secrets.RESPONSES_BASE_URL }} # Includes /v1 when the proxy requires it.
+    ai-secret: ${{ secrets.AI_SECRET }}
+    model: gpt-6.1-sol
+    effort: high
+    max-turns: 50
+    review-prompts: '[{"prompt":"Check changed code for correctness and regressions."}]'
+```
+
+Model names and routing aliases are passed literally. A proxy must preserve `reasoning.effort`, tool-call identifiers, and tool-result history. Configure the proxy's supported effort levels explicitly when its defaults would clamp `xhigh` or `max`. If an alias needs different capabilities or a context window than Codex's bundled metadata provides, set `codex-model-catalog-url` to the proxy's Codex-compatible catalog. A plain OpenAI `/models` list is insufficient. The catalog must describe the literal alias, supported efforts, context window, and tool capabilities. Unsupported effort values fail explicitly; the action does not replace an alias or silently lower effort.
+
+Codex uses HTTP by default. Enable `codex-websockets: true` only when the proxy supports the native Responses WebSocket protocol or its HTTP fallback. The native goal starts after the complete review context is loaded. Only host-validated submissions count as completion. Codex keeps goal state in a private temporary home outside the checkout and removes it on shutdown. It does not load the consumer's Codex configuration, credentials, project instructions, plugins, or hooks automatically; repository guidance remains part of the shared briefing.
+
+The backend is GPT-first. Muse/OpenCode, Qwen/Bailian, Gemini, and Grok are outside this rollout. `max-turns` limits app-server turns rather than tokens or HTTP requests. Keep a workflow timeout such as `timeout-minutes: 60` as the outer bound.
 
 Authentication is API-key only. The removed `ai-auth-mode` input is rejected instead of enabling Claude Code subscription-token authentication.
 
@@ -418,7 +444,7 @@ The replay CLI runs the normal review runner against an exact local pull request
 
 Replay output uses **version 2**: goals include host-owned `inspection` and submissions include `limitations` instead of the old assessment. Case input remains **version 1**.
 
-Set `AI_PR_REVIEWER_SECRET` (or `ANTHROPIC_API_KEY`) for the model credential. Set `AI_PR_REVIEWER_BASE_URL` to the consumer's configured proxy when needed, or record `aiBaseUrl` in the case. The case's `config.reviewPrompts`, model, budgets, system prompt, and HTTP MCP server configuration are passed to the normal runner.
+Set `AI_PR_REVIEWER_SECRET` for the model credential. Claude replay also accepts `ANTHROPIC_API_KEY`. Old cases default to Claude. For Codex, set `config.executor` to `codex` and provide the proxy URL through `AI_PR_REVIEWER_BASE_URL` or `config.aiBaseUrl`; neither an Anthropic credential nor its endpoint is used as a fallback. Optional `config.codexWebsockets` and `config.codexModelCatalogUrl` mirror the action inputs. The case's goals, literal model, effort, budgets, system prompt, and HTTP MCP configuration are passed to the normal runner.
 
 ```json
 {
@@ -454,7 +480,11 @@ npm run replay:review -- --case /data/cases/example-001.json --checkout /tmp/exa
 
 Replay cases should preserve production inputs and reviewer-visible context. Do not add expected findings, labels, or evaluation notes to `config.reviewPrompts`, the PR body, conversation, or repository contents. Live accuracy evaluation is deferred until after merge and prerelease publication.
 
-Repository CI and release jobs run on GitHub-hosted `ubuntu-latest` runners. RC releases use npm's target OS and CPU selection to package the SDK's prebuilt native dependency for each supported platform, record the RC and stable tags plus SDK and native CLI versions in each manifest, verify archive checksums, and publish those assets. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required.
+`npm run test:codex-proxies` requires Docker and runs complete native reviews through pinned CLIProxyAPI v8.0.27 and LiteLLM v1.105.0 containers against a controlled upstream. It checks reasoning effort and tool history at that upstream, then removes its own containers and temporary configuration. Normal PR CI runs this acceptance gate alongside native process and existing Claude regressions. The reduced-context model fixture is derived from OpenAI's `rust-v0.160.1` model catalog to exercise native compaction.
+
+When the Docker daemon runs outside the test process's network, set `AI_PR_REVIEWER_PROXY_TEST_DOCKER_HOST` to the reachable daemon host and `AI_PR_REVIEWER_PROXY_TEST_UPSTREAM_HOST` to the test process's reachable host. These affect test fixtures only. Configuration is copied through Docker's API so it does not depend on shared host paths.
+
+Repository CI and release jobs run on GitHub-hosted `ubuntu-latest` runners. RC releases use npm's target OS and CPU selection to package Claude and Codex's prebuilt native dependencies for all six supported platforms. Manifests retain the Claude SDK/CLI fields and add `codexCliVersion`. Stable releases promote the matching RC archives byte for byte after source verification. No container build is required for the consumer action.
 
 ## License
 
