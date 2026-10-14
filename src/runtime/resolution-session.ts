@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 import {
   createSdkMcpServer,
   query as sdkQuery,
-  tool,
   type HookCallback,
   type McpServerConfig,
   type Options,
@@ -34,6 +33,13 @@ import {
   makeUserMessage,
   safeAgentEnvironment,
 } from "./agent-session.js";
+import { tool, toClaudeTool } from "./review-tool.js";
+import { createReviewSession, type ReviewSession } from "./review-session.js";
+import { RepositorySnapshot } from "./repository-snapshot.js";
+import { ReviewQueryReaderStore } from "./review-context-tools.js";
+import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
+import { jsonToolResult } from "./agent-review-tools.js";
+import { toolResponseDocument } from "./review-assessment.js";
 
 const MAX_RESOLUTION_REPAIR_ATTEMPTS = 2;
 const MAX_THREAD_CONTEXT_LENGTH = 32_000;
@@ -115,9 +121,22 @@ function redactedThread(
 
 function resolutionReadEvidenceHook(targetPath: string, evidence: { read: boolean }): HookCallback {
   return (input) => {
-    if (input.hook_event_name !== "PostToolUse" || input.tool_name !== "Read") {
+    if (input.hook_event_name !== "PostToolUse") {
       return Promise.resolve({ continue: true });
     }
+    if (input.tool_name === "mcp__resolution_output__read_repository_file") {
+      const document = toolResponseDocument(input.tool_response);
+      if (
+        document?.kind === "text" &&
+        document.revision === "head" &&
+        typeof document.path === "string" &&
+        resolve(input.cwd, document.path) === resolve(input.cwd, targetPath) &&
+        !(isRecord(input.tool_response) && input.tool_response.isError === true)
+      )
+        evidence.read = true;
+      return Promise.resolve({ continue: true });
+    }
+    if (input.tool_name !== "Read") return Promise.resolve({ continue: true });
     const toolInput = isRecord(input.tool_input) ? input.tool_input : undefined;
     const filePath = toolInput?.file_path;
     if (
@@ -184,7 +203,14 @@ function optionsForResolution(
       PreToolUse: [{ matcher: "^(Read|Glob|Grep)$", hooks: [repositoryReadHook] }],
       ...(readEvidenceHook === undefined
         ? {}
-        : { PostToolUse: [{ matcher: "^Read$", hooks: [readEvidenceHook] }] }),
+        : {
+            PostToolUse: [
+              {
+                matcher: "^(Read|mcp__resolution_output__read_repository_file)$",
+                hooks: [readEvidenceHook],
+              },
+            ],
+          }),
     },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },
@@ -257,19 +283,54 @@ export async function verifyResolution(
     },
     { alwaysLoad: true },
   );
+  const snapshot =
+    config.executor === "codex"
+      ? new RepositorySnapshot(cwd, context.baseSha, context.headSha, context.baseSha, [], signal)
+      : undefined;
+  const readers = new ReviewQueryReaderStore(() => undefined, signal);
+  const repositoryTools =
+    snapshot === undefined
+      ? []
+      : [
+          tool(
+            "read_repository_file",
+            "Read one exact tracked text file at the immutable current head; continue with its cursor when done=false.",
+            {
+              path: z.string().min(1).max(4_096),
+              cursor: z.string().min(1).max(100).optional(),
+            },
+            async ({ path, cursor }) => {
+              throwIfAborted(signal);
+              if (cursor !== undefined)
+                return readers.readPage(cursor, "repository_file", { revision: "head", path });
+              const file = await snapshot.file("head", path);
+              if (file.source === undefined) return jsonToolResult(file);
+              const query = readers.createSource(file.source, "repository_file", {
+                revision: "head",
+                path,
+                kind: file.kind,
+                headSha: context.headSha,
+              });
+              return readers.readPage(query.cursor, "repository_file", { revision: "head", path });
+            },
+            { alwaysLoad: true },
+          ),
+          ...createRepositoryDiscoveryTools({ snapshot, readers, isActive: () => true, signal }),
+        ];
+  const resolutionTools = [outputTool, ...repositoryTools];
   const outputServer = createSdkMcpServer({
     name: "resolution_output",
     version: "1.0.0",
     instructions:
       "Read the current repository path in the supplied prompt, then call submit_resolution exactly once.",
-    tools: [outputTool],
+    tools: resolutionTools.map(toClaudeTool),
     alwaysLoad: true,
   });
   const input = new PromptStream();
   let resultTurn = deferred<SDKResultMessage>();
   let reader: Promise<void> | undefined;
   let readerFailure: Error | undefined;
-  let session: ReturnType<ResolutionQuery> | undefined;
+  let session: ReviewSession | undefined;
   let monitor: SdkSessionMonitor | undefined;
   let sessionPhase = "starting";
   let repairAttempts = 0;
@@ -279,6 +340,7 @@ export async function verifyResolution(
     finalizing: false,
   };
   let sessionClosed = false;
+  let closedOperation: void | Promise<void>;
   let sessionId: string | undefined;
   let activeGoal = false;
   let activeGoalReason: string | undefined;
@@ -286,10 +348,10 @@ export async function verifyResolution(
   const sessionLabel = `resolution ${verifierIndex + 1}`;
   let writeMonitorEvent: (event: string, details: Readonly<Record<string, unknown>>) => void = () =>
     undefined;
-  const closeSession = (): void => {
-    if (session === undefined || sessionClosed) return;
+  const closeSession = (): void | Promise<void> => {
+    if (session === undefined || sessionClosed) return closedOperation;
     sessionClosed = true;
-    session.close();
+    return (closedOperation = session.close());
   };
   let shutdown: Promise<void> | undefined;
   const finishSession = async (): Promise<void> => {
@@ -307,7 +369,19 @@ export async function verifyResolution(
   if (signal?.aborted) abortTurn();
   try {
     throwIfAborted(signal);
-    session = queryAgent({
+    session = createReviewSession(queryAgent, {
+      config,
+      cwd,
+      tools: resolutionTools,
+      outputServerName: "resolution_output",
+      isAccepted: () => resolution !== undefined,
+      ...(snapshot === undefined
+        ? {}
+        : {
+            cleanup: async () => {
+              await Promise.all([...readers.cleanupOperations(), snapshot.cleanup()]);
+            },
+          }),
       prompt: input,
       options: optionsForResolution(
         config,
@@ -491,7 +565,14 @@ export async function verifyResolution(
         });
         continue;
       }
-      if (result.subtype !== "success") {
+      if (
+        result.subtype !== "success" &&
+        !(
+          config.executor === "codex" &&
+          result.subtype === "error_max_turns" &&
+          resolution !== undefined
+        )
+      ) {
         await finishSession();
         throwIfAborted(signal);
         writeMonitorEvent("failure", {
@@ -548,7 +629,7 @@ export async function verifyResolution(
     sessionState.expectedSessionClose = true;
     monitor?.stop();
     input.finish();
-    closeSession();
+    void closeSession();
     signal?.removeEventListener("abort", abortTurn);
     writeMonitorEvent("cleanup", { outcome: "success" });
     writeMonitorEvent("end", {

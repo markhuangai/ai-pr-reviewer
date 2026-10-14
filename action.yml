@@ -2,6 +2,10 @@ name: Goal-Driven AI PR Reviewer
 description: Conversation-aware pull request reviews with isolated AI sessions, MCP-enabled tools, and stale-review lifecycle management.
 author: MarkHuang.ai
 inputs:
+  executor:
+    description: "Review backend: claude or codex."
+    required: false
+    default: claude
   github-pat:
     description: >-
       A GitHub PAT scoped to the target repository. Summary-only runs need Contents
@@ -9,7 +13,7 @@ inputs:
       write because lifecycle reconciliation resolves review threads.
     required: true
   ai-base-url:
-    description: Anthropic Messages API-compatible base URL.
+    description: Anthropic Messages API base URL for Claude, or Responses API proxy base URL for Codex (usually ending in /v1).
     required: true
   ai-secret:
     description: API key for the configured AI endpoint.
@@ -18,7 +22,7 @@ inputs:
     description: Model identifier accepted by the configured AI endpoint.
     required: true
   effort:
-    description: "Optional Claude reasoning effort level: low, medium, high, xhigh, or max."
+    description: "Optional model reasoning effort: low, medium, high, xhigh, or max; requires support from the selected model and proxy."
     required: false
   system-prompt:
     description: Optional full replacement for the built-in review system prompt; the effective prompt is written to the redacted action log.
@@ -34,7 +38,7 @@ inputs:
     required: false
     default: "5"
   max-turns:
-    description: Maximum Claude Agent SDK turns per goal session (2-500), including /goal, conversation and diff reading, and output repair.
+    description: Maximum turns per goal session (2-500). Claude counts SDK model/tool turns; Codex counts app-server turns, including native goal continuations and repairs, each of which may contain multiple model calls.
     required: false
     default: "50"
   auto-approve:

@@ -2,6 +2,7 @@ import { strict as assert } from "node:assert";
 import test from "node:test";
 
 import {
+  reviewMarker,
   aggregateInternals,
   aggregateReview,
   buildReviewBody,
@@ -688,4 +689,11 @@ test("rejects an AI prompt that cannot fit in an inline comment", () => {
       }),
     /AI prompt exceeds GitHub's review comment capacity/u,
   );
+});
+
+test("Claude fingerprints stay unchanged while Codex execution distinguishes reviews", () => {
+  const existing = reviewMarker(context, config);
+  assert.equal(reviewMarker(context, { ...config, executor: "claude" }), existing);
+  const codex = { ...config, executor: "codex" as const };
+  assert.notEqual(reviewMarker(context, codex), existing);
 });

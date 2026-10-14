@@ -85,7 +85,7 @@ test("automatic reads serialize undelivered pages and preserve deletion and rena
     ledger,
   });
   const readDiff = (input: { remaining?: boolean; paths?: string[]; cursor?: string }) =>
-    diffTool.handler({ paths: undefined, cursor: undefined, remaining: undefined, ...input }, {});
+    diffTool.handler({ paths: undefined, cursor: undefined, remaining: undefined, ...input });
   const document = (response: Awaited<ReturnType<typeof diffTool.handler>>) => {
     const value = toolResponseDocument(response);
     assert.ok(value);
@@ -108,10 +108,11 @@ test("automatic reads serialize undelivered pages and preserve deletion and rena
   record({ paths: ["a-retired.txt"] }, selected);
   const firstRange = (document(selected).ranges as ReviewSourceRange[])[0];
   assert.ok(firstRange);
-  const missing = await repositoryFileTool.handler(
-    { revision: "head", path: "a-retired.txt", cursor: undefined },
-    {},
-  );
+  const missing = await repositoryFileTool.handler({
+    revision: "head",
+    path: "a-retired.txt",
+    cursor: undefined,
+  });
   ledger.observeBatch([
     {
       tool_name: "mcp__review_output__read_repository_file",

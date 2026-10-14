@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-
 import type {
   AggregatedFinding,
   AggregatedModelUsage,
@@ -19,7 +18,6 @@ import type {
 } from "./types.js";
 import type { ContextFileIdentityByGoal } from "./context-files.js";
 import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
-
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
 const MAX_FINDING_RANGE_LENGTH = 1_000;
@@ -41,16 +39,13 @@ const SEVERITY_ICON: Record<Severity, string> = {
   MODERATE: "🟠",
   LOW: "🟡",
 };
-
 const EMPTY_CONVERSATION_DIGEST = createHash("sha256").update("[]").digest("hex");
-
 interface AggregateReviewOptions {
   readonly conversationDigest?: string;
   readonly contextFiles?: ContextFileIdentityByGoal;
   readonly briefingDigest?: string;
   readonly coverageGoals?: readonly GoalResult[];
 }
-
 function normalizeText(value: string): string {
   return value
     .toLowerCase()
@@ -58,11 +53,9 @@ function normalizeText(value: string): string {
     .trim()
     .replace(/\s+/g, " ");
 }
-
 function hasNonAscii(value: string): boolean {
   return Array.from(value).some((character) => (character.codePointAt(0) ?? 0) > 0x7f);
 }
-
 function tokenSet(value: string): ReadonlySet<string> {
   return new Set(
     normalizeText(value)
@@ -70,7 +63,6 @@ function tokenSet(value: string): ReadonlySet<string> {
       .filter((token) => token.length > 2 || hasNonAscii(token)),
   );
 }
-
 function overlap(left: string, right: string): number {
   const a = tokenSet(left);
   const b = tokenSet(right);
@@ -79,7 +71,6 @@ function overlap(left: string, right: string): number {
   for (const token of a) if (b.has(token)) intersection += 1;
   return intersection / (a.size + b.size - intersection);
 }
-
 function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unknown {
   return Object.fromEntries(
     Object.entries(servers)
@@ -108,7 +99,6 @@ function stableMcpShape(servers: Readonly<Record<string, HttpMcpServer>>): unkno
       ]),
   );
 }
-
 function stableModelPricing(pricing: ModelPricingConfig | undefined): unknown {
   if (pricing === undefined) return undefined;
   return {
@@ -128,7 +118,6 @@ function stableModelPricing(pricing: ModelPricingConfig | undefined): unknown {
     ),
   };
 }
-
 export function reviewMarker(
   context: PullRequestContext,
   config: ReviewConfig,
@@ -140,6 +129,7 @@ export function reviewMarker(
     [...files].sort((left, right) => left.path.localeCompare(right.path)),
   );
   const fingerprint = JSON.stringify({
+    ...(config.executor !== "codex" ? {} : { executor: "codex" }),
     baseSha: context.baseSha,
     model: config.model,
     ...(config.effort === undefined ? {} : { effort: config.effort }),
@@ -161,7 +151,6 @@ export function reviewMarker(
   const digest = createHash("sha256").update(fingerprint).digest("hex");
   return `<!-- ai-pr-reviewer:v3:${context.headSha}:${digest} -->`;
 }
-
 function emptyTokenCounts(): TokenCounts {
   return {
     inputTokens: 0,

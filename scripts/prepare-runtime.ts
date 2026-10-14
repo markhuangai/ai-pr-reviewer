@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -82,6 +82,46 @@ export async function prepareRuntime(
       `Claude SDK native package does not match target ${rawTargetOs}/${rawTargetCpu}.`,
     );
   }
+  const codexPackage = readPackage(
+    await readFile(join(cwd, "node_modules/@openai/codex/package.json"), "utf8"),
+  );
+  if (typeof codexPackage.version !== "string") {
+    throw new Error("Codex package metadata has no version.");
+  }
+  const codexNative = readPackage(
+    await readFile(
+      join(cwd, "node_modules/@openai/codex-" + platformSuffix + "/package.json"),
+      "utf8",
+    ),
+  );
+  if (
+    codexNative.version !== codexPackage.version + "-" + platformSuffix ||
+    !isStringArray(codexNative.os) ||
+    !codexNative.os.includes(rawTargetOs) ||
+    !isStringArray(codexNative.cpu) ||
+    !codexNative.cpu.includes(rawTargetCpu)
+  ) {
+    throw new Error(
+      "Codex native package does not match target " + rawTargetOs + "/" + rawTargetCpu + ".",
+    );
+  }
+  const architecture = rawTargetCpu === "x64" ? "x86_64" : "aarch64";
+  const triples: Record<string, string> = {
+    linux: "unknown-linux-musl",
+    darwin: "apple-darwin",
+    win32: "pc-windows-msvc",
+  };
+  const triple = `${architecture}-${triples[rawTargetOs]}`;
+  await access(
+    join(
+      cwd,
+      "node_modules/@openai/codex-" + platformSuffix,
+      "vendor",
+      triple,
+      "bin",
+      rawTargetOs === "win32" ? "codex.exe" : "codex",
+    ),
+  );
   const bundle = join(resolve(cwd, destination), "bundle");
   await mkdir(join(bundle, "runtime"), { recursive: true });
   await cp(join(cwd, "build/index.js"), join(bundle, "index.js"));
@@ -105,6 +145,7 @@ export async function prepareRuntime(
         nodeMajor: 24,
         sdkVersion: sdkPackage.version,
         cliVersion: sdkPackage.claudeCodeVersion ?? "unknown",
+        codexCliVersion: codexPackage.version,
         sourceCommit,
       },
       null,

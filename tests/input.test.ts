@@ -12,6 +12,30 @@ function reader(values: Record<string, string>) {
   return { get: (name: string): string => values[name] ?? "" };
 }
 
+test("Codex inputs preserve model aliases, effort, and generic proxy settings", () => {
+  const values = {
+    "github-pat": "token",
+    "ai-base-url": "https://proxy.example/v1",
+    "ai-secret": "key",
+    model: "gpt-6.1-sol/my-route",
+    "review-prompts": '[{"prompt":"Review"}]',
+  };
+  const defaults = readReviewConfig(reader(values));
+  assert.equal(defaults.executor, "claude");
+  assert.equal(defaults.maxTurns, 50);
+  const codex = readReviewConfig(
+    reader({
+      ...values,
+      executor: "codex",
+      effort: "max",
+    }),
+  );
+  assert.equal(codex.executor, "codex");
+  assert.equal(codex.model, values.model);
+  assert.equal(codex.effort, "max");
+  assert.throws(() => readReviewConfig(reader({ ...values, executor: "other" })), /executor/u);
+});
+
 test("reads structured goals and strict HTTP MCP configuration", () => {
   const config = readReviewConfig(
     reader({

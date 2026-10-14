@@ -735,6 +735,10 @@ export async function bootstrapRuntime(options: BootstrapRuntimeOptions = {}): P
           manifest.nodeMajor !== 24 ||
           typeof manifest.sdkVersion !== "string" ||
           typeof manifest.cliVersion !== "string" ||
+          (manifest.codexCliVersion !== undefined &&
+            typeof manifest.codexCliVersion !== "string") ||
+          (process.env.INPUT_EXECUTOR?.trim() === "codex" &&
+            typeof manifest.codexCliVersion !== "string") ||
           typeof manifest.sourceCommit !== "string" ||
           manifest.sourceCommit.length === 0
         ) {

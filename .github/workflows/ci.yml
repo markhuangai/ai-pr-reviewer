@@ -35,6 +35,8 @@ jobs:
         run: npm audit --audit-level=high
       - name: Check formatting, lint, types, and unit tests
         run: npm run check
+      - name: Validate Codex through pinned Responses-compatible proxies
+        run: npm run test:codex-proxies
       - name: Build compiled runtime and bootstrap
         run: npm run build && npm run bundle:bootstrap
       - name: Verify reproducible compiled runtime

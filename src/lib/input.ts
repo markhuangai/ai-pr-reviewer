@@ -470,10 +470,15 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     throw new Error("Input 'ai-auth-mode' is no longer supported; API-key authentication is used.");
   }
   const pullRequestUrl = reader.get("pull-request-url").trim();
+  const executor = reader.get("executor").trim() || "claude";
+  if (executor !== "claude" && executor !== "codex") {
+    throw new Error("Input 'executor' must be 'claude' or 'codex'.");
+  }
   const modelPricing = parseModelPricing(reader.get("model-pricing"));
   const effort = readEffort(reader.get("effort"));
   const systemPrompt = reader.get("system-prompt").trim();
   return {
+    executor,
     githubToken: required(reader.get("github-pat"), "github-pat"),
     aiBaseUrl: readUrl(required(reader.get("ai-base-url"), "ai-base-url"), "ai-base-url"),
     aiSecret: required(reader.get("ai-secret"), "ai-secret"),

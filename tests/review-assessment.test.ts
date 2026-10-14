@@ -805,7 +805,7 @@ test("keeps four structured state snapshots without advancing or evicting source
     assert.ok(parsed);
     return parsed;
   };
-  const first = document(await state.handler({ paths: undefined, cursor: undefined }, {}));
+  const first = document(await state.handler({ paths: undefined, cursor: undefined }));
   assert.equal(first.done, false);
   assert.equal(first.content, undefined);
   const records = first.records as {
@@ -820,7 +820,7 @@ test("keeps four structured state snapshots without advancing or evicting source
   assert.ok(restartedPaths.includes(changedFile.path));
   assert.ok(restartedPaths.includes("old.ts"));
   const cursor = String(first.nextCursor);
-  const original = document(await state.handler({ paths: undefined, cursor }, {}));
+  const original = document(await state.handler({ paths: undefined, cursor }));
   ledger.observeBatch([
     call(
       "read_repository_file",
@@ -829,15 +829,15 @@ test("keeps four structured state snapshots without advancing or evicting source
     ),
   ]);
   const originalFirst = document(
-    await state.handler({ paths: undefined, cursor: cursor.replace(/:2$/u, ":1") }, {}),
+    await state.handler({ paths: undefined, cursor: cursor.replace(/:2$/u, ":1") }),
   );
   assert.deepEqual(originalFirst, first);
   recovery.observeUse("rejected", {});
   for (let index = 0; index < 3; index += 1)
-    await state.handler({ paths: undefined, cursor: undefined }, {});
-  assert.deepEqual(document(await state.handler({ paths: undefined, cursor }, {})), original);
-  await state.handler({ paths: undefined, cursor: undefined }, {});
-  const expired = await state.handler({ paths: undefined, cursor }, {});
+    await state.handler({ paths: undefined, cursor: undefined });
+  assert.deepEqual(document(await state.handler({ paths: undefined, cursor })), original);
+  await state.handler({ paths: undefined, cursor: undefined });
+  const expired = await state.handler({ paths: undefined, cursor });
   assert.equal(expired.isError, true);
   assert.match(JSON.stringify(expired), /expired/u);
   assert.equal(readers.has(query.cursor), true);
@@ -902,7 +902,7 @@ test("reports both rename sides consistently for base, head, diff, and filtered 
       previousObserved: mode === "base" || mode === "diff",
     };
     for (const paths of [undefined, ["old.ts"], ["new.ts"]]) {
-      const response = await state.handler({ paths, cursor: undefined }, {});
+      const response = await state.handler({ paths, cursor: undefined });
       assert.ok(Buffer.byteLength(JSON.stringify(response)) <= MODEL_TOOL_RESULT_BYTES);
       const document = reviewAssessmentInternals.toolResponseDocument(response);
       assert.ok(document);
