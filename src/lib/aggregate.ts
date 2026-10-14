@@ -129,15 +129,7 @@ export function reviewMarker(
     [...files].sort((left, right) => left.path.localeCompare(right.path)),
   );
   const fingerprint = JSON.stringify({
-    ...(config.executor !== "codex"
-      ? {}
-      : {
-          executor: "codex",
-          codexWebsockets: config.codexWebsockets ?? false,
-          ...(config.codexModelCatalogUrl === undefined
-            ? {}
-            : { codexModelCatalogUrl: config.codexModelCatalogUrl }),
-        }),
+    ...(config.executor !== "codex" ? {} : { executor: "codex" }),
     baseSha: context.baseSha,
     model: config.model,
     ...(config.effort === undefined ? {} : { effort: config.effort }),

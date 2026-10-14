@@ -257,13 +257,10 @@ export class CodexSession implements ReviewSession {
           env_key: "AI_PR_REVIEWER_CODEX_API_KEY",
           wire_api: "responses",
           requires_openai_auth: false,
-          supports_websockets: this.input.config.codexWebsockets ?? false,
+          supports_websockets: true,
           request_max_retries: 1,
           stream_max_retries: 1,
           stream_idle_timeout_ms: 300_000,
-          ...(this.input.config.codexModelCatalogUrl === undefined
-            ? {}
-            : { model_catalog_url: this.input.config.codexModelCatalogUrl }),
         },
       },
       ...(this.input.config.effort === undefined
@@ -305,7 +302,7 @@ export class CodexSession implements ReviewSession {
         browser_use_external: false,
         computer_use: false,
         tool_suggest: false,
-        api_key_model_discovery: this.input.config.codexModelCatalogUrl !== undefined,
+        api_key_model_discovery: false,
       },
       mcp_servers: mcp,
     };

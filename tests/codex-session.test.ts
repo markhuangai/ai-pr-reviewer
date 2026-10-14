@@ -55,11 +55,7 @@ test("native reviews use runner proxies while local MCP bypasses them", async (t
         });
       }
       process.env[name] = new URL(fixture.url).origin;
-      const result = await nativeReview(
-        subtest,
-        "http://native-model.invalid/v1",
-        fixture.catalogUrl,
-      );
+      const result = await nativeReview(subtest, "http://native-model.invalid/v1");
       assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
       assert.ok(fixture.requests.length > 0);
       assert.ok(
@@ -80,7 +76,7 @@ test(
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
     const fixture = await modelFixture(t, completeReviewScript({ continuation: true }));
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.equal(result.submission?.findings[0]?.line, 2);
     assert.deepEqual(result.inspection, { observedPaths: ["review.txt"], missingPaths: [] });
@@ -104,7 +100,7 @@ test(
   async (t) => {
     await isolatedTemporaryRoot(t);
     const fixture = await modelFixture(t, completeReviewScript({ compact: true }));
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.ok(fixture.requests.some(({ body }) => toolNames(body).length === 0));
     assert.ok((result.diagnostics?.evidenceReferences ?? 0) > 0);
@@ -138,14 +134,7 @@ test(
       }
       return script(request);
     });
-    const result = await nativeReview(
-      t,
-      fixture.url,
-      fixture.catalogUrl,
-      {},
-      undefined,
-      artifact.filesByGoal[0],
-    );
+    const result = await nativeReview(t, fixture.url, {}, undefined, artifact.filesByGoal[0]);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.ok(fixture.requests.some(({ body }) => historyText(body).includes(sentinel)));
     assert.ok(output.some((line) => line.includes("read_context_file")));
@@ -163,7 +152,7 @@ test(
       ...script(request),
       cachedInputTokens: 30,
     }));
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     const usage = result.tokenUsage?.models[0];
     assert.equal(usage?.inputTokens, fixture.requests.length * 70);
@@ -190,7 +179,7 @@ test(
         input: `*** Begin Patch\n*** Update File: ${join(checkout, "review.txt")}\n@@\n-before\n+tampered\n*** End Patch`,
       };
     });
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, {}, (root) => {
+    const result = await nativeReview(t, fixture.url, {}, (root) => {
       checkout = root;
       return Promise.resolve();
     });
@@ -217,7 +206,7 @@ test(
       if (index === 2) return { text: "The native goal is complete." };
       return script(request);
     });
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.ok(result.submission);
     assert.ok(fixture.requests.some(({ body }) => /submit_review|repair/u.test(historyText(body))));
@@ -230,7 +219,7 @@ test(
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
     const fixture = await modelFixture(t, completeReviewScript({ continuation: true }));
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, { maxTurns: 2 });
+    const result = await nativeReview(t, fixture.url, { maxTurns: 2 });
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.ok(result.submission);
     assert.deepEqual(await readdir(temporary), []);
@@ -248,7 +237,7 @@ test(
         ? { wait: true }
         : script(request),
     );
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.equal(result.tokenUsage?.complete, false);
     assert.deepEqual(await readdir(temporary), []);
@@ -261,7 +250,7 @@ test(
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
     const fixture = await modelFixture(t, () => ({ text: "Continue reviewing the goal." }));
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, { maxTurns: 2 });
+    const result = await nativeReview(t, fixture.url, { maxTurns: 2 });
     assert.notEqual(result.status, "completed");
     assert.equal(result.submission, undefined);
     assert.equal(result.diagnostics?.termination, "max-turns-exhausted");
@@ -294,7 +283,7 @@ test(
       if (historyText(request.body).includes("SOURCE_DELIVERY_SENTINEL")) observed = true;
       return script(request);
     });
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, {}, async (root) => {
+    const result = await nativeReview(t, fixture.url, {}, async (root) => {
       await writeFile(join(root, "large.txt"), content);
     });
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
@@ -309,7 +298,7 @@ test(
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
     const fixture = await modelFixture(t, completeReviewScript());
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, {
+    const result = await nativeReview(t, fixture.url, {
       mcpServers: {
         unavailable: { type: "http", url: "http://127.0.0.1:1/mcp" },
       },
@@ -342,7 +331,7 @@ test(
       );
       return script(request);
     });
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl, {
+    const result = await nativeReview(t, fixture.url, {
       mcpServers: {
         external: {
           type: "http",
@@ -360,20 +349,20 @@ test(
 );
 
 test(
-  "selected effort survives literal aliases and native WebSocket-to-HTTP fallback",
+  "selected effort survives literal aliases and default native WebSocket-to-HTTP fallback",
   { timeout: 90_000 },
   async (t) => {
     await isolatedTemporaryRoot(t);
     for (const effort of ["low", "high", "max"] as const) {
       await t.test(effort, async (subtest) => {
         const fixture = await modelFixture(subtest, completeReviewScript());
-        const result = await nativeReview(subtest, fixture.url, fixture.catalogUrl, {
+        const result = await nativeReview(subtest, fixture.url, {
           model: "gpt-6.1-sol-fixture-alias",
           effort,
-          codexWebsockets: true,
         });
         assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
         assert.ok(fixture.upgrades() > 0);
+        assert.deepEqual(fixture.lookups, []);
         assert.ok(
           fixture.requests.every(
             ({ body }) =>
@@ -400,7 +389,7 @@ test(
         ? { error: 400 }
         : script(request),
     );
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "failed");
     assert.ok(result.submission);
     assert.match(result.error ?? "", /Controlled upstream failure|400/u);
@@ -437,7 +426,7 @@ test("native retry notices do not defeat an accepted review", { timeout: 30_000 
     }
     return script(request);
   });
-  const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+  const result = await nativeReview(t, fixture.url);
   assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
   assert.equal(retried, true);
   assert.match(output.join(""), /session api-retry/u);
@@ -465,7 +454,7 @@ test(
       process.kill(pid, "SIGKILL");
       return { wait: true };
     });
-    const result = await nativeReview(t, fixture.url, fixture.catalogUrl);
+    const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "failed");
     assert.match(result.error ?? "", /closed stdout|exited/u);
     assert.deepEqual(await readdir(temporary), []);
@@ -500,7 +489,6 @@ test(
         reviewConfig({
           executor: "codex",
           aiBaseUrl: fixture.url,
-          codexModelCatalogUrl: fixture.catalogUrl,
           model: "gpt-6.1-sol",
           maxTurns: 2,
         }),
@@ -564,7 +552,6 @@ test(
       reviewConfig({
         executor: "codex",
         aiBaseUrl: fixture.url,
-        codexModelCatalogUrl: fixture.catalogUrl,
         model: "gpt-6.1-sol",
         maxTurns: 2,
         mcpServers: { external: { type: "http", url: "http://127.0.0.1:1/mcp" } },

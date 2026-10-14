@@ -119,11 +119,15 @@ function assertToolHistory(body: Record<string, unknown>): void {
   let outputs = 0;
   for (const item of items) {
     if (!isRecord(item)) continue;
-    if (item.type === "function_call" && typeof item.call_id === "string") calls.add(item.call_id);
+    if (
+      (item.type === "function_call" || item.type === "custom_tool_call") &&
+      typeof item.call_id === "string"
+    )
+      calls.add(item.call_id);
     for (const call of Array.isArray(item.tool_calls) ? item.tool_calls : [])
       if (isRecord(call) && typeof call.id === "string") calls.add(call.id);
     const id =
-      item.type === "function_call_output"
+      item.type === "function_call_output" || item.type === "custom_tool_call_output"
         ? item.call_id
         : item.role === "tool"
           ? item.tool_call_id
@@ -146,7 +150,7 @@ for (const kind of ["cliproxyapi", "litellm"] as const) {
       await t.test(effort, async (subtest) => {
         const fixture = await modelFixture(subtest, completeReviewScript());
         const url = await proxyFixture(subtest, kind, fixture.port);
-        const result = await nativeReview(subtest, url, fixture.catalogUrl, {
+        const result = await nativeReview(subtest, url, {
           aiSecret: "fixture-client-key",
           model: "gpt-6.1-sol-fixture-alias",
           effort,

@@ -80,14 +80,11 @@ test("old replay cases default to Claude and Codex cases retain explicit setting
       executor: "codex",
       effort: "max",
       aiBaseUrl: "https://proxy.example/v1",
-      codexWebsockets: false,
-      codexModelCatalogUrl: "https://proxy.example/catalog",
     },
   });
   assert.equal(selected.config.executor, "codex");
   assert.equal(selected.config.model, "literal-route");
   assert.equal(selected.config.effort, "max");
-  assert.equal(selected.config.codexWebsockets, false);
 });
 
 async function temporaryDirectory(prefix: string): Promise<string> {

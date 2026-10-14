@@ -64,8 +64,6 @@ export interface ReviewGoal {
 
 export interface ReviewConfig {
   readonly executor?: ReviewExecutor;
-  readonly codexWebsockets?: boolean;
-  readonly codexModelCatalogUrl?: string;
   readonly githubToken: string;
   readonly aiBaseUrl: string;
   readonly aiSecret: string;

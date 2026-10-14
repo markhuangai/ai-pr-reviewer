@@ -28,28 +28,12 @@ test("Codex inputs preserve model aliases, effort, and generic proxy settings", 
       ...values,
       executor: "codex",
       effort: "max",
-      "codex-websockets": "true",
-      "codex-model-catalog-url": "https://proxy.example/catalog?token=fixture-catalog-key",
     }),
   );
   assert.equal(codex.executor, "codex");
   assert.equal(codex.model, values.model);
   assert.equal(codex.effort, "max");
-  assert.equal(codex.codexWebsockets, true);
-  assert.ok(reviewSecretCandidates(codex).includes("fixture-catalog-key"));
-  assert.equal(readReviewConfig(reader({ ...values, executor: "codex" })).codexWebsockets, false);
   assert.throws(() => readReviewConfig(reader({ ...values, executor: "other" })), /executor/u);
-  assert.throws(
-    () => readReviewConfig(reader({ ...values, "codex-websockets": "true" })),
-    /require executor/u,
-  );
-  assert.throws(
-    () =>
-      readReviewConfig(
-        reader({ ...values, executor: "codex", "codex-model-catalog-url": "file:///catalog" }),
-      ),
-    /http/u,
-  );
 });
 
 test("reads structured goals and strict HTTP MCP configuration", () => {

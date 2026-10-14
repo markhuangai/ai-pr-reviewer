@@ -6,13 +6,6 @@ inputs:
     description: "Review backend: claude or codex."
     required: false
     default: claude
-  codex-websockets:
-    description: Permit native Codex WebSockets with HTTP fallback; requires executor codex.
-    required: false
-    default: "false"
-  codex-model-catalog-url:
-    description: Optional Codex-compatible proxy model catalog URL; requires executor codex.
-    required: false
   github-pat:
     description: >-
       A GitHub PAT scoped to the target repository. Summary-only runs need Contents

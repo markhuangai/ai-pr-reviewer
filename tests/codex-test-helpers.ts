@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -34,8 +34,21 @@ export type ModelReply =
   | { readonly interruptStream: true }
   | { readonly wait: true };
 
-function wireTools(body: Record<string, unknown>): { name: string; namespace?: string }[] {
-  const result: { name: string; namespace?: string }[] = [];
+function wireTools(
+  body: Record<string, unknown>,
+): { name: string; namespace?: string; codeMode?: boolean }[] {
+  const result: { name: string; namespace?: string; codeMode?: boolean }[] = [];
+  const addTool = (spec: Record<string, unknown>, namespace?: string): void => {
+    if (typeof spec.name !== "string") return;
+    result.push({ name: spec.name, ...(namespace === undefined ? {} : { namespace }) });
+    if (
+      (spec.name === "exec" || spec.name.endsWith("__exec")) &&
+      typeof spec.description === "string"
+    ) {
+      for (const match of spec.description.matchAll(/declare const tools: \{ (\w+)\(/gu))
+        if (match[1] !== undefined) result.push({ name: match[1], codeMode: true });
+    }
+  };
   const definitions: unknown[] = Array.isArray(body.tools) ? body.tools : [];
   for (const item of Array.isArray(body.input) ? body.input : []) {
     if (isRecord(item) && item.type === "additional_tools" && Array.isArray(item.tools))
@@ -45,12 +58,11 @@ function wireTools(body: Record<string, unknown>): { name: string; namespace?: s
     if (!isRecord(tool)) continue;
     if (tool.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools)) {
       for (const child of tool.tools) {
-        if (isRecord(child) && typeof child.name === "string")
-          result.push({ name: child.name, namespace: tool.name });
+        if (isRecord(child)) addTool(child, tool.name);
       }
     } else {
       const spec = isRecord(tool.function) ? tool.function : tool;
-      if (typeof spec.name === "string") result.push({ name: spec.name });
+      addTool(spec);
     }
   }
   return result;
@@ -71,7 +83,7 @@ export function historyDocuments(body: Record<string, unknown>): Record<string, 
       try {
         visit(JSON.parse(value));
       } catch {
-        /* Ordinary model text is not a JSON document. */
+        if (value.includes("\n")) for (const line of value.split("\n")) visit(line);
       }
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item);
@@ -103,6 +115,14 @@ function respond(
       tool,
       "The real Codex request must expose " + reply.tool + "; names=" + toolNames(body).join(","),
     );
+  if (tool?.codeMode && "tool" in reply) {
+    respond(response, body, {
+      ...reply,
+      tool: "exec",
+      input: `text(JSON.stringify(await tools.${tool.name}(${JSON.stringify("input" in reply ? reply.input : reply.args)})));`,
+    });
+    return;
+  }
   const id = "resp_" + randomUUID().replaceAll("-", "");
   const callId = "call_" + randomUUID().replaceAll("-", "");
   response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
@@ -131,7 +151,9 @@ function respond(
                 type: "function",
                 function: {
                   name: tool.name,
-                  arguments: JSON.stringify("args" in reply ? reply.args : {}),
+                  arguments: JSON.stringify(
+                    "input" in reply ? { input: reply.input } : "args" in reply ? reply.args : {},
+                  ),
                 },
               },
             ],
@@ -267,18 +289,16 @@ export async function modelFixture(
   t: TestContext,
   next: (request: ModelRequest, index: number) => ModelReply | Promise<ModelReply>,
 ) {
-  const catalog = JSON.parse(
-    await readFile(new URL("../../tests/fixtures/codex-models.json", import.meta.url), "utf8"),
-  ) as { models: Record<string, unknown>[] };
-  catalog.models.push({ ...catalog.models[0], slug: "gpt-6.1-sol-fixture-alias" });
   const requests: ModelRequest[] = [];
+  const lookups: string[] = [];
   const failures: unknown[] = [];
   let upgrades = 0;
   const server = createServer((request, response) => {
     void (async () => {
       if (request.method === "GET") {
-        response.writeHead(200, { "Content-Type": "application/json" });
-        response.end(JSON.stringify(catalog));
+        lookups.push(request.url ?? "");
+        response.writeHead(404);
+        response.end();
         return;
       }
       const chunks: Buffer[] = [];
@@ -339,9 +359,9 @@ export async function modelFixture(
   const port = (server.address() as AddressInfo).port;
   return {
     requests,
+    lookups,
     port,
     url: `http://127.0.0.1:${port}/v1`,
-    catalogUrl: `http://127.0.0.1:${port}/catalog`,
     upgrades: () => upgrades,
   };
 }
@@ -369,7 +389,7 @@ export function completeReviewScript({ continuation = false, compact = false } =
     const call = calls[step++];
     if (call !== undefined)
       return compact && "tool" in call && call.tool === "read_pr_diff"
-        ? { ...call, inputTokens: 20_000 }
+        ? { ...call, inputTokens: 300_000 }
         : call;
     if (!historyText(request.body).includes("Review submission accepted.")) {
       if (compact) assert.equal(compacted, true, "The real native process must compact.");
@@ -427,7 +447,6 @@ export async function isolatedTemporaryRoot(t: TestContext): Promise<string> {
 export async function nativeReview(
   t: TestContext,
   url: string,
-  catalogUrl: string,
   config = {},
   populate?: (root: string) => Promise<void>,
   contextFiles: readonly PreparedContextFile[] = [],
@@ -466,7 +485,6 @@ export async function nativeReview(
     reviewConfig({
       executor: "codex",
       aiBaseUrl: url,
-      codexModelCatalogUrl: catalogUrl,
       model: "gpt-6.1-sol",
       effort: "high",
       maxTurns: 6,

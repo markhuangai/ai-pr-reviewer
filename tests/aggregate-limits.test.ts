@@ -691,21 +691,9 @@ test("rejects an AI prompt that cannot fit in an inline comment", () => {
   );
 });
 
-test("Claude fingerprints stay unchanged while Codex execution settings distinguish reviews", () => {
+test("Claude fingerprints stay unchanged while Codex execution distinguishes reviews", () => {
   const existing = reviewMarker(context, config);
   assert.equal(reviewMarker(context, { ...config, executor: "claude" }), existing);
   const codex = { ...config, executor: "codex" as const };
   assert.notEqual(reviewMarker(context, codex), existing);
-  assert.equal(
-    reviewMarker(context, codex),
-    reviewMarker(context, { ...codex, codexWebsockets: false }),
-  );
-  assert.notEqual(
-    reviewMarker(context, codex),
-    reviewMarker(context, { ...codex, codexWebsockets: true }),
-  );
-  assert.notEqual(
-    reviewMarker(context, codex),
-    reviewMarker(context, { ...codex, codexModelCatalogUrl: "https://proxy.example/catalog" }),
-  );
 });

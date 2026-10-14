@@ -155,8 +155,6 @@ const caseSchema = z
     config: z
       .object({
         executor: z.enum(["claude", "codex"]).default("claude"),
-        codexWebsockets: z.boolean().optional(),
-        codexModelCatalogUrl: httpUrlSchema.optional(),
         aiBaseUrl: httpUrlSchema.optional(),
         model: z.string().trim().min(1),
         effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
@@ -363,18 +361,8 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
     process.env.AI_PR_REVIEWER_BASE_URL ??
     (input.executor === "claude" ? "https://api.anthropic.com" : undefined);
   if (aiBaseUrl === undefined) throw new Error("Codex replay requires an explicit proxy base URL.");
-  if (
-    input.executor !== "codex" &&
-    (input.codexWebsockets || input.codexModelCatalogUrl !== undefined)
-  ) {
-    throw new Error("Codex replay settings require executor codex.");
-  }
   return {
     executor: input.executor,
-    ...(input.codexWebsockets === undefined ? {} : { codexWebsockets: input.codexWebsockets }),
-    ...(input.codexModelCatalogUrl === undefined
-      ? {}
-      : { codexModelCatalogUrl: input.codexModelCatalogUrl }),
     githubToken: "",
     aiBaseUrl,
     aiSecret,
