@@ -363,7 +363,7 @@ export class CodexSession implements ReviewSession {
           : {
               threadId: this.input.forkFrom,
               excludeTurns: true,
-              config: { mcp_servers: mcp, features: { goals: goal !== undefined } },
+              config: { mcp_servers: mcp, features: config.features },
             }),
       },
     );

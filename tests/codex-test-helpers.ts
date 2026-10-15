@@ -637,6 +637,10 @@ export function sharedReviewScript({
       return reply;
     }
     if (shared) {
+      assert.ok(
+        toolNames(body).every((name) => !/shell|exec_command|web_search|spawn_agent/u.test(name)),
+        "Forked reviewers must retain the disabled native-tool boundaries.",
+      );
       assert.ok(history.includes("Intent: ") || compacted, "The native fork must inherit the map.");
       if (!compacted)
         assert.ok(
