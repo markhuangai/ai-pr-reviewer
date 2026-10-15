@@ -7,9 +7,10 @@ import type {
   GoalSubmission,
   GoalResult,
   ReviewFinding,
+  ReviewModelUsage,
   ReviewEvidenceReference,
 } from "../lib/types.js";
-import { isRecord } from "./agent-logging.js";
+import { isRecord, withTokenUsage, type AcceptedSubmissionMcpStatus } from "./agent-logging.js";
 import { jsonToolResult } from "./agent-review-tools.js";
 import {
   type ReviewEvidenceLedger,
@@ -565,4 +566,39 @@ export function reviewSubmissionRejectionResult(
     }),
     isError: true,
   };
+}
+
+export function acceptedSubmissionResult(
+  goal: string,
+  submission: GoalSubmission,
+  status: AcceptedSubmissionMcpStatus,
+  models: readonly ReviewModelUsage[],
+  tokenAccountingComplete: boolean,
+): GoalResult {
+  const configuredMcpError =
+    status.error === undefined
+      ? status.failures.length === 0
+        ? undefined
+        : `Configured MCP server failure: ${status.failures}`
+      : `Configured MCP server status check failed: ${status.error}`;
+  const error =
+    configuredMcpError ??
+    (submission.limitations.length === 0
+      ? undefined
+      : `Required review investigation remains incomplete for: ${[...new Set(submission.limitations.flatMap((limit) => limit.paths))].slice(0, 20).join(", ") || "goal-wide requirements"}.`);
+  return withTokenUsage(
+    {
+      prompt: goal,
+      status:
+        configuredMcpError !== undefined
+          ? "failed"
+          : submission.limitations.length > 0
+            ? "incomplete"
+            : "completed",
+      submission,
+      ...(error === undefined ? {} : { error }),
+    },
+    models,
+    tokenAccountingComplete,
+  );
 }

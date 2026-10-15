@@ -29,7 +29,7 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "./lib/review-context.js";
-import { redact, redactGoalResults as redactGoals } from "./lib/redaction.js";
+import { redact, redactDiscovery, redactGoalResults as redactGoals } from "./lib/redaction.js";
 import { DiagnosticLogger, type DiagnosticDescriptor } from "./lib/diagnostics.js";
 import { emptyReviewBriefing, reviewBriefingDigest } from "./lib/review-evidence.js";
 import type { ReviewLifecycleSnapshot } from "./lib/github-review-lifecycle.js";
@@ -534,7 +534,7 @@ export async function runAction(
           body: redact(issue.body, secrets),
         })),
       };
-      const rawGoals = await diagnostics.withSpan(
+      const run = await diagnostics.withSpan(
         actionDescriptor(
           "review",
           "action.goals.run",
@@ -554,6 +554,8 @@ export async function runAction(
           ),
       );
       throwIfAborted(signal);
+      const rawGoals = run.goals;
+      const discovery = redactDiscovery(run.discovery, secrets);
       const goals = await diagnostics.withSpan(
         actionDescriptor(
           "review",
@@ -574,6 +576,7 @@ export async function runAction(
             contextFiles: preparedContextFiles.identity,
             briefingDigest: reviewBriefingDigest(context, briefing),
             coverageGoals: rawGoals,
+            ...(discovery === undefined ? {} : { discovery }),
           }),
       );
       if (config.interactWithPullRequest && review.omittedFindings.length > 0) {

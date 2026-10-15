@@ -566,7 +566,7 @@ test("changed-file prompt contains metadata without REST patches", () => {
 test("handles sparse goal arrays without leaking the shared diff", async (t) => {
   const repository = await makeExistingCommitRepository(t);
   const prompts = new Array<ReviewConfig["reviewPrompts"][number]>(1);
-  const results = await runReviewGoals(
+  const { goals: results } = await runReviewGoals(
     repository.context,
     [],
     emptyConversation,

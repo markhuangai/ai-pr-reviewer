@@ -842,18 +842,20 @@ test("wires the injected resolution verifier through the interactive action", as
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     runResolutionVerifiers: (_context, threads) => {
       verifiedThreads = threads.map((item) => item.nodeId);
       return Promise.resolve([

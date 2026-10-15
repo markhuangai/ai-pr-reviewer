@@ -886,6 +886,7 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
 
 export function reviewConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfig {
   return {
+    sharedDiscovery: false,
     githubToken: "github-secret",
     aiBaseUrl: "https://ai.example.test",
     aiSecret: "ai-secret",

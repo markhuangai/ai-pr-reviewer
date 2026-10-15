@@ -12,6 +12,8 @@ import {
   isolatedTemporaryRoot,
   modelFixture,
   nativeReview,
+  sharedReviewRun,
+  sharedReviewScript,
 } from "./codex-test-helpers.js";
 
 const execFileAsync = promisify(execFile);
@@ -144,6 +146,21 @@ function assertToolHistory(body: Record<string, unknown>): void {
 }
 
 for (const kind of ["cliproxyapi", "litellm"] as const) {
+  test(
+    "forked multi-goal Codex reviews through " + images[kind],
+    { timeout: 300_000 },
+    async (t) => {
+      const script = sharedReviewScript();
+      const fixture = await modelFixture(t, script.next);
+      const url = await proxyFixture(t, kind, fixture.port);
+      const { run } = await sharedReviewRun(t, url, "codex", script, true, {
+        aiSecret: "fixture-client-key",
+        model: "gpt-6.1-sol-fixture-alias",
+      });
+      assert.equal(run.discovery?.status, "completed");
+      for (const { body } of fixture.requests) assertToolHistory(body);
+    },
+  );
   test("complete native Codex reviews through " + images[kind], { timeout: 300_000 }, async (t) => {
     await isolatedTemporaryRoot(t);
     for (const effort of ["low", "high", "max"] as const) {

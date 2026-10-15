@@ -281,7 +281,7 @@ test("reconciles prepared lifecycle candidates before skipping an identical revi
     },
     runGoals: () => {
       goalRuns += 1;
-      return Promise.resolve([]);
+      return Promise.resolve({ goals: [] });
     },
     writeSummary: () => Promise.resolve(),
   });
@@ -391,7 +391,7 @@ test("finalizes resolved lifecycle reviews before skipping an identical review",
     },
     runGoals: () => {
       goalRuns += 1;
-      return Promise.resolve([]);
+      return Promise.resolve({ goals: [] });
     },
     writeSummary: () => Promise.resolve(),
   });
@@ -571,7 +571,7 @@ test("refreshes the conversation digest after lifecycle comment edits before dup
       ]),
     runGoals: () => {
       goalRuns += 1;
-      return Promise.resolve([]);
+      return Promise.resolve({ goals: [] });
     },
     writeSummary: () => Promise.resolve(),
   });

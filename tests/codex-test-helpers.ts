@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,10 +10,17 @@ import {
   emptyConversation,
   runReviewGoalWithEmptyGuidance,
 } from "./agent-test-helpers.js";
-import { makeReplayRepository, makeDiffFromSnapshots } from "./git-test-helpers.js";
+import {
+  makeReplayRepository,
+  makeDiffFromSnapshots,
+  commitFixtureSnapshot,
+} from "./git-test-helpers.js";
 import type { TestContext } from "node:test";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import type { PreparedContextFile } from "../src/lib/context-files.js";
+import { prepareContextFiles } from "../src/lib/context-files.js";
+import { runReviewGoals } from "../src/runtime/agent.js";
+import type { ReviewConfig, ReviewExecutor } from "../src/lib/types.js";
 
 export interface ModelRequest {
   readonly path: string;
@@ -125,6 +132,74 @@ function respond(
   }
   const id = "resp_" + randomUUID().replaceAll("-", "");
   const callId = "call_" + randomUUID().replaceAll("-", "");
+  if (Array.isArray(body.messages) && typeof body.max_tokens === "number") {
+    const content =
+      tool === undefined
+        ? { type: "text", text: "text" in reply ? reply.text : "" }
+        : {
+            type: "tool_use",
+            id: callId,
+            name: tool.name,
+            input: "args" in reply ? reply.args : {},
+          };
+    const message = {
+      id,
+      type: "message",
+      role: "assistant",
+      model: body.model,
+      content: [content],
+      stop_reason: tool === undefined ? "end_turn" : "tool_use",
+      stop_sequence: null,
+      usage: {
+        input_tokens: reply.inputTokens ?? 100,
+        output_tokens: 10,
+        cache_read_input_tokens: reply.cachedInputTokens ?? 0,
+        cache_creation_input_tokens: 0,
+      },
+    };
+    if (body.stream !== true) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(message));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+    const event = (type: string, data: unknown) =>
+      response.write("event: " + type + "\ndata: " + JSON.stringify(data) + "\n\n");
+    event("message_start", {
+      type: "message_start",
+      message: {
+        ...message,
+        content: [],
+        stop_reason: null,
+        usage: { ...message.usage, output_tokens: 0 },
+      },
+    });
+    event("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: tool === undefined ? { type: "text", text: "" } : { ...content, input: {} },
+    });
+    event("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta:
+        tool === undefined
+          ? { type: "text_delta", text: "text" in reply ? reply.text : "" }
+          : {
+              type: "input_json_delta",
+              partial_json: JSON.stringify("args" in reply ? reply.args : {}),
+            },
+    });
+    event("content_block_stop", { type: "content_block_stop", index: 0 });
+    event("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: message.stop_reason, stop_sequence: null },
+      usage: { output_tokens: 10 },
+    });
+    event("message_stop", { type: "message_stop" });
+    response.end();
+    return;
+  }
   response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
   if (Array.isArray(body.messages)) {
     const chunk = (delta: unknown, finish: string | null = null) =>
@@ -295,7 +370,7 @@ export async function modelFixture(
   let upgrades = 0;
   const server = createServer((request, response) => {
     void (async () => {
-      if (request.method === "GET") {
+      if (request.method === "GET" || request.method === "HEAD") {
         lookups.push(request.url ?? "");
         response.writeHead(404);
         response.end();
@@ -304,7 +379,13 @@ export async function modelFixture(
       const chunks: Buffer[] = [];
       for await (const chunk of request as AsyncIterable<Uint8Array>)
         chunks.push(Buffer.from(chunk));
+      assert.ok(chunks.length > 0, `Empty upstream request: ${request.method} ${request.url}`);
       const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+      if (request.url?.includes("count_tokens")) {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ input_tokens: 100 }));
+        return;
+      }
       const entry = { path: request.url ?? "", body };
       requests.push(entry);
       const reply = await next(entry, requests.length - 1);
@@ -497,4 +578,212 @@ export async function nativeReview(
     contextFiles,
     controller,
   );
+}
+
+export function sharedReviewScript({
+  shared = true,
+  exhaust = false,
+  compact = false,
+  partial = false,
+} = {}) {
+  let discoveryStep = 0;
+  let compacted = false;
+  const steps = new Map<string, number>();
+  const reads: { goal: string; tool: string }[] = [];
+  const next = ({ body }: ModelRequest): ModelReply => {
+    const history = historyText(body);
+    if (toolNames(body).length === 0) {
+      compacted = true;
+      return {
+        text: "The shared orientation read the overview, briefing and review.txt diff. The change adds an unchecked value. Finish a neutral map with explicit unknowns.",
+      };
+    }
+    const label = ["ALPHA", "BETA", "GAMMA"].find((name) => history.includes("GOAL_" + name));
+    if (label === undefined) {
+      if (history.includes("Discovery change map accepted."))
+        return { text: "Orientation complete." };
+      if (
+        history.includes("Finish the change map from evidence already delivered") ||
+        (exhaust && discoveryStep >= 17)
+      )
+        return {
+          tool: "finish_discovery",
+          args: {
+            changeMap:
+              "Intent: add a value to review.txt. Area: the text consumer. Entry points and tests need further investigation. Unknowns: surrounding consumers were not read.",
+          },
+        };
+      const sequence: ModelReply[] = [
+        { tool: "read_change_overview", args: {} },
+        {
+          tool: "read_pr_diff",
+          args: { paths: ["review.txt"] },
+          ...(compact ? { inputTokens: 300_000 } : {}),
+        },
+        {
+          tool: "finish_discovery",
+          args: {
+            changeMap:
+              "Intent: append a value in review.txt. Area: the text consumer. Entry point: review.txt. Tests and consumers remain unknown; reviewers must investigate independently.",
+          },
+        },
+      ];
+      const reply: ModelReply = exhaust
+        ? { tool: "read_change_overview", args: {} }
+        : (sequence[discoveryStep] ?? { text: "Orientation complete." });
+      discoveryStep++;
+      if ("tool" in reply && reply.tool.startsWith("read_"))
+        reads.push({ goal: "discovery", tool: reply.tool });
+      return reply;
+    }
+    if (shared) {
+      assert.ok(history.includes("Intent: ") || compacted, "The native fork must inherit the map.");
+      if (!compacted)
+        assert.ok(
+          history.includes("+after") || (partial && history.includes("+" + "x".repeat(50))),
+          "The native fork must inherit actual selected source results.",
+        );
+      assert.ok(
+        history.includes(privatePaths.get(label) ?? "missing"),
+        "The first child request must contain its authorized context index.",
+      );
+      assert.ok(
+        history.includes("FULL_GOAL_END_" + label),
+        "The first child request must contain the full goal beyond the native command limit.",
+      );
+    }
+    if (history.includes("Review submission accepted.")) return { text: "Review complete." };
+    const step = steps.get(label) ?? 0;
+    steps.set(label, step + 1);
+    const calls: ModelReply[] = [
+      { tool: "read_review_briefing", args: {} },
+      ...(!shared || partial ? [{ tool: "read_pr_diff", args: { remaining: true } } as const] : []),
+      { tool: "read_review_state", args: {} },
+      { tool: "read_context_file", args: { path: privatePaths.get(label) ?? "missing" } },
+      {
+        tool: "read_repository_file",
+        args: { revision: "head", path: label.toLowerCase() + ".txt" },
+      },
+      {
+        tool: "submit_review",
+        args: { summary: "Checked the goal independently.", findings: [], limitations: [] },
+      },
+    ];
+    for (const sibling of ["ALPHA", "BETA", "GAMMA"].filter((name) => name !== label)) {
+      assert.ok(!history.includes("GOAL_" + sibling));
+      assert.ok(!history.includes("PRIVATE_" + sibling + "_DATA"));
+      assert.ok(!history.includes("LATER_" + sibling + "_SOURCE"));
+    }
+    const reply = calls[step] ?? { text: "Review complete." };
+    if ("tool" in reply && reply.tool.startsWith("read_"))
+      reads.push({ goal: label, tool: reply.tool });
+    return reply;
+  };
+  const privatePaths = new Map<string, string>();
+  return { next, reads, privatePaths, partial };
+}
+
+export async function sharedReviewRun(
+  t: TestContext,
+  url: string,
+  executor: ReviewExecutor,
+  script: ReturnType<typeof sharedReviewScript>,
+  sharedDiscovery = true,
+  overrides: Partial<ReviewConfig> = {},
+  lifecycle: {
+    readonly controller?: AbortController;
+    readonly runner?: typeof runReviewGoals;
+    readonly expectedStatuses?: readonly string[];
+  } = {},
+) {
+  const temporary = await isolatedTemporaryRoot(t);
+  const repository = await makeReplayRepository(t, async (root) => {
+    for (const label of ["ALPHA", "BETA", "GAMMA"])
+      await writeFile(join(root, label.toLowerCase() + ".txt"), "LATER_" + label + "_SOURCE\n");
+  });
+  let context = repository.context;
+  if (script.partial) {
+    await writeFile(join(repository.root, "review.txt"), "before\n" + "x".repeat(4300) + "\n");
+    const headSha = await commitFixtureSnapshot(
+      repository.root,
+      repository.temporaryRoot,
+      repository.headSha,
+    );
+    context = { ...context, headSha };
+  }
+  const goals = [];
+  for (const label of ["ALPHA", "BETA", "GAMMA"]) {
+    const path = join(temporary, label + ".txt");
+    await writeFile(path, "PRIVATE_" + label + "_DATA");
+    script.privatePaths.set(label, path);
+    goals.push({
+      prompt:
+        "GOAL_" +
+        label +
+        ": independently inspect the change. " +
+        "Goal detail. ".repeat(400) +
+        "FULL_GOAL_END_" +
+        label,
+      files: [path],
+    });
+  }
+  const prepared = await prepareContextFiles(goals, repository.root);
+  const controller = lifecycle.controller ?? new AbortController();
+  const cancel = () => {
+    controller.abort(t.signal.reason);
+  };
+  t.signal.addEventListener("abort", cancel, { once: true });
+  t.after(() => {
+    t.signal.removeEventListener("abort", cancel);
+  });
+  try {
+    const config = reviewConfig({
+      executor,
+      sharedDiscovery,
+      aiBaseUrl: executor === "claude" ? url.replace(/\/v1$/u, "") : url,
+      model: executor === "claude" ? "claude-sonnet-4-5" : "gpt-6.1-sol",
+      effort: "high",
+      maxTurns: 20,
+      reviewPrompts: goals,
+      parallelCount: 2,
+      autoApprove: true,
+      ...overrides,
+    });
+    const run = await (lifecycle.runner ?? runReviewGoals)(
+      context,
+      [
+        {
+          path: "review.txt",
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          changes: 1,
+          addedLines: new Set([2]),
+        },
+      ],
+      emptyConversation,
+      config,
+      prepared.filesByGoal,
+      repository.root,
+      undefined,
+      controller,
+      { linkedIssues: [], linkedIssueReferencesTruncated: false, repositoryGuidance: [] },
+    );
+    assert.deepEqual(
+      run.goals.map((goal) => goal.status),
+      lifecycle.expectedStatuses ?? ["completed", "completed", "completed"],
+      JSON.stringify(run),
+    );
+    for (const goal of run.goals)
+      if (goal.status === "completed")
+        assert.deepEqual(goal.inspection, { observedPaths: ["review.txt"], missingPaths: [] });
+    return { run, config, context };
+  } finally {
+    await prepared.cleanup();
+    assert.equal(
+      (await readdir(temporary)).some((name) => name.startsWith("ai-pr-reviewer-discovery-")),
+      false,
+      "The run owner must remove discovery storage after all child shutdowns.",
+    );
+  }
 }

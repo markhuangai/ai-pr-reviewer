@@ -1,17 +1,15 @@
 import { lstatSync, realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
 import type {
   ChangedFile,
-  GoalResult,
-  GoalSubmission,
   ReviewFindingEvidence,
   ReviewInspection,
   ReviewEvidenceBounds,
   ReviewEvidenceReference,
   ReviewFinding,
-  ReviewModelUsage,
   ReviewSourceRange,
 } from "../lib/types.js";
 import {
@@ -20,7 +18,6 @@ import {
   mergeDeliveredRanges,
   type DiffFileSpan,
 } from "./agent-review-tools.js";
-import { withTokenUsage, type AcceptedSubmissionMcpStatus } from "./agent-logging.js";
 
 import { pathSchema, reviewEvidenceResultSchema } from "./review-evidence-schema.js";
 export {
@@ -32,40 +29,6 @@ export {
 } from "./review-evidence-schema.js";
 
 const MAX_EVIDENCE_CURSORS = 32;
-export function acceptedSubmissionResult(
-  goal: string,
-  submission: GoalSubmission,
-  status: AcceptedSubmissionMcpStatus,
-  models: readonly ReviewModelUsage[],
-  tokenAccountingComplete: boolean,
-): GoalResult {
-  const configuredMcpError =
-    status.error === undefined
-      ? status.failures.length === 0
-        ? undefined
-        : `Configured MCP server failure: ${status.failures}`
-      : `Configured MCP server status check failed: ${status.error}`;
-  const error =
-    configuredMcpError ??
-    (submission.limitations.length === 0
-      ? undefined
-      : `Required review investigation remains incomplete for: ${[...new Set(submission.limitations.flatMap((limit) => limit.paths))].slice(0, 20).join(", ") || "goal-wide requirements"}.`);
-  return withTokenUsage(
-    {
-      prompt: goal,
-      status:
-        configuredMcpError !== undefined
-          ? "failed"
-          : submission.limitations.length > 0
-            ? "incomplete"
-            : "completed",
-      submission,
-      ...(error === undefined ? {} : { error }),
-    },
-    models,
-    tokenAccountingComplete,
-  );
-}
 
 export interface RepositoryReviewToolCall {
   readonly tool_name: string;
@@ -416,6 +379,42 @@ export class ReviewEvidenceLedger {
     private readonly files: readonly ChangedFile[] = [],
     private readonly snapshot?: { mergeBaseSha: string; headSha: string },
   ) {}
+
+  checkpoint() {
+    return structuredClone({
+      identity: createHash("sha256")
+        .update(
+          JSON.stringify({
+            cwd: this.cwd,
+            snapshot: this.snapshot,
+            files: this.files.map((file) => ({ ...file, addedLines: [...file.addedLines] })),
+          }),
+        )
+        .digest("hex"),
+      sequence: this.sequence,
+      references: [...this.references],
+      delivered: [...this.delivered],
+      nativeDelivered: [...this.nativeDelivered],
+      observedCalls: [...this.observedCalls],
+      requiredBytes: this.requiredBytes,
+      uniqueSourceBytes: this.uniqueSourceBytes,
+      repeatedSourceBytes: this.repeatedSourceBytes,
+    });
+  }
+
+  inherit(source: ReturnType<ReviewEvidenceLedger["checkpoint"]>): void {
+    if (this.sequence !== 0 || source.identity !== this.checkpoint().identity)
+      throw new Error("Shared evidence does not match this immutable review snapshot.");
+    const state = structuredClone(source);
+    this.sequence = state.sequence;
+    for (const [key, value] of state.references) this.references.set(key, value);
+    for (const [key, value] of state.delivered) this.delivered.set(key, value);
+    for (const [key, value] of state.nativeDelivered) this.nativeDelivered.set(key, value);
+    for (const id of state.observedCalls) this.observedCalls.add(id);
+    this.requiredBytes = state.requiredBytes;
+    this.uniqueSourceBytes = state.uniqueSourceBytes;
+    this.repeatedSourceBytes = state.repeatedSourceBytes;
+  }
 
   get inspectionProgress(): number {
     return this.requiredBytes + reviewInspection(this.files, this.references).observedPaths.length;

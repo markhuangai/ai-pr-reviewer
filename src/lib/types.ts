@@ -72,6 +72,7 @@ export interface ReviewConfig {
   readonly systemPrompt?: string;
   readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly ReviewGoal[];
+  readonly sharedDiscovery?: boolean;
   readonly parallelCount: number;
   readonly maxTurns: number;
   readonly autoApprove: boolean;
@@ -236,6 +237,24 @@ export interface GoalResult {
     readonly uniqueSourceBytes?: number;
     readonly repeatedSourceBytes?: number;
   };
+}
+
+export interface DiscoveryResult {
+  readonly status: "completed" | "failed";
+  readonly error?: string;
+  readonly tokenUsage: GoalTokenUsage;
+  readonly diagnostics: {
+    readonly readCalls: number;
+    readonly deliveredBytes: number;
+    readonly elapsedMs: number;
+    readonly compactions: number;
+    readonly termination: string;
+  };
+}
+
+export interface ReviewGoalsResult {
+  readonly goals: readonly GoalResult[];
+  readonly discovery?: DiscoveryResult;
 }
 
 export interface TokenCounts {

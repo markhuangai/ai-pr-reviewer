@@ -63,18 +63,20 @@ test("correlates action phases and cleanup outcomes in diagnostics", async (t) =
       createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
       readFiles: () => Promise.resolve([]),
       runGoals: () =>
-        Promise.resolve([
-          {
-            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-            prompt: "correctness",
-            status: "completed",
-            submission: {
-              limitations: [],
-              summary: "clean",
-              findings: [],
+        Promise.resolve({
+          goals: [
+            {
+              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+              prompt: "correctness",
+              status: "completed",
+              submission: {
+                limitations: [],
+                summary: "clean",
+                findings: [],
+              },
             },
-          },
-        ]),
+          ],
+        }),
       writeSummary: () => Promise.resolve(),
     },
     new AbortController(),
@@ -289,18 +291,20 @@ test("keeps secret-bearing coverage paths for completeness without publishing th
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     readFiles: () => Promise.resolve(files),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: [...[changedPath]], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed" as const,
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: [...[changedPath]], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed" as const,
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: (summaryContext, review, goals) => {
       summary = buildRunSummary(summaryContext, review, goals);
       publishedGoals = goals;
@@ -612,7 +616,7 @@ test("summary-only URL reviews make GET requests and write one run summary", asy
       ]);
       assert.deepEqual(contextFiles, [[]]);
       assert.equal(cwd, workspace);
-      return Promise.resolve(goals);
+      return Promise.resolve({ goals: goals });
     },
     writeSummary: (context, review, completedGoals) => {
       summaryWrites += 1;
@@ -764,20 +768,22 @@ test("denied optional issues warn once while summary and interactive reviews kee
                   { number: 12, status: 403 },
                   { number: 13, status: 403 },
                 ]);
-                return Promise.resolve([
-                  {
-                    prompt: "correctness",
-                    status: incomplete ? "incomplete" : "completed",
-                    inspection: { observedPaths: [], missingPaths: [] },
-                    submission: {
-                      summary: "Reviewed code",
-                      findings: [],
-                      limitations: incomplete
-                        ? [{ paths: [], reason: "Required investigation could not finish." }]
-                        : [],
+                return Promise.resolve({
+                  goals: [
+                    {
+                      prompt: "correctness",
+                      status: incomplete ? "incomplete" : "completed",
+                      inspection: { observedPaths: [], missingPaths: [] },
+                      submission: {
+                        summary: "Reviewed code",
+                        findings: [],
+                        limitations: incomplete
+                          ? [{ paths: [], reason: "Required investigation could not finish." }]
+                          : [],
+                      },
                     },
-                  },
-                ]);
+                  ],
+                });
               },
               writeSummary: () => {
                 summaryWrites += 1;
@@ -865,7 +871,7 @@ test("skips an identical current-head review by the authenticated user", async (
       createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
       runGoals: () => {
         goalRuns += 1;
-        return Promise.resolve([]);
+        return Promise.resolve({ goals: [] });
       },
       writeSummary: () => Promise.resolve(),
     },
@@ -924,18 +930,20 @@ test("passes immutable context snapshots to goals and cleans them after the run"
         assert.equal(await readFile(snapshotPath, "utf8"), originalContent);
         await writeFile(contextPath, "changed after capture\n");
         assert.equal(await readFile(snapshotPath, "utf8"), originalContent);
-        return [
-          {
-            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-            prompt: "Review ticket requirements.",
-            status: "completed",
-            submission: {
-              limitations: [],
-              summary: "clean",
-              findings: [],
+        return {
+          goals: [
+            {
+              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+              prompt: "Review ticket requirements.",
+              status: "completed",
+              submission: {
+                limitations: [],
+                summary: "clean",
+                findings: [],
+              },
             },
-          },
-        ];
+          ],
+        };
       },
       writeSummary: () => Promise.resolve(),
     },
@@ -973,18 +981,20 @@ test("falls back from a rejected approval to a comment review", async (t) => {
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
 
@@ -1016,18 +1026,20 @@ test("downgrades a stale auto-approval to a captured comment", async (t) => {
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
 
@@ -1057,18 +1069,20 @@ test("downgrades approval when the captured base changed", async (t) => {
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
 
@@ -1094,18 +1108,20 @@ test("propagates non-approval review failures", async (t) => {
       readEventContext: () => Promise.resolve(context),
       createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
       runGoals: () =>
-        Promise.resolve([
-          {
-            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-            prompt: "correctness",
-            status: "completed",
-            submission: {
-              limitations: [],
-              summary: "finding",
-              findings: [],
+        Promise.resolve({
+          goals: [
+            {
+              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+              prompt: "correctness",
+              status: "completed",
+              submission: {
+                limitations: [],
+                summary: "finding",
+                findings: [],
+              },
             },
-          },
-        ]),
+          ],
+        }),
       writeSummary: () => Promise.resolve(),
     }),
     /GitHub unavailable/u,
@@ -1150,18 +1166,20 @@ test("reviews the captured pull request discussion without rechecking it", async
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
@@ -1191,18 +1209,20 @@ test("reviews the captured event refs without querying their live state", async 
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
@@ -1290,18 +1310,20 @@ test("reconciles interactive lifecycle state before and after the current review
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
@@ -1350,18 +1372,20 @@ test("keeps lifecycle mutations disabled in summary-only mode", async (t) => {
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "clean",
-            findings: [],
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "clean",
+              findings: [],
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: () => Promise.resolve(),
   });
   assert.equal(result.skipped, false);
@@ -1400,24 +1424,26 @@ test("publishes 25 inline findings and writes overflow to the run summary", asyn
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
     readFiles: () => Promise.resolve(files),
     runGoals: () =>
-      Promise.resolve([
-        {
-          inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
-          prompt: "correctness",
-          status: "completed",
-          submission: {
-            limitations: [],
-            summary: "overflow",
-            findings: files.map((file, index) => ({
-              title: `Finding ${String(index).padStart(2, "0")}`,
-              severity: "MODERATE" as const,
-              body: `Evidence ${index}`,
-              path: file.path,
-              line: 1,
-            })),
+      Promise.resolve({
+        goals: [
+          {
+            inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+            prompt: "correctness",
+            status: "completed",
+            submission: {
+              limitations: [],
+              summary: "overflow",
+              findings: files.map((file, index) => ({
+                title: `Finding ${String(index).padStart(2, "0")}`,
+                severity: "MODERATE" as const,
+                body: `Evidence ${index}`,
+                path: file.path,
+                line: 1,
+              })),
+            },
           },
-        },
-      ]),
+        ],
+      }),
     writeSummary: (summaryContext, review, goals) => {
       publicationOrder.push("summary");
       summaryWrites += 1;

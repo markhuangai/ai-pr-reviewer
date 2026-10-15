@@ -8,7 +8,7 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from "./agent-test-helpers.js";
-import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
+import { acceptedSubmissionResult } from "../src/runtime/review-submission.js";
 import type { GoalSubmission } from "../src/lib/types.js";
 import { writeReviewDiagnostic } from "../src/runtime/review-diagnostics.js";
 

@@ -1,8 +1,8 @@
+import { acceptedSubmissionResult } from "./review-submission.js";
+import { ReviewBriefingReader } from "./review-briefing.js";
 import {
   query as sdkQuery,
   type HookCallback,
-  type SDKActiveGoalMessage,
-  type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -28,7 +28,6 @@ import {
   logAgentLifecycleMessage,
   logAgentMessageSafely,
   logQueuedUserMessage,
-  modelUsageSnapshot,
   acceptedSubmissionDetails,
   readAcceptedSubmissionMcpFailures,
   readAcceptedSubmissionMcpStatus,
@@ -46,7 +45,6 @@ import {
   PullRequestConversationReader,
   type PullRequestDiffArtifact,
   PullRequestDiffReader,
-  ReviewBriefingReader,
   jsonToolResult,
 } from "./agent-review-tools.js";
 import {
@@ -71,7 +69,6 @@ import {
 } from "./agent-session.js";
 import {
   ReviewEvidenceLedger,
-  acceptedSubmissionResult,
   toolResponseDocument,
   type ReviewValidationGap,
 } from "./review-assessment.js";
@@ -97,6 +94,14 @@ import {
   type ReviewSession,
 } from "./review-session.js";
 import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
+import {
+  assertDiscoverySnapshot,
+  assertIndependentSession,
+  sharedModelUsage,
+  forkSessionOptions,
+  runSharedDiscovery,
+  type SharedReviewSeed,
+} from "./shared-discovery.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
 export async function runReviewGoal(
   goal: string,
@@ -114,9 +119,11 @@ export async function runReviewGoal(
     linkedIssues: [],
     linkedIssueReferencesTruncated: false,
   },
+  sharedSeed?: SharedReviewSeed,
 ): Promise<GoalResult> {
   const signal = abortController?.signal;
   throwIfAborted(signal);
+  assertDiscoverySnapshot(sharedSeed, context, conversation, briefing);
   let submission: GoalSubmission | undefined;
   const startedAt = Date.now();
   const recovery = new ReviewSubmissionRecovery(config.maxTurns);
@@ -176,6 +183,7 @@ export async function runReviewGoal(
     mergeBaseSha: diff.mergeBaseSha,
     headSha: context.headSha,
   });
+  if (sharedSeed !== undefined) evidenceLedger.inherit(sharedSeed.evidence);
   const {
     inspectionDetails,
     recoveryDetails,
@@ -249,6 +257,7 @@ export async function runReviewGoal(
     ...briefing,
     repositoryGuidance,
   });
+  if (sharedSeed !== undefined) briefingReader.inherit(sharedSeed.briefing);
   const discussionQueryCursors = new Map<string, string>();
   const queryReaderDiscussionKeys = new Map<string, string>();
   const detachDiscussionQuery = (cursor: string): void => {
@@ -528,11 +537,12 @@ export async function runReviewGoal(
     return (closedOperation = session.close());
   };
   let shutdown: Promise<void> | undefined;
+  let confirmClosed: (() => void) | undefined;
   const finishSession = async (): Promise<void> => {
     monitor?.stop();
     sessionState.expectedSessionClose = true;
     input.finish();
-    await (shutdown ??= closeSdkSession(closeSession, reader));
+    await (shutdown ??= closeSdkSession(closeSession, reader).then(() => confirmClosed?.()));
     if (readerFailure !== undefined) throw readerFailure;
   };
   const tokenUsageState: {
@@ -585,6 +595,7 @@ export async function runReviewGoal(
     });
     session = createReviewSession(queryAgent, {
       config,
+      ...forkSessionOptions(sharedSeed),
       cwd,
       tools: reviewTools,
       outputServerName,
@@ -603,6 +614,7 @@ export async function runReviewGoal(
       ),
     });
     const activeSession = session;
+    confirmClosed = sharedSeed?.retainSession();
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
     const readMcpFailures = (): Promise<readonly string[]> =>
       readAcceptedSubmissionMcpFailures(() => activeSession.mcpServerStatus(), configuredMcpNames);
@@ -684,9 +696,8 @@ export async function runReviewGoal(
     sessionPhase = "waiting-for-sdk-message";
     reader = (async () => {
       try {
-        for await (const message of activeSession as AsyncIterable<
-          SDKMessage | SDKActiveGoalMessage
-        >) {
+        for await (const message of activeSession) {
+          assertIndependentSession(message, sharedSeed);
           activeMonitor.observe(sdkSessionActivity(message, toolUses));
           if (message.type !== "active_goal")
             logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
@@ -696,7 +707,7 @@ export async function runReviewGoal(
           if (isReviewActive()) recovery.observeMessage(message, observeRejection);
           if (message.type === "result") {
             if (submission !== undefined) activeMonitor.stop();
-            const snapshot = modelUsageSnapshot(message.modelUsage);
+            const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
             tokenUsageState.latestSnapshotValid = snapshot !== undefined;
             if (snapshot !== undefined) tokenUsageState.models = snapshot;
             const completedTurn = turn;
@@ -737,6 +748,7 @@ export async function runReviewGoal(
       undefined,
       cwd,
       config.interactWithPullRequest,
+      sharedSeed !== undefined,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -982,4 +994,4 @@ export async function runReviewGoal(
     );
   }
 }
-export const runReviewGoals = createReviewGoalsRunner(runReviewGoal, sdkQuery);
+export const runReviewGoals = createReviewGoalsRunner(runReviewGoal, sdkQuery, runSharedDiscovery);

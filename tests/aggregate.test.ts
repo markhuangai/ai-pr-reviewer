@@ -11,7 +11,7 @@ import {
 import type { GoalResult, ReviewConfig } from "../src/lib/types.js";
 import { config, context, files } from "./aggregate-test-fixtures.js";
 import { redactGoalResults } from "../src/lib/redaction.js";
-import { acceptedSubmissionResult } from "../src/runtime/review-assessment.js";
+import { acceptedSubmissionResult } from "../src/runtime/review-submission.js";
 
 test("partial review summaries identify incomplete checks without publishing raw goal errors", () => {
   const diagnostics = (termination: string) => ({

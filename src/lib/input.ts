@@ -487,6 +487,7 @@ export function readReviewConfig(reader: InputReader): ReviewConfig {
     ...(systemPrompt.length === 0 ? {} : { systemPrompt }),
     ...(modelPricing === undefined ? {} : { modelPricing }),
     reviewPrompts: parseReviewPrompts(reader.get("review-prompts")),
+    sharedDiscovery: parseBoolean(reader.get("shared-discovery"), "shared-discovery", true),
     parallelCount: parseInteger(
       reader.get("parallel-count") || "5",
       "parallel-count",
