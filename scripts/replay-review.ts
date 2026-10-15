@@ -15,13 +15,15 @@ import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
 } from "../src/lib/review-context.js";
-import { redact, redactGoalResults } from "../src/lib/redaction.js";
+import { redact, redactDiscovery, redactGoalResults } from "../src/lib/redaction.js";
 import { emptyReviewBriefing } from "../src/lib/review-evidence.js";
 import type {
   GoalResult,
   PullRequestContext,
   ReviewBriefing,
   ReviewConfig,
+  ReviewGoalsResult,
+  DiscoveryResult,
 } from "../src/lib/types.js";
 import { runReviewGoals } from "../src/runtime/agent.js";
 import { isWithinRepository } from "../src/runtime/agent-review-tools.js";
@@ -161,6 +163,7 @@ const caseSchema = z
         systemPrompt: z.string().trim().optional(),
         modelPricing: pricingSchema.optional(),
         reviewPrompts: z.array(goalSchema).min(1).max(REVIEW_INPUT_LIMITS.maxPrompts),
+        sharedDiscovery: z.boolean().default(true),
         parallelCount: z
           .number()
           .int()
@@ -261,6 +264,7 @@ export interface ReplayOutput {
   readonly allGoalsFailed: boolean;
   readonly findings: unknown;
   readonly goals: readonly Omit<GoalResult, "prompt">[];
+  readonly discovery?: DiscoveryResult;
 }
 
 export type ReplayRunner = typeof runReviewGoals;
@@ -373,6 +377,7 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
       : { systemPrompt: input.systemPrompt }),
     ...(input.modelPricing === undefined ? {} : { modelPricing: input.modelPricing }),
     reviewPrompts: input.reviewPrompts,
+    sharedDiscovery: input.sharedDiscovery,
     parallelCount: input.parallelCount,
     maxTurns: input.maxTurns,
     autoApprove: input.autoApprove,
@@ -402,7 +407,7 @@ export async function replayCase(
   const secrets = reviewSecretCandidates(config);
   const files = await readPullRequestFilesFromCheckout(context, root);
   const contextFiles = await prepareContextFiles(config.reviewPrompts, root);
-  let rawGoals: readonly GoalResult[];
+  let run: ReviewGoalsResult;
   try {
     const redactedContext: PullRequestContext = {
       ...context,
@@ -428,7 +433,7 @@ export async function replayCase(
         body: redact(issue.body, secrets),
       })),
     };
-    rawGoals = await runner(
+    run = await runner(
       redactedContext,
       files,
       redactedConversation,
@@ -442,10 +447,16 @@ export async function replayCase(
   } finally {
     await contextFiles.cleanup();
   }
+  const rawGoals = run.goals;
+  const discovery = redactDiscovery(run.discovery, secrets);
   const goals = redactGoalResults(rawGoals, secrets);
-  const review = aggregateReview(context, config, files, goals, { coverageGoals: rawGoals });
+  const review = aggregateReview(context, config, files, goals, {
+    coverageGoals: rawGoals,
+    ...(discovery === undefined ? {} : { discovery }),
+  });
   return {
     version: 2,
+    ...(discovery === undefined ? {} : { discovery }),
     caseId: redact(input.caseId, secrets),
     ...(input.labels === undefined ? {} : { labels: redactJson(input.labels, secrets) }),
     repository: redact(context.repository, secrets),

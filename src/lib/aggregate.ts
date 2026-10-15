@@ -5,6 +5,8 @@ import type {
   AggregatedReview,
   AggregatedTokenUsage,
   ChangedFile,
+  DiscoveryResult,
+  GoalTokenUsage,
   GoalResult,
   HttpMcpServer,
   ModelPricingConfig,
@@ -45,6 +47,7 @@ interface AggregateReviewOptions {
   readonly contextFiles?: ContextFileIdentityByGoal;
   readonly briefingDigest?: string;
   readonly coverageGoals?: readonly GoalResult[];
+  readonly discovery?: DiscoveryResult;
 }
 function normalizeText(value: string): string {
   return value
@@ -136,6 +139,9 @@ export function reviewMarker(
     ...(config.systemPrompt === undefined ? {} : { systemPrompt: config.systemPrompt }),
     aiBaseUrl: config.aiBaseUrl,
     prompts: config.reviewPrompts.map((goal) => goal.prompt),
+    ...(config.sharedDiscovery !== false && config.reviewPrompts.length > 1
+      ? { sharedDiscovery: 1 }
+      : {}),
     ...(stableContextFiles.some((files) => files.length > 0)
       ? { contextFiles: stableContextFiles }
       : {}),
@@ -189,12 +195,12 @@ function configuredRates(
 }
 
 function aggregateTokenUsage(
-  goals: readonly GoalResult[],
+  snapshots: readonly (GoalTokenUsage | undefined)[],
   pricing: ModelPricingConfig | undefined,
 ): AggregatedTokenUsage {
   const modelsByKey = new Map<string, ReviewModelUsage>();
-  for (const goal of goals) {
-    for (const usage of goal.tokenUsage?.models ?? []) {
+  for (const snapshot of snapshots) {
+    for (const usage of snapshot?.models ?? []) {
       const key = modelUsageKey(usage);
       const existing = modelsByKey.get(key);
       modelsByKey.set(
@@ -231,7 +237,8 @@ function aggregateTokenUsage(
       return { ...usage, pricingModel: configured.model, pricing: configured.rates };
     });
 
-  const complete = goals.length > 0 && goals.every((goal) => goal.tokenUsage?.complete === true);
+  const complete =
+    snapshots.length > 0 && snapshots.every((snapshot) => snapshot?.complete === true);
   return {
     models,
     totals,
@@ -508,6 +515,7 @@ export function aggregateReview(
     : [];
   const coverageGoals = options.coverageGoals ?? goals;
   const partial =
+    options.discovery?.status === "failed" ||
     goals.length === 0 ||
     goals.some(
       (goal) =>
@@ -524,6 +532,8 @@ export function aggregateReview(
   );
   const event = config.autoApprove && !partial && !hasBlockingFinding ? "APPROVE" : "COMMENT";
   const publishedFindings = config.interactWithPullRequest ? inlineFindings : findings;
+  const usage = goals.map((goal) => goal.tokenUsage);
+  if (options.discovery !== undefined) usage.push(options.discovery.tokenUsage);
   const summary =
     publishedFindings.length === 0
       ? "No actionable issues found."
@@ -537,7 +547,7 @@ export function aggregateReview(
     event,
     partial,
     allGoalsFailed,
-    tokenUsage: aggregateTokenUsage(goals, config.modelPricing),
+    tokenUsage: aggregateTokenUsage(usage, config.modelPricing),
   };
 }
 
@@ -665,7 +675,7 @@ function accountingCallout(usage: AggregatedTokenUsage, hasUnpricedModels: boole
   return [
     `> ${accounting}`,
     ...(lowerBound === undefined ? [] : [lowerBound]),
-    "> ℹ️ Claude Agent SDK model usage only; external MCP service usage is excluded.",
+    "> ℹ️ Model session usage, including shared discovery; external MCP service usage is excluded.",
   ];
 }
 

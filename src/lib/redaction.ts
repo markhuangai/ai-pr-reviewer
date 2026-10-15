@@ -1,4 +1,29 @@
-import type { GoalResult } from "./types.js";
+import type { DiscoveryResult, GoalResult } from "./types.js";
+
+export function redactDiscovery(
+  result: DiscoveryResult | undefined,
+  secrets: readonly string[],
+): DiscoveryResult | undefined {
+  if (result === undefined) return undefined;
+  return {
+    ...result,
+    ...(result.error === undefined ? {} : { error: redact(result.error, secrets) }),
+    diagnostics: {
+      ...result.diagnostics,
+      termination: redact(result.diagnostics.termination, secrets),
+    },
+    tokenUsage: {
+      ...result.tokenUsage,
+      models: result.tokenUsage.models.map((usage) => ({
+        ...usage,
+        model: redact(usage.model, secrets),
+        ...(usage.canonicalModel === undefined
+          ? {}
+          : { canonicalModel: redact(usage.canonicalModel, secrets) }),
+      })),
+    },
+  };
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

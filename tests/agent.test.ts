@@ -597,7 +597,7 @@ test("accepts only complete non-negative SDK model usage snapshots", () => {
 
 test("runs parallel review goals over independent readers and cleans the shared diff", async (t) => {
   const repository = await makeExistingCommitRepository(t);
-  const results = await runReviewGoals(
+  const { goals: results } = await runReviewGoals(
     repository.context,
     [],
     emptyConversation,

@@ -2,7 +2,7 @@
 
 This repository contains a goal-driven, MCP-enabled JavaScript GitHub Action for reviewing pull requests in any repository. A small, checked-in Node 24 bootstrap verifies and downloads a platform runtime from this repository's GitHub Release. Consumers do not install npm packages, run Python, or build a container.
 
-Each review prompt runs one isolated Claude Agent SDK session by default, or an opt-in native Codex app-server session for GPT models. Both backends use native goals, automatic compaction, an immutable pull-request briefing, fixed-revision Git readers, optional exact workflow-provided context files, and explicitly configured HTTP MCP servers. Claude also provides `Read`, `Glob`, and `Grep` over the pristine head checkout; Codex uses bounded Git-based file discovery and source readers through authenticated loopback MCP. Shell, writes, web access, and agents are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Token usage is combined across every goal and included in a default-collapsed section in both destinations.
+Each review prompt runs one independent Claude Agent SDK session by default, or an opt-in native Codex app-server session for GPT models. Multi-goal reviews first run bounded shared orientation, then fork its conversation into independent goal sessions. Both backends use native goals, automatic compaction, an immutable pull-request briefing, fixed-revision Git readers, optional exact workflow-provided context files, and explicitly configured HTTP MCP servers. Claude also provides `Read`, `Glob`, and `Grep` over the pristine head checkout; Codex uses bounded Git-based file discovery and source readers through authenticated loopback MCP. Shell, writes, web access, and agents are unavailable. Validated findings are deterministically merged and deduplicated, then posted as one GitHub pull request review or written only to the workflow run summary. Token usage is combined across every goal and included in a default-collapsed section in both destinations.
 
 ## Consumer workflow
 
@@ -85,6 +85,7 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `system-prompt`    | no       |          | Full replacement; written to the redacted action log.                                                                                                                                                     |
 | `model-pricing`    | no       |          | Strict JSON with a currency prefix and per-model rates per one million tokens.                                                                                                                            |
 | `review-prompts`   | yes      |          | Non-empty JSON array of `{ "prompt", "files"? }` goal objects.                                                                                                                                            |
+| `shared-discovery` | no       | `true`   | Run shared bounded orientation and fork its history for two or more goals; `false` retains independent starts.                                                                                            |
 | `parallel-count`   | no       | `5`      | Integer from 1 to 10; limits concurrently running goal sessions.                                                                                                                                          |
 | `max-turns`        | no       | `50`     | Integer from 2 to 500 per goal. Claude counts SDK turns; Codex counts app-server turns, including native continuations and host repairs. Each Codex turn can make multiple model requests and tool calls. |
 | `auto-approve`     | no       | `false`  | An approval is attempted only when every goal completes and no finding is Moderate, High, or Critical.                                                                                                    |
@@ -93,6 +94,18 @@ Use `@v1` for the newest stable release in major version 1, or `@v1-prerelease` 
 | `mcp-servers`      | no       | empty    | Strict YAML mapping of HTTP MCP servers. Stdio and SSE transports are rejected.                                                                                                                           |
 
 `effort` applies to every isolated goal session and its output-repair turns. It is a behavioral signal rather than a strict token budget, and `xhigh` or `max` requires support from the selected model and endpoint. The reviewer subprocess does not inherit `CLAUDE_CODE_EFFORT_LEVEL`; configure effort through this action input instead.
+
+### Shared discovery
+
+With two or more goals, shared discovery first builds a neutral change map: the intent, affected areas, useful entry points and tests, and explicit unknowns. It starts with a paginated overview, then selectively reads fixed-revision source. It does not require the entire briefing or diff, produce findings, or assign paths to individual goals.
+
+Orientation permits at most 16 reads and 64 KiB of delivered tool results, with an 8 KiB change map and a ten-minute deadline. It allows up to `min(3, max-turns)` runtime turns, reserving the final turn for finishing the map. Claude counts model/tool iterations; Codex counts app-server turns. Reading-budget exhaustion ends exploration with explicit uncertainties. A provider failure or missing accepted map fails the run instead of silently starting independent reviews.
+
+Each goal forks the completed conversation and inherits only delivered briefing pages and source evidence for the same immutable snapshot. It finishes every unread briefing page and changed path, then investigates its own goal. The map is navigation advice, never finding evidence. Goal prompts, exact workflow context files, external MCP results, submission state, and recovery budgets remain independent. `parallel-count` limits the child sessions, including queued forks.
+
+Claude persists the parent and forks only inside a private temporary configuration directory. Codex uses private temporary thread storage and a separate process and MCP bridge for each child. The run removes that storage after every child closes, including failure and cancellation. Single-goal runs retain independent starts. Set `shared-discovery: false` to compare the previous behavior.
+
+The usage summary counts discovery once plus each child's new requests, including charges for inherited context. Redacted logs and replay output report discovery reads, delivered bytes, elapsed time, compactions, and termination. Shared orientation reduces repeated navigation; actual cost depends on preparation overhead, inherited context, and the model or proxy's cache behavior. Native compaction remains enabled, and large reviews can still compact later.
 
 ### GPT models through a proxy
 
@@ -198,7 +211,7 @@ Context file contents are sent to the configured AI endpoint only when the agent
 
 ### Token usage and model pricing
 
-The action always combines the latest cumulative SDK usage snapshot from every isolated goal. Configure `model-pricing` to add an estimated cost; omit it to show tokens without any cost text. Every rate is required, must be a finite non-negative JSON number, and is interpreted per one million tokens.
+The action combines shared discovery usage once with the latest usage snapshot for new work in every independent goal fork. Configure `model-pricing` to add an estimated cost; omit it to show tokens without any cost text. Every rate is required, must be a finite non-negative JSON number, and is interpreted per one million tokens.
 
 ```yaml
 model-pricing: |
@@ -234,7 +247,7 @@ For 100,000 input tokens, 50,000 output tokens, 1,000,000 cache-hit tokens, and 
 | <code>review-model</code> |  $1.2 |     $2 |     $0.12 |           $0.6 |
 
 > ✅ **Complete SDK accounting**
-> ℹ️ Claude Agent SDK model usage only; external MCP service usage is excluded.
+> ℹ️ Model session usage, including shared discovery; external MCP service usage is excluded.
 
 </details>
 ```
@@ -323,7 +336,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 
 ## Review behavior
 
-- Each configured prompt starts one isolated Claude Agent SDK session with Claude Code's `/goal` Stop hook; the full review prompt follows in that same session.
+- Multi-goal runs share bounded orientation by default. Each prompt then runs in its own native conversation fork with independent goal state; disabled and single-goal runs start fresh.
 - Repository search does not use a second search/filter service: native `Glob` finds paths and native `Grep` searches content across the checked-out repository (except `.git`). The fixed Git tools exist to bind evidence to the captured pull-request revisions and changed paths; they are not substitutes for repository search.
 - Goal sessions run concurrently up to `parallel-count`. After every goal finishes, their results are synthesized and deduplicated into one review.
 - A structured goal may optionally read only its exact authorized workflow context files. Each goal gets independent readers over immutable snapshots, and submitting a review does not require reading optional files.

@@ -235,7 +235,7 @@ test("six isolated goals finish a 101-file deletion-heavy sweep within the confi
   });
   const logs = t.mock.method(process.stdout, "write", () => true);
   let nextGoal = 0;
-  const results = await runReviewGoals(
+  const { goals: results } = await runReviewGoals(
     context,
     files,
     emptyConversation,

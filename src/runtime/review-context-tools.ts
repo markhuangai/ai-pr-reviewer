@@ -1,3 +1,4 @@
+import type { ReviewBriefingReader } from "./review-briefing.js";
 import { randomUUID } from "node:crypto";
 import { tool } from "./review-tool.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -11,7 +12,6 @@ import {
   MODEL_TOOL_RESULT_BYTES,
   StringPageReader,
   RepositoryFilePageReader,
-  type ReviewBriefingReader,
   type PullRequestConversationReader,
   type PullRequestDiffReader,
   type PullRequestDiffArtifact,

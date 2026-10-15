@@ -322,7 +322,7 @@ test("keeps immutable body-read failures redacted through action lifecycle spans
               cleanup: () => Promise.resolve(),
             } as unknown as ContextFileArtifact),
           readFiles: () => Promise.resolve([]),
-          runGoals: () => Promise.resolve([]),
+          runGoals: () => Promise.resolve({ goals: [] }),
           writeSummary: () => Promise.resolve(),
         },
         new AbortController(),
@@ -403,18 +403,20 @@ test("cancellation prevents new summaries and pull request writes", async (t) =>
           ) => {
             assert.equal(receivedController, controller);
             controller.abort(reason);
-            return Promise.resolve([
-              {
-                inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-                prompt: "correctness",
-                status: "completed",
-                submission: {
-                  limitations: [],
-                  summary: "clean",
-                  findings: [],
+            return Promise.resolve({
+              goals: [
+                {
+                  inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+                  prompt: "correctness",
+                  status: "completed",
+                  submission: {
+                    limitations: [],
+                    summary: "clean",
+                    findings: [],
+                  },
                 },
-              },
-            ]);
+              ],
+            });
           },
           writeSummary: () => {
             summaries += 1;
@@ -468,18 +470,20 @@ test("correlates full action cleanup failures with the parent failure", async (t
             cleanup: () => Promise.reject(new Error("context cleanup failed")),
           } as unknown as ContextFileArtifact),
         runGoals: () =>
-          Promise.resolve([
-            {
-              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-              prompt: "correctness",
-              status: "completed",
-              submission: {
-                limitations: [],
-                summary: "clean",
-                findings: [],
+          Promise.resolve({
+            goals: [
+              {
+                inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+                prompt: "correctness",
+                status: "completed",
+                submission: {
+                  limitations: [],
+                  summary: "clean",
+                  findings: [],
+                },
               },
-            },
-          ]),
+            ],
+          }),
         writeSummary: () => Promise.resolve(),
       },
       new AbortController(),
@@ -524,7 +528,7 @@ test("rejects mismatched event URL targets", async (t) => {
         createApi: () => api,
         readEventContext: () => Promise.resolve(context),
         createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-        runGoals: () => Promise.resolve([]),
+        runGoals: () => Promise.resolve({ goals: [] }),
         writeSummary: () => Promise.resolve(),
       },
     ),
@@ -546,7 +550,7 @@ test("writes failed and partial summary-only results before reporting failure", 
     createApi: () => api,
     readEventContext: () => Promise.resolve(context),
     createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
-    runGoals: () => Promise.resolve(goals),
+    runGoals: () => Promise.resolve({ goals: goals }),
     writeSummary: (
       summaryContext: PullRequestContext,
       review: NonNullable<Awaited<ReturnType<typeof runAction>>["review"]>,
@@ -626,26 +630,28 @@ test("does not post an interactive review when every goal fails", async (t) => {
       readEventContext: () => Promise.resolve(context),
       createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
       runGoals: () =>
-        Promise.resolve([
-          {
-            inspection: { observedPaths: ["review.txt"], missingPaths: [] },
-            prompt: "correctness",
-            status: "failed",
-            error: "failed",
-            tokenUsage: {
-              complete: true,
-              models: [
-                {
-                  model: "review-model",
-                  inputTokens: 4,
-                  outputTokens: 3,
-                  cacheReadInputTokens: 2,
-                  cacheCreationInputTokens: 1,
-                },
-              ],
+        Promise.resolve({
+          goals: [
+            {
+              inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+              prompt: "correctness",
+              status: "failed",
+              error: "failed",
+              tokenUsage: {
+                complete: true,
+                models: [
+                  {
+                    model: "review-model",
+                    inputTokens: 4,
+                    outputTokens: 3,
+                    cacheReadInputTokens: 2,
+                    cacheCreationInputTokens: 1,
+                  },
+                ],
+              },
             },
-          },
-        ]),
+          ],
+        }),
       writeSummary: (summaryContext, review, goals) => {
         summaries.push(buildRunSummary(summaryContext, review, goals));
         return Promise.resolve();
