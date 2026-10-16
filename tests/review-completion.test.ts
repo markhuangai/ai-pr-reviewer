@@ -312,7 +312,10 @@ test("six isolated goals finish a 101-file deletion-heavy sweep within the confi
   );
   logs.mock.restore();
   assert.equal(results.length, 6);
-  assert.ok(results.every((result) => result.status === "completed"));
+  assert.ok(
+    results.every((result) => result.status === "completed"),
+    JSON.stringify(results.map(({ status, error }) => ({ status, error }))),
+  );
   assert.ok(results.every((result) => result.inspection?.missingPaths.length === 0));
   assert.equal(results[0]?.diagnostics?.repeatedSourceBytes, 0);
   assert.ok(results.slice(1).every((result) => (result.diagnostics?.repeatedSourceBytes ?? 0) > 0));

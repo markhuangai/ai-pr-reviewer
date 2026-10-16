@@ -806,7 +806,7 @@ export async function runReviewGoalsWithRunner(
     }
   };
   try {
-    if (config.sharedDiscovery !== false && config.reviewPrompts.length > 1) {
+    if (config.reviewPrompts.length > 1) {
       if (discover === undefined) throw new Error("The shared discovery runner is unavailable.");
       shared = await discover({
         context,

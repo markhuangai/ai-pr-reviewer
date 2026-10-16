@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { access, readdir } from "node:fs/promises";
 import test from "node:test";
 import { z } from "zod";
-import { aggregateReview, reviewMarker } from "../src/lib/aggregate.js";
+import { aggregateReview } from "../src/lib/aggregate.js";
 import { readReviewConfig } from "../src/lib/input.js";
 import { redactDiscovery } from "../src/lib/redaction.js";
 import type { ChangedFile, DiscoveryResult } from "../src/lib/types.js";
@@ -42,7 +42,7 @@ const file: ChangedFile = {
 };
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 
-test("discovery defaults on and distinguishes multi-goal fingerprints", () => {
+test("multi-goal configuration has no shared discovery control", () => {
   const values: Record<string, string> = {
     "github-pat": "fixture",
     "ai-base-url": "https://fixture.test",
@@ -51,18 +51,8 @@ test("discovery defaults on and distinguishes multi-goal fingerprints", () => {
     "review-prompts": '[{"prompt":"alpha"},{"prompt":"beta"}]',
   };
   const config = readReviewConfig({ get: (name) => values[name] ?? "" });
-  assert.equal(config.sharedDiscovery, true);
-  const baseline = reviewMarker(goalContext, { ...config, sharedDiscovery: false });
-  assert.notEqual(reviewMarker(goalContext, config), baseline);
-  const single = { ...config, reviewPrompts: config.reviewPrompts.slice(0, 1) };
-  assert.equal(
-    reviewMarker(goalContext, single),
-    reviewMarker(goalContext, { ...single, sharedDiscovery: false }),
-  );
-  values["shared-discovery"] = "false";
-  assert.equal(readReviewConfig({ get: (name) => values[name] ?? "" }).sharedDiscovery, false);
-  values["shared-discovery"] = "invalid";
-  assert.throws(() => readReviewConfig({ get: (name) => values[name] ?? "" }), /shared-discovery/u);
+  assert.equal(config.reviewPrompts.length, 2);
+  assert.equal("sharedDiscovery" in config, false);
 });
 
 test("huge change overviews paginate under the read budget without claiming inspection", () => {
@@ -318,14 +308,14 @@ test(
 );
 
 test(
-  "real Codex independent reviews retain full coverage with sharing disabled",
+  "real Codex single-goal reviews retain full coverage without discovery",
   { timeout: 120_000 },
   async (t) => {
-    const script = sharedReviewScript({ shared: false });
+    const script = sharedReviewScript({ goalCount: 1 });
     const fixture = await modelFixture(t, script.next);
-    const { run } = await sharedReviewRun(t, fixture.url, "codex", script, false);
+    const { run } = await sharedReviewRun(t, fixture.url, "codex", script);
     assert.equal(run.discovery, undefined);
-    assert.equal(script.reads.filter((read) => read.tool === "read_pr_diff").length, 3);
+    assert.equal(script.reads.filter((read) => read.tool === "read_pr_diff").length, 1);
   },
 );
 
@@ -422,7 +412,7 @@ for (const executor of ["claude", "codex"] as const) {
         return { wait: true };
       });
       await assert.rejects(
-        sharedReviewRun(t, fixture.url, executor, script, true, {}, { controller }),
+        sharedReviewRun(t, fixture.url, executor, script, {}, { controller }),
         /cancel/u,
       );
       assert.deepEqual([...started].sort(), ["ALPHA", "BETA"]);
@@ -477,7 +467,6 @@ for (const executor of ["claude", "codex"] as const) {
         fixture.url,
         executor,
         script,
-        true,
         {},
         { runner, expectedStatuses: ["completed", "failed", "completed"] },
       );
@@ -603,7 +592,6 @@ for (const executor of ["claude", "codex"] as const) {
       const fixture = await modelFixture(t, () => ({ error: 400 }));
       const config = reviewConfig({
         executor,
-        sharedDiscovery: true,
         aiBaseUrl: executor === "claude" ? fixture.url.replace(/\/v1$/u, "") : fixture.url,
         model: executor === "claude" ? "claude-sonnet-4-5" : "gpt-6.1-sol",
         maxTurns: 20,

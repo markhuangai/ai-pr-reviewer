@@ -61,11 +61,10 @@ test("old replay cases default to Claude and Codex cases retain explicit setting
     },
   };
   assert.equal(parseReplayCase(input).config.executor, "claude");
-  assert.equal(parseReplayCase(input).config.sharedDiscovery, true);
-  assert.equal(
-    parseReplayCase({ ...input, config: { ...input.config, sharedDiscovery: false } }).config
-      .sharedDiscovery,
-    false,
+  assert.equal("sharedDiscovery" in parseReplayCase(input).config, false);
+  assert.throws(
+    () => parseReplayCase({ ...input, config: { ...input.config, sharedDiscovery: false } }),
+    /sharedDiscovery/u,
   );
   const selected = parseReplayCase({
     ...input,
@@ -219,7 +218,7 @@ test("replays a frozen case without publishing, switching revisions, or exposing
     replayFindingLine = 2;
     assert.equal(contextFiles[0]?.length, 0);
     assert.equal(config.reviewPrompts[0]?.prompt, "Review the changed behavior.");
-    assert.equal(config.sharedDiscovery, true);
+    assert.equal("sharedDiscovery" in config, false);
     assert.equal(JSON.stringify(config).includes("known-defect"), false);
     return Promise.resolve({
       discovery: {
@@ -520,7 +519,6 @@ test("builds replay outside its pristine package checkout and cleans success and
     config: {
       model: "consumer-model-id",
       reviewPrompts: [{ prompt: "Review" }],
-      sharedDiscovery: false,
     },
   });
   const previousSecret = process.env.AI_PR_REVIEWER_SECRET;
@@ -538,7 +536,7 @@ test("builds replay outside its pristine package checkout and cleans success and
   let calls = 0;
   const runner: ReplayRunner = (_context, files, _conversation, _config, _files, checkout) => {
     calls += 1;
-    assert.equal(_config.sharedDiscovery, false);
+    assert.equal("sharedDiscovery" in _config, false);
     assert.equal(checkout, canonicalRoot);
     assert.deepEqual(
       files.map((file) => file.path),

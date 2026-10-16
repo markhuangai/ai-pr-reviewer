@@ -139,9 +139,7 @@ export function reviewMarker(
     ...(config.systemPrompt === undefined ? {} : { systemPrompt: config.systemPrompt }),
     aiBaseUrl: config.aiBaseUrl,
     prompts: config.reviewPrompts.map((goal) => goal.prompt),
-    ...(config.sharedDiscovery !== false && config.reviewPrompts.length > 1
-      ? { sharedDiscovery: 1 }
-      : {}),
+    ...(config.reviewPrompts.length > 1 ? { sharedDiscovery: 1 } : {}),
     ...(stableContextFiles.some((files) => files.length > 0)
       ? { contextFiles: stableContextFiles }
       : {}),

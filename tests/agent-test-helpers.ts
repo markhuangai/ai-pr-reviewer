@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   access,
   chmod,
@@ -397,6 +398,7 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
       (matcher) => matcher.hooks,
     ) as readonly HookCallback[];
     const observationController = new AbortController();
+    const toolPrefix = randomUUID();
     let observedToolUse = 0;
     const observedReferences: string[] = [];
     const tools = Object.fromEntries(
@@ -417,7 +419,7 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
                 {
                   tool_name: `mcp__review_output__${name}`,
                   tool_input: toolInput,
-                  tool_use_id: `test-tool-${observedToolUse}`,
+                  tool_use_id: `${toolPrefix}-${observedToolUse}`,
                   tool_response: toolResponse,
                 },
               ],
@@ -461,10 +463,27 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
         ? rawTools.read_context_file?.handler({ path: scenario.contextFilePath })
         : undefined;
     const session = {
-      async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+      async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
         const goalMessage = await messages.next();
-        const reviewMessage = await messages.next();
         assert.equal(goalMessage.done, false);
+        if (tools.finish_discovery !== undefined) {
+          yield { type: "system", subtype: "init", session_id: "test-discovery" } as SDKMessage;
+          assert.ok(tools.read_change_overview);
+          await tools.read_change_overview.handler({});
+          const result = await tools.finish_discovery.handler({
+            changeMap:
+              "Intent and affected paths are in the overview. Callers and tests remain unknown.",
+          });
+          assert.equal(result.isError, undefined);
+          yield {
+            type: "result",
+            subtype: "success",
+            num_turns: 1,
+            modelUsage: {},
+          } as SDKResultMessage;
+          return;
+        }
+        const reviewMessage = await messages.next();
         assert.equal(reviewMessage.done, false);
         scenario.inspectPrompts?.([goalMessage.value, reviewMessage.value]);
         if (preflight !== undefined) {
@@ -879,6 +898,7 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
       mcpServerStatus: () => Promise.resolve(scenario.mcpStatuses ?? []),
       interrupt: () => Promise.resolve(undefined),
       close: () => undefined,
+      [Symbol.asyncDispose]: () => Promise.resolve(),
     };
     return session;
   }) as unknown as AgentQuery;
@@ -886,7 +906,6 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
 
 export function reviewConfig(overrides: Partial<ReviewConfig> = {}): ReviewConfig {
   return {
-    sharedDiscovery: false,
     githubToken: "github-secret",
     aiBaseUrl: "https://ai.example.test",
     aiSecret: "ai-secret",

@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { randomUUID } from "node:crypto";
 import type {
   HookInput,
   Options,
@@ -47,6 +48,7 @@ export function reviewProtocolQuery(
       .instance;
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const signal = new AbortController().signal;
+    const sessionId = randomUUID();
     let sequence = 0;
     let close: (() => void) | undefined;
     const closed = new Promise<void>((resolve) => {
@@ -57,7 +59,7 @@ export function reviewProtocolQuery(
       messages,
       closed,
       async *call(name, input, batch = true) {
-        const id = `protocol-${++sequence}`;
+        const id = `${sessionId}-${++sequence}`;
         const toolName = `mcp__review_output__${name}`;
         const use = {
           type: "assistant",
@@ -69,7 +71,7 @@ export function reviewProtocolQuery(
         yield use;
         yield use;
         const hookBase = {
-          session_id: "protocol",
+          session_id: sessionId,
           transcript_path: "",
           cwd: options.cwd ?? "",
           tool_name: toolName,
@@ -122,11 +124,24 @@ export function reviewProtocolQuery(
     return {
       async *[Symbol.asyncIterator]() {
         assert.equal((await messages.next()).done, false);
-        assert.equal((await messages.next()).done, false);
+        const discovery = options.allowedTools?.includes("mcp__review_output__finish_discovery");
+        if (!discovery) assert.equal((await messages.next()).done, false);
         await server.connect(serverTransport);
         await client.connect(clientTransport);
         try {
-          yield* exercise(protocol);
+          if (discovery) {
+            yield {
+              type: "system",
+              subtype: "init",
+              session_id: sessionId,
+            } as SDKMessage;
+            yield* protocol.call("read_change_overview", {});
+            yield* protocol.call("finish_discovery", {
+              changeMap:
+                "Intent and affected paths are in the overview. Callers and tests remain unknown.",
+            });
+            yield protocolResult();
+          } else yield* exercise(protocol);
         } finally {
           await client.close();
           await server.close();
@@ -137,6 +152,7 @@ export function reviewProtocolQuery(
       close: () => {
         close?.();
       },
+      [Symbol.asyncDispose]: () => Promise.resolve(),
     };
   }) as unknown as AgentQuery;
 }
