@@ -22,13 +22,13 @@ test(
 );
 
 test(
-  "real Claude independent starts retain full coverage when sharing is disabled",
+  "real Claude single-goal reviews retain full coverage without discovery",
   { timeout: 180_000 },
   async (t) => {
-    const script = sharedReviewScript({ shared: false });
+    const script = sharedReviewScript({ goalCount: 1 });
     const fixture = await modelFixture(t, script.next);
-    const { run } = await sharedReviewRun(t, fixture.url, "claude", script, false);
+    const { run } = await sharedReviewRun(t, fixture.url, "claude", script);
     assert.equal(run.discovery, undefined);
-    assert.equal(script.reads.filter((read) => read.tool === "read_pr_diff").length, 3);
+    assert.equal(script.reads.filter((read) => read.tool === "read_pr_diff").length, 1);
   },
 );

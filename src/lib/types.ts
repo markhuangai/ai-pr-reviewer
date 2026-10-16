@@ -72,7 +72,6 @@ export interface ReviewConfig {
   readonly systemPrompt?: string;
   readonly modelPricing?: ModelPricingConfig;
   readonly reviewPrompts: readonly ReviewGoal[];
-  readonly sharedDiscovery?: boolean;
   readonly parallelCount: number;
   readonly maxTurns: number;
   readonly autoApprove: boolean;

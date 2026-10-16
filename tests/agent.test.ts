@@ -626,7 +626,7 @@ test("runs parallel review goals over independent readers and cleans the shared 
   assert.deepEqual(await readdir(repository.temporaryRoot), []);
 });
 
-test("stops scheduling review goals after cancellation and removes the shared diff", async (t) => {
+test("cancels discovery before scheduling review goals and removes the shared diff", async (t) => {
   const repository = await makeExistingCommitRepository(t);
   const previousTemporaryRoot = process.env.RUNNER_TEMP;
   process.env.RUNNER_TEMP = repository.temporaryRoot;
@@ -649,7 +649,6 @@ test("stops scheduling review goals after cancellation and removes the shared di
     return {
       async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
         await messages.next();
-        await messages.next();
         markStarted?.();
         await new Promise<never>((_resolve, reject) => {
           controller.signal.addEventListener(
@@ -665,6 +664,7 @@ test("stops scheduling review goals after cancellation and removes the shared di
       mcpServerStatus: () => Promise.resolve([]),
       interrupt: () => Promise.resolve(undefined),
       close: () => undefined,
+      [Symbol.asyncDispose]: () => Promise.resolve(),
     };
   }) as unknown as AgentQuery;
   const running = runReviewGoals(

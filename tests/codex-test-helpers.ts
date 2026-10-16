@@ -581,11 +581,12 @@ export async function nativeReview(
 }
 
 export function sharedReviewScript({
-  shared = true,
+  goalCount = 3,
   exhaust = false,
   compact = false,
   partial = false,
 } = {}) {
+  const shared = goalCount > 1;
   let discoveryStep = 0;
   let compacted = false;
   const steps = new Map<string, number>();
@@ -684,7 +685,7 @@ export function sharedReviewScript({
     return reply;
   };
   const privatePaths = new Map<string, string>();
-  return { next, reads, privatePaths, partial };
+  return { next, reads, privatePaths, partial, goalCount };
 }
 
 export async function sharedReviewRun(
@@ -692,7 +693,6 @@ export async function sharedReviewRun(
   url: string,
   executor: ReviewExecutor,
   script: ReturnType<typeof sharedReviewScript>,
-  sharedDiscovery = true,
   overrides: Partial<ReviewConfig> = {},
   lifecycle: {
     readonly controller?: AbortController;
@@ -716,7 +716,7 @@ export async function sharedReviewRun(
     context = { ...context, headSha };
   }
   const goals = [];
-  for (const label of ["ALPHA", "BETA", "GAMMA"]) {
+  for (const label of ["ALPHA", "BETA", "GAMMA"].slice(0, script.goalCount)) {
     const path = join(temporary, label + ".txt");
     await writeFile(path, "PRIVATE_" + label + "_DATA");
     script.privatePaths.set(label, path);
@@ -743,7 +743,6 @@ export async function sharedReviewRun(
   try {
     const config = reviewConfig({
       executor,
-      sharedDiscovery,
       aiBaseUrl: executor === "claude" ? url.replace(/\/v1$/u, "") : url,
       model: executor === "claude" ? "claude-sonnet-4-5" : "gpt-6.1-sol",
       effort: "high",
@@ -775,7 +774,7 @@ export async function sharedReviewRun(
     );
     assert.deepEqual(
       run.goals.map((goal) => goal.status),
-      lifecycle.expectedStatuses ?? ["completed", "completed", "completed"],
+      lifecycle.expectedStatuses ?? goals.map(() => "completed"),
       JSON.stringify(run),
     );
     for (const goal of run.goals)

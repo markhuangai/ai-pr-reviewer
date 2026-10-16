@@ -37,10 +37,6 @@ inputs:
     description: Maximum number of isolated goal sessions running concurrently.
     required: false
     default: "5"
-  shared-discovery:
-    description: Share bounded orientation and fork its conversation before multi-goal reviews.
-    required: false
-    default: "true"
   max-turns:
     description: Maximum turns per goal session (2-500). Claude counts SDK model/tool turns; Codex counts app-server turns, including native goal continuations and repairs, each of which may contain multiple model calls.
     required: false

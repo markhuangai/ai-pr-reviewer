@@ -163,7 +163,6 @@ const caseSchema = z
         systemPrompt: z.string().trim().optional(),
         modelPricing: pricingSchema.optional(),
         reviewPrompts: z.array(goalSchema).min(1).max(REVIEW_INPUT_LIMITS.maxPrompts),
-        sharedDiscovery: z.boolean().default(true),
         parallelCount: z
           .number()
           .int()
@@ -377,7 +376,6 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
       : { systemPrompt: input.systemPrompt }),
     ...(input.modelPricing === undefined ? {} : { modelPricing: input.modelPricing }),
     reviewPrompts: input.reviewPrompts,
-    sharedDiscovery: input.sharedDiscovery,
     parallelCount: input.parallelCount,
     maxTurns: input.maxTurns,
     autoApprove: input.autoApprove,

@@ -153,7 +153,7 @@ for (const kind of ["cliproxyapi", "litellm"] as const) {
       const script = sharedReviewScript();
       const fixture = await modelFixture(t, script.next);
       const url = await proxyFixture(t, kind, fixture.port);
-      const { run } = await sharedReviewRun(t, url, "codex", script, true, {
+      const { run } = await sharedReviewRun(t, url, "codex", script, {
         aiSecret: "fixture-client-key",
         model: "gpt-6.1-sol-fixture-alias",
       });
