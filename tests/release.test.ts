@@ -196,7 +196,45 @@ test("promotes only the latest matching RC", () => {
     prerelease: false,
     source_rc_tag: "v1.0.0-rc.1",
   });
-  assert.throws(() => validateStable("1.0.1", releases, []), /active matching release-candidate/i);
+  assert.throws(() => validateStable("1.0.1", releases, []), /allowed promotion target/i);
+});
+
+test("promotes the latest patch RC directly to the next minor or major stable release", () => {
+  const releases = history("v1.0.0-rc.0", "v1.0.0", "v1.0.1-rc.0", "v1.0.1-rc.1");
+  for (const version of ["1.1.0", "2.0.0"]) {
+    assert.deepEqual(validateStable(version, releases, []), {
+      release_tag: `v${version}`,
+      stable_tag: `v${version}`,
+      prerelease: false,
+      source_rc_tag: "v1.0.1-rc.1",
+    });
+  }
+  for (const version of ["1.0.2", "1.1.1", "1.2.0", "2.0.1", "3.0.0"])
+    assert.throws(() => validateStable(version, releases, []), /allowed promotion target/i);
+});
+
+test("replays direct promotions and continues from the promoted stable version", () => {
+  const releases = history("v1.0.0-rc.0", "v1.0.0", "v1.0.1-rc.0", "v1.1.0");
+  assert.equal(validatePrerelease("1.1.1-rc.0", releases, []).release_tag, "v1.1.1-rc.0");
+  assert.throws(
+    () => validatePrerelease("1.0.2-rc.0", releases, []),
+    /not an allowed next release/i,
+  );
+  const invalid = history("v1.0.0-rc.0", "v1.0.0", "v1.0.1-rc.0", "v1.2.0");
+  assert.throws(
+    () => validatePrerelease("1.2.1-rc.0", invalid, []),
+    /does not promote the active/i,
+  );
+});
+
+test("rejects direct promotion without a prior stable or across two minor increments", () => {
+  assert.throws(
+    () => validateStable("1.1.0", history("v1.0.0-rc.0"), []),
+    /allowed promotion target/i,
+  );
+  const releases = history("v1.0.0-rc.0", "v1.0.0", "v1.1.0-rc.0");
+  assert.throws(() => validateStable("1.2.0", releases, []), /allowed promotion target/i);
+  assert.equal(validateStable("2.0.0", releases, []).source_rc_tag, "v1.1.0-rc.0");
 });
 
 test("allows only exact patch, minor, or major base increments", () => {

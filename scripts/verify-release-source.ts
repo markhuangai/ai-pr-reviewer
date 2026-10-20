@@ -4,6 +4,17 @@ import { pathToFileURL } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const RC_TAG_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.(0|[1-9][0-9]*)$/;
+const RELEASE_POLICY_PATHS = new Set([
+  ".github/workflows/release.yml",
+  "README.md",
+  "scripts/validate-release.ts",
+  "scripts/verify-release-source.ts",
+  "src/lib/bootstrap/version.ts",
+  "dist/lib/bootstrap/version.js",
+  "tests/bootstrap.test.ts",
+  "tests/release.test.ts",
+  "tests/release-source.test.ts",
+]);
 
 async function git(args: readonly string[], cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", args, {
@@ -35,7 +46,18 @@ export async function verifyReleaseSource(
   const sourceTree = await git(["rev-parse", `${sourceCommit}^{tree}`], cwd);
   const stableTree = await git(["rev-parse", `${resolvedStableCommit}^{tree}`], cwd);
   if (sourceTree !== stableTree) {
-    throw new Error(`${stableCommit} does not have the same Git tree as ${sourceRcTag}.`);
+    const changed = await git(
+      ["diff", "--no-renames", "--name-only", "-z", sourceCommit, resolvedStableCommit],
+      cwd,
+    );
+    const runtimeChanges = changed
+      .split("\0")
+      .filter((path) => path && !RELEASE_POLICY_PATHS.has(path));
+    if (runtimeChanges.length > 0) {
+      throw new Error(
+        `${stableCommit} does not have the same runtime source as ${sourceRcTag}: ${runtimeChanges.join(", ")}.`,
+      );
+    }
   }
   return { sourceCommit, tree: sourceTree };
 }

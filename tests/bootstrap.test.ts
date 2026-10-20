@@ -81,7 +81,16 @@ test("parses only exact stable and release-candidate action tags", () => {
     stableTag: "v1.2.3",
     prerelease: true,
   });
-  for (const value of ["1.2.3", "v1", "v1.2.3-rc", "v01.2.3", "dev", undefined]) {
+  for (const value of [
+    "1.2.3",
+    "v1",
+    "v1.2.3-rc",
+    "v01.2.3",
+    "v9007199254740992.0.0",
+    "v1.0.0-rc.9007199254740992",
+    "dev",
+    undefined,
+  ]) {
     assert.equal(parseActionReleaseTag(value), undefined);
   }
 });
@@ -246,7 +255,22 @@ test("matches runtime manifests to exact action releases", () => {
   assert.equal(isCompatibleRuntimeManifest(stable, "v1.2.4-rc.0", "v1.2.4"), false);
 });
 
-test("downloads, verifies, extracts, and executes a runtime bundle", async (t) => {
+test("accepts unchanged RC manifests only for permitted stable promotions", () => {
+  for (const tag of ["v1.1.9", "v1.2.0", "v2.0.0"]) {
+    const release = parseActionReleaseTag(tag);
+    assert.ok(release);
+    assert.equal(isCompatibleRuntimeManifest(release, "v1.1.9-rc.2", "v1.1.9"), true);
+    assert.equal(isCompatibleRuntimeManifest(release, "v1.1.9-rc.2", "v1.2.0"), false);
+    assert.equal(isCompatibleRuntimeManifest(release, "v1.1.9", "v1.1.9"), false);
+  }
+  for (const tag of ["v1.1.8", "v1.1.10", "v1.2.1", "v1.3.0", "v3.0.0", "v1.2.0-rc.0"]) {
+    const release = parseActionReleaseTag(tag);
+    assert.ok(release);
+    assert.equal(isCompatibleRuntimeManifest(release, "v1.1.9-rc.2", "v1.1.9"), false);
+  }
+});
+
+test("downloads, verifies, extracts, and executes an unchanged bundle across stable promotions", async (t) => {
   const diagnosticLines: string[] = [];
   const diagnostics = new DiagnosticLogger({
     component: "bootstrap",
@@ -298,27 +322,29 @@ test("downloads, verifies, extracts, and executes a runtime bundle", async (t) =
   t.after(() => closeServer(server));
   const { port } = server.address() as AddressInfo;
   const assetUrl = `http://127.0.0.1:${port}/runtime?signature=signed-secret`;
-  const code = await bootstrapRuntime({
-    releaseRef: "v1.1.1-rc.0",
-    temporaryRoot: root,
-    getJson: <T>(): Promise<T> =>
-      Promise.resolve({
-        tag_name: "v1.1.1-rc.0",
-        draft: false,
-        prerelease: true,
-        assets: [
-          {
-            name: assetName,
-            browser_download_url: assetUrl,
-            size: bytes.byteLength,
-          },
-        ],
-      } as T),
-    diagnostics,
-  });
+  for (const releaseRef of ["v1.1.1-rc.0", "v1.1.1", "v1.2.0", "v2.0.0"]) {
+    const code = await bootstrapRuntime({
+      releaseRef,
+      temporaryRoot: root,
+      getJson: <T>(): Promise<T> =>
+        Promise.resolve({
+          tag_name: releaseRef,
+          draft: false,
+          prerelease: releaseRef.includes("-rc."),
+          assets: [
+            {
+              name: assetName,
+              browser_download_url: assetUrl,
+              size: bytes.byteLength,
+            },
+          ],
+        } as T),
+      diagnostics,
+    });
 
-  assert.equal(code, 0);
-  assert.equal(await readFile(output, "utf8"), sourceCommit);
+    assert.equal(code, 0);
+    assert.equal(await readFile(output, "utf8"), sourceCommit);
+  }
   const records = diagnosticLines.map(
     (line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>,
   );

@@ -6,6 +6,8 @@ export function parseActionReleaseTag(value) {
     const match = VERSION_TAG_PATTERN.exec(value);
     if (!match?.[1] || !match[2] || !match[3])
         return undefined;
+    if ([match[1], match[2], match[3], match[4]].some((part) => part !== undefined && !Number.isSafeInteger(Number(part))))
+        return undefined;
     const stableTag = `v${match[1]}.${match[2]}.${match[3]}`;
     return {
         tag: value,
@@ -38,7 +40,10 @@ export function isCompatibleRuntimeManifest(release, artifactTag, stableTag) {
     const artifact = parseActionReleaseTag(artifactTag);
     if (!artifact?.prerelease || artifact.stableTag !== stableTag)
         return false;
-    return release.prerelease
-        ? release.tag === artifactTag && release.stableTag === stableTag
-        : release.tag === stableTag;
+    if (release.prerelease)
+        return release.tag === artifactTag && release.stableTag === stableTag;
+    const [major, minor] = artifact.stableTag.slice(1).split(".");
+    return (release.tag === stableTag ||
+        release.tag === `v${major}.${Number(minor) + 1}.0` ||
+        release.tag === `v${Number(major) + 1}.0.0`);
 }

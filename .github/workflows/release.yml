@@ -68,7 +68,7 @@ jobs:
           --channel "${REQUESTED_CHANNEL}"
           --releases "${RUNNER_TEMP}/releases.json"
           --tags "${RUNNER_TEMP}/tags.json"
-      - name: Verify stable source matches the latest release candidate
+      - name: Verify stable runtime source matches the latest release candidate
         if: steps.version.outputs.prerelease == 'false'
         shell: bash
         env:

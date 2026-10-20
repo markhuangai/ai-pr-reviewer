@@ -89,6 +89,16 @@ function isNextStable(current: Version, candidate: Version): boolean {
   );
 }
 
+function canPromote(stable: Version | undefined, active: Version, candidate: Version): boolean {
+  return (
+    sameBase(active, candidate) ||
+    (stable !== undefined &&
+      candidate.patch === 0 &&
+      isNextStable(stable, candidate) &&
+      isNextStable(active, candidate))
+  );
+}
+
 function readRecords<T>(value: unknown, name: string): T[] {
   if (!Array.isArray(value)) fail(`${name} must be a JSON array.`);
   const pages = value.every(Array.isArray) ? value.flat() : value;
@@ -152,7 +162,7 @@ function replayHistory(releases: readonly ReleaseRecord[]): ReleaseState {
         active = version;
         continue;
       }
-      if (!sameBase(active, version)) {
+      if (!canPromote(stable, active, version)) {
         fail(`${releaseTag} does not promote the active ${stableTag(active)} RC sequence.`);
       }
       stable = version;
@@ -232,8 +242,10 @@ export function validateReleaseRequest(
       fail(`${releaseTag} is not an allowed next release after ${tag(state.stable)}.`);
     }
   } else {
-    if (!state.active || !sameBase(state.active, requested)) {
-      fail(`${releaseTag} requires an active matching release-candidate sequence.`);
+    if (!state.active || !canPromote(state.stable, state.active, requested)) {
+      fail(
+        `${releaseTag} requires an active release-candidate sequence with an allowed promotion target.`,
+      );
     }
   }
 
