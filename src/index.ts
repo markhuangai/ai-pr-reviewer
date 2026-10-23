@@ -576,6 +576,7 @@ export async function runAction(
             contextFiles: preparedContextFiles.identity,
             briefingDigest: reviewBriefingDigest(context, briefing),
             coverageGoals: rawGoals,
+            coverageDisplayPath: (path) => redact(path, secrets),
             ...(discovery === undefined ? {} : { discovery }),
           }),
       );

@@ -227,10 +227,15 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     signal,
   );
   const readers = new ReviewQueryReaderStore(() => undefined, signal);
-  const ledger = new ReviewEvidenceLedger(cwd, files, {
-    mergeBaseSha: diff.mergeBaseSha,
-    headSha: context.headSha,
-  });
+  const ledger = new ReviewEvidenceLedger(
+    cwd,
+    files,
+    {
+      mergeBaseSha: diff.mergeBaseSha,
+      headSha: context.headSha,
+    },
+    diff.files,
+  );
   const secrets = reviewSecretCandidates(config);
   let resourceCleanup: Promise<unknown> | undefined;
   const cleanupResources = () =>

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { escapeHtmlText } from "./redaction.js";
+import { aggregateCoverage, buildCoverageDetails } from "./review-coverage.js";
 import type {
   AggregatedFinding,
   AggregatedModelUsage,
@@ -47,6 +49,7 @@ interface AggregateReviewOptions {
   readonly contextFiles?: ContextFileIdentityByGoal;
   readonly briefingDigest?: string;
   readonly coverageGoals?: readonly GoalResult[];
+  readonly coverageDisplayPath?: (path: string) => string;
   readonly discovery?: DiscoveryResult;
 }
 function normalizeText(value: string): string {
@@ -546,6 +549,12 @@ export function aggregateReview(
     partial,
     allGoalsFailed,
     tokenUsage: aggregateTokenUsage(usage, config.modelPricing),
+    coverage: aggregateCoverage(
+      files,
+      coverageGoals,
+      config.reviewPrompts.length,
+      options.coverageDisplayPath ?? ((path) => path),
+    ),
   };
 }
 
@@ -568,15 +577,6 @@ function totalTokens(counts: TokenCounts): number {
     counts.cacheReadInputTokens +
     counts.cacheCreationInputTokens
   );
-}
-
-function escapeHtmlText(value: string): string {
-  return value
-    .replace(/&/gu, "&amp;")
-    .replace(/</gu, "&lt;")
-    .replace(/>/gu, "&gt;")
-    .replace(/\r/gu, "&#13;")
-    .replace(/\n/gu, "&#10;");
 }
 
 function escapeMarkdownText(value: string): string {
@@ -755,9 +755,9 @@ function incompleteGoalDetails(goals: readonly GoalResult[]): string {
 
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
-  const tokenUsage = buildTokenUsageDetails(review.tokenUsage);
+  const details = `${buildCoverageDetails(review.coverage)}\n\n${buildTokenUsageDetails(review.tokenUsage)}`;
   if (!review.partial && review.findings.length === 0)
-    return [review.marker, "## ✨ Good job!", "", review.summary, "", tokenUsage].join("\n");
+    return [review.marker, "## ✨ Good job!", "", review.summary, "", details].join("\n");
 
   const sections = review.partial
     ? [
@@ -772,7 +772,7 @@ export function buildReviewBody(review: AggregatedReview, goals: readonly GoalRe
   if (review.findings.length > 0) {
     sections.push("", review.summary, "", findingDestination(review));
   }
-  sections.push("", tokenUsage);
+  sections.push("", details);
   const body = sections.join("\n");
   if (body.length <= MAX_REVIEW_BODY_LENGTH) return body;
   return `${body.slice(0, MAX_REVIEW_BODY_LENGTH - 120)}\n\n> Review body truncated at 60 KB; see inline comments for the highest-severity findings.`;
@@ -827,6 +827,8 @@ export function buildRunSummary(
         : review.findings.length === 0
           ? "No actionable issues found."
           : findingSummary(review.findings),
+    "",
+    buildCoverageDetails(review.coverage),
     "",
     tokenUsage,
   ];

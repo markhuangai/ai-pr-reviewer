@@ -208,6 +208,32 @@ The action captures private immutable snapshots before duplicate detection and a
 
 Context file contents are sent to the configured AI endpoint only when the agent reads them. The action omits the page contents from tool-result logs, but paths are logged and the model may repeat relevant excerpts in assistant text or findings. Treat files as untrusted evidence and never authorize credentials, tokens, or unrelated sensitive data.
 
+### Review coverage
+
+PR reviews and workflow summaries include a default-collapsed coverage section immediately above token usage:
+
+```markdown
+<details>
+<summary>🔍 Review coverage · 95% of total changes</summary>
+
+| File      | Lines read | Total changes | Coverage | Reviewers read | Total reviewer profiles |
+| :-------- | ---------: | ------------: | -------: | -------------: | ----------------------: |
+| file1.go  |         17 |            20 |      85% |              5 |                       7 |
+| file2.go  |         40 |            40 |     100% |              7 |                       7 |
+| **Total** |     **57** |        **60** |  **95%** |              — |                   **7** |
+
+> Lines read counts distinct added or deleted lines delivered to at least one reviewer, including inherited source evidence. Repeated reads count once. Total changes excludes unchanged context; the headline divides summed lines read by summed total changes.
+> Reviewers read counts profiles receiving at least one changed line in that file. Total reviewer profiles includes failed and unfinished profiles; discovery is not an additional profile. Coverage does not measure review quality or completion.
+
+</details>
+```
+
+**Lines read** counts unique changed lines delivered to at least one profile. Added lines use the head revision and deleted lines use the merge base; unchanged context does not count. **Reviewers read** counts profiles receiving at least one changed line in that file, including source inherited from shared discovery. The discovery session is not an additional profile. **Total reviewer profiles** includes configured profiles that fail or do not finish.
+
+The headline divides the total unique lines read by all added and deleted lines. Percentages round down to one decimal place and omit trailing `.0`. Binary and metadata-only changes with no countable changed lines remain visible as `N/A`. Missing tracking produces lower-bound counts, or `N/A` when no profile has tracking. Large tables omit whole file rows with a notice; their totals still include every file.
+
+Coverage describes verified source delivery. Existing completion and approval rules still apply, so 100% coverage can accompany an incomplete or failed review.
+
 ### Token usage and model pricing
 
 The action combines shared discovery usage once with the latest usage snapshot for new work in every independent goal fork. Configure `model-pricing` to add an estimated cost; omit it to show tokens without any cost text. Every rate is required, must be a finite non-negative JSON number, and is interpreted per one million tokens.
@@ -357,7 +383,7 @@ The MCP service can provide context, but it cannot grant the reviewer write acce
 - The action writes the full secret-redacted system prompt, `/goal`, review, continuation, and repair user prompts, assistant text, and internal review-output validation errors to the GitHub Actions log. Long messages use numbered chunks so the redacted content remains reconstructable. Session initialization and completion, one-minute heartbeats, last SDK activity, goal iterations and reasons, turn results, repairs, five-minute stall detection, interruption and continuation, and automatic compaction attempts and boundaries are logged explicitly with bounded lifecycle details. Logs and replay results also include submission/repair counts, rejection categories, evidence-reference counts, and termination reasons; these diagnostics are excluded from public reviews. Provider, session, configured external MCP, and ordinary successful tool results remain bounded previews. Context file tool results log an omission marker instead of page contents; hidden model reasoning is not logged.
 - Findings use four severities: Critical for credible immediate compromise, irreversible data loss, or broad outage; High for serious impact on a reachable path; Moderate for bounded impact or a less likely trigger; and Low for a limited-impact but actionable defect. Informational observations, style preferences, and nits are omitted.
 - Interactive findings must cite a participating added line in the pull request diff. A missing or invalid anchor rejects the complete goal submission for same-session repair instead of moving the finding into the review body or attaching it to an unrelated line. Findings are sorted by severity, deduplicated across goals, and limited to the 25 highest-priority inline comments. Additional findings are omitted from the pull request review but retained in the workflow summary and diagnostics. Each published comment includes a severity marker, short impact and fix, and a default-collapsed agent prompt generated from the verified finding location.
-- Public reviews never include review prompts, model summaries, raw goal errors, or finding provenance. A complete review with no findings posts only a friendly success message. A partial review reports the completed-check count, numbered incomplete checks, host-derived reasons such as turn exhaustion, unread-path counts, declared limitation counts, and rerun guidance. The workflow summary includes the same check reasons and existing bounded investigation details; full secret-redacted diagnostics remain in the GitHub Actions log.
+- Public reviews never include review prompts, model summaries, raw goal errors, or finding provenance. A complete review with no findings posts a friendly success message followed by collapsed review coverage and token usage. A partial review reports the completed-check count, numbered incomplete checks, host-derived reasons such as turn exhaustion, unread-path counts, declared limitation counts, and rerun guidance. The workflow summary includes the same check reasons and existing bounded investigation details; full secret-redacted diagnostics remain in the GitHub Actions log.
 - If required evidence cannot be finished within the model context, provider limits, or configured `max-turns`, the affected paths are reported as incomplete instead of being described as reviewed. GitHub's changed-file API still limits review metadata to 3,000 files.
 - When interaction is enabled, a partial review is posted as a comment and the action fails. If every goal fails, no review is posted and the action fails.
 - In summary-only mode, every finding is included in the run summary rather than split between body and inline destinations. The summary is capped below GitHub's 1 MiB per-step limit and omits only whole findings when needed.

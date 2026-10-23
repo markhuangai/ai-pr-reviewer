@@ -14,6 +14,7 @@ import type { PullRequestContext, ReviewSourceRange } from "../lib/types.js";
 import { readPullRequestFilesFromSnapshots } from "../lib/git-changed-files.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
 import { streamGitToFile, diffArguments, indexDiff } from "./git-stream.js";
+import type { ChangedDiffLine } from "./review-coverage.js";
 
 const DIFF_PAGE_BYTES = 4 * 1024;
 const CONVERSATION_PAGE_BYTES = 4 * 1024;
@@ -233,6 +234,7 @@ export interface DiffFileSpan {
   readonly paths: readonly string[];
   readonly offset: number;
   readonly size: number;
+  readonly changedLines?: readonly ChangedDiffLine[];
 }
 
 interface DiffReadSpan extends DiffFileSpan {

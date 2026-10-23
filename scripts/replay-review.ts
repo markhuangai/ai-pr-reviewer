@@ -450,6 +450,7 @@ export async function replayCase(
   const goals = redactGoalResults(rawGoals, secrets);
   const review = aggregateReview(context, config, files, goals, {
     coverageGoals: rawGoals,
+    coverageDisplayPath: (path) => redact(path, secrets),
     ...(discovery === undefined ? {} : { discovery }),
   });
   return {

@@ -1,10 +1,11 @@
 import { execFile, spawn } from "node:child_process";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { parseGitNameStatus } from "../lib/git-changed-files.js";
 import type { DiffFileSpan } from "./agent-review-tools.js";
+import { indexDiffLines } from "./review-coverage.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -155,31 +156,8 @@ export async function indexDiff(
     }
   }
   const files = parseGitNameStatus(names.join("\0") + (names.length === 0 ? "" : "\0"));
-  const boundaries: number[] = [];
-  const marker = Buffer.from("diff --git ");
-  let offset = 0;
-  let lineStart = 0;
-  let prefix = Buffer.alloc(0);
-  for await (const chunk of createReadStream(path)) {
-    throwIfAborted(signal);
-    const buffer = chunk as Buffer;
-    for (let start = 0; start < buffer.length;) {
-      const newline = buffer.indexOf(10, start);
-      const end = newline < 0 ? buffer.length : newline;
-      if (prefix.length < marker.length) {
-        prefix = Buffer.concat([
-          prefix,
-          buffer.subarray(start, Math.min(end, start + marker.length - prefix.length)),
-        ]);
-        if (prefix.length === marker.length && prefix.equals(marker)) boundaries.push(lineStart);
-      }
-      if (newline < 0) break;
-      prefix = Buffer.alloc(0);
-      lineStart = offset + newline + 1;
-      start = newline + 1;
-    }
-    offset += buffer.length;
-  }
+  const patches = await indexDiffLines(path, signal);
+  const boundaries = patches.map((patch) => patch.offset);
   let boundaryIndex = 0;
   const starts = patchCounts.map((count) => {
     const start = boundaries[boundaryIndex];
@@ -188,9 +166,23 @@ export async function indexDiff(
   });
   if (boundaries.length !== boundaryIndex || (size > 0 && starts[0] !== 0))
     throw new Error("Captured diff boundaries do not match Git path metadata.");
-  return files.map((file, index) => ({
-    paths: [file.path, ...(file.previousPath === undefined ? [] : [file.previousPath])],
-    offset: starts[index] as number,
-    size: (starts[index + 1] ?? size) - (starts[index] as number),
-  }));
+  let patchIndex = 0;
+  return files.map((file, index) => {
+    const offset = starts[index] as number;
+    const count = patchCounts[index] as number;
+    const changedLines = patches.slice(patchIndex, patchIndex + count).flatMap((patch) =>
+      patch.lines.map((line) => ({
+        ...line,
+        start: line.start - offset,
+        end: line.end - offset,
+      })),
+    );
+    patchIndex += count;
+    return {
+      paths: [file.path, ...(file.previousPath === undefined ? [] : [file.previousPath])],
+      offset,
+      size: (starts[index + 1] ?? size) - offset,
+      changedLines,
+    };
+  });
 }

@@ -179,10 +179,8 @@ export async function runReviewGoal(
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
   const conversationReader = new PullRequestConversationReader(conversation);
-  const evidenceLedger = new ReviewEvidenceLedger(cwd, files, {
-    mergeBaseSha: diff.mergeBaseSha,
-    headSha: context.headSha,
-  });
+  const reviewSnapshot = { mergeBaseSha: diff.mergeBaseSha, headSha: context.headSha };
+  const evidenceLedger = new ReviewEvidenceLedger(cwd, files, reviewSnapshot, diff.files);
   if (sharedSeed !== undefined) evidenceLedger.inherit(sharedSeed.evidence);
   const {
     inspectionDetails,
@@ -196,6 +194,10 @@ export async function runReviewGoal(
     recovery,
     startedAt,
     logSecrets,
+    sourceContextDelivered: () =>
+      sharedSeed === undefined ||
+      lifecycle.sessionId !== undefined ||
+      evidenceLedger.issued.size > sharedSeed.evidence.references.length,
   });
   const evidenceHook: HookCallback = (input) => {
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });

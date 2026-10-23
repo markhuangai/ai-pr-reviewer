@@ -7,13 +7,21 @@ import {
   runReviewGoals,
   agentInternals,
   emptyConversation,
+  makeRepository,
+  makeDiffFromSnapshots,
+  readFile,
+  RepositorySnapshot,
   runReviewGoalWithEmptyGuidance as runReviewGoal,
   type SDKMessage,
 } from "./agent-test-helpers.js";
-import { rm } from "node:fs/promises";
+import { rm, rename, symlink, chmod } from "node:fs/promises";
 import { makeReplayRepository, commitFixtureSnapshot } from "./git-test-helpers.js";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
-import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
+import { ReviewEvidenceLedger, toolResponseDocument } from "../src/runtime/review-assessment.js";
+import {
+  createReviewSourceTools,
+  ReviewQueryReaderStore,
+} from "../src/runtime/review-context-tools.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
 import {
   ReviewSubmissionRecovery,
@@ -388,4 +396,259 @@ test("limitations are reconsidered once without erasing findings or genuine bloc
       scenario !== "scope",
     );
   }
+});
+
+test("coverage follows complete source lines through pagination, inheritance, and overlapping diffs", async (t) => {
+  const long = "漢🙂".repeat(5_000);
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await writeFile(join(root, "review.txt"), `common\nnew one\n${long}\nlast`);
+    },
+    async (root) => {
+      await writeFile(join(root, "review.txt"), "common\nold one\nold two\nlast");
+    },
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  assert.equal(files[0]?.changes, 4);
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const identity = { mergeBaseSha: diff.mergeBaseSha, headSha: repository.headSha };
+  const parent = new ReviewEvidenceLedger(repository.root, files, identity, diff.files);
+  const child = new ReviewEvidenceLedger(repository.root, files, identity, diff.files);
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    diff.mergeBaseSha,
+    files,
+  );
+  const readers = new ReviewQueryReaderStore(() => undefined);
+  t.after(() => snapshot.cleanup());
+  t.after(() => Promise.all(readers.cleanupOperations()));
+  const tools = createReviewSourceTools({
+    signal: new AbortController().signal,
+    isActive: () => true,
+    diff,
+    headSha: repository.headSha,
+    queryReaders: readers,
+    repositorySnapshot: snapshot,
+    ledger: parent,
+  });
+  const input = { revision: "head" as const, path: "review.txt", cursor: undefined };
+  const first = await tools.repositoryFileTool.handler(input);
+  assert.deepEqual(parent.finalInspection.lineCoverage?.[0]?.addedLines, []);
+  parent.observeBatch([call("read_repository_file", input, first)]);
+  assert.deepEqual(parent.finalInspection.lineCoverage?.[0], {
+    path: "review.txt",
+    addedLines: [[2, 3]],
+    deletedLines: [],
+  });
+  const checkpoint = parent.checkpoint();
+  child.inherit(checkpoint);
+  assert.deepEqual(child.finalInspection.lineCoverage, parent.finalInspection.lineCoverage);
+  let page = toolResponseDocument(first);
+  let pages = 1;
+  while (page?.done === false) {
+    const nextInput = { ...input, cursor: String(page.nextCursor) };
+    const response = await tools.repositoryFileTool.handler(nextInput);
+    parent.observeBatch([call("read_repository_file", nextInput, response)]);
+    page = toolResponseDocument(response);
+    pages += 1;
+  }
+  assert.ok(pages > 2);
+  assert.deepEqual(parent.finalInspection.lineCoverage?.[0]?.addedLines, [[2, 4]]);
+  assert.deepEqual(child.finalInspection.lineCoverage?.[0]?.addedLines, [[2, 3]]);
+  const baseInput = { ...input, revision: "base" as const };
+  parent.observeBatch([
+    call("read_repository_file", baseInput, await tools.repositoryFileTool.handler(baseInput)),
+  ]);
+  assert.deepEqual(parent.finalInspection.lineCoverage?.[0]?.deletedLines, [[2, 4]]);
+
+  const diffLedger = new ReviewEvidenceLedger(repository.root, files, identity, diff.files);
+  const diffTools = createReviewSourceTools({
+    signal: new AbortController().signal,
+    isActive: () => true,
+    diff,
+    headSha: repository.headSha,
+    queryReaders: readers,
+    repositorySnapshot: snapshot,
+    ledger: diffLedger,
+  });
+  const selected = { paths: ["review.txt"], remaining: undefined, cursor: undefined };
+  const partial = await diffTools.diffTool.handler(selected);
+  diffLedger.observeBatch([call("read_pr_diff", selected, partial)]);
+  assert.deepEqual(diffLedger.finalInspection.lineCoverage?.[0], {
+    path: "review.txt",
+    addedLines: [[2, 3]],
+    deletedLines: [[2, 4]],
+  });
+  diffLedger.observeBatch([
+    call("read_pr_diff", selected, await diffTools.diffTool.handler(selected)),
+  ]);
+  assert.deepEqual(diffLedger.finalInspection.lineCoverage?.[0]?.addedLines, [[2, 3]]);
+  const remaining = { paths: undefined, remaining: true, cursor: undefined };
+  let done = false;
+  while (!done) {
+    const response = await diffTools.diffTool.handler(remaining);
+    diffLedger.observeBatch([call("read_pr_diff", remaining, response)]);
+    done = toolResponseDocument(response)?.done === true;
+  }
+  assert.deepEqual(diffLedger.finalInspection.lineCoverage, parent.finalInspection.lineCoverage);
+  const native = new ReviewEvidenceLedger(repository.root, files, identity, diff.files);
+  const nativeResponse = {
+    type: "text",
+    file: {
+      filePath: join(repository.root, "review.txt"),
+      content: "new one",
+      startLine: 2,
+      numLines: 1,
+      totalLines: 4,
+    },
+  };
+  native.observeBatch([
+    call(
+      "Read",
+      { file_path: join(repository.root, "review.txt"), offset: 2, limit: 1 },
+      nativeResponse,
+    ),
+  ]);
+  const truncated = {
+    ...nativeResponse,
+    truncated: true,
+    file: { ...nativeResponse.file, content: long, startLine: 3 },
+  };
+  native.observeBatch([
+    call(
+      "Read",
+      { file_path: join(repository.root, "review.txt"), offset: 3, limit: 1 },
+      truncated,
+    ),
+  ]);
+  assert.deepEqual(native.finalInspection.lineCoverage?.[0], {
+    path: "review.txt",
+    addedLines: [[2, 3]],
+    deletedLines: [],
+  });
+  const wrong = toolResponseDocument(first);
+  assert.ok(wrong);
+  const rejected = new ReviewEvidenceLedger(repository.root, files, identity, diff.files);
+  rejected.observeBatch([
+    call("read_repository_file", input, jsonResponse({ ...wrong, headSha: "f".repeat(40) })),
+  ]);
+  assert.deepEqual(rejected.finalInspection.lineCoverage?.[0]?.addedLines, []);
+  assert.equal((await readFile(join(repository.root, "review.txt"), "utf8")).includes(long), true);
+});
+
+test("coverage indexes renamed, deleted, binary, metadata, and type-changed files once", async (t) => {
+  const repository = await makeRepository(
+    t,
+    async (root) => {
+      await rename(join(root, "old.ts"), join(root, "new.ts"));
+      await writeFile(join(root, "new.ts"), "stable\n".repeat(10) + "new\n");
+      await rm(join(root, "removed.txt"));
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 2]));
+      await chmod(join(root, "mode.sh"), 0o755);
+      await rm(join(root, "kind"));
+      await symlink("new-target", join(root, "kind"));
+    },
+    async (root) => {
+      await writeFile(join(root, "old.ts"), "stable\n".repeat(10) + "old\n");
+      await writeFile(join(root, "removed.txt"), "removed\nlast");
+      await writeFile(join(root, "binary.bin"), Buffer.from([0, 1]));
+      await writeFile(join(root, "mode.sh"), "echo fixture\n");
+      await writeFile(join(root, "kind"), "old-kind\n");
+    },
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const result = await runReviewGoal(
+    "read every change",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig(),
+    diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      let done = false;
+      while (!done)
+        done =
+          protocolDocument(yield* protocol.call("read_pr_diff", { remaining: true })).done === true;
+      assert.equal(
+        (yield* protocol.call("submit_review", { summary: "done", findings: [], limitations: [] }))
+          .isError,
+        undefined,
+      );
+      yield protocolResult();
+    }),
+  );
+  assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
+  const renamed = result.inspection?.lineCoverage?.find((file) => file.path === "new.ts");
+  assert.deepEqual(renamed, { path: "new.ts", addedLines: [[11, 12]], deletedLines: [[11, 12]] });
+  assert.equal(
+    result.inspection?.lineCoverage?.some((file) => file.path === "old.ts"),
+    false,
+  );
+  const review = aggregateReview(repository.context, reviewConfig(), files, [result]);
+  assert.equal(
+    review.coverage.linesRead,
+    files.reduce((sum, file) => sum + file.changes, 0),
+  );
+  assert.equal(review.coverage.files.find((file) => file.path === "binary.bin")?.linesRead, 0);
+  assert.equal(review.coverage.files.find((file) => file.path === "mode.sh")?.totalChanges, 0);
+});
+
+test("failed goals retain verified partial line coverage", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const result = await runReviewGoal(
+    "fail after reading",
+    0,
+    repository.context,
+    files,
+    emptyConversation,
+    reviewConfig(),
+    repository.diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      yield* protocolBriefing(protocol);
+      yield* protocol.call("read_pr_diff", { paths: ["review.txt"] });
+      throw new Error("fixture provider failure after source delivery");
+    }),
+  );
+  assert.equal(result.status, "failed");
+  assert.deepEqual(
+    result.inspection?.lineCoverage?.find((file) => file.path === "review.txt"),
+    { path: "review.txt", addedLines: [[1, 2]], deletedLines: [[1, 2]] },
+  );
+  assert.deepEqual(
+    result.inspection?.lineCoverage?.find((file) => file.path === "unread.txt")?.addedLines,
+    [],
+  );
 });
