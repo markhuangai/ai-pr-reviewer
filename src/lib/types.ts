@@ -159,6 +159,28 @@ export interface ReviewFindingEvidence {
 export interface ReviewInspection {
   readonly observedPaths: readonly string[];
   readonly missingPaths: readonly string[];
+  readonly lineCoverage?: readonly ReviewFileLineCoverage[];
+}
+
+export type ReviewLineRange = readonly [start: number, endExclusive: number];
+
+export interface ReviewFileLineCoverage {
+  readonly path: string;
+  readonly addedLines: readonly ReviewLineRange[];
+  readonly deletedLines: readonly ReviewLineRange[];
+}
+
+export interface ReviewCoverage {
+  readonly files: readonly {
+    readonly path: string;
+    readonly linesRead: number;
+    readonly totalChanges: number;
+    readonly reviewersRead: number;
+  }[];
+  readonly linesRead: number;
+  readonly totalChanges: number;
+  readonly totalReviewerProfiles: number;
+  readonly trackedReviewerProfiles: number;
 }
 
 export interface ReviewSourceRange {
@@ -291,6 +313,7 @@ export interface AggregatedReview {
   readonly partial: boolean;
   readonly allGoalsFailed: boolean;
   readonly tokenUsage: AggregatedTokenUsage;
+  readonly coverage: ReviewCoverage;
 }
 
 export interface PullRequestReviewComment {

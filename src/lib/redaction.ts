@@ -70,6 +70,14 @@ export function redactGoalResults(
           inspection: {
             observedPaths: goal.inspection.observedPaths.map((path) => redact(path, secrets)),
             missingPaths: goal.inspection.missingPaths.map((path) => redact(path, secrets)),
+            ...(goal.inspection.lineCoverage === undefined
+              ? {}
+              : {
+                  lineCoverage: goal.inspection.lineCoverage.map((file) => ({
+                    ...file,
+                    path: redact(file.path, secrets),
+                  })),
+                }),
           },
         }),
     ...(goal.diagnostics === undefined
@@ -115,4 +123,13 @@ export function redactGoalResults(
           },
         }),
   }));
+}
+
+export function escapeHtmlText(value: string): string {
+  return value
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/\r/gu, "&#13;")
+    .replace(/\n/gu, "&#10;");
 }

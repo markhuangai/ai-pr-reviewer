@@ -392,6 +392,7 @@ export function createReviewSourceTools({
       if (snapshot.kind !== "text") return jsonToolResult(snapshot);
       if (snapshot.source === undefined)
         throw new Error("Text repository snapshot did not provide a query source.");
+      await ledger.coverage.indexSource(path, revision, snapshot.source, signal);
       const metadata = {
         revision,
         path,

@@ -20,6 +20,7 @@ import {
 } from "./agent-review-tools.js";
 
 import { pathSchema, reviewEvidenceResultSchema } from "./review-evidence-schema.js";
+import { ReviewCoverageTracker } from "./review-coverage.js";
 export {
   evidenceRefSchema,
   pathSchema,
@@ -369,6 +370,7 @@ export class ReviewEvidenceLedger {
     }
   >();
   private readonly nativeDelivered = new Map<string, [number, number][]>();
+  readonly coverage: ReviewCoverageTracker;
   private requiredBytes = 0;
   uniqueSourceBytes = 0;
   repeatedSourceBytes = 0;
@@ -378,7 +380,10 @@ export class ReviewEvidenceLedger {
     private readonly cwd: string,
     private readonly files: readonly ChangedFile[] = [],
     private readonly snapshot?: { mergeBaseSha: string; headSha: string },
-  ) {}
+    diffFiles?: readonly DiffFileSpan[],
+  ) {
+    this.coverage = new ReviewCoverageTracker(files, diffFiles);
+  }
 
   checkpoint() {
     return structuredClone({
@@ -395,6 +400,7 @@ export class ReviewEvidenceLedger {
       references: [...this.references],
       delivered: [...this.delivered],
       nativeDelivered: [...this.nativeDelivered],
+      coverage: this.coverage.checkpoint(),
       observedCalls: [...this.observedCalls],
       requiredBytes: this.requiredBytes,
       uniqueSourceBytes: this.uniqueSourceBytes,
@@ -410,6 +416,7 @@ export class ReviewEvidenceLedger {
     for (const [key, value] of state.references) this.references.set(key, value);
     for (const [key, value] of state.delivered) this.delivered.set(key, value);
     for (const [key, value] of state.nativeDelivered) this.nativeDelivered.set(key, value);
+    this.coverage.inherit(state.coverage);
     for (const id of state.observedCalls) this.observedCalls.add(id);
     this.requiredBytes = state.requiredBytes;
     this.uniqueSourceBytes = state.uniqueSourceBytes;
@@ -422,6 +429,14 @@ export class ReviewEvidenceLedger {
 
   get inspection(): ReviewInspection {
     return reviewInspection(this.files, this.references);
+  }
+
+  get finalInspection(): ReviewInspection {
+    return this.coverage.inspection(
+      this.inspection,
+      [...this.delivered.values()],
+      [...this.references.values()],
+    );
   }
 
   hasPrefix(paths: readonly string[], start: number, revision?: "base" | "head"): boolean {

@@ -294,7 +294,11 @@ test("keeps secret-bearing coverage paths for completeness without publishing th
       Promise.resolve({
         goals: [
           {
-            inspection: { observedPaths: [...[changedPath]], missingPaths: [] },
+            inspection: {
+              observedPaths: [...[changedPath]],
+              missingPaths: [],
+              lineCoverage: [{ path: changedPath, addedLines: [[1, 2]], deletedLines: [] }],
+            },
             prompt: "correctness",
             status: "completed" as const,
             submission: {
@@ -314,6 +318,7 @@ test("keeps secret-bearing coverage paths for completeness without publishing th
 
   const output = JSON.stringify({ review: result.review, summary, goals: publishedGoals });
   assert.equal(result.review?.partial, false);
+  assert.equal(result.review.coverage.files[0]?.linesRead, 1);
   assert.match(output, /\[REDACTED\]\.ts/u);
   assert.doesNotMatch(output, /test-ai-secret/u);
 });

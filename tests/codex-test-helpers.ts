@@ -779,7 +779,11 @@ export async function sharedReviewRun(
     );
     for (const goal of run.goals)
       if (goal.status === "completed")
-        assert.deepEqual(goal.inspection, { observedPaths: ["review.txt"], missingPaths: [] });
+        assert.deepEqual(goal.inspection, {
+          observedPaths: ["review.txt"],
+          missingPaths: [],
+          lineCoverage: [{ path: "review.txt", addedLines: [[2, 3]], deletedLines: [] }],
+        });
     return { run, config, context };
   } finally {
     await prepared.cleanup();

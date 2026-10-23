@@ -11,6 +11,8 @@ import {
 } from "../src/lib/aggregate.js";
 import type { GoalResult } from "../src/lib/types.js";
 import { config, context, files } from "./aggregate-test-fixtures.js";
+import { buildCoverageDetails } from "../src/lib/review-coverage.js";
+import { redact, redactGoalResults } from "../src/lib/redaction.js";
 
 test("keeps verified findings at separate locations distinct", () => {
   const review = aggregateReview(
@@ -649,6 +651,137 @@ test("binary changed-file metadata does not block an otherwise qualified approva
   );
   assert.equal(review.partial, false);
   assert.equal(review.event, "APPROVE");
+});
+
+test("coverage distinguishes unavailable tracking, lower bounds, and changes without lines", () => {
+  const changed = files[0];
+  assert.ok(changed);
+  const manifest = [{ ...changed, additions: 2001, changes: 2001 }];
+  const tracked: GoalResult = {
+    prompt: "tracked",
+    status: "incomplete",
+    inspection: {
+      observedPaths: [],
+      missingPaths: [changed.path],
+      lineCoverage: [{ path: changed.path, addedLines: [[1, 2001]], deletedLines: [] }],
+    },
+  };
+  const untracked: GoalResult = { prompt: "untracked", status: "failed" };
+  const review = aggregateReview(context, config, manifest, [tracked, untracked]);
+  assert.equal(review.coverage.linesRead, 2000);
+  assert.match(
+    buildReviewBody(review, [tracked, untracked]),
+    /Review coverage · at least 99\.9% of total changes/u,
+  );
+  const unknown = aggregateReview(context, config, manifest, [untracked]);
+  assert.match(
+    buildReviewBody(unknown, [untracked]),
+    /Review coverage · N\/A \(tracking unavailable\)/u,
+  );
+  assert.equal(unknown.coverage.linesRead, 0);
+  const metadata = [{ ...changed, additions: 0, changes: 0 }];
+  const empty: GoalResult = {
+    ...tracked,
+    inspection: { observedPaths: [], missingPaths: [], lineCoverage: [] },
+  };
+  const noLines = aggregateReview(context, config, metadata, [empty, empty]);
+  assert.match(buildReviewBody(noLines, [empty, empty]), /N\/A \(no countable changed lines\)/u);
+  assert.match(
+    buildReviewBody(noLines, [empty, empty]),
+    /src\/change\.ts<\/code> \| 0 \| 0 \| N\/A/u,
+  );
+  const noFiles = aggregateReview(context, config, [], [empty, empty]);
+  assert.match(buildReviewBody(noFiles, [empty, empty]), /no countable changed lines/u);
+});
+
+test("coverage retains raw identities through redaction collisions without publishing secrets", () => {
+  const changed = files[0];
+  assert.ok(changed);
+  const secrets = ["private-one", "private-two"];
+  const manifest = secrets.map((secret, index) => ({
+    ...changed,
+    path: `${secret}.ts`,
+    changes: index + 1,
+  }));
+  const goal: GoalResult = {
+    prompt: "private profile",
+    status: "completed",
+    submission: { summary: "done", findings: [], limitations: [] },
+    inspection: {
+      observedPaths: manifest.map((file) => file.path),
+      missingPaths: [],
+      lineCoverage: manifest.map((file) => ({
+        path: file.path,
+        addedLines: [[1, file.changes + 1]],
+        deletedLines: [],
+      })),
+    },
+  };
+  const redacted = redactGoalResults([goal], secrets);
+  const review = aggregateReview(
+    context,
+    { ...config, reviewPrompts: [{ prompt: "coverage", files: [] }] },
+    manifest,
+    redacted,
+    {
+      coverageGoals: [goal],
+      coverageDisplayPath: (path) => redact(path, secrets),
+    },
+  );
+  assert.deepEqual(
+    review.coverage.files.map(({ path, linesRead }) => ({ path, linesRead })),
+    [
+      { path: "[REDACTED].ts", linesRead: 1 },
+      { path: "[REDACTED].ts", linesRead: 2 },
+    ],
+  );
+  assert.equal(redacted[0]?.inspection?.lineCoverage?.[0]?.path, "[REDACTED].ts");
+  assert.equal(goal.inspection?.lineCoverage?.[0]?.path, "private-one.ts");
+  assert.doesNotMatch(
+    JSON.stringify({ review, redacted, body: buildReviewBody(review, redacted) }),
+    /private-one|private-two/u,
+  );
+});
+
+test("coverage bounds escaped UTF-8 rows and keeps complete totals and accounting blocks", () => {
+  const changed = files[0];
+  assert.ok(changed);
+  const manifest = Array.from({ length: 3000 }, (_, index) => ({
+    ...changed,
+    path: index === 0 ? "<script>|line\nbreak.ts" : `${index}-${"界".repeat(1000)}.ts`,
+    changes: 1,
+  }));
+  const goal: GoalResult = {
+    prompt: "large",
+    status: "completed",
+    submission: { summary: "done", findings: [], limitations: [] },
+    inspection: {
+      observedPaths: manifest.map((file) => file.path),
+      missingPaths: [],
+      lineCoverage: manifest.map((file) => ({
+        path: file.path,
+        addedLines: [[1, 2]],
+        deletedLines: [],
+      })),
+    },
+  };
+  const review = aggregateReview(context, config, manifest, [goal, goal]);
+  const block = buildCoverageDetails(review.coverage);
+  assert.ok(Buffer.byteLength(block, "utf8") <= 20_000);
+  assert.match(block, /additional file row\(s\) omitted/u);
+  assert.match(block, /\*\*Total\*\* \| \*\*3,000\*\* \| \*\*3,000\*\*/u);
+  assert.match(block, /&lt;script&gt;&#124;line&#10;break\.ts/u);
+  assert.doesNotMatch(block, /<script>|line\nbreak/u);
+  assert.ok(block.endsWith("</details>"));
+  for (const output of [
+    buildReviewBody(review, [goal, goal]),
+    buildRunSummary(context, review, [goal, goal]),
+  ]) {
+    assert.equal([...output.matchAll(/<details>/gu)].length, 2);
+    assert.equal([...output.matchAll(/<\/details>/gu)].length, 2);
+    assert.ok(output.indexOf("🔍 Review coverage") < output.indexOf("📊 Token usage"));
+    assert.ok(output.length <= 60_000);
+  }
 });
 
 test("bounds oversized inline prose while preserving a generated AI prompt", () => {

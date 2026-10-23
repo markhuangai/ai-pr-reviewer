@@ -4,10 +4,10 @@ import { randomUUID } from "node:crypto";
 import { access, readdir } from "node:fs/promises";
 import test from "node:test";
 import { z } from "zod";
-import { aggregateReview } from "../src/lib/aggregate.js";
+import { aggregateReview, buildReviewBody, buildRunSummary } from "../src/lib/aggregate.js";
 import { readReviewConfig } from "../src/lib/input.js";
 import { redactDiscovery } from "../src/lib/redaction.js";
-import type { ChangedFile, DiscoveryResult } from "../src/lib/types.js";
+import type { ChangedFile, DiscoveryResult, GoalResult } from "../src/lib/types.js";
 import { runReviewGoal, runReviewGoals } from "../src/runtime/agent.js";
 import { MODEL_TOOL_RESULT_BYTES, jsonToolResult } from "../src/runtime/agent-review-tools.js";
 import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
@@ -712,7 +712,96 @@ for (const executor of ["claude", "codex"] as const) {
       );
       assert.equal(result.status, "failed");
       assert.equal(fixture.requests.length, before);
+      assert.deepEqual(result.inspection?.lineCoverage, [
+        { path: file.path, addedLines: [], deletedLines: [] },
+      ]);
       await access(discovery.seed.sessionHome);
     },
   );
 }
+
+test("coverage unions changed lines across seven profiles and stays independent of approval", () => {
+  const manifest = [
+    {
+      ...file,
+      path: "file1.go",
+      additions: 12,
+      deletions: 8,
+      changes: 20,
+      addedLines: new Set(Array.from({ length: 12 }, (_, index) => index + 1)),
+    },
+    {
+      ...file,
+      path: "file2.go",
+      additions: 40,
+      deletions: 0,
+      changes: 40,
+      addedLines: new Set(Array.from({ length: 40 }, (_, index) => index + 1)),
+    },
+  ];
+  const profiles = Array.from({ length: 7 }, (_, index) => ({
+    prompt: `PRIVATE PROFILE ${index}`,
+    files: [],
+  }));
+  const goals: GoalResult[] = profiles.map(({ prompt }, index) => ({
+    prompt,
+    status: "completed",
+    submission: { summary: "clean", findings: [], limitations: [] },
+    inspection: {
+      observedPaths: manifest.map((file) => file.path),
+      missingPaths: [],
+      lineCoverage: [
+        {
+          path: "file1.go",
+          addedLines: index < 5 ? [[1, 11]] : [],
+          deletedLines: index < 5 ? [[1, 8]] : [],
+        },
+        { path: "file2.go", addedLines: [[1, 41]], deletedLines: [] },
+      ],
+    },
+  }));
+  const settings = reviewConfig({ reviewPrompts: profiles, autoApprove: true });
+  const review = aggregateReview(goalContext, settings, manifest, goals);
+  assert.deepEqual(review.coverage.files, [
+    { path: "file1.go", linesRead: 17, totalChanges: 20, reviewersRead: 5 },
+    { path: "file2.go", linesRead: 40, totalChanges: 40, reviewersRead: 7 },
+  ]);
+  assert.equal(review.coverage.linesRead, 57);
+  assert.equal(review.event, "APPROVE");
+  for (const output of [
+    buildReviewBody(review, goals),
+    buildRunSummary(goalContext, review, goals),
+  ]) {
+    assert.match(
+      output,
+      /<details>\n<summary>🔍 Review coverage · 95% of total changes<\/summary>/u,
+    );
+    assert.match(output, /file1\.go<\/code> \| 17 \| 20 \| 85% \| 5 \| 7/u);
+    assert.match(output, /file2\.go<\/code> \| 40 \| 40 \| 100% \| 7 \| 7/u);
+    assert.match(output, /\*\*Total\*\* \| \*\*57\*\* \| \*\*60\*\* \| \*\*95%\*\*/u);
+    assert.ok(output.indexOf("🔍 Review coverage") < output.indexOf("📊 Token usage"));
+    assert.doesNotMatch(output, /<details open|###.*Review coverage|PRIVATE PROFILE/u);
+    assert.match(output, /Total changes excludes unchanged context/u);
+    assert.match(output, /Reviewers read counts profiles receiving at least one changed line/u);
+    assert.match(
+      output,
+      /includes failed and unfinished profiles; discovery is not an additional profile/u,
+    );
+  }
+  const failed = goals.map((goal) => ({ ...goal, status: "failed" as const }));
+  const last = failed[6];
+  assert.ok(last);
+  failed[6] = {
+    ...last,
+    inspection: {
+      observedPaths: manifest.map((file) => file.path),
+      missingPaths: [],
+      lineCoverage: [{ path: "file1.go", addedLines: [[11, 13]], deletedLines: [[8, 9]] }],
+    },
+  };
+  const fullButFailed = aggregateReview(goalContext, settings, manifest, failed);
+  assert.equal(fullButFailed.coverage.linesRead, 60);
+  assert.equal(fullButFailed.event, "COMMENT");
+  assert.match(buildReviewBody(fullButFailed, failed), /Review coverage · 100% of total changes/u);
+  assert.match(buildRunSummary(goalContext, fullButFailed, failed), /^## ⚠️ AI review failed/u);
+});

@@ -95,6 +95,7 @@ export function createReviewDiagnostics({
   recovery,
   startedAt,
   logSecrets,
+  sourceContextDelivered,
 }: {
   goalIndex: number;
   files: readonly ChangedFile[];
@@ -102,6 +103,7 @@ export function createReviewDiagnostics({
   recovery: ReviewSubmissionRecovery;
   startedAt: number;
   logSecrets: readonly string[];
+  sourceContextDelivered: () => boolean;
 }) {
   function inspectionDetails(): Readonly<Record<string, unknown>> {
     const inspection = reviewInspection(files, evidenceLedger.issued);
@@ -149,7 +151,20 @@ export function createReviewDiagnostics({
       repeatedSourceBytes: evidenceLedger.repeatedSourceBytes,
     };
     writeAgentMonitorEvent(goalIndex, "review-recovery", diagnostics, logSecrets);
-    const inspection = reviewInspection(files, evidenceLedger.issued);
+    let inspection = evidenceLedger.finalInspection;
+    if (
+      result.status === "failed" &&
+      !sourceContextDelivered() &&
+      inspection.lineCoverage !== undefined
+    )
+      inspection = {
+        ...inspection,
+        lineCoverage: inspection.lineCoverage.map(({ path }) => ({
+          path,
+          addedLines: [],
+          deletedLines: [],
+        })),
+      };
     if (result.status === "incomplete") {
       const categories = [
         ...new Set([

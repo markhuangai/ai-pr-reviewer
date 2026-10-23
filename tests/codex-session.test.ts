@@ -79,7 +79,11 @@ test(
     const result = await nativeReview(t, fixture.url);
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
     assert.equal(result.submission?.findings[0]?.line, 2);
-    assert.deepEqual(result.inspection, { observedPaths: ["review.txt"], missingPaths: [] });
+    assert.deepEqual(result.inspection, {
+      observedPaths: ["review.txt"],
+      missingPaths: [],
+      lineCoverage: [{ path: "review.txt", addedLines: [[2, 3]], deletedLines: [] }],
+    });
     assert.ok((result.diagnostics?.submissionAttempts ?? 0) >= 2);
     assert.ok(fixture.requests.some(({ body }) => historyText(body).includes("rejected")));
     assert.ok(fixture.requests.some(({ body }) => historyText(body).includes("Continue")));
