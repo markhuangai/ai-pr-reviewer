@@ -771,7 +771,7 @@ test("coverage bounds escaped UTF-8 rows and keeps complete totals and accountin
   assert.match(block, /additional file row\(s\) omitted/u);
   assert.match(block, /\*\*Total\*\* \| \*\*3,000\*\* \| \*\*3,000\*\*/u);
   assert.match(block, /&lt;script&gt;&#124;line&#10;break\.ts/u);
-  assert.doesNotMatch(block, /<script>|line\nbreak/u);
+  assert.doesNotMatch(block, /<script>|line\nbreak/iu);
   assert.ok(block.endsWith("</details>"));
   for (const output of [
     buildReviewBody(review, [goal, goal]),
