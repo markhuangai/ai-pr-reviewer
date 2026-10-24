@@ -441,11 +441,13 @@ gh workflow run release.yml \
 
 The lockfile and release workflow enforce the project's supply-chain policy:
 
-- every locked npm dependency must be at least 168 hours old before installation;
+- every locked npm dependency must be at least 168 hours old before installation, except for a documented, approved security exception;
 - exact lockfile versions, integrity hashes, npm signature checks, lifecycle-script disabling, and no runtime package installation;
 - `npm audit --audit-level=high` blocks vulnerable releases;
 - consumers may pin exact immutable action release tags for reproducibility or choose a documented major alias for automatic updates;
-- a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days.
+- a candidate with a vulnerable dependency is not promoted while its fix is younger than seven days unless that fix has an approved security exception.
+
+Approved temporary exception: `body-parser@2.4.0` may complete quarantine early to fix [GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828). The shared CI and release age checker requires its exact pinned integrity hash and npm publication timestamp (`2026-10-22T11:39:38.614Z`) and logs each use. The exception becomes inactive when the normal quarantine clears on October 29, 2026 at 11:39:38.614 UTC. All other package ages, integrity checks, npm signatures, and vulnerability audits remain required.
 
 CI also runs CodeQL JavaScript/TypeScript analysis for pull requests targeting `main` and pushes to `main`. The CodeQL job scans without installing dependencies or executing project build scripts.
 

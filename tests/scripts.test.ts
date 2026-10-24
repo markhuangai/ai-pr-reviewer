@@ -168,8 +168,100 @@ test("checks package ages through a local registry and reports every invalid ent
   assert.deepEqual(await checkPackageAgeFile(lockPath, now, registry), {
     checked: 0,
     failures: [],
+    exceptions: [],
   });
   await assert.rejects(checkPackageAge({}), /no packages mapping/u);
+});
+
+test("limits the approved package-age exception to its artifact and publication window", async (t) => {
+  const candidate: {
+    name: string;
+    version: string;
+    integrity: string;
+    published: unknown;
+    now: number;
+  } = {
+    name: "body-parser",
+    version: "2.4.0",
+    integrity:
+      "sha512-Ifk1KcLrxaGt1occQagQNFNNOqRt1LFuehEnHHzB8Z6cRgIxRU1TBaiIsUiCdA+gy5PL7Y1IX31DNKkRmxtXjQ==",
+    published: "2026-10-22T11:39:38.614Z",
+    now: Date.parse("2026-10-24T12:00:00.000Z"),
+  };
+  let version = candidate.version;
+  let published = candidate.published;
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests += 1;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ time: { [version]: published } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => closeServer(server));
+  const { port } = server.address() as AddressInfo;
+  const registry = `http://127.0.0.1:${port}`;
+  const cases: Array<[string, Partial<typeof candidate>, number, number]> = [
+    ["approved security fix", {}, 0, 1],
+    ["another package", { name: "unrelated" }, 1, 0],
+    ["another version", { version: "2.4.1" }, 1, 0],
+    ["another artifact", { integrity: "sha512-other" }, 1, 0],
+    ["missing integrity", { integrity: "" }, 1, 0],
+    ["missing timestamp", { published: undefined }, 1, 0],
+    ["invalid timestamp", { published: "not-a-date" }, 1, 0],
+    ["changed publication", { published: "2026-10-23T11:39:38.614Z" }, 1, 0],
+    ["future publication", { now: Date.parse("2026-10-22T00:00:00.000Z") }, 1, 0],
+    ["normal quarantine boundary", { now: Date.parse("2026-10-29T11:39:38.614Z") }, 0, 0],
+  ];
+  for (const [name, overrides, failures, exceptions] of cases) {
+    await t.test(name, async () => {
+      const input = { ...candidate, ...overrides };
+      version = input.version;
+      published = input.published;
+      const result = await checkPackageAge(
+        {
+          packages: {
+            [`node_modules/${input.name}`]: {
+              version,
+              resolved: "https://registry.test/package.tgz",
+              integrity: input.integrity,
+            },
+          },
+        },
+        input.now,
+        registry,
+      );
+      assert.equal(result.failures.length, failures);
+      assert.equal(result.exceptions.length, exceptions);
+      if (exceptions > 0) {
+        assert.ok(result.exceptions[0]?.includes("body-parser@2.4.0"));
+        assert.ok(result.exceptions[0]?.includes("GHSA-27r3-jxmh-p828"));
+      }
+    });
+  }
+
+  version = candidate.version;
+  published = candidate.published;
+  const entry = {
+    version,
+    resolved: "https://registry.test/package.tgz",
+    integrity: candidate.integrity,
+  };
+  const before = requests;
+  const result = await checkPackageAge(
+    {
+      packages: {
+        "node_modules/body-parser": entry,
+        "node_modules/nested/node_modules/body-parser": { ...entry, integrity: "sha512-other" },
+        "node_modules/other/node_modules/body-parser": entry,
+      },
+    },
+    candidate.now,
+    registry,
+  );
+  assert.equal(result.checked, 1);
+  assert.equal(requests - before, 1);
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.exceptions.length, 1);
 });
 
 test("fails package-age checks when the registry request fails", async (t) => {
