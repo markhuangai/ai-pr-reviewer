@@ -17,6 +17,7 @@ import { CodexAppServer, codexExecutable, type CodexConfigValue } from "./codex-
 import { startCodexMcpServer, type CodexMcpServer } from "./codex-mcp-server.js";
 import type { ReviewSession, ReviewSessionInput } from "./review-session.js";
 import type { ReviewTool } from "./review-tool.js";
+import { codexProviderError } from "./session-recovery.js";
 
 type Message = SDKMessage | SDKActiveGoalMessage;
 
@@ -531,6 +532,7 @@ export class CodexSession implements ReviewSession {
   private result(
     subtype: "success" | "error_max_turns" | "error_during_execution",
     error?: string,
+    nativeError?: unknown,
   ): void {
     this.emit({
       type: "result",
@@ -544,6 +546,7 @@ export class CodexSession implements ReviewSession {
       modelUsage: this.modelUsage,
       permission_denials: [],
       stop_reason: null,
+      ...(subtype === "error_during_execution" ? { codex_error: nativeError } : {}),
       ...(subtype === "success" ? { result: "" } : { errors: [error ?? "Codex turn failed."] }),
     });
   }
@@ -572,6 +575,7 @@ export class CodexSession implements ReviewSession {
         this.result(
           "error_during_execution",
           typeof error === "string" ? error : "Codex turn failed.",
+          params.turn.error,
         );
       } else if (this.turns >= this.input.config.maxTurns && !this.input.isAccepted?.()) {
         this.limited = true;
@@ -596,6 +600,7 @@ export class CodexSession implements ReviewSession {
         this.result(
           "error_during_execution",
           typeof error === "string" ? error : "Codex turn failed.",
+          params.turn.error,
         );
       }
     } else if (method === "thread/goal/updated") {
@@ -667,8 +672,7 @@ export class CodexSession implements ReviewSession {
           attempt: 1,
           max_retries: 1,
           retry_delay_ms: 0,
-          error_status: null,
-          error: "server_error",
+          ...codexProviderError(params.error),
         });
       }
     } else if (

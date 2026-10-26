@@ -400,7 +400,7 @@ test("missing inspection retains an empty valid candidate as incomplete at the b
     repository.root,
     reviewProtocolQuery(async function* (protocol) {
       yield* protocolBriefing(protocol);
-      for (let index = 0; index < 5; index += 1) {
+      for (let index = 0; index < 6; index += 1) {
         assert.equal(
           (yield* protocol.call("submit_review", {
             summary: "Not inspected",

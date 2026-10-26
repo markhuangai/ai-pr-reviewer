@@ -1,3 +1,4 @@
+import type { ReviewConversationSnapshot } from "../lib/review-context.js";
 import type { ReviewBriefingReader } from "./review-briefing.js";
 import { randomUUID } from "node:crypto";
 import { tool } from "./review-tool.js";
@@ -18,6 +19,7 @@ import {
 } from "./agent-review-tools.js";
 import {
   reviewInspection,
+  toolResponseDocument,
   type ReviewEvidenceLedger,
   type ReviewValidationGap,
 } from "./review-assessment.js";
@@ -621,8 +623,10 @@ export function createReviewStateTool({
         addBatch();
         for (const gap of gaps().filter(
           (gap) => gap.paths.length === 0 || gap.paths.some(selected),
-        ))
+        )) {
+          if (gap.nextCall !== undefined) records.push({ kind: "next_call", ...gap.nextCall });
           records.push({ kind: "gap", ...gap });
+        }
         records.push(...optionalCalls);
         for (const file of files.filter(
           (file) =>
@@ -707,6 +711,8 @@ export function createReviewContextTools({
   conversationReader,
   contextReaders,
   onConversationComplete,
+  onDiscussionPage,
+  onContextPage,
 }: {
   isActive: () => boolean;
   signal: AbortSignal | undefined;
@@ -714,6 +720,8 @@ export function createReviewContextTools({
   conversationReader: PullRequestConversationReader;
   contextReaders: ReadonlyMap<string, { file: PreparedContextFile; reader: PullRequestDiffReader }>;
   onConversationComplete: () => void;
+  onDiscussionPage?: (page: number) => void;
+  onContextPage?: () => void;
 }) {
   const conversationTool = tool(
     "read_pr_conversation",
@@ -727,6 +735,7 @@ export function createReviewContextTools({
         });
       }
       const page = conversationReader.readNext();
+      if (page.content.length > 0) onDiscussionPage?.(page.page);
       if (page.done) onConversationComplete();
       return Promise.resolve(jsonToolResult(page));
     },
@@ -776,6 +785,7 @@ export function createReviewContextTools({
             }
             const metadata = { path, sizeBytes: contextReader.file.sizeBytes };
             const page = await contextReader.reader.readNext(metadata);
+            if (page.content.length > 0) onContextPage?.();
             return jsonToolResult({
               ...metadata,
               ...page,
@@ -784,4 +794,139 @@ export function createReviewContextTools({
           { alwaysLoad: true },
         );
   return { conversationTool, briefingTool, contextFileTool };
+}
+
+export function createReviewThreadTool({
+  isActive,
+  signal,
+  conversation,
+  queryReaders,
+  discussionPathScope,
+  discussionReadPaths,
+  discussionReadThreadIds,
+  discussionQueryCursors,
+  queryReaderDiscussionKeys,
+  onPage,
+}: {
+  isActive: () => boolean;
+  signal: AbortSignal | undefined;
+  conversation: ReviewConversationSnapshot;
+  queryReaders: ReviewQueryReaderStore;
+  discussionPathScope: (path: string) => string;
+  discussionReadPaths: Set<string>;
+  discussionReadThreadIds: Set<number>;
+  discussionQueryCursors: Map<string, string>;
+  queryReaderDiscussionKeys: Map<string, string>;
+  onPage: (selector: Readonly<Record<string, unknown>>, page: number) => void;
+}) {
+  return tool(
+    "read_pr_threads",
+    "Read prior discussion for one exact thread ID or changed-file path from the briefing index. Continue a paginated read with its cursor and the same ID or path selector.",
+    {
+      id: z.number().int().positive().optional(),
+      path: z.string().min(1).max(4_096).optional(),
+      cursor: z.string().min(1).max(100).optional(),
+    },
+    ({ id, path, cursor }): Promise<CallToolResult> => {
+      throwIfAborted(signal);
+      if (!isActive())
+        return Promise.resolve({
+          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
+        });
+      return Promise.resolve().then(async () => {
+        const hasOneSelector = (id === undefined) !== (path === undefined);
+        const selector = id === undefined ? (path === undefined ? undefined : { path }) : { id };
+        if (cursor !== undefined) {
+          if (!hasOneSelector || selector === undefined)
+            return queryReaders.invalidCursor(
+              "Continue a discussion read with the same id or path selector.",
+              cursor,
+            );
+          const response = await queryReaders.readPage(cursor, "thread", { selector });
+          const page = toolResponseDocument(response);
+          if (
+            typeof page?.page === "number" &&
+            typeof page.content === "string" &&
+            page.content.length > 0
+          )
+            onPage(selector, page.page);
+          return response;
+        }
+        if ((id === undefined) === (path === undefined)) {
+          return {
+            content: [{ type: "text", text: "Provide exactly one discussion thread id or path." }],
+            isError: true,
+          };
+        }
+        const requestedPathScope = path === undefined ? undefined : discussionPathScope(path);
+        const querySelector = selector as Readonly<Record<string, unknown>>;
+        const discussionKey =
+          id === undefined ? `path:${requestedPathScope as string}` : `id:${String(id)}`;
+        const existingCursor = discussionQueryCursors.get(discussionKey);
+        if (existingCursor !== undefined && queryReaders.has(existingCursor)) {
+          return jsonToolResult({
+            selector,
+            reused: true,
+            done: false,
+            nextCursor: existingCursor,
+          });
+        }
+        discussionQueryCursors.delete(discussionKey);
+        const entries = conversation.entries.filter((entry) =>
+          id === undefined
+            ? entry.kind === "inline_thread" &&
+              requestedPathScope !== undefined &&
+              discussionPathScope(entry.path) === requestedPathScope
+            : entry.id === id,
+        );
+        if (entries.length === 0) {
+          return {
+            content: [
+              { type: "text", text: "No matching discussion entry exists in the snapshot." },
+            ],
+            isError: true,
+          };
+        }
+        const discussionPaths = new Set(
+          entries
+            .filter(
+              (entry): entry is Extract<typeof entry, { kind: "inline_thread" }> =>
+                entry.kind === "inline_thread",
+            )
+            .map((entry) => entry.path),
+        );
+        const query = queryReaders.createString(
+          JSON.stringify({ entries }),
+          { selector: querySelector },
+          () => {
+            if (id !== undefined) {
+              for (const entry of entries)
+                if (entry.kind === "inline_thread") discussionReadThreadIds.add(entry.id);
+              return;
+            }
+            for (const discussionPath of discussionPaths)
+              discussionReadPaths.add(discussionPathScope(discussionPath));
+          },
+        );
+        discussionQueryCursors.set(discussionKey, query.cursor);
+        queryReaderDiscussionKeys.set(query.cursor, discussionKey);
+        const pageResult = query.reader.readNext({
+          selector: querySelector,
+          nextCursor: query.cursor,
+        });
+        onPage(querySelector, pageResult.page);
+        if (pageResult.done) {
+          await queryReaders.finish(query.cursor);
+        }
+        return jsonToolResult({
+          selector: querySelector,
+          page: pageResult.page,
+          content: pageResult.content,
+          done: pageResult.done,
+          ...(pageResult.done ? {} : { nextCursor: query.cursor }),
+        });
+      });
+    },
+    { alwaysLoad: true },
+  );
 }

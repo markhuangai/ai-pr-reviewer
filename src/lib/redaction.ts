@@ -133,3 +133,7 @@ export function escapeHtmlText(value: string): string {
     .replace(/\r/gu, "&#13;")
     .replace(/\n/gu, "&#10;");
 }
+
+export function escapeMarkdownText(value: string): string {
+  return escapeHtmlText(value.replace(/[-\\`*_[\]{}()#+.!|]/gu, "\\$&"));
+}

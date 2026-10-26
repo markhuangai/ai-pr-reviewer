@@ -6,7 +6,6 @@ import {
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { PreparedContextFile } from "../lib/context-files.js";
 import { reviewSecretCandidates } from "../lib/input.js";
@@ -45,12 +44,10 @@ import {
   PullRequestConversationReader,
   type PullRequestDiffArtifact,
   PullRequestDiffReader,
-  jsonToolResult,
 } from "./agent-review-tools.js";
 import {
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
-  SDK_SESSION_STALL_MS,
   closeSdkSession,
   createDeferred,
   createReviewSessionRecoveryMonitor,
@@ -74,7 +71,8 @@ import {
 } from "./review-assessment.js";
 import {
   ReviewSubmissionRecovery,
-  retainValidReviewFindings,
+  investigationOnly,
+  retainReviewSubmission,
   unreadReviewFindingPaths,
   reviewSubmissionGaps,
   reviewSubmissionRejectionResult,
@@ -82,12 +80,18 @@ import {
 import {
   ReviewQueryReaderStore,
   createReviewStateTool,
+  createReviewThreadTool,
   createReviewContextTools,
   createReviewSourceTools,
 } from "./review-context-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
+import {
+  ProviderRecovery,
+  waitForProviderRetry,
+  type SessionRecoveryFailure,
+} from "./session-recovery.js";
 import {
   createReviewSession,
   createReviewMcpServers,
@@ -98,6 +102,7 @@ import {
   assertDiscoverySnapshot,
   assertIndependentSession,
   sharedModelUsage,
+  modelUsageSince,
   forkSessionOptions,
   runSharedDiscovery,
   type SharedReviewSeed,
@@ -127,6 +132,8 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   const startedAt = Date.now();
   const recovery = new ReviewSubmissionRecovery(config.maxTurns);
+  const provider = new ProviderRecovery();
+  const accepted = createDeferred<undefined>();
   const recoveryExhausted = createDeferred<undefined>();
   const submissionName = "mcp__review_output__submit_review";
   let validationGaps: readonly ReviewValidationGap[] = [];
@@ -147,7 +154,7 @@ export async function runReviewGoal(
               : [],
           )
         : [];
-    recovery.observeProgress(evidenceLedger.inspectionProgress);
+    recovery.observeProgress(inspectionProgress());
     const changed = recovery.reject(
       id,
       recordedCategories.length > 0
@@ -159,11 +166,7 @@ export async function runReviewGoal(
     if (changed)
       logDiagnostic("submission-decision", {
         toolCallId: id,
-        decision:
-          recordedCategories.length > 0 &&
-          recordedCategories.every((category) => category === "inspection")
-            ? "continued"
-            : "rejected",
+        decision: investigationOnly(recordedCategories) ? "continued" : "rejected",
         categories:
           recordedCategories.length > 0
             ? recordedCategories
@@ -194,6 +197,10 @@ export async function runReviewGoal(
     recovery,
     startedAt,
     logSecrets,
+    sessionRecovery: () => ({
+      ...provider.diagnostics,
+      stallRecoveries: monitor?.recoveryCount ?? 0,
+    }),
     sourceContextDelivered: () =>
       sharedSeed === undefined ||
       lifecycle.sessionId !== undefined ||
@@ -202,7 +209,8 @@ export async function runReviewGoal(
   const evidenceHook: HookCallback = (input) => {
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
     const references = evidenceLedger.observeBatch(input.tool_calls);
-    recovery.observeProgress(evidenceLedger.inspectionProgress);
+    recovery.observeProgress(inspectionProgress());
+    monitor?.observeProgress();
     const deliveredInspection = inspectionDetails();
     for (const delivery of evidenceLedger.deliveries)
       logDiagnostic("source-delivery", { ...delivery, ...deliveredInspection });
@@ -271,6 +279,10 @@ export async function runReviewGoal(
   const queryReaders = new ReviewQueryReaderStore(detachDiscussionQuery, signal);
   const discussionReadPaths = new Set<string>();
   const discussionReadThreadIds = new Set<number>();
+  const discussionPages = new Set<string>();
+  let contextPages = 0;
+  const inspectionProgress = () =>
+    evidenceLedger.inspectionProgress + briefingReader.deliveredPages + discussionPages.size;
   const discussionPathScopes = new Map<string, string>();
   for (const file of files) {
     discussionPathScopes.set(file.path, file.path);
@@ -296,6 +308,12 @@ export async function runReviewGoal(
       for (const entry of conversation.entries)
         if (entry.kind === "inline_thread")
           discussionReadPaths.add(discussionPathScope(entry.path));
+    },
+    onDiscussionPage: (page) => {
+      discussionPages.add(`conversation:${page}`);
+    },
+    onContextPage: () => {
+      contextPages++;
     },
   });
   const reviewStateTool = createReviewStateTool({
@@ -323,107 +341,20 @@ export async function runReviewGoal(
     repositorySnapshot,
     ledger: evidenceLedger,
   });
-  const discussionThreadTool = tool(
-    "read_pr_threads",
-    "Read prior discussion for one exact thread ID or changed-file path from the briefing index. Continue a paginated read with its cursor and the same ID or path selector.",
-    {
-      id: z.number().int().positive().optional(),
-      path: z.string().min(1).max(4_096).optional(),
-      cursor: z.string().min(1).max(100).optional(),
+  const discussionThreadTool = createReviewThreadTool({
+    isActive: isReviewActive,
+    signal,
+    conversation,
+    queryReaders,
+    discussionPathScope,
+    discussionReadPaths,
+    discussionReadThreadIds,
+    discussionQueryCursors,
+    queryReaderDiscussionKeys,
+    onPage: (selector, page) => {
+      discussionPages.add(`${JSON.stringify(selector)}:${page}`);
     },
-    ({ id, path, cursor }): Promise<CallToolResult> => {
-      throwIfAborted(signal);
-      if (!reviewPromptActive)
-        return Promise.resolve({
-          content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
-        });
-      return Promise.resolve().then(async () => {
-        const hasOneSelector = (id === undefined) !== (path === undefined);
-        const selector = id === undefined ? (path === undefined ? undefined : { path }) : { id };
-        if (cursor !== undefined) {
-          if (!hasOneSelector || selector === undefined)
-            return queryReaders.invalidCursor(
-              "Continue a discussion read with the same id or path selector.",
-              cursor,
-            );
-          return queryReaders.readPage(cursor, "thread", { selector });
-        }
-        if ((id === undefined) === (path === undefined)) {
-          return {
-            content: [{ type: "text", text: "Provide exactly one discussion thread id or path." }],
-            isError: true,
-          };
-        }
-        const requestedPathScope = path === undefined ? undefined : discussionPathScope(path);
-        const querySelector = selector as Readonly<Record<string, unknown>>;
-        const discussionKey =
-          id === undefined ? `path:${requestedPathScope as string}` : `id:${String(id)}`;
-        const existingCursor = discussionQueryCursors.get(discussionKey);
-        if (existingCursor !== undefined && queryReaders.has(existingCursor)) {
-          return jsonToolResult({
-            selector,
-            reused: true,
-            done: false,
-            nextCursor: existingCursor,
-          });
-        }
-        discussionQueryCursors.delete(discussionKey);
-        const entries = conversation.entries.filter((entry) =>
-          id === undefined
-            ? entry.kind === "inline_thread" &&
-              requestedPathScope !== undefined &&
-              discussionPathScope(entry.path) === requestedPathScope
-            : entry.id === id,
-        );
-        if (entries.length === 0) {
-          return {
-            content: [
-              { type: "text", text: "No matching discussion entry exists in the snapshot." },
-            ],
-            isError: true,
-          };
-        }
-        const discussionPaths = new Set(
-          entries
-            .filter(
-              (entry): entry is Extract<typeof entry, { kind: "inline_thread" }> =>
-                entry.kind === "inline_thread",
-            )
-            .map((entry) => entry.path),
-        );
-        const query = queryReaders.createString(
-          JSON.stringify({ entries }),
-          { selector: querySelector },
-          () => {
-            if (id !== undefined) {
-              for (const entry of entries)
-                if (entry.kind === "inline_thread") discussionReadThreadIds.add(entry.id);
-              return;
-            }
-            for (const discussionPath of discussionPaths)
-              discussionReadPaths.add(discussionPathScope(discussionPath));
-          },
-        );
-        discussionQueryCursors.set(discussionKey, query.cursor);
-        queryReaderDiscussionKeys.set(query.cursor, discussionKey);
-        const pageResult = query.reader.readNext({
-          selector: querySelector,
-          nextCursor: query.cursor,
-        });
-        if (pageResult.done) {
-          await queryReaders.finish(query.cursor);
-        }
-        return jsonToolResult({
-          selector: querySelector,
-          page: pageResult.page,
-          content: pageResult.content,
-          done: pageResult.done,
-          ...(pageResult.done ? {} : { nextCursor: query.cursor }),
-        });
-      });
-    },
-    { alwaysLoad: true },
-  );
+  });
   const unreadFindingPaths = (findings: readonly unknown[]): readonly string[] =>
     unreadReviewFindingPaths(
       findings,
@@ -441,6 +372,10 @@ export async function runReviewGoal(
       briefingReader.complete,
       unreadFindingPaths,
       recovery.limitationReconsiderationPending,
+      (path) =>
+        queryReaders.continuation(
+          discussionQueryCursors.get(`path:${discussionPathScope(path)}`) ?? "",
+        ) ?? { tool: "read_pr_threads", arguments: { path } },
     );
   }
   const outputTool = tool(
@@ -491,6 +426,7 @@ export async function runReviewGoal(
         );
       });
       submission = candidate;
+      accepted.resolve(undefined);
       logDiagnostic("submission-decision", {
         decision: "accepted",
         ...inspectionDetails(),
@@ -523,6 +459,13 @@ export async function runReviewGoal(
   ];
   const mcpServers = createReviewMcpServers(config, reviewTools, contextFileTool !== undefined);
   const input = new PromptStream();
+  const queueMessage = (text: string, label: string): void => {
+    const message = makeUserMessage(text);
+    input.push(message);
+    logAgentEventSafely(goalIndex, logSecrets, (write) => {
+      logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
+    });
+  };
   let turn = createDeferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
@@ -533,6 +476,7 @@ export async function runReviewGoal(
   let sessionClosed = false;
   let closedOperation: void | Promise<void>;
   const stalledSubmission = createDeferred<undefined>();
+  const recoveryFailure = createDeferred<SessionRecoveryFailure>();
   const closeSession = (): void | Promise<void> => {
     if (session === undefined || sessionClosed) return closedOperation;
     sessionClosed = true;
@@ -553,28 +497,16 @@ export async function runReviewGoal(
   } = { models: [], latestSnapshotValid: false };
   const withDiagnostics = (result: GoalResult): GoalResult =>
     finalizeDiagnostics(result, sessionPhase, validationGaps);
-  const retainedSubmission = (): GoalSubmission | undefined => {
-    const input = recovery.latestInput;
-    const schema = config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema;
-    const parsed = schema.safeParse(input);
-    const gaps = submissionGaps(input);
-    if (
-      parsed.success &&
-      gaps.every((gap) => gap.category === "inspection" || gap.category === "limitation")
-    ) {
-      const candidate = toSubmission(parsed.data);
-      if (gaps.length > 0 && gaps.every((gap) => gap.category === "limitation")) return candidate;
-      const reason = `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`;
-      return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };
-    }
-    return retainValidReviewFindings(
+  const retainedSubmission = (): GoalSubmission | undefined =>
+    retainReviewSubmission(
       recovery.latestInput,
       files,
       evidenceLedger.issued,
-      (finding) => briefingReader.complete && unreadFindingPaths([finding]).length === 0,
       config.interactWithPullRequest,
+      submissionGaps(recovery.latestInput),
+      (finding) => briefingReader.complete && unreadFindingPaths([finding]).length === 0,
+      `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`,
     );
-  };
   const abortTurn = (): void => {
     input.finish();
     turn.reject(signal?.reason ?? new Error("The pull request review was cancelled."));
@@ -655,6 +587,14 @@ export async function runReviewGoal(
     let stalledMcpStatus = { checked: false, failures: "" };
     let stalledSubmissionFinalization: Promise<void> | undefined;
     const activeMonitor = createReviewSessionRecoveryMonitor({
+      progress: () =>
+        inspectionProgress() +
+        evidenceLedger.uniqueSourceBytes +
+        evidenceLedger.uniqueNativeLines +
+        contextPages,
+      onRecoveryFailure: (reason) => {
+        recoveryFailure.resolve(reason);
+      },
       snapshot: () => ({
         ...reviewSessionSnapshot(
           sessionPhase,
@@ -700,6 +640,7 @@ export async function runReviewGoal(
       try {
         for await (const message of activeSession) {
           assertIndependentSession(message, sharedSeed);
+          provider.observe(message);
           activeMonitor.observe(sdkSessionActivity(message, toolUses));
           if (message.type !== "active_goal")
             logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
@@ -710,8 +651,12 @@ export async function runReviewGoal(
           if (message.type === "result") {
             if (submission !== undefined) activeMonitor.stop();
             const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
-            tokenUsageState.latestSnapshotValid = snapshot !== undefined;
-            if (snapshot !== undefined) tokenUsageState.models = snapshot;
+            tokenUsageState.latestSnapshotValid =
+              modelUsageSince(snapshot, tokenUsageState.models) !== undefined;
+            if (snapshot !== undefined && tokenUsageState.latestSnapshotValid)
+              tokenUsageState.models = snapshot;
+            if (provider.failure(message) !== undefined)
+              tokenUsageState.latestSnapshotValid = false;
             const completedTurn = turn;
             turn = createDeferred<SDKResultMessage>();
             completedTurn.resolve(message);
@@ -767,8 +712,19 @@ export async function runReviewGoal(
         turn.promise.then((result) => ({ kind: "result" as const, result })),
         recoveryExhausted.promise.then(() => ({ kind: "recovery-exhausted" as const })),
         stalledSubmission.promise.then(() => ({ kind: "stalled-submission" as const })),
+        recoveryFailure.promise.then((reason) => ({ kind: "recovery-failed" as const, reason })),
       ]);
       throwIfAborted(signal);
+      if (outcome.kind === "recovery-failed") {
+        sessionPhase = outcome.reason;
+        return await finalizeUnaccepted(
+          outcome.reason === "interrupt-timeout"
+            ? "The stalled session did not finish its interrupted turn within 30 seconds."
+            : "The goal stalled again after two recovery attempts.",
+          false,
+          true,
+        );
+      }
       if (outcome.kind === "stalled-submission" || stalledSubmissionFinalization !== undefined) {
         const acceptedSubmission = submission;
         if (acceptedSubmission === undefined) {
@@ -806,8 +762,13 @@ export async function runReviewGoal(
         return await finalizeUnaccepted(`Review recovery stopped: ${sessionPhase}.`, false);
       }
       const { result } = outcome;
-      if (sessionState.stallBoundaryPending) {
+      const providerFailure = provider.failure(result);
+      const interrupted = sessionState.stallBoundaryPending;
+      if (interrupted) {
+        activeMonitor.interruptedTurnFinished();
         sessionState.stallBoundaryPending = false;
+      }
+      if (interrupted && providerFailure === undefined) {
         writeAgentMonitorEvent(
           goalIndex,
           "interrupted-turn-boundary",
@@ -859,10 +820,10 @@ export async function runReviewGoal(
           );
         }
         sessionPhase = "waiting-for-continuation-result";
-        const continuation = makeUserMessage(
-          `The previous turn was interrupted after ${SDK_SESSION_STALL_MS} ms without an SDK message. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.`,
+        queueMessage(
+          "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+          `stall-continuation-${activeMonitor.recoveryCount}`,
         );
-        input.push(continuation);
         writeAgentMonitorEvent(
           goalIndex,
           "continuation-queued",
@@ -873,15 +834,52 @@ export async function runReviewGoal(
           },
           logSecrets,
         );
-        logAgentEventSafely(goalIndex, logSecrets, (write) => {
-          logQueuedUserMessage(
-            continuation,
-            `stall-continuation-${activeMonitor.recoveryCount}`,
-            goalIndex,
-            logSecrets,
-            write,
+        continue;
+      }
+      if (providerFailure !== undefined) {
+        recovery.finishProviderTurn();
+        const delay = submission === undefined ? provider.retryDelay(providerFailure) : undefined;
+        if (delay === undefined) {
+          sessionPhase =
+            providerFailure.retryable && submission === undefined
+              ? "provider-retries-exhausted"
+              : "provider-error";
+          return await finalizeUnaccepted(
+            providerFailure.message,
+            tokenUsageState.latestSnapshotValid,
+            true,
           );
-        });
+        }
+        sessionPhase = "waiting-for-provider-retry";
+        activeMonitor.pause();
+        writeAgentMonitorEvent(
+          goalIndex,
+          "provider-retry",
+          {
+            retry: provider.retries,
+            max_retries: 2,
+            retry_delay_ms: delay,
+            error_status: providerFailure.status,
+            error: providerFailure.category,
+          },
+          logSecrets,
+        );
+        await waitForProviderRetry(delay, signal, accepted.promise);
+        throwIfAborted(signal);
+        activeMonitor.resume();
+        if (submission !== undefined) {
+          sessionPhase = "provider-error";
+          return await finalizeUnaccepted(
+            providerFailure.message,
+            tokenUsageState.latestSnapshotValid,
+            true,
+          );
+        }
+        sessionPhase = "waiting-for-continuation-result";
+        queueMessage(
+          "The model provider request failed temporarily. Continue the same review from the existing evidence and exact next calls in read_review_state, then submit through submit_review.",
+          `provider-retry-${provider.retries}`,
+        );
         continue;
       }
       if (result.subtype !== "success") {
@@ -910,7 +908,7 @@ export async function runReviewGoal(
           ),
         );
       }
-      recovery.observeProgress(evidenceLedger.inspectionProgress);
+      recovery.observeProgress(inspectionProgress());
       const recoveryKind = recovery.finishTurn();
       if (recovery.exhausted) {
         sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
@@ -921,7 +919,7 @@ export async function runReviewGoal(
       }
       throwIfAborted(signal);
       sessionPhase = "waiting-for-repair-result";
-      const repairMessage = makeUserMessage(
+      queueMessage(
         repairPrompt(
           recoveryKind === "inspection"
             ? { kind: "inspection", remainingCycles: recovery.remainingInspectionCycles }
@@ -930,22 +928,18 @@ export async function runReviewGoal(
           config.interactWithPullRequest,
           validationGaps[0]?.message.slice(0, 1_000),
         ),
+        recoveryKind === "inspection"
+          ? `inspection-continuation-${recovery.inspectionContinuations}`
+          : `repair-${recovery.repairAttempts + 1}`,
       );
-      input.push(repairMessage);
-      logAgentEventSafely(goalIndex, logSecrets, (write) => {
-        logQueuedUserMessage(
-          repairMessage,
-          recoveryKind === "inspection"
-            ? `inspection-continuation-${recovery.inspectionContinuations}`
-            : `repair-${recovery.repairAttempts + 1}`,
-          goalIndex,
-          logSecrets,
-          write,
-        );
-      });
     }
   } catch (error) {
-    sessionPhase = "failed";
+    if (
+      !sessionPhase.startsWith("provider-") &&
+      sessionPhase !== "interrupt-timeout" &&
+      sessionPhase !== "stall-recovery-exhausted"
+    )
+      sessionPhase = "failed";
     let failure = readerFailure?.message ?? errorMessage(error);
     try {
       await finishSession();
