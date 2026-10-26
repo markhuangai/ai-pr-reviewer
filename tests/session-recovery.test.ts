@@ -123,6 +123,28 @@ test("does not classify SDK limits or interruptions as provider errors", () => {
   assert.equal(provider.failure(result)?.retryable, true);
 });
 
+test("a recovered assistant response clears retry metadata before a later interruption", () => {
+  for (const prior of [
+    { type: "system", subtype: "api_retry", error: "server_error", error_status: 500 },
+    { type: "assistant", error: "server_error" },
+  ] as SDKMessage[]) {
+    const provider = new ProviderRecovery();
+    provider.observe(prior);
+    provider.observe({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "Recovered response" }] },
+    } as SDKMessage);
+    const interrupted = protocolResult("error_during_execution");
+    provider.observe(interrupted);
+    assert.equal(provider.failure(interrupted), undefined);
+    provider.observe(prior);
+    provider.observe({ type: "system", subtype: "status", status: null } as SDKMessage);
+    const failed = protocolResult("error_during_execution");
+    provider.observe(failed);
+    assert.equal(provider.failure(failed)?.retryable, true);
+  }
+});
+
 test("final Codex metadata supersedes an earlier transient retry", () => {
   for (const [info, retryable] of [
     ["unauthorized", false],

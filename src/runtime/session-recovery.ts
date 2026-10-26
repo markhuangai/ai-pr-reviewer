@@ -69,7 +69,10 @@ export class ProviderRecovery {
   }
 
   observe(message: SDKMessage | SDKActiveGoalMessage): void {
-    if (message.type === "assistant" && message.error !== undefined) this.error = message.error;
+    if (message.type === "assistant") {
+      this.error = message.error;
+      if (message.error === undefined) this.status = undefined;
+    }
     if (message.type === "system" && message.subtype === "api_retry") {
       this.error = message.error;
       this.status = message.error_status;
