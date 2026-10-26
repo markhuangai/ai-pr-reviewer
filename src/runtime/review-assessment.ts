@@ -1,3 +1,4 @@
+export type { ReviewValidationGap } from "./review-evidence-schema.js";
 import { lstatSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -19,8 +20,13 @@ import {
   type DiffFileSpan,
 } from "./agent-review-tools.js";
 
-import { pathSchema, reviewEvidenceResultSchema } from "./review-evidence-schema.js";
+import {
+  pathSchema,
+  reviewEvidenceResultSchema,
+  type ReviewValidationGap,
+} from "./review-evidence-schema.js";
 import { ReviewCoverageTracker } from "./review-coverage.js";
+import { isRecord } from "./agent-logging.js";
 export {
   evidenceRefSchema,
   pathSchema,
@@ -49,10 +55,6 @@ type EvidenceCursorContext = Pick<
   | "changedPaths"
   | "contentKind"
 >;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isText(value: unknown): value is string {
   return typeof value === "string";
@@ -277,13 +279,6 @@ function sameEvidenceScope(left: ReviewEvidenceReference, right: ReviewEvidenceR
   );
 }
 
-export interface ReviewValidationGap {
-  readonly category:
-    "inspection" | "evidence" | "schema" | "discussion" | "location" | "briefing" | "limitation";
-  readonly message: string;
-  readonly paths: readonly string[];
-}
-
 export function reviewFindingGaps(
   finding: ReviewFinding & ReviewFindingEvidence,
   changedFiles: readonly ChangedFile[],
@@ -373,6 +368,7 @@ export class ReviewEvidenceLedger {
   readonly coverage: ReviewCoverageTracker;
   private requiredBytes = 0;
   uniqueSourceBytes = 0;
+  uniqueNativeLines = 0;
   repeatedSourceBytes = 0;
   deliveries: Readonly<Record<string, unknown>>[] = [];
 
@@ -404,6 +400,7 @@ export class ReviewEvidenceLedger {
       observedCalls: [...this.observedCalls],
       requiredBytes: this.requiredBytes,
       uniqueSourceBytes: this.uniqueSourceBytes,
+      uniqueNativeLines: this.uniqueNativeLines,
       repeatedSourceBytes: this.repeatedSourceBytes,
     });
   }
@@ -420,6 +417,7 @@ export class ReviewEvidenceLedger {
     for (const id of state.observedCalls) this.observedCalls.add(id);
     this.requiredBytes = state.requiredBytes;
     this.uniqueSourceBytes = state.uniqueSourceBytes;
+    this.uniqueNativeLines = state.uniqueNativeLines;
     this.repeatedSourceBytes = state.repeatedSourceBytes;
   }
 
@@ -751,6 +749,7 @@ export class ReviewEvidenceLedger {
             bounds.startLine + bounds.numLines,
           );
           newLines = update.total - update.before;
+          this.uniqueNativeLines += newLines;
           repeatedLines = bounds.numLines - newLines;
           if (
             reviewInspection(this.files, this.references).missingPaths.includes(reference.path) &&

@@ -26,6 +26,16 @@ export const SEVERITY_VALUES = ["CRITICAL", "HIGH", "MODERATE", "LOW"] as const;
 
 export const MAX_REPAIR_ATTEMPTS = 5;
 
+export function investigationOnly(categories: readonly string[]): boolean {
+  return (
+    categories.length > 0 &&
+    categories.every(
+      (category) =>
+        category === "inspection" || category === "briefing" || category === "discussion",
+    )
+  );
+}
+
 export const LIMITATION_RECONSIDERATION_GAP: ReviewValidationGap = {
   category: "limitation",
   message:
@@ -93,8 +103,7 @@ export class ReviewSubmissionRecovery {
     remainingCorrections: number;
     remainingInspectionCycles: number;
   } {
-    const inspectionOnly =
-      categories.length > 0 && categories.every((category) => category === "inspection");
+    const inspectionOnly = investigationOnly(categories);
     const noProgress = inspectionOnly
       ? this.progress > this.previousProgress
         ? 0
@@ -169,8 +178,7 @@ export class ReviewSubmissionRecovery {
     }
     for (const category of new Set(categories))
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
-    if (categories.length > 0 && categories.every((category) => category === "inspection"))
-      this.inspectionCycle();
+    if (investigationOnly(categories)) this.inspectionCycle();
     else {
       this.recoveryKind = "validation";
       this.validationFailures += 1;
@@ -219,6 +227,10 @@ export class ReviewSubmissionRecovery {
     }
     this.activitySinceResult = false;
     return this.recoveryKind;
+  }
+
+  finishProviderTurn(): void {
+    this.activitySinceResult = false;
   }
 
   diagnostics(
@@ -416,6 +428,27 @@ export function retainValidReviewFindings(
   };
 }
 
+export function retainReviewSubmission(
+  input: unknown,
+  files: readonly ChangedFile[],
+  references: ReadonlyMap<string, ReviewEvidenceReference>,
+  interactive: boolean,
+  gaps: readonly ReviewValidationGap[],
+  canReport: (finding: ReviewFinding) => boolean,
+  reason: string,
+): GoalSubmission | undefined {
+  const parsed = (interactive ? interactiveSubmissionSchema : submissionSchema).safeParse(input);
+  if (
+    parsed.success &&
+    gaps.every((gap) => gap.category === "inspection" || gap.category === "limitation")
+  ) {
+    const candidate = toSubmission(parsed.data);
+    if (gaps.length > 0 && gaps.every((gap) => gap.category === "limitation")) return candidate;
+    return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };
+  }
+  return retainValidReviewFindings(input, files, references, canReport, interactive);
+}
+
 export const unreadReviewFindingPaths = (
   findings: readonly unknown[],
   conversation: ReviewConversationSnapshot,
@@ -455,6 +488,7 @@ export function reviewSubmissionGaps(
   briefingComplete: boolean,
   unreadFindingPaths: (findings: readonly unknown[]) => readonly string[],
   limitationReconsiderationPending = false,
+  discussionNextCall?: (path: string) => NonNullable<ReviewValidationGap["nextCall"]>,
 ): readonly ReviewValidationGap[] {
   const parsed = (interactive ? interactiveSubmissionSchema : submissionSchema).safeParse(input);
   if (!parsed.success)
@@ -509,11 +543,12 @@ export function reviewSubmissionGaps(
       paths: [],
     });
   const unread = unreadFindingPaths(candidate.findings);
-  if (unread.length > 0)
+  for (const path of unread)
     gaps.push({
       category: "discussion",
       message: "Read prior discussion threads for these finding paths first.",
-      paths: unread,
+      paths: [path],
+      nextCall: discussionNextCall?.(path) ?? { tool: "read_pr_threads", arguments: { path } },
     });
   if (candidate.findings.some((finding) => !findingLocationValid(finding, files, interactive)))
     gaps.push({
@@ -550,8 +585,8 @@ export function reviewSubmissionRejectionResult(
   }
   return {
     ...jsonToolResult({
-      message: validationGaps.every((gap) => gap.category === "inspection")
-        ? "Continue required inspection with read_review_state's exact next calls. New required source delivery does not spend validation corrections."
+      message: investigationOnly(validationGaps.map((gap) => gap.category))
+        ? "Continue required investigation with read_review_state's exact next calls. Source, briefing, and discussion reads do not spend validation corrections."
         : "Review submission rejected. Call read_review_state for inspection progress, existing evidence, and exact next calls; correct only the reported gaps.",
       gaps,
       omittedGaps: validationGaps.length - gaps.length,
@@ -561,7 +596,10 @@ export function reviewSubmissionRejectionResult(
         ? { tool: "read_review_briefing", arguments: {} }
         : validationGaps.some((gap) => gap.category === "inspection")
           ? { tool: "read_pr_diff", arguments: { remaining: true } }
-          : { tool: "read_review_state", arguments: {} },
+          : (validationGaps.find((gap) => gap.nextCall !== undefined)?.nextCall ?? {
+              tool: "read_review_state",
+              arguments: {},
+            }),
       ...(remainingInspectionCycles === undefined ? {} : { remainingInspectionCycles }),
     }),
     isError: true,

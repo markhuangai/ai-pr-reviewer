@@ -68,6 +68,9 @@ export function writeReviewDiagnostic(
     "reviewComplete",
     "tokenAccountingComplete",
     "error",
+    "providerRetries",
+    "providerErrorStatus",
+    "stallRecoveries",
   ]);
   const projected = Object.fromEntries(Object.entries(details).filter(([key]) => allowed.has(key)));
   logAgentEventSafely(
@@ -96,6 +99,7 @@ export function createReviewDiagnostics({
   startedAt,
   logSecrets,
   sourceContextDelivered,
+  sessionRecovery,
 }: {
   goalIndex: number;
   files: readonly ChangedFile[];
@@ -104,6 +108,11 @@ export function createReviewDiagnostics({
   startedAt: number;
   logSecrets: readonly string[];
   sourceContextDelivered: () => boolean;
+  sessionRecovery?: () => {
+    providerRetries: number;
+    stallRecoveries: number;
+    providerErrorStatus?: number;
+  };
 }) {
   function inspectionDetails(): Readonly<Record<string, unknown>> {
     const inspection = reviewInspection(files, evidenceLedger.issued);
@@ -127,6 +136,7 @@ export function createReviewDiagnostics({
       maxRecoveryCycles: recovery.maxCycles,
       remainingCorrections: recovery.remainingCorrections,
       remainingInspectionCycles: recovery.remainingInspectionCycles,
+      ...sessionRecovery?.(),
     };
   }
   function logDiagnostic(
@@ -149,6 +159,7 @@ export function createReviewDiagnostics({
       ...recovery.diagnostics(evidenceLedger.issued.size, sessionPhase),
       uniqueSourceBytes: evidenceLedger.uniqueSourceBytes,
       repeatedSourceBytes: evidenceLedger.repeatedSourceBytes,
+      ...sessionRecovery?.(),
     };
     writeAgentMonitorEvent(goalIndex, "review-recovery", diagnostics, logSecrets);
     let inspection = evidenceLedger.finalInspection;

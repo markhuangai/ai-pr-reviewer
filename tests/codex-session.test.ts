@@ -31,6 +31,8 @@ import { startCodexMcpServer } from "../src/runtime/codex-mcp-server.js";
 import { tool } from "../src/runtime/review-tool.js";
 import { verifyResolution } from "../src/runtime/resolution-session.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
+import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 
 test("native reviews use runner proxies while local MCP bypasses them", async (t) => {
   for (const name of ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) {
@@ -398,6 +400,94 @@ test(
     assert.ok(result.submission);
     assert.match(result.error ?? "", /Controlled upstream failure|400/u);
     assert.deepEqual(await readdir(temporary), []);
+  },
+);
+
+test(
+  "native permanent terminal errors override earlier transport retries in review and discovery",
+  { timeout: 180_000 },
+  async (t) => {
+    for (const discovery of [false, true]) {
+      for (const status of [401, 402, 400, 418]) {
+        await t.test(`${discovery ? "discovery" : "review"} HTTP ${status}`, async (subtest) => {
+          const temporary = await isolatedTemporaryRoot(subtest);
+          const output: string[] = [];
+          subtest.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+            output.push(chunk.toString());
+            return true;
+          });
+          const schedule = globalThis.setTimeout;
+          const backoffs: number[] = [];
+          subtest.mock.method(
+            globalThis,
+            "setTimeout",
+            (callback: (...args: unknown[]) => void, milliseconds?: number, ...args: unknown[]) => {
+              if (
+                milliseconds !== undefined &&
+                milliseconds >= 120_000 &&
+                milliseconds <= 255_000
+              ) {
+                backoffs.push(milliseconds);
+                return schedule(callback, 1, ...args);
+              }
+              return schedule(callback, milliseconds, ...args);
+            },
+          );
+          const fixture = await modelFixture(subtest, (_, index) =>
+            index === 0 ? { interruptStream: true } : { error: status },
+          );
+          if (discovery) {
+            const repository = await makeReplayRepository(subtest);
+            const diff = await makeDiffFromSnapshots(
+              repository.root,
+              repository.baseSha,
+              repository.headSha,
+              repository.temporaryRoot,
+            );
+            subtest.after(() => diff.cleanup());
+            const result = await runSharedDiscovery({
+              context: repository.context,
+              files: [],
+              conversation: emptyConversation,
+              config: reviewConfig({
+                executor: "codex",
+                aiBaseUrl: fixture.url,
+                model: "gpt-6.1-sol",
+              }),
+              diff,
+              cwd: repository.root,
+              queryAgent: query,
+              abortController: undefined,
+              briefing: {
+                linkedIssues: [],
+                linkedIssueReferencesTruncated: false,
+                repositoryGuidance: [],
+              },
+            });
+            assert.equal(result.result.status, "failed");
+            assert.equal(result.result.diagnostics.termination, "provider-error");
+            assert.equal(result.seed, undefined);
+          } else {
+            const result = await nativeReview(subtest, fixture.url);
+            assert.equal(result.status, "failed");
+            assert.equal(result.diagnostics?.termination, "provider-error");
+            assert.equal(result.diagnostics?.providerRetries, 0);
+            assert.match(output.join(""), /session api-retry/u);
+          }
+          assert.deepEqual(backoffs, []);
+          assert.ok(fixture.requests.length >= 2);
+          assert.ok(
+            fixture.requests.every(
+              ({ body }) =>
+                !/provider request failed temporarily|provider is available for another attempt/u.test(
+                  historyText(body),
+                ),
+            ),
+          );
+          assert.deepEqual(await readdir(temporary), []);
+        });
+      }
+    }
   },
 );
 

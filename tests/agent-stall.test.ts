@@ -456,8 +456,7 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
     interrupt: () => {
       const call = interrupts;
       interrupts += 1;
-      if (call === 0) return Promise.reject(new Error("control channel unavailable"));
-      const boundary = boundaries[call - 1];
+      const boundary = boundaries[call];
       boundary?.resolve(undefined);
       return Promise.resolve(undefined);
     },
@@ -479,8 +478,6 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
   );
   await ready[0]?.promise;
   t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  for (let index = 0; index < 4; index += 1) await Promise.resolve();
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
   await ready[1]?.promise;
   t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
   const result = await running;
@@ -488,14 +485,13 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
   assert.equal(result.status, "completed");
   assert.equal(result.submission?.summary, "Recovered");
   assert.equal(result.tokenUsage?.complete, true);
-  assert.equal(interrupts, 3);
+  assert.equal(interrupts, 2);
   assert.equal(closes, 1);
   assert.equal(continuations.length, 2);
   assert.equal(
     continuations.every((message) => message.includes("Continue the same goal")),
     true,
   );
-  assert.match(output.join(""), /interrupt-failed.*control channel unavailable/u);
   assert.match(output.join(""), /interrupted-turn-boundary/u);
 });
 

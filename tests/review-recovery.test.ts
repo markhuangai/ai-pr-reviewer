@@ -349,7 +349,7 @@ test("labels inspection, validation, and empty-turn recovery with the active bud
       const steps = [
         {
           input: undefined,
-          label: "inspection continuation (4 inspection recovery cycles remaining)",
+          label: "inspection continuation (5 inspection recovery cycles remaining)",
           failures: 0,
           inspections: 1,
         },

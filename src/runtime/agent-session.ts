@@ -1,3 +1,20 @@
+import {
+  createReviewSessionRecoveryMonitor,
+  SdkSessionMonitor,
+  SDK_SESSION_HEARTBEAT_MS,
+  SDK_SESSION_STALL_MS,
+  SDK_SUBMISSION_GRACE_MS,
+  SDK_SESSION_CLOSE_MS,
+} from "./session-recovery.js";
+export {
+  closeSdkSession,
+  createReviewSessionRecoveryMonitor,
+  SdkSessionMonitor,
+  SDK_SESSION_HEARTBEAT_MS,
+  SDK_SESSION_STALL_MS,
+  SDK_SUBMISSION_GRACE_MS,
+  SDK_SESSION_CLOSE_MS,
+} from "./session-recovery.js";
 import { ReviewBriefingReader } from "./review-briefing.js";
 import { randomUUID } from "node:crypto";
 
@@ -42,8 +59,6 @@ import {
   chunkAgentLogValue,
   completeAgentLogValue,
   createAgentLifecycleState,
-  errorMessage,
-  isRecord,
   logAgentEventSafely,
   logAgentLifecycleMessage,
   logAgentMessage,
@@ -163,253 +178,6 @@ export class PromptStream implements AsyncIterable<SDKUserMessage> {
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return this;
   }
-}
-
-export const SDK_SESSION_HEARTBEAT_MS = 60_000;
-export const SDK_SESSION_STALL_MS = 300_000;
-export const SDK_SUBMISSION_GRACE_MS = 30_000;
-export const SDK_SESSION_CLOSE_MS = 5_000;
-
-export async function closeSdkSession(
-  close: () => void | Promise<void>,
-  reader: Promise<void> | undefined,
-): Promise<void> {
-  const closed = close();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      Promise.all([reader, closed]),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(
-            new Error(
-              `SDK message reader did not stop within ${SDK_SESSION_CLOSE_MS} ms after close().`,
-            ),
-          );
-        }, SDK_SESSION_CLOSE_MS);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-export interface SdkSessionActivity {
-  readonly type: string;
-  readonly subtype?: string;
-  readonly tool?: string;
-}
-
-export interface SdkSessionStall {
-  readonly recovery: number;
-  readonly elapsedSinceMessageMs: number;
-}
-
-export interface SdkSessionClock {
-  now(): number;
-  setTimeout(callback: () => void, milliseconds: number): ReturnType<typeof setTimeout>;
-  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
-  setInterval(callback: () => void, milliseconds: number): ReturnType<typeof setInterval>;
-  clearInterval(handle: ReturnType<typeof setInterval>): void;
-}
-
-const systemSessionClock: SdkSessionClock = {
-  now: () => Date.now(),
-  setTimeout: (callback, milliseconds) => setTimeout(callback, milliseconds),
-  clearTimeout: (handle) => {
-    clearTimeout(handle);
-  },
-  setInterval: (callback, milliseconds) => setInterval(callback, milliseconds),
-  clearInterval: (handle) => {
-    clearInterval(handle);
-  },
-};
-
-export interface SdkSessionMonitorOptions {
-  readonly snapshot: () => Readonly<Record<string, unknown>>;
-  readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
-  readonly onStall: (stall: SdkSessionStall) => void | Promise<void>;
-  readonly onSubmissionDeadline?: () => void;
-  readonly heartbeatMs?: number;
-  readonly stallMs?: number;
-  readonly clock?: SdkSessionClock;
-}
-
-export class SdkSessionMonitor {
-  private readonly clock: SdkSessionClock;
-  private readonly heartbeatMs: number;
-  private readonly stallMs: number;
-  private readonly startedAt: number;
-  private lastMessageAt: number;
-  private lastActivity: SdkSessionActivity | undefined;
-  private recoveries = 0;
-  private heartbeatHandle: ReturnType<typeof setInterval> | undefined;
-  private watchdogHandle: ReturnType<typeof setTimeout> | undefined;
-  private stopped = false;
-  private submissionAccepted = false;
-  private submissionHandle: ReturnType<typeof setTimeout> | undefined;
-
-  constructor(private readonly options: SdkSessionMonitorOptions) {
-    this.clock = options.clock ?? systemSessionClock;
-    this.heartbeatMs = options.heartbeatMs ?? SDK_SESSION_HEARTBEAT_MS;
-    this.stallMs = options.stallMs ?? SDK_SESSION_STALL_MS;
-    if (this.heartbeatMs < 1 || this.stallMs < 1) {
-      throw new RangeError("SDK session monitor intervals must be positive.");
-    }
-    this.startedAt = this.clock.now();
-    this.lastMessageAt = this.startedAt;
-  }
-
-  start(): void {
-    if (this.stopped || this.heartbeatHandle !== undefined) return;
-    this.heartbeatHandle = this.clock.setInterval(() => {
-      this.writeHeartbeat();
-    }, this.heartbeatMs);
-    this.armWatchdog();
-  }
-
-  observe(activity: SdkSessionActivity): void {
-    if (this.stopped) return;
-    this.lastActivity = activity;
-    this.lastMessageAt = this.clock.now();
-    this.armWatchdog();
-  }
-
-  acceptSubmission(): void {
-    if (this.stopped || this.submissionAccepted) return;
-    this.submissionAccepted = true;
-    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
-    this.options.write("submission-accepted", { grace_ms: SDK_SUBMISSION_GRACE_MS });
-    this.submissionHandle = this.clock.setTimeout(() => {
-      this.stop();
-      this.options.write("submission-deadline", { grace_ms: SDK_SUBMISSION_GRACE_MS });
-      this.options.onSubmissionDeadline?.();
-    }, SDK_SUBMISSION_GRACE_MS);
-  }
-
-  stop(): void {
-    if (this.stopped) return;
-    this.stopped = true;
-    if (this.heartbeatHandle !== undefined) this.clock.clearInterval(this.heartbeatHandle);
-    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
-    if (this.submissionHandle !== undefined) this.clock.clearTimeout(this.submissionHandle);
-    this.heartbeatHandle = undefined;
-    this.watchdogHandle = undefined;
-  }
-
-  get recoveryCount(): number {
-    return this.recoveries;
-  }
-
-  private details(now = this.clock.now(), timingFirst = false): Readonly<Record<string, unknown>> {
-    const snapshot = this.options.snapshot();
-    const timing = {
-      elapsed_session_ms: Math.max(0, now - this.startedAt),
-      elapsed_since_sdk_message_ms: Math.max(0, now - this.lastMessageAt),
-      last_sdk_message_type: this.lastActivity?.type ?? "none",
-      ...(this.lastActivity?.subtype === undefined
-        ? {}
-        : { last_sdk_message_subtype: this.lastActivity.subtype }),
-      ...(this.lastActivity?.tool === undefined ? {} : { last_tool: this.lastActivity.tool }),
-      stall_recoveries: this.recoveries,
-    };
-    return timingFirst ? { ...timing, ...snapshot } : { ...snapshot, ...timing };
-  }
-
-  private writeHeartbeat(): void {
-    if (this.stopped) return;
-    this.options.write("heartbeat", this.details());
-  }
-
-  private armWatchdog(): void {
-    if (this.stopped || this.submissionAccepted) return;
-    if (this.watchdogHandle !== undefined) this.clock.clearTimeout(this.watchdogHandle);
-    this.watchdogHandle = this.clock.setTimeout(() => {
-      this.handleStall();
-    }, this.stallMs);
-  }
-
-  private handleStall(): void {
-    if (this.stopped) return;
-    const now = this.clock.now();
-    const elapsedSinceMessageMs = Math.max(0, now - this.lastMessageAt);
-    if (elapsedSinceMessageMs < this.stallMs) {
-      this.armWatchdog();
-      return;
-    }
-    this.recoveries += 1;
-    const stall = { recovery: this.recoveries, elapsedSinceMessageMs };
-    this.options.write("stall-detected", {
-      ...this.details(now, true),
-      recovery: this.recoveries,
-    });
-    this.armWatchdog();
-    void Promise.resolve()
-      .then(() => this.options.onStall(stall))
-      .catch((error: unknown) => {
-        this.options.write("stall-handler-failed", {
-          recovery: stall.recovery,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-  }
-}
-
-export interface ReviewSessionRecoveryMonitorOptions {
-  readonly snapshot: () => Readonly<Record<string, unknown>>;
-  readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
-  readonly hasAcceptedSubmission: () => boolean;
-  readonly setPhase: (phase: string) => void;
-  readonly finishAcceptedInput: () => void;
-  readonly markBoundaryPending: () => void;
-  readonly interrupt: () => Promise<unknown>;
-  readonly finalizeAcceptedSubmission: () => void;
-}
-
-export function createReviewSessionRecoveryMonitor(
-  options: ReviewSessionRecoveryMonitorOptions,
-): SdkSessionMonitor {
-  let finalizing = false;
-  const recover = (stall?: SdkSessionStall): void => {
-    if (finalizing) return;
-    const submissionAccepted = options.hasAcceptedSubmission();
-    options.setPhase(submissionAccepted ? "finalizing-submission" : "interrupting-stalled-turn");
-    const details = {
-      recovery: stall?.recovery ?? 0,
-      ...(stall === undefined ? {} : { elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs }),
-      submission_accepted: submissionAccepted,
-    };
-    options.write("interrupt-started", details);
-    if (submissionAccepted) {
-      finalizing = true;
-      options.finishAcceptedInput();
-      options.finalizeAcceptedSubmission();
-    } else options.markBoundaryPending();
-    void Promise.resolve()
-      .then(options.interrupt)
-      .then((receipt) => {
-        const stillQueued =
-          isRecord(receipt) && Array.isArray(receipt.still_queued)
-            ? receipt.still_queued.length
-            : undefined;
-        options.write("interrupt-finished", {
-          recovery: details.recovery,
-          ...(stillQueued === undefined ? {} : { still_queued: stillQueued }),
-        });
-      })
-      .catch((error: unknown) => {
-        options.write("interrupt-failed", {
-          recovery: details.recovery,
-          error: errorMessage(error),
-        });
-      });
-  };
-  return new SdkSessionMonitor({
-    snapshot: options.snapshot,
-    write: options.write,
-    onStall: recover,
-    onSubmissionDeadline: recover,
-  });
 }
 
 export function reviewSessionSnapshot(
@@ -803,6 +571,9 @@ export async function runReviewGoalsWithRunner(
         briefing,
         shared?.seed,
       );
+      core.info(
+        `Review progress: ${results.filter((result) => result?.status === "completed").length} of ${config.reviewPrompts.length} goals completed; goal ${index + 1} ${results[index].status}.`,
+      );
     }
   };
   try {
@@ -826,6 +597,13 @@ export async function runReviewGoalsWithRunner(
             prompt: goal.prompt,
             status: "failed",
             error: shared?.result.error ?? "Shared discovery did not produce a checkpoint.",
+            diagnostics: {
+              submissionAttempts: 0,
+              repairAttempts: 0,
+              evidenceReferences: 0,
+              rejectionCounts: {},
+              termination: `discovery-${shared?.result.diagnostics.termination ?? "failed"}`,
+            },
             tokenUsage: { models: [], complete: true },
           })),
         };

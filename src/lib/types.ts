@@ -257,6 +257,9 @@ export interface GoalResult {
     readonly recoveryCycles?: number;
     readonly uniqueSourceBytes?: number;
     readonly repeatedSourceBytes?: number;
+    readonly providerRetries?: number;
+    readonly providerErrorStatus?: number;
+    readonly stallRecoveries?: number;
   };
 }
 

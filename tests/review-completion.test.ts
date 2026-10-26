@@ -13,6 +13,7 @@ import {
   RepositorySnapshot,
   runReviewGoalWithEmptyGuidance as runReviewGoal,
   type SDKMessage,
+  type ReviewConversationSnapshot,
 } from "./agent-test-helpers.js";
 import { rm, rename, symlink, chmod } from "node:fs/promises";
 import { makeReplayRepository, commitFixtureSnapshot } from "./git-test-helpers.js";
@@ -651,4 +652,92 @@ test("failed goals retain verified partial line coverage", async (t) => {
     result.inspection?.lineCoverage?.find((file) => file.path === "unread.txt")?.addedLines,
     [],
   );
+});
+
+test("briefing and paginated discussion recovery supplies exact calls without spending corrections", async (t) => {
+  const repository = await recoveryRepository(t);
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const conversation: ReviewConversationSnapshot = {
+    digest: "discussion-recovery",
+    entries: [
+      {
+        kind: "inline_thread",
+        id: 91,
+        rootAvailable: true,
+        createdAt: "2026-10-01T00:00:00Z",
+        path: "review.txt",
+        line: 1,
+        isResolved: false,
+        isOutdated: false,
+        messages: [
+          {
+            id: 91,
+            authorRole: "human",
+            body: "Prior discussion about the changed behavior.\n".repeat(3_000),
+            createdAt: "2026-10-01T00:00:00Z",
+            updatedAt: "2026-10-01T00:00:00Z",
+          },
+        ],
+      },
+    ],
+  };
+  let pages = 0;
+  const result = await runReviewGoal(
+    "discussion",
+    0,
+    repository.context,
+    files,
+    conversation,
+    reviewConfig({ interactWithPullRequest: true }),
+    repository.diff,
+    repository.root,
+    reviewProtocolQuery(async function* (protocol) {
+      const initial = protocolDocument(
+        yield* protocol.call("submit_review", {
+          summary: "not ready",
+          findings: [],
+          limitations: [],
+        }),
+      );
+      assert.deepEqual(initial.nextCall, { tool: "read_review_briefing", arguments: {} });
+      assert.equal(initial.remainingCorrections, 5);
+      yield* protocolBriefing(protocol);
+      yield* protocol.call("read_pr_diff", { remaining: true });
+      const inspected = yield* recoveryState(protocol, ["review.txt"]);
+      const reference = inspected.evidence.find(
+        (entry) => entry.status === "complete" && entry.paths?.includes("review.txt"),
+      );
+      assert.ok(reference);
+      const submission = recoverySubmission(reference.id);
+      for (;;) {
+        const rejected = yield* protocol.call("submit_review", submission);
+        if (rejected.isError !== true) break;
+        const state = yield* recoveryState(protocol, ["review.txt"]);
+        assert.equal(state.validationFailures, 0);
+        assert.equal(state.remainingCorrections, 5);
+        const next = state.calls.find(
+          (call) => call.kind === "next_call" && call.tool === "read_pr_threads",
+        );
+        assert.ok(next);
+        assert.equal(next.arguments.path, "review.txt");
+        assert.equal(typeof next.arguments.cursor, pages === 0 ? "undefined" : "string");
+        assert.deepEqual(protocolDocument(rejected).nextCall, {
+          tool: next.tool,
+          arguments: next.arguments,
+        });
+        const page = protocolDocument(yield* protocol.call(next.tool, next.arguments));
+        assert.equal(page.page, ++pages);
+        assert.ok(pages < 40);
+      }
+      yield protocolResult();
+    }),
+  );
+  assert.ok(pages > 5);
+  assert.equal(result.status, "completed", result.error ?? "Expected complete discussion");
+  assert.equal(result.diagnostics?.validationFailures, 0);
+  assert.equal(result.submission?.findings.length, 1);
 });

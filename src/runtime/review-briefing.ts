@@ -236,6 +236,10 @@ export class ReviewBriefingReader {
     return this.delivered.size === this.pages.length;
   }
 
+  get deliveredPages(): number {
+    return this.delivered.size;
+  }
+
   checkpoint() {
     return {
       identity: createHash("sha256").update(JSON.stringify(this.pages)).digest("hex"),

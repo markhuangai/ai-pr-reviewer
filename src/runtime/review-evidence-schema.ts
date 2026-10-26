@@ -67,3 +67,14 @@ export const reviewEvidenceResultSchema = z
       .optional(),
   })
   .strict();
+
+export interface ReviewValidationGap {
+  readonly category:
+    "inspection" | "evidence" | "schema" | "discussion" | "location" | "briefing" | "limitation";
+  readonly message: string;
+  readonly paths: readonly string[];
+  readonly nextCall?: {
+    readonly tool: string;
+    readonly arguments: Readonly<Record<string, unknown>>;
+  };
+}

@@ -467,7 +467,7 @@ export function writeAgentMonitorEvent(
     goalIndex,
     secrets,
     (safeWrite) => {
-      writeAgentLifecycleLog(goalIndex, event, details, secrets, safeWrite);
+      writeCompleteAgentLog(goalIndex, "session", event, "details", details, secrets, safeWrite);
     },
     write,
   );
@@ -623,6 +623,9 @@ export function logAgentLifecycleMessage(
         duration_api_ms: message.duration_api_ms,
         stop_reason: message.stop_reason,
         is_error: message.is_error,
+        ...(message.subtype === "success" && message.api_error_status !== undefined
+          ? { api_error_status: message.api_error_status }
+          : {}),
       },
       secrets,
       write,

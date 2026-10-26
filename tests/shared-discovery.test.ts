@@ -31,6 +31,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { createDeferred, createReviewGoalsRunner } from "../src/runtime/agent-session.js";
 import { modelUsageSince } from "../src/runtime/shared-discovery.js";
 import { historyText } from "./codex-test-helpers.js";
+import { CodexSession } from "../src/runtime/codex-session.js";
 
 const file: ChangedFile = {
   path: "review.txt",
@@ -391,6 +392,63 @@ test(
   },
 );
 
+test(
+  "discovery's deadline closes a session even when its interrupt never acknowledges",
+  {
+    timeout: 120_000,
+  },
+  async (t) => {
+    const temporary = await isolatedTemporaryRoot(t);
+    const repository = await makeReplayRepository(t);
+    const interrupted = createDeferred<undefined>();
+    t.mock.method(CodexSession.prototype, "interrupt", () => {
+      interrupted.resolve(undefined);
+      return new Promise<undefined>(() => undefined);
+    });
+    const schedule = globalThis.setTimeout;
+    let expire: (() => void) | undefined;
+    t.mock.method(
+      globalThis,
+      "setTimeout",
+      (callback: (...args: unknown[]) => void, milliseconds?: number, ...args: unknown[]) => {
+        if (milliseconds === DISCOVERY_LIMITS.milliseconds)
+          expire = () => {
+            callback(...args);
+          };
+        return schedule(callback, milliseconds, ...args);
+      },
+    );
+    const fixture = await modelFixture(t, () => ({ tool: "read_change_overview", args: {} }));
+    const diff = await makeDiffFromSnapshots(
+      repository.root,
+      repository.baseSha,
+      repository.headSha,
+      repository.temporaryRoot,
+    );
+    t.after(() => diff.cleanup());
+    const running = runSharedDiscovery({
+      context: repository.context,
+      files: [file],
+      conversation: emptyConversation,
+      config: reviewConfig({ executor: "codex", aiBaseUrl: fixture.url, model: "gpt-6.1-sol" }),
+      diff,
+      cwd: repository.root,
+      queryAgent: query,
+      abortController: undefined,
+      briefing,
+    });
+    await interrupted.promise;
+    assert.ok(expire);
+    expire();
+    const result = await running;
+    assert.equal(result.result.status, "failed");
+    assert.equal(result.seed, undefined);
+    assert.equal(result.result.diagnostics.termination, "deadline");
+    assert.match(result.result.error ?? "", /ten-minute deadline/u);
+    assert.deepEqual(await readdir(temporary), []);
+  },
+);
+
 for (const executor of ["claude", "codex"] as const) {
   test(
     "real " + executor + " cancels active forks without starting the queued goal",
@@ -573,7 +631,10 @@ for (const executor of ["claude", "codex"] as const) {
           });
           assert.equal(result.result.status, "failed");
           assert.equal(result.seed, undefined);
-          assert.equal(result.result.diagnostics.termination, deadline ? "deadline" : "failed");
+          assert.equal(
+            result.result.diagnostics.termination,
+            deadline ? "deadline" : "finish-exhausted",
+          );
           assert.match(
             result.result.error ?? "",
             deadline ? /ten-minute/u : /without an accepted change map|turn limit/u,
