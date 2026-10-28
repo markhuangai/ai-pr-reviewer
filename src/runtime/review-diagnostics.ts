@@ -185,7 +185,7 @@ export function createReviewDiagnostics({
       ];
       logDiagnostic("submission-decision", {
         decision: "finalized-incomplete",
-        categories: categories.length > 0 ? categories : ["limitation"],
+        categories,
         ...inspectionDetails(),
         ...recoveryDetails(),
         termination: sessionPhase,

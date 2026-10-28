@@ -677,17 +677,15 @@ export async function runAction(
           };
         }
       }
-      if (review.omittedFindings.length > 0) {
-        await diagnostics.withSpan(
-          actionDescriptor(
-            "publication",
-            "action.summary.write-overflow",
-            "write findings omitted from the interactive review to the workflow summary",
-          ),
-          () => dependencies.writeSummary(context, review, goals),
-        );
-        throwIfAborted(signal);
-      }
+      await diagnostics.withSpan(
+        actionDescriptor(
+          "publication",
+          "action.summary.write",
+          "write the interactive review result to the workflow summary",
+        ),
+        () => dependencies.writeSummary(context, review, goals),
+      );
+      throwIfAborted(signal);
       try {
         await diagnostics.withSpan(
           actionDescriptor(

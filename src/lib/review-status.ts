@@ -4,8 +4,7 @@ import { escapeMarkdownText } from "./redaction.js";
 export function incompleteGoalDetails(goals: readonly GoalResult[]): string {
   const rows = goals.flatMap((goal, index) => {
     const missing = goal.inspection?.missingPaths.length ?? 0;
-    const limitations = goal.submission?.limitations.length ?? 0;
-    if (goal.status === "completed" && missing === 0 && limitations === 0) return [];
+    if (goal.status === "completed" && missing === 0) return [];
     const terminationReasons: Readonly<Record<string, string>> = {
       "max-turns-exhausted": "Configured SDK turn limit reached",
       "validation-exhausted": "Submission correction budget exhausted",
@@ -31,8 +30,6 @@ export function incompleteGoalDetails(goals: readonly GoalResult[]): string {
     if (goal.diagnostics?.providerErrorStatus !== undefined)
       reasons.push(`Provider HTTP ${goal.diagnostics.providerErrorStatus}`);
     if (missing > 0) reasons.push(`${missing} changed path${missing === 1 ? "" : "s"} unread`);
-    if (limitations > 0)
-      reasons.push(`${limitations} declared limitation${limitations === 1 ? "" : "s"}`);
     if (goal.status === "failed") reasons.push("Goal failed; inspect the workflow logs");
     if (reasons.length === 0) reasons.push("Required investigation did not finish");
     return [

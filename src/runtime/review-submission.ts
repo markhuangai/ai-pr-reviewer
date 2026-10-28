@@ -36,13 +36,6 @@ export function investigationOnly(categories: readonly string[]): boolean {
   );
 }
 
-export const LIMITATION_RECONSIDERATION_GAP: ReviewValidationGap = {
-  category: "limitation",
-  message:
-    "Required source inspection is complete. Reconsider the declared limitations once: paths outside this goal's scope belong in the summary, not limitations. Remove only scope exclusions; preserve genuine unfinished investigation and resubmit to confirm it.",
-  paths: [],
-};
-
 export class ReviewSubmissionRecovery {
   private readonly uses = new Map<string, { allowed: boolean; input: unknown }>();
   private readonly rejections = new Set<string>();
@@ -50,10 +43,6 @@ export class ReviewSubmissionRecovery {
   private recoveryKind: "inspection" | "validation" = "inspection";
   private progress = 0;
   private previousProgress = 0;
-  private limitationReconsiderationRequested = false;
-  private limitationReconsiderationId: string | undefined;
-  private readonly limitationReconsiderationUses = new Set<string>();
-  private latestUseId: string | undefined;
   validationFailures = 0;
   inspectionContinuations = 0;
   consecutiveNoProgress = 0;
@@ -134,22 +123,6 @@ export class ReviewSubmissionRecovery {
     return this.uses.has(id);
   }
 
-  reconsiderLimitations(
-    gaps: readonly ReviewValidationGap[],
-    hasLimitations: boolean,
-  ): readonly ReviewValidationGap[] {
-    if (gaps.length > 0 || !hasLimitations || this.limitationReconsiderationRequested) return gaps;
-    this.limitationReconsiderationRequested = true;
-    return [LIMITATION_RECONSIDERATION_GAP];
-  }
-
-  get limitationReconsiderationPending(): boolean {
-    return (
-      this.limitationReconsiderationRequested &&
-      (this.limitationReconsiderationId === undefined ||
-        this.limitationReconsiderationUses.has(this.latestUseId ?? ""))
-    );
-  }
   allows(id: string): boolean {
     return this.uses.get(id)?.allowed === true;
   }
@@ -163,7 +136,6 @@ export class ReviewSubmissionRecovery {
     this.activitySinceResult = true;
     if (this.allows(id)) {
       this.latestInput = input;
-      this.latestUseId = id;
       this.recoveryCycles += 1;
     }
   }
@@ -171,11 +143,6 @@ export class ReviewSubmissionRecovery {
   reject(id: string, categories: readonly string[]): boolean {
     if (!this.allows(id) || this.rejections.has(id)) return false;
     this.rejections.add(id);
-    if (categories.includes("limitation")) {
-      if (this.limitationReconsiderationId === undefined)
-        for (const useId of this.uses.keys()) this.limitationReconsiderationUses.add(useId);
-      this.limitationReconsiderationId = id;
-    }
     for (const category of new Set(categories))
       this.rejectionCounts[category] = (this.rejectionCounts[category] ?? 0) + 1;
     if (investigationOnly(categories)) this.inspectionCycle();
@@ -438,12 +405,8 @@ export function retainReviewSubmission(
   reason: string,
 ): GoalSubmission | undefined {
   const parsed = (interactive ? interactiveSubmissionSchema : submissionSchema).safeParse(input);
-  if (
-    parsed.success &&
-    gaps.every((gap) => gap.category === "inspection" || gap.category === "limitation")
-  ) {
+  if (parsed.success && gaps.every((gap) => gap.category === "inspection")) {
     const candidate = toSubmission(parsed.data);
-    if (gaps.length > 0 && gaps.every((gap) => gap.category === "limitation")) return candidate;
     return { ...candidate, limitations: [...candidate.limitations, { paths: [], reason }] };
   }
   return retainValidReviewFindings(input, files, references, canReport, interactive);
@@ -487,7 +450,6 @@ export function reviewSubmissionGaps(
   interactive: boolean,
   briefingComplete: boolean,
   unreadFindingPaths: (findings: readonly unknown[]) => readonly string[],
-  limitationReconsiderationPending = false,
   discussionNextCall?: (path: string) => NonNullable<ReviewValidationGap["nextCall"]>,
 ): readonly ReviewValidationGap[] {
   const parsed = (interactive ? interactiveSubmissionSchema : submissionSchema).safeParse(input);
@@ -559,9 +521,7 @@ export function reviewSubmissionGaps(
         finding.path === undefined ? [] : [finding.path],
       ),
     });
-  return gaps.length === 0 && limitationReconsiderationPending && parsed.data.limitations.length > 0
-    ? [LIMITATION_RECONSIDERATION_GAP]
-    : gaps;
+  return gaps;
 }
 
 export function reviewSubmissionRejectionResult(
@@ -619,22 +579,12 @@ export function acceptedSubmissionResult(
         ? undefined
         : `Configured MCP server failure: ${status.failures}`
       : `Configured MCP server status check failed: ${status.error}`;
-  const error =
-    configuredMcpError ??
-    (submission.limitations.length === 0
-      ? undefined
-      : `Required review investigation remains incomplete for: ${[...new Set(submission.limitations.flatMap((limit) => limit.paths))].slice(0, 20).join(", ") || "goal-wide requirements"}.`);
   return withTokenUsage(
     {
       prompt: goal,
-      status:
-        configuredMcpError !== undefined
-          ? "failed"
-          : submission.limitations.length > 0
-            ? "incomplete"
-            : "completed",
+      status: configuredMcpError !== undefined ? "failed" : "completed",
       submission,
-      ...(error === undefined ? {} : { error }),
+      ...(configuredMcpError === undefined ? {} : { error: configuredMcpError }),
     },
     models,
     tokenAccountingComplete,

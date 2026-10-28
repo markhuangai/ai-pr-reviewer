@@ -515,23 +515,22 @@ test("a sixth accepted submission wins over recovery exhaustion", async (t) => {
       yield* protocolBriefing(protocol);
       yield* protocol.call("read_pr_diff", {});
       const limited = {
-        summary: "No complete investigation",
+        summary: "Inspection complete with a caveat",
         findings: [],
         limitations: [
-          { paths: ["review.txt"], reason: "A required external behavior remains unavailable." },
+          { paths: ["review.txt"], reason: "Optional external verification remains unavailable." },
         ],
       };
-      assert.equal((yield* protocol.call("submit_review", limited)).isError, true);
-      for (let index = 0; index < 4; index += 1) yield* protocol.call("submit_review", {});
+      for (let index = 0; index < 5; index += 1) yield* protocol.call("submit_review", {});
       const accepted = yield* protocol.call("submit_review", limited);
       assert.equal(accepted.isError, undefined);
       yield protocolResult();
     }),
   );
-  assert.equal(result.status, "incomplete");
+  assert.equal(result.status, "completed");
   assert.equal(result.diagnostics?.submissionAttempts, 6);
-  assert.equal(result.diagnostics?.rejectionCounts.schema, 4);
-  assert.equal(result.diagnostics?.rejectionCounts.limitation, 1);
+  assert.equal(result.diagnostics?.rejectionCounts.schema, 5);
+  assert.equal(result.diagnostics?.rejectionCounts.limitation, undefined);
   assert.equal(result.tokenUsage?.complete, true);
 });
 
@@ -544,7 +543,7 @@ test("accepted reviews at the SDK turn limit keep their normal completion gates"
   );
   const scenarios = [
     { kind: "complete", expected: "completed" },
-    { kind: "limited", expected: "incomplete" },
+    { kind: "limited", expected: "completed" },
     { kind: "MCP failed", expected: "failed" },
     { kind: "MCP unavailable", expected: "failed" },
     { kind: "provider", expected: "failed" },
@@ -552,7 +551,9 @@ test("accepted reviews at the SDK turn limit keep their normal completion gates"
   for (const scenario of scenarios) {
     const terminal = scenario.kind === "provider" ? "error_during_execution" : "error_max_turns";
     const limitations =
-      scenario.kind === "limited" ? [{ paths: ["review.txt"], reason: "Unavailable." }] : [];
+      scenario.kind === "complete"
+        ? []
+        : [{ paths: ["review.txt"], reason: "Optional verification unavailable." }];
     const mcp = scenario.kind === "MCP failed" || scenario.kind === "MCP unavailable";
     const config = reviewConfig({
       autoApprove: true,
@@ -575,8 +576,6 @@ test("accepted reviews at the SDK turn limit keep their normal completion gates"
           yield* protocolBriefing(protocol);
           assert.equal(protocolDocument(yield* protocol.call("read_pr_diff", {})).done, true);
           const submission = { summary: "Inspected changes.", findings: [], limitations };
-          if (limitations.length > 0)
-            assert.equal((yield* protocol.call("submit_review", submission)).isError, true);
           assert.equal((yield* protocol.call("submit_review", submission)).isError, undefined);
           yield { ...protocolResult(terminal), num_turns: 101 };
         },

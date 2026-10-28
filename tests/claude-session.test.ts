@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { isRecord } from "../src/runtime/agent-logging.js";
 import test from "node:test";
 import { aggregateReview } from "../src/lib/aggregate.js";
 import {
@@ -6,6 +7,7 @@ import {
   sharedReviewRun,
   sharedReviewScript,
   historyText,
+  historyDocuments,
   isolatedTemporaryRoot,
 } from "./codex-test-helpers.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
@@ -120,5 +122,77 @@ test(
     assert.equal(result.result.status, "completed", result.result.error ?? "Discovery failed");
     assert.equal(result.result.diagnostics.readCalls, 1);
     assert.ok(result.seed);
+  },
+);
+
+test(
+  "real claude accepts informational limitations without a correction turn",
+  { timeout: 180_000 },
+  async (t) => {
+    const limitations = [
+      { paths: ["review.txt"], reason: "This feature is intentionally unsupported." },
+      { paths: [], reason: "Optional external verification is unavailable." },
+    ];
+    const script = sharedReviewScript({ goalCount: 1 });
+    const fixture = await modelFixture(t, (request) => {
+      const reply = script.next(request);
+      if (!("tool" in reply) || reply.tool !== "submit_review") return reply;
+      const records: unknown[] = historyDocuments(request.body).flatMap((doc) =>
+        Array.isArray(doc.records) ? (doc.records as unknown[]) : [],
+      );
+      const evidence = records.find(
+        (record) =>
+          isRecord(record) &&
+          record.kind === "evidence" &&
+          isRecord(record.reference) &&
+          record.reference.kind === "repository_diff" &&
+          record.reference.status === "complete",
+      );
+      assert.ok(isRecord(evidence) && isRecord(evidence.reference));
+      return {
+        ...reply,
+        args: {
+          ...reply.args,
+          limitations,
+          findings: [
+            {
+              title: "Check the changed line",
+              severity: "LOW",
+              why: "The changed value is unchecked.",
+              fix: "Validate the value.",
+              path: "review.txt",
+              line: 2,
+              evidenceRefs: [evidence.reference.id],
+              countercheck: "Checked the complete diff for a guard.",
+              counterevidenceRefs: [],
+            },
+          ],
+        },
+      };
+    });
+    const { run, config, context } = await sharedReviewRun(t, fixture.url, "claude", script);
+    assert.equal(run.goals[0]?.status, "completed");
+    assert.equal(run.goals[0]?.error, undefined);
+    assert.deepEqual(run.goals[0]?.submission?.limitations, limitations);
+    assert.equal(run.goals[0]?.submission?.findings[0]?.title, "Check the changed line");
+    assert.equal(run.goals[0]?.diagnostics?.submissionAttempts, 1);
+    assert.equal(run.goals[0]?.diagnostics?.validationFailures, 0);
+    const review = aggregateReview(
+      context,
+      config,
+      [
+        {
+          path: "review.txt",
+          status: "modified",
+          additions: 1,
+          deletions: 0,
+          changes: 1,
+          addedLines: new Set([2]),
+        },
+      ],
+      run.goals,
+    );
+    assert.equal(review.partial, false);
+    assert.equal(review.event, "APPROVE");
   },
 );

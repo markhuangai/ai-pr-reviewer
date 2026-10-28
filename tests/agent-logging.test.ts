@@ -64,9 +64,9 @@ test("review diagnostics preserve complete host records while redacting secrets 
   assert.equal(record.tokenAccountingComplete, true);
 });
 
-test("retains valid findings while marking explicitly incomplete investigation", () => {
+test("retains findings and informational limitations while enforcing MCP health", () => {
   const submission: GoalSubmission = {
-    summary: "One supported issue; remaining path could not be read.",
+    summary: "Inspected changes with an optional verification caveat.",
     findings: [
       {
         title: "Supported issue",
@@ -79,7 +79,7 @@ test("retains valid findings while marking explicitly incomplete investigation",
     limitations: [
       {
         paths: ["src/other.ts"],
-        reason: "The required read failed before the file could be inspected.",
+        reason: "Optional external verification was unavailable.",
       },
     ],
   };
@@ -90,9 +90,9 @@ test("retains valid findings while marking explicitly incomplete investigation",
     [],
     true,
   );
-  assert.equal(result.status, "incomplete");
+  assert.equal(result.status, "completed");
   assert.deepEqual(result.submission, submission);
-  assert.match(result.error ?? "", /src\/other\.ts/u);
+  assert.equal(result.error, undefined);
 
   const mcpFailure = acceptedSubmissionResult(
     "correctness",
@@ -102,6 +102,7 @@ test("retains valid findings while marking explicitly incomplete investigation",
     true,
   );
   assert.equal(mcpFailure.status, "failed");
+  assert.deepEqual(mcpFailure.submission, submission);
   assert.match(mcpFailure.error ?? "", /security: unavailable/u);
 });
 

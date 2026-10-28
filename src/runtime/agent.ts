@@ -371,7 +371,6 @@ export async function runReviewGoal(
       config.interactWithPullRequest,
       briefingReader.complete,
       unreadFindingPaths,
-      recovery.limitationReconsiderationPending,
       (path) =>
         queryReaders.continuation(
           discussionQueryCursors.get(`path:${discussionPathScope(path)}`) ?? "",
@@ -397,10 +396,7 @@ export async function runReviewGoal(
           ],
         });
       }
-      validationGaps = recovery.reconsiderLimitations(
-        submissionGaps(input),
-        input.limitations.length > 0,
-      );
+      validationGaps = submissionGaps(input);
       if (validationGaps.length > 0) {
         const budget = recovery.rejectionBudget(validationGaps.map((gap) => gap.category));
         return Promise.resolve(

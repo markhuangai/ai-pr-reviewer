@@ -497,6 +497,10 @@ test("exhausted provider recovery retains findings and the last valid cumulative
     repository.root,
     repository.baseSha,
   );
+  const limitation = {
+    paths: ["review.txt"],
+    reason: "Optional service verification is unavailable.",
+  };
   const schedule = globalThis.setTimeout;
   t.mock.method(
     globalThis,
@@ -519,7 +523,10 @@ test("exhausted provider recovery retains findings and the last valid cumulative
     );
     assert.ok(evidence);
     assert.equal(
-      (yield* protocol.call("submit_review", recoverySubmission(evidence.id))).isError,
+      (yield* protocol.call("submit_review", {
+        ...recoverySubmission(evidence.id),
+        limitations: [limitation],
+      })).isError,
       true,
     );
     yield {
@@ -562,6 +569,7 @@ test("exhausted provider recovery retains findings and the last valid cumulative
   assert.equal(result.diagnostics?.inspectionContinuations, 1);
   assert.equal(result.diagnostics?.validationFailures, 0);
   assert.equal(result.submission?.findings.length, 1);
+  assert.deepEqual(result.submission?.limitations[0], limitation);
   assert.equal(result.tokenUsage?.models[0]?.inputTokens, 100);
   assert.equal(result.tokenUsage?.complete, false);
   const review = aggregateReview(repository.context, config, files, [result]);

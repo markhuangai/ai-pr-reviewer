@@ -65,7 +65,7 @@ test("partial review summaries identify incomplete checks without publishing raw
       output,
       /\| 2 \| Incomplete \| Configured SDK turn limit reached; 1 changed path unread/u,
     );
-    assert.match(output, /\| 3 \| Incomplete \| 1 declared limitation/u);
+    assert.match(output, /\| 3 \| Incomplete \| Required investigation did not finish/u);
     assert.match(output, /\| 4 \| Failed \| Goal failed/u);
     assert.match(output, /Submission correction budget exhausted/u);
     assert.match(output, /Required inspection stopped making progress/u);
@@ -76,7 +76,9 @@ test("partial review summaries identify incomplete checks without publishing raw
       /PRIVATE GOAL|PRIVATE SUMMARY|PRIVATE RAW ERROR|private-token|<script>/iu,
     );
   }
-  assert.doesNotMatch(body, /\[why\]|example\.test/u);
+  assert.doesNotMatch(body, /(?<!\\)\[why\]\(https/u);
+  assert.match(body, /&lt;SCRIPT&gt;/u);
+  assert.doesNotMatch(body, /declared limitation/u);
   assert.match(summary, /&lt;SCRIPT&gt;/u);
   const failed = goals[3];
   assert.ok(failed);
@@ -107,6 +109,7 @@ test("renders a clean review without exposing goal internals", () => {
   assert.doesNotMatch(body, /estimated cost|Pricing:|Rates per 1M/iu);
   assert.equal(review.event, "APPROVE");
   assert.doesNotMatch(body, /PRIVATE REVIEW GOAL|PRIVATE MODEL SUMMARY|### Goals|completed/u);
+  assert.doesNotMatch(body, /📝 Review limitations/u);
 });
 
 test("requires canonical inspection and completed investigation from every goal", () => {
@@ -129,14 +132,6 @@ test("requires canonical inspection and completed investigation from every goal"
       inspection: {
         observedPaths: files.map((file) => file.path),
         missingPaths: ["src/change.ts"],
-      },
-    },
-    {
-      ...complete,
-      submission: {
-        summary: "partial",
-        findings: [],
-        limitations: [{ paths: [], reason: "The required caller was unavailable." }],
       },
     },
   ];
@@ -225,17 +220,16 @@ test("retains supported findings while suppressing approval for incomplete cover
   assert.match(summary, /src\/other\.ts/u);
 });
 
-test("renders bounded, escaped goal-wide reasons after redaction with complete inspection", () => {
-  const reason = "private-token <script> & [unavailable](https://example.test)";
+test("completed limitations remain informational and appear in both public outputs", () => {
   const goal: GoalResult = {
     ...acceptedSubmissionResult(
-      "check",
+      "PRIVATE GOAL",
       {
-        summary: "No findings",
+        summary: "PRIVATE SUMMARY",
         findings: [],
         limitations: [
-          { paths: [], reason },
-          { paths: [], reason },
+          { paths: [files[0]?.path ?? ""], reason: "This feature is intentionally unsupported." },
+          { paths: [], reason: "private-token <script> & [unavailable](https://example.test)" },
         ],
       },
       { checked: true, failures: "" },
@@ -246,41 +240,37 @@ test("renders bounded, escaped goal-wide reasons after redaction with complete i
   };
   const redacted = redactGoalResults([goal], ["private-token"]);
   const review = aggregateReview(context, config, files, redacted);
-  const summary = buildRunSummary(context, review, redacted);
-  assert.equal(goal.status, "incomplete");
-  assert.equal(review.event, "COMMENT");
-  assert.equal(review.partial, true);
-  assert.match(summary, /### Goal-wide limitations/u);
-  assert.match(summary, /REDACTED/u);
-  assert.match(summary, /&lt;script&gt;/u);
-  for (const raw of ["private-token", "<script>", "[unavailable]("])
-    assert.equal(summary.includes(raw), false);
-  assert.equal(summary.split("&lt;script&gt;").length, 2);
-  const manyGoals = redactGoalResults(
-    Array.from({ length: 50 }, (_, goalIndex) => ({
-      ...goal,
-      submission: {
-        summary: "partial",
-        findings: [],
-        limitations: [
-          { paths: [files[0]?.path ?? ""], reason: "Path specific reason." },
-          ...Array.from({ length: 99 }, (_, index) => ({
-            paths: [],
-            reason: `${goalIndex}:${index} ${"🙂".repeat(490)}`,
-          })),
-        ],
-      },
-    })),
-    [],
+  assert.equal(goal.status, "completed");
+  assert.equal(goal.error, undefined);
+  assert.equal(review.event, "APPROVE");
+  assert.equal(review.partial, false);
+  assert.equal(
+    aggregateReview(context, { ...config, autoApprove: false }, files, redacted).event,
+    "COMMENT",
   );
-  const bounded = buildRunSummary(
-    context,
-    aggregateReview(context, config, files, manyGoals),
-    manyGoals,
-  );
-  assert.match(bounded, /Path specific reason/u);
-  assert.match(bounded, /4930 additional reason\(s\) omitted/u);
-  assert.ok(Buffer.byteLength(bounded) < 1_000_000);
+  for (const output of [
+    buildReviewBody(review, redacted),
+    buildRunSummary(context, review, redacted),
+  ]) {
+    assert.match(output, /<summary>📝 Review limitations · 2<\/summary>/u);
+    assert.match(
+      output,
+      /\| 1 \| <code>src\/change\.ts<\/code> \| This feature is intentionally unsupported/u,
+    );
+    assert.match(output, /\| 1 \| Whole check \|/u);
+    assert.match(output, /REDACTED/u);
+    assert.match(output, /&lt;script&gt;/u);
+    assert.doesNotMatch(
+      output,
+      /private-token|<script>|PRIVATE GOAL|PRIVATE SUMMARY|<details open/iu,
+    );
+    assert.doesNotMatch(
+      output,
+      /Incomplete checks|Incomplete investigation|Goal-wide limitations|declared limitation/u,
+    );
+    assert.ok(output.indexOf("🔍 Review coverage") < output.indexOf("📝 Review limitations"));
+    assert.ok(output.indexOf("📝 Review limitations") < output.indexOf("📊 Token usage"));
+  }
 });
 
 test("combines token usage across every goal without showing cost when pricing is absent", () => {
