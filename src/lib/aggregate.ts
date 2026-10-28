@@ -29,6 +29,8 @@ const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
 const MAX_RUN_SUMMARY_BYTES = 1_000_000;
 const MAX_TOKEN_USAGE_DETAILS_LENGTH = 20_000;
+const MAX_LIMITATION_DETAILS_BYTES = 10_000;
+const MAX_DISPLAY_LIMITATIONS = 20;
 const MAX_DISPLAY_MODEL_LENGTH = 500;
 const MERGED_FINDING_TRUNCATION_NOTICE = "> Additional duplicate evidence omitted after 16 KB.";
 const SEVERITY_ORDER: Record<Severity, number> = {
@@ -519,12 +521,7 @@ export function aggregateReview(
   const partial =
     options.discovery?.status === "failed" ||
     goals.length === 0 ||
-    goals.some(
-      (goal) =>
-        goal.status !== "completed" ||
-        goal.submission === undefined ||
-        goal.submission.limitations.length > 0,
-    ) ||
+    goals.some((goal) => goal.status !== "completed" || goal.submission === undefined) ||
     coverageGoals.length !== goals.length ||
     coverageGoals.some((goal) => goal.inspection === undefined) ||
     missingReviewCoverage(files, coverageGoals).length > 0;
@@ -722,9 +719,54 @@ function buildTokenUsageDetails(usage: AggregatedTokenUsage): string {
   return rendered;
 }
 
+function buildLimitationDetails(goals: readonly GoalResult[]): string {
+  const limitations = goals.flatMap((goal, index) =>
+    (goal.submission?.limitations ?? []).map((limitation) => ({ check: index + 1, limitation })),
+  );
+  if (limitations.length === 0) return "";
+  const render = (rows: readonly string[]) => {
+    const omitted = limitations.length - rows.length;
+    return [
+      "<details>",
+      `<summary>📝 Review limitations · ${limitations.length}</summary>`,
+      "",
+      "| Check | Applies to | Limitation |",
+      "|:--|:--|:--|",
+      ...rows,
+      ...(omitted === 0
+        ? []
+        : [
+            "",
+            `> ${omitted} additional limitation(s) omitted; see the workflow logs for full details.`,
+          ]),
+      "",
+      "</details>",
+    ].join("\n");
+  };
+  const rows: string[] = [];
+  for (const { check, limitation } of limitations.slice(0, MAX_DISPLAY_LIMITATIONS)) {
+    const paths =
+      limitation.paths.length === 0
+        ? "Whole check"
+        : limitation.paths
+            .map((path) => `<code>${escapeHtmlText(path).replace(/\|/gu, "&#124;")}</code>`)
+            .join("<br>");
+    const row = `| ${check} | ${paths} | ${escapeMarkdownText(limitation.reason)} |`;
+    if (Buffer.byteLength(render([...rows, row]), "utf8") > MAX_LIMITATION_DETAILS_BYTES) break;
+    rows.push(row);
+  }
+  return render(rows);
+}
+
 export function buildReviewBody(review: AggregatedReview, goals: readonly GoalResult[]): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
-  const details = `${buildCoverageDetails(review.coverage)}\n\n${buildTokenUsageDetails(review.tokenUsage)}`;
+  const details = [
+    buildCoverageDetails(review.coverage),
+    buildLimitationDetails(goals),
+    buildTokenUsageDetails(review.tokenUsage),
+  ]
+    .filter((section) => section.length > 0)
+    .join("\n\n");
   if (!review.partial && review.findings.length === 0)
     return [review.marker, "## ✨ Good job!", "", review.summary, "", details].join("\n");
 
@@ -781,6 +823,7 @@ export function buildRunSummary(
 ): string {
   const completed = goals.filter((goal) => goal.status === "completed").length;
   const tokenUsage = buildTokenUsageDetails(review.tokenUsage);
+  const limitations = buildLimitationDetails(goals);
   const lines = [
     runSummaryHeading(review),
     "",
@@ -799,19 +842,15 @@ export function buildRunSummary(
     "",
     buildCoverageDetails(review.coverage),
     "",
+    ...(limitations.length === 0 ? [] : [limitations, ""]),
     tokenUsage,
   ];
   if (review.partial) {
     lines.push("", incompleteGoalDetails(goals));
     const incompleteCoverage = new Map<string, string>();
-    const goalWideReasons = new Set<string>();
     for (const goal of goals) {
       for (const path of goal.inspection?.missingPaths ?? [])
         incompleteCoverage.set(path, "The changed code was not fully delivered to this goal.");
-      for (const limitation of goal.submission?.limitations ?? []) {
-        if (limitation.paths.length === 0) goalWideReasons.add(limitation.reason);
-        for (const path of limitation.paths) incompleteCoverage.set(path, limitation.reason);
-      }
     }
     if (incompleteCoverage.size > 0) {
       const shown = [...incompleteCoverage].slice(0, 20);
@@ -826,18 +865,6 @@ export function buildRunSummary(
         ),
         ...(incompleteCoverage.size > shown.length
           ? [`- ${incompleteCoverage.size - shown.length} additional path(s) omitted.`]
-          : []),
-      );
-    }
-    if (goalWideReasons.size > 0) {
-      const shown = [...goalWideReasons].slice(0, 20);
-      lines.push(
-        "",
-        "### Goal-wide limitations",
-        "",
-        ...shown.map((reason) => `- ${escapeMarkdownText(reason)}`),
-        ...(goalWideReasons.size > shown.length
-          ? [`- ${goalWideReasons.size - shown.length} additional reason(s) omitted.`]
           : []),
       );
     }

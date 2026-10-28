@@ -736,3 +736,56 @@ test("main treats cancellation as a clean stop", async (t) => {
   assert.doesNotMatch(output.join(""), /::error::/u);
   assert.equal(process.exitCode, previousExitCode);
 });
+
+test("interactive summary errors and cancellation stop PR publication", async (t) => {
+  const { context, workspace } = await cleanWorkspace(t);
+  useWorkspace(t, workspace);
+  for (const outcome of ["failure", "cancellation"]) {
+    const controller = new AbortController();
+    let reviews = 0;
+    let summaries = 0;
+    const api = {
+      ...emptyConversationApi(),
+      createReview: () => {
+        reviews += 1;
+        return Promise.resolve();
+      },
+    } as unknown as GitHubApi;
+    await assert.rejects(
+      runAction(
+        actionReader(),
+        [],
+        {
+          createApi: () => api,
+          readEventContext: () => Promise.resolve(context),
+          createWorkspace: () => Promise.reject(new Error("unexpected temporary workspace")),
+          runGoals: () =>
+            Promise.resolve({
+              goals: [
+                {
+                  prompt: "check",
+                  status: "completed",
+                  inspection: { observedPaths: ["review.txt"], missingPaths: [] },
+                  submission: {
+                    summary: "done",
+                    findings: [],
+                    limitations: [{ paths: [], reason: "Optional verification unavailable." }],
+                  },
+                },
+              ],
+            }),
+          writeSummary: () => {
+            summaries += 1;
+            if (outcome === "failure") return Promise.reject(new Error("Summary write failed."));
+            controller.abort(new CancellationError("SIGTERM"));
+            return Promise.resolve();
+          },
+        },
+        controller,
+      ),
+      outcome === "failure" ? /Summary write failed/u : /cancelled/u,
+    );
+    assert.equal(summaries, 1);
+    assert.equal(reviews, 0);
+  }
+});

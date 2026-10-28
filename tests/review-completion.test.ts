@@ -25,10 +25,6 @@ import {
 } from "../src/runtime/review-context-tools.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
 import {
-  ReviewSubmissionRecovery,
-  reviewSubmissionGaps,
-} from "../src/runtime/review-submission.js";
-import {
   reviewProtocolQuery,
   protocolDocument,
   recoveryState,
@@ -54,46 +50,6 @@ function call(tool_name: string, tool_input: unknown, tool_response: unknown) {
 function jsonResponse(value: unknown): unknown {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
-
-test("batched limited submissions wait for reconsideration while clean and later uses can proceed", () => {
-  const recovery = new ReviewSubmissionRecovery(100);
-  const ledger = new ReviewEvidenceLedger("/repo");
-  const limited = {
-    summary: "Inspected goal",
-    findings: [],
-    limitations: [{ paths: [], reason: "Required evidence remains unavailable." }],
-  };
-  const gaps = (input: unknown) =>
-    reviewSubmissionGaps(
-      input,
-      [],
-      ledger,
-      false,
-      true,
-      () => [],
-      recovery.limitationReconsiderationPending,
-    );
-  recovery.observeUse("batch-a", limited);
-  recovery.observeUse("batch-b", limited);
-  const first = recovery.reconsiderLimitations(gaps(limited), true);
-  assert.deepEqual(
-    first.map((gap) => gap.category),
-    ["limitation"],
-  );
-  assert.equal(recovery.limitationReconsiderationPending, true);
-  assert.deepEqual(recovery.reconsiderLimitations(gaps(limited), true), first);
-  const clean = { ...limited, limitations: [] };
-  assert.deepEqual(recovery.reconsiderLimitations(gaps(clean), false), []);
-  recovery.reject("batch-a", ["limitation"]);
-  assert.equal(recovery.limitationReconsiderationPending, true);
-  recovery.reject("batch-b", ["limitation"]);
-  recovery.observeUse("batch-a", limited);
-  assert.equal(recovery.limitationReconsiderationPending, true);
-  recovery.observeUse("later", limited);
-  assert.equal(recovery.limitationReconsiderationPending, false);
-  assert.deepEqual(recovery.reconsiderLimitations(gaps(limited), true), []);
-  assert.equal(recovery.validationFailures, 2);
-});
 
 test("automatic diff pages require valid ranges and cannot claim inspection from done alone", () => {
   const snapshot = { mergeBaseSha: "1".repeat(40), headSha: "2".repeat(40) };
@@ -333,26 +289,25 @@ test("six isolated goals finish a 101-file deletion-heavy sweep within the confi
   assert.equal(review.event, "APPROVE");
 });
 
-test("limitations are reconsidered once without erasing findings or genuine blockers", async (t) => {
+test("informational limitations are accepted immediately and retain supported findings", async (t) => {
   const repository = await recoveryRepository(t);
   const files = await readPullRequestFilesFromSnapshots(
     repository.context,
     repository.root,
     repository.baseSha,
   );
-  for (const scenario of ["scope", "confirmed", "exhausted"] as const) {
-    const reason =
-      scenario === "scope"
-        ? "Outside this goal's scope."
-        : "Required runtime evidence remains unavailable.";
+  for (const reason of [
+    "This feature is intentionally unsupported.",
+    "Optional runtime verification is unavailable.",
+  ]) {
     const limitation = { paths: ["review.txt"], reason };
     const result = await runReviewGoal(
-      scenario,
+      "check",
       0,
       repository.context,
       files,
       emptyConversation,
-      reviewConfig({ maxTurns: scenario === "exhausted" ? 2 : 100 }),
+      reviewConfig(),
       repository.diff,
       repository.root,
       reviewProtocolQuery(async function* (protocol) {
@@ -364,37 +319,25 @@ test("limitations are reconsidered once without erasing findings or genuine bloc
         );
         assert.ok(reference);
         const limited = { ...recoverySubmission(reference.id), limitations: [limitation] };
-        const response = yield* protocol.call("submit_review", limited);
-        assert.equal(response.isError, true);
-        assert.deepEqual(protocolDocument(response).categories, ["limitation"]);
-        const pending = yield* recoveryState(protocol);
-        assert.equal(pending.validationFailures, 1);
-        assert.equal(pending.gaps[0]?.category, "limitation");
-        if (scenario === "exhausted") {
-          yield { ...protocolResult("error_max_turns"), num_turns: 3 };
-          return;
-        }
-        const replacement =
-          scenario === "scope"
-            ? { ...limited, summary: "The excluded path is outside this goal.", limitations: [] }
-            : limited;
-        assert.equal((yield* protocol.call("submit_review", replacement)).isError, undefined);
+        assert.equal((yield* protocol.call("submit_review", limited)).isError, undefined);
         yield protocolResult();
       }),
     );
-    assert.equal(result.status, scenario === "scope" ? "completed" : "incomplete");
+    assert.equal(result.status, "completed");
+    assert.equal(result.error, undefined);
     assert.equal(result.submission?.findings.length, 1);
-    assert.equal(result.diagnostics?.rejectionCounts.limitation, 1);
-    assert.equal(result.diagnostics?.validationFailures, 1);
-    if (scenario === "scope") assert.deepEqual(result.submission?.limitations, []);
-    else assert.deepEqual(result.submission?.limitations, [limitation]);
+    assert.equal(result.diagnostics?.submissionAttempts, 1);
+    assert.equal(result.diagnostics?.validationFailures, 0);
+    assert.deepEqual(result.submission?.limitations, [limitation]);
     assert.deepEqual(result.inspection?.missingPaths, []);
-    if (scenario === "exhausted")
-      assert.equal(result.diagnostics?.termination, "max-turns-exhausted");
+    const review = aggregateReview(repository.context, reviewConfig({ autoApprove: true }), files, [
+      result,
+    ]);
+    assert.equal(review.partial, false);
     assert.equal(
-      aggregateReview(repository.context, reviewConfig({ autoApprove: true }), files, [result])
-        .partial,
-      scenario !== "scope",
+      review.event,
+      "COMMENT",
+      "The retained high-severity finding still prevents approval.",
     );
   }
 });

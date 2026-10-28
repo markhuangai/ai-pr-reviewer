@@ -449,6 +449,59 @@ test("keeps the collapsed token block within review and run-summary limits", () 
   assert.doesNotMatch(body, /<details open/iu);
 });
 
+test("limitation sections bound complete escaped entries and preserve check order", () => {
+  for (const limitations of [
+    Array.from({ length: 12 }, (_, index) => ({
+      paths: index === 0 ? ["<script>|line\nbreak.ts", "second.ts"] : [],
+      reason: `Note ${index}: private-token <details> & [link](https://example.test)`,
+    })),
+    Array.from({ length: 12 }, (_, index) => ({
+      paths: [],
+      reason: `${index} ${"界".repeat(990)}`,
+    })),
+    [{ paths: ["界".repeat(4000)], reason: "This whole entry exceeds the display budget." }],
+  ]) {
+    const goals = redactGoalResults(
+      ["completed", "incomplete"].map((status) => ({
+        prompt: "PRIVATE GOAL",
+        status: status as GoalResult["status"],
+        inspection: { observedPaths: files.map((file) => file.path), missingPaths: [] },
+        submission: { summary: "PRIVATE SUMMARY", findings: [], limitations },
+      })),
+      ["private-token"],
+    );
+    const review = aggregateReview(context, config, files, goals);
+    assert.equal(review.partial, true);
+    assert.equal(review.event, "COMMENT");
+    for (const output of [
+      buildReviewBody(review, goals),
+      buildRunSummary(context, review, goals),
+    ]) {
+      const block = output.match(
+        /<details>\n<summary>📝 Review limitations[\s\S]*?<\/details>/u,
+      )?.[0];
+      assert.ok(block);
+      assert.ok(Buffer.byteLength(block, "utf8") <= 10_000);
+      assert.ok([...block.matchAll(/^\| [12] \|/gmu)].length <= 20);
+      assert.match(block, new RegExp(`Review limitations · ${limitations.length * 2}<`, "u"));
+      assert.match(block, /additional limitation\(s\) omitted; see the workflow logs/u);
+      assert.doesNotMatch(
+        output,
+        /private-token|<script>|<details open|PRIVATE GOAL|PRIVATE SUMMARY/iu,
+      );
+      assert.equal([...output.matchAll(/<details>/gu)].length, 3);
+      assert.equal([...output.matchAll(/<\/details>/gu)].length, 3);
+      assert.ok(output.indexOf("🔍 Review coverage") < output.indexOf("📝 Review limitations"));
+      assert.ok(output.indexOf("📝 Review limitations") < output.indexOf("📊 Token usage"));
+      if (limitations[0]?.paths[0]?.startsWith("<script>")) {
+        assert.match(block, /&lt;script&gt;&#124;line&#10;break\.ts<\/code><br><code>second\.ts/u);
+        assert.match(block, /4 additional limitation/u);
+        assert.ok(block.indexOf("| 1 |") < block.indexOf("| 2 |"));
+      }
+    }
+  }
+});
+
 test("caps run summaries by UTF-8 bytes without cutting a finding", () => {
   const goals: readonly GoalResult[] = Array.from({ length: 100 }, (_, index) => {
     const identifier = String(index).padStart(3, "0");
@@ -781,6 +834,37 @@ test("coverage bounds escaped UTF-8 rows and keeps complete totals and accountin
     assert.equal([...output.matchAll(/<\/details>/gu)].length, 2);
     assert.ok(output.indexOf("🔍 Review coverage") < output.indexOf("📊 Token usage"));
     assert.ok(output.length <= 60_000);
+  }
+  const limited: GoalResult = {
+    ...goal,
+    submission: {
+      summary: "done",
+      findings: [],
+      limitations: Array.from({ length: 30 }, () => ({ paths: [], reason: "界".repeat(990) })),
+    },
+    tokenUsage: {
+      complete: true,
+      models: Array.from({ length: 1000 }, (_, index) => ({
+        model: `${index}-${"界".repeat(1000)}`,
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadInputTokens: 1,
+        cacheCreationInputTokens: 0,
+      })),
+    },
+  };
+  const combined = aggregateReview(context, config, manifest, [limited, limited]);
+  for (const output of [
+    buildReviewBody(combined, [limited, limited]),
+    buildRunSummary(context, combined, [limited, limited]),
+  ]) {
+    assert.equal([...output.matchAll(/<details>/gu)].length, 3);
+    assert.equal([...output.matchAll(/<\/details>/gu)].length, 3);
+    assert.ok(output.length <= 60_000);
+    assert.ok(Buffer.byteLength(output, "utf8") <= 1_000_000);
+    assert.doesNotMatch(output, /Review body truncated/u);
+    assert.match(output, /additional limitation/u);
+    assert.match(output, /additional model rows omitted/u);
   }
 });
 

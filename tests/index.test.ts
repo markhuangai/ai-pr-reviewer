@@ -747,7 +747,7 @@ test("denied optional issues warn once while summary and interactive reviews kee
           });
           published.length = 0;
           let goalRuns = 0;
-          let summaryWrites = 0;
+          const summaries: string[] = [];
           const pending = runAction(
             actionReader({ "interact-with-pr": String(interact), "auto-approve": "true" }),
             ["#12", "denied-body-secret"],
@@ -782,16 +782,16 @@ test("denied optional issues warn once while summary and interactive reviews kee
                       submission: {
                         summary: "Reviewed code",
                         findings: [],
-                        limitations: incomplete
-                          ? [{ paths: [], reason: "Required investigation could not finish." }]
-                          : [],
+                        limitations: [
+                          { paths: [], reason: "Optional service verification is unavailable." },
+                        ],
                       },
                     },
                   ],
                 });
               },
-              writeSummary: () => {
-                summaryWrites += 1;
+              writeSummary: (summaryContext, review, goals) => {
+                summaries.push(buildRunSummary(summaryContext, review, goals));
                 return Promise.resolve();
               },
             },
@@ -807,7 +807,17 @@ test("denied optional issues warn once while summary and interactive reviews kee
             assert.equal(result.review?.allGoalsFailed, false);
           }
           assert.equal(goalRuns, 1);
-          assert.equal(summaryWrites, interact ? 0 : 1);
+          assert.equal(summaries.length, 1);
+          assert.match(summaries[0] ?? "", /📝 Review limitations · 1/u);
+          assert.match(summaries[0] ?? "", /Optional service verification is unavailable/u);
+          assert.match(
+            summaries[0] ?? "",
+            incomplete ? /Result: incomplete/u : /Result: complete/u,
+          );
+          if (interact) {
+            assert.match(published[0]?.body ?? "", /📝 Review limitations · 1/u);
+            assert.doesNotMatch(published[0]?.body ?? "", /declared limitation/u);
+          }
           assert.deepEqual(
             published.map((review) => review.event),
             interact ? [incomplete ? "COMMENT" : "APPROVE"] : [],
@@ -964,6 +974,7 @@ test("falls back from a rejected approval to a comment review", async (t) => {
   const { context, workspace } = await cleanWorkspace(t);
   useWorkspace(t, workspace);
   const requests: PullRequestReviewRequest[] = [];
+  let summaries = 0;
   const api = {
     ...emptyConversationApi(),
     getPullRequestRefs: () =>
@@ -993,17 +1004,22 @@ test("falls back from a rejected approval to a comment review", async (t) => {
             prompt: "correctness",
             status: "completed",
             submission: {
-              limitations: [],
+              limitations: [{ paths: [], reason: "This feature is intentionally unsupported." }],
               summary: "clean",
               findings: [],
             },
           },
         ],
       }),
-    writeSummary: () => Promise.resolve(),
+    writeSummary: () => {
+      summaries += 1;
+      return Promise.resolve();
+    },
   });
 
   assert.equal(result.skipped, false);
+  assert.equal(summaries, 1);
+  assert.ok(requests.every((request) => request.body.includes("📝 Review limitations · 1")));
   assert.deepEqual(
     requests.map((request) => request.event),
     ["APPROVE", "COMMENT"],
