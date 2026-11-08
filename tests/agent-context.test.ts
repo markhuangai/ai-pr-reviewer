@@ -1,3 +1,17 @@
+import { createRepositoryDiscoveryTools } from "../src/runtime/repository-discovery-tools.js";
+import { RepositorySnapshot } from "../src/runtime/repository-snapshot.js";
+import {
+  createReviewSourceTools,
+  createReviewStateTool,
+  createReviewThreadTool,
+} from "../src/runtime/review-context-tools.js";
+import {
+  ReviewEvidenceLedger,
+  reviewInspection,
+  toolResponseDocument,
+} from "../src/runtime/review-assessment.js";
+import { ReviewSubmissionRecovery } from "../src/runtime/review-submission.js";
+import { writeReviewDiagnostic } from "../src/runtime/review-diagnostics.js";
 import { ReviewQueryReaderStore } from "../src/runtime/review-context-tools.js";
 import {
   access,
@@ -682,4 +696,271 @@ test("bounds selected-diff metadata before creating a query and resumes the larg
     }),
   );
   assert.equal(result.status, "incomplete", result.error ?? "");
+});
+
+test("real discovery cursors recover their original tools and never satisfy inspection", async (t) => {
+  const repository = await makeRepository(t, async (root) => {
+    await Promise.all(
+      Array.from({ length: 140 }, (_, index) =>
+        writeFile(join(root, `${index}-${"p".repeat(170)}.txt`), "matching line\n".repeat(3)),
+      ),
+    );
+  });
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+    undefined,
+    repository.temporaryRoot,
+  );
+  const readers = new ReviewQueryReaderStore(() => undefined);
+  t.after(async () => {
+    await Promise.all(readers.cleanupOperations());
+    await snapshot.cleanup();
+  });
+  const ledger = new ReviewEvidenceLedger(repository.root);
+  const lines: string[] = [];
+  const state = createReviewStateTool({
+    signal: undefined,
+    isActive: () => true,
+    files: files.slice(0, 1),
+    headSha: repository.headSha,
+    mergeBaseSha: repository.baseSha,
+    briefingComplete: () => true,
+    ledger,
+    readers,
+    recovery: new ReviewSubmissionRecovery(),
+    gaps: () => [],
+    onSnapshot: (details) => {
+      writeReviewDiagnostic(0, "recovery-decision", details, [], (line) => lines.push(line));
+    },
+  });
+  const tools = createRepositoryDiscoveryTools({ snapshot, readers, isActive: () => true });
+  for (const name of ["list_repository_files", "search_repository"]) {
+    const tool = tools.find((tool) => tool.name === name);
+    assert.ok(tool);
+    const selector =
+      name === "list_repository_files"
+        ? { revision: "head" }
+        : { revision: "head", pattern: "matching", paths: [] };
+    let response = await tool.handler(selector);
+    let page = toolResponseDocument(response);
+    assert.ok(page);
+    assert.equal(page.done, false);
+    assert.equal(page.discoveryTool, undefined);
+    const cursor = String(page.nextCursor);
+    const expected = { tool: name, arguments: { ...selector, cursor } };
+    const mismatch = await tool.handler({ ...selector, revision: "base", cursor });
+    assert.equal(mismatch.isError, true);
+    assert.deepEqual(toolResponseDocument(mismatch)?.nextCall, expected);
+    const wrongKind = await readers.readPage(cursor, "diff");
+    assert.deepEqual(toolResponseDocument(wrongKind)?.nextCall, expected);
+    assert.deepEqual(readers.continuation(cursor), expected);
+    await state.handler({ paths: undefined, cursor: undefined });
+    const diagnostic = JSON.parse(
+      lines.map((line) => line.slice(line.indexOf(": ") + 2)).join(""),
+    ) as { snapshotId: string; optionalCalls: unknown[]; mergeBaseSha: string; headSha: string };
+    assert.ok(diagnostic.snapshotId);
+    assert.equal(diagnostic.headSha, repository.headSha);
+    assert.equal(diagnostic.mergeBaseSha, repository.baseSha);
+    assert.deepEqual(diagnostic.optionalCalls, [{ kind: "active_read", ...expected }]);
+    t.diagnostic(lines.join("\n"));
+    lines.length = 0;
+    let pages = 1;
+    let received = String(page.content);
+    for (;;) {
+      ledger.observeBatch([
+        {
+          tool_name: name,
+          tool_input: { ...selector, ...(pages === 1 ? {} : { cursor }) },
+          tool_use_id: `${name}-${pages}`,
+          tool_response: response,
+        },
+      ]);
+      assert.deepEqual(reviewInspection(files, ledger.issued).observedPaths, []);
+      assert.ok(Buffer.byteLength(JSON.stringify(response)) <= MODEL_TOOL_RESULT_BYTES);
+      if (page.done === true) break;
+      response = await tool.handler({ ...selector, cursor });
+      page = toolResponseDocument(response);
+      assert.ok(page);
+      assert.equal(page.page, ++pages);
+      received += String(page.content);
+    }
+    assert.ok(pages > 1);
+    assert.match(received, /139-ppp/u);
+    assert.equal(readers.has(cursor), false);
+    assert.equal(readers.continuation(cursor), undefined);
+    const expired = await tool.handler({ ...selector, cursor });
+    assert.equal(expired.isError, true);
+    assert.match(JSON.stringify(expired), /unknown, expired, or already complete/u);
+    assert.equal(toolResponseDocument(expired)?.nextCall, undefined);
+  }
+});
+
+test("first and continuation source pages share metadata, budgets, and one completion", async (t) => {
+  const content = 'changed-🙂-\u0001-"-\\\n'.repeat(3_000);
+  const repository = await makeRepository(t, (root) =>
+    writeFile(join(root, "review.txt"), content),
+  );
+  const files = await readPullRequestFilesFromSnapshots(
+    repository.context,
+    repository.root,
+    repository.baseSha,
+  );
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  const snapshot = new RepositorySnapshot(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.baseSha,
+    files,
+    undefined,
+    repository.temporaryRoot,
+  );
+  const removed: string[] = [];
+  const readers = new ReviewQueryReaderStore((cursor) => removed.push(cursor));
+  t.after(async () => {
+    await Promise.all(readers.cleanupOperations());
+    await snapshot.cleanup();
+    await diff.cleanup();
+  });
+  const { diffTool, repositoryFileTool } = createReviewSourceTools({
+    signal: undefined,
+    isActive: () => true,
+    diff,
+    headSha: repository.headSha,
+    queryReaders: readers,
+    repositorySnapshot: snapshot,
+    ledger: new ReviewEvidenceLedger(repository.root, files),
+  });
+  for (const kind of ["diff", "repository_file"]) {
+    let result =
+      kind === "diff"
+        ? await diffTool.handler({ paths: ["review.txt"], cursor: undefined, remaining: undefined })
+        : await repositoryFileTool.handler({
+            revision: "head",
+            path: "review.txt",
+            cursor: undefined,
+          });
+    const first = toolResponseDocument(result);
+    assert.ok(first);
+    assert.equal(first.done, false);
+    if (kind === "repository_file") assert.equal(first.sizeBytes, Buffer.byteLength(content));
+    const cursor = String(first.nextCursor);
+    let page = first;
+    let pages = 1;
+    let received = "";
+    for (;;) {
+      assert.equal(result.isError, undefined);
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) <= MODEL_TOOL_RESULT_BYTES);
+      assert.equal(page.headSha, repository.headSha);
+      assert.equal(page.mergeBaseSha, repository.baseSha);
+      received += String(page.content);
+      if (page.done === true) break;
+      assert.equal(readers.has(cursor), true);
+      result = await readers.readPage(
+        cursor,
+        kind === "diff" ? "diff" : "repository_file",
+        kind === "diff" ? { paths: ["review.txt"] } : { revision: "head", path: "review.txt" },
+      );
+      const nextPage = toolResponseDocument(result);
+      assert.ok(nextPage);
+      page = nextPage;
+      assert.equal(page.page, ++pages);
+    }
+    if (kind === "repository_file") assert.equal(received, content);
+    else assert.match(received, /changed-🙂/u);
+    assert.equal(received.includes("�"), false);
+    assert.equal(readers.has(cursor), false);
+    await readers.finish(cursor);
+    assert.equal(removed.filter((entry) => entry === cursor).length, 1);
+  }
+});
+
+test("thread first and final pages account for progress and complete exactly once", async (t) => {
+  const paths = new Set<string>();
+  const threads = new Set<number>();
+  const removed: string[] = [];
+  const readers = new ReviewQueryReaderStore((cursor) => removed.push(cursor));
+  t.after(() => Promise.all(readers.cleanupOperations()));
+  const delivered: number[] = [];
+  const body = 'discussion-🙂-\u0001-"-\\\n'.repeat(2_000);
+  const tool = createReviewThreadTool({
+    signal: undefined,
+    isActive: () => true,
+    conversation: {
+      digest: "thread-fixture",
+      entries: [
+        {
+          kind: "inline_thread",
+          id: 7,
+          path: "review.txt",
+          rootAvailable: true,
+          createdAt: "fixture",
+          isResolved: false,
+          isOutdated: false,
+          messages: [
+            { id: 7, authorRole: "human", createdAt: "fixture", updatedAt: "fixture", body },
+          ],
+        },
+      ],
+    },
+    queryReaders: readers,
+    discussionPathScope: (path) => path,
+    discussionReadPaths: paths,
+    discussionReadThreadIds: threads,
+    discussionQueryCursors: new Map(),
+    queryReaderDiscussionKeys: new Map(),
+    onPage: (_selector, page) => delivered.push(page),
+  });
+  let response = await tool.handler({ id: 7, path: undefined, cursor: undefined });
+  let page = toolResponseDocument(response);
+  assert.ok(page);
+  assert.equal(page.done, false);
+  assert.deepEqual(delivered, [1]);
+  assert.equal(threads.has(7), false);
+  const cursor = String(page.nextCursor);
+  const mismatch = await tool.handler({ id: 8, path: undefined, cursor });
+  assert.equal(mismatch.isError, true);
+  assert.deepEqual(delivered, [1]);
+  let received = String(page.content);
+  while (page.done !== true) {
+    response = await tool.handler({ id: 7, path: undefined, cursor });
+    assert.ok(Buffer.byteLength(JSON.stringify(response)) <= MODEL_TOOL_RESULT_BYTES);
+    page = toolResponseDocument(response);
+    assert.ok(page);
+    received += String(page.content);
+    if (page.done !== true) assert.equal(threads.has(7), false);
+  }
+  assert.ok(delivered.length > 1);
+  assert.deepEqual(
+    delivered,
+    Array.from({ length: delivered.length }, (_, index) => index + 1),
+  );
+  assert.equal(threads.has(7), true);
+  const parsed = JSON.parse(received) as { entries: { messages: { body: string }[] }[] };
+  assert.equal(parsed.entries[0]?.messages[0]?.body, body);
+  await readers.finish(cursor);
+  assert.deepEqual(removed, [cursor]);
+  const complete: number[] = [];
+  const small = readers.createString("small", { selector: { id: 9 } }, () => complete.push(9));
+  assert.equal(
+    toolResponseDocument(await readers.readPage(small.cursor, "thread", { selector: { id: 9 } }))
+      ?.done,
+    true,
+  );
+  await readers.finish(small.cursor);
+  assert.deepEqual(complete, [9]);
 });

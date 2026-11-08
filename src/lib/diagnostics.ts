@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { redact } from "./redaction.js";
 
 const MAX_DIAGNOSTIC_LINE_LENGTH = 8_000;
 const MAX_DIAGNOSTIC_STRING_LENGTH = 2_048;
@@ -100,25 +101,6 @@ export function registerSafeDiagnosticError(
 ): void {
   if (isObjectLike(error)) safeDiagnosticMessages.set(error, message);
   else primitiveMessages?.set(error, message);
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
-
-function redactSecret(value: string, secret: string): string {
-  if (secret.length < 8 && /^[A-Za-z0-9]+$/u.test(secret)) {
-    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "gu");
-    return value.replace(pattern, "[REDACTED]");
-  }
-  return value.split(secret).join("[REDACTED]");
-}
-
-function redact(value: string, secrets: readonly string[]): string {
-  return secrets
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length)
-    .reduce((result, secret) => redactSecret(result, secret), value);
 }
 
 function truncate(value: string, maxLength = MAX_DIAGNOSTIC_STRING_LENGTH): string {

@@ -32,9 +32,12 @@ import type {
 
 export type QueryReaderKind = "diff" | "repository_file" | "thread" | "discovery";
 
+export type RepositoryDiscoveryTool = "list_repository_files" | "search_repository";
+
 export interface QueryReaderEntry {
   readonly reader: StringPageReader | RepositoryFilePageReader;
   readonly kind: QueryReaderKind;
+  readonly discoveryTool?: RepositoryDiscoveryTool;
   readonly metadata: Readonly<Record<string, unknown>>;
   readonly cleanup?: () => Promise<void>;
 }
@@ -78,6 +81,7 @@ export class ReviewQueryReaderStore {
     source: RepositoryQuerySource,
     kind: QueryReaderKind,
     metadata: Readonly<Record<string, unknown>>,
+    discoveryTool?: RepositoryDiscoveryTool,
   ): { readonly cursor: string; readonly reader: RepositoryFilePageReader } {
     this.makeRoom();
     const cursor = randomUUID();
@@ -86,6 +90,7 @@ export class ReviewQueryReaderStore {
       reader,
       kind,
       metadata: { ...metadata, sizeBytes: source.sizeBytes },
+      ...(discoveryTool === undefined ? {} : { discoveryTool }),
       cleanup: source.cleanup,
     });
     return { cursor, reader };
@@ -181,6 +186,14 @@ export class ReviewQueryReaderStore {
     const entry = this.readers.get(cursor);
     if (entry === undefined) return undefined;
     const metadata = entry.metadata;
+    if (entry.kind === "discovery") {
+      if (entry.discoveryTool === undefined)
+        throw new Error("Discovery reader has no originating tool.");
+      return {
+        tool: entry.discoveryTool,
+        arguments: { ...(metadata.selector as Record<string, unknown>), cursor },
+      };
+    }
     if (entry.kind === "thread")
       return {
         tool: "read_pr_threads",
@@ -363,13 +376,11 @@ export function createReviewSourceTools({
       };
       queryReaders.assertResumableSelection(metadata);
       const query = queryReaders.createDiff(diff, selectedPaths ?? [], metadata);
-      const page = await query.reader.readNext({ ...metadata, nextCursor: query.cursor });
-      if (page.done) await queryReaders.finish(query.cursor);
-      return jsonToolResult({
-        ...metadata,
-        ...page,
-        ...(page.done ? {} : { nextCursor: query.cursor }),
-      });
+      return queryReaders.readPage(
+        query.cursor,
+        "diff",
+        selectedPaths === undefined ? undefined : { paths: selectedPaths },
+      );
     },
     { alwaysLoad: true },
   );
@@ -403,18 +414,7 @@ export function createReviewSourceTools({
         mergeBaseSha: diff.mergeBaseSha,
       };
       const query = queryReaders.createSource(snapshot.source, "repository_file", metadata);
-      const page = await query.reader.readNext({
-        ...metadata,
-        kind: snapshot.kind,
-        sizeBytes: snapshot.sizeBytes,
-        nextCursor: query.cursor,
-      });
-      if (page.done) await queryReaders.finish(query.cursor);
-      return jsonToolResult({
-        ...metadata,
-        ...page,
-        ...(page.done ? {} : { nextCursor: query.cursor }),
-      });
+      return queryReaders.readPage(query.cursor, "repository_file", { revision, path });
     },
     { alwaysLoad: true },
   );
@@ -819,6 +819,17 @@ export function createReviewThreadTool({
   queryReaderDiscussionKeys: Map<string, string>;
   onPage: (selector: Readonly<Record<string, unknown>>, page: number) => void;
 }) {
+  const readPage = async (cursor: string, selector: Readonly<Record<string, unknown>>) => {
+    const response = await queryReaders.readPage(cursor, "thread", { selector });
+    const page = toolResponseDocument(response);
+    if (
+      typeof page?.page === "number" &&
+      typeof page.content === "string" &&
+      page.content.length > 0
+    )
+      onPage(selector, page.page);
+    return response;
+  };
   return tool(
     "read_pr_threads",
     "Read prior discussion for one exact thread ID or changed-file path from the briefing index. Continue a paginated read with its cursor and the same ID or path selector.",
@@ -842,15 +853,7 @@ export function createReviewThreadTool({
               "Continue a discussion read with the same id or path selector.",
               cursor,
             );
-          const response = await queryReaders.readPage(cursor, "thread", { selector });
-          const page = toolResponseDocument(response);
-          if (
-            typeof page?.page === "number" &&
-            typeof page.content === "string" &&
-            page.content.length > 0
-          )
-            onPage(selector, page.page);
-          return response;
+          return readPage(cursor, selector);
         }
         if ((id === undefined) === (path === undefined)) {
           return {
@@ -910,21 +913,7 @@ export function createReviewThreadTool({
         );
         discussionQueryCursors.set(discussionKey, query.cursor);
         queryReaderDiscussionKeys.set(query.cursor, discussionKey);
-        const pageResult = query.reader.readNext({
-          selector: querySelector,
-          nextCursor: query.cursor,
-        });
-        onPage(querySelector, pageResult.page);
-        if (pageResult.done) {
-          await queryReaders.finish(query.cursor);
-        }
-        return jsonToolResult({
-          selector: querySelector,
-          page: pageResult.page,
-          content: pageResult.content,
-          done: pageResult.done,
-          ...(pageResult.done ? {} : { nextCursor: query.cursor }),
-        });
+        return readPage(query.cursor, querySelector);
       });
     },
     { alwaysLoad: true },

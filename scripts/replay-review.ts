@@ -10,7 +10,7 @@ import { aggregateReview } from "../src/lib/aggregate.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { readGitMergeBase } from "../src/lib/git-changed-files.js";
 import { readPullRequestFilesFromCheckout } from "../src/lib/github-api.js";
-import { REVIEW_INPUT_LIMITS, reviewSecretCandidates } from "../src/lib/input.js";
+import { readUrl, REVIEW_INPUT_LIMITS, reviewSecretCandidates } from "../src/lib/input.js";
 import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
@@ -30,26 +30,18 @@ import { isWithinRepository } from "../src/runtime/agent-review-tools.js";
 
 const execFileAsync = promisify(execFile);
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
-const httpUrlSchema = z
-  .string()
-  .trim()
-  .max(REVIEW_INPUT_LIMITS.maxUrlLength)
-  .pipe(z.url())
-  .refine((value) => {
-    const url = new URL(value);
-    return (
-      (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password
-    );
+function replayUrlSchema(requireHttps = false) {
+  return z.string().transform((value, context) => {
+    try {
+      return readUrl(value, "URL", requireHttps);
+    } catch (error) {
+      context.addIssue({ code: "custom", message: (error as Error).message });
+      return z.NEVER;
+    }
   });
-const mcpUrlSchema = z
-  .string()
-  .trim()
-  .max(REVIEW_INPUT_LIMITS.maxUrlLength)
-  .pipe(z.url())
-  .refine((value) => {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password;
-  });
+}
+const httpUrlSchema = replayUrlSchema();
+const mcpUrlSchema = replayUrlSchema(true);
 
 const contextSchema = z
   .object({
@@ -367,7 +359,10 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
   return {
     executor: input.executor,
     githubToken: "",
-    aiBaseUrl,
+    aiBaseUrl: readUrl(
+      aiBaseUrl,
+      input.aiBaseUrl !== undefined ? "config.aiBaseUrl" : "AI_PR_REVIEWER_BASE_URL",
+    ),
     aiSecret,
     model: input.model,
     ...(input.effort === undefined ? {} : { effort: input.effort }),

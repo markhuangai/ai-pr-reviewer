@@ -5,6 +5,7 @@ import {
   inputInternals,
   inputSecretCandidates,
   readReviewConfig,
+  readUrl,
   reviewSecretCandidates,
 } from "../src/lib/input.js";
 
@@ -581,4 +582,36 @@ server:
   assert.ok(secrets.includes('secret\\"with-escape'));
   assert.equal(secrets.includes("public"), false);
   assert.equal(secrets.includes("public-value"), true);
+});
+
+test("shared URL policy normalizes only pathname slashes and preserves query data", () => {
+  const values = {
+    "github-pat": "fixture-token",
+    "ai-secret": "fixture-key",
+    model: "test",
+    "review-prompts": '[{"prompt":"Review"}]',
+  };
+  for (const [value, expected] of [
+    [" https://proxy.example/v1///?q=/ ", "https://proxy.example/v1?q=/"],
+    ["http://proxy.example/", "http://proxy.example/"],
+    ["https://proxy.example/v1///#section", "https://proxy.example/v1#section"],
+  ] as const) {
+    assert.equal(readUrl(value, "endpoint"), expected);
+    assert.equal(readReviewConfig(reader({ ...values, "ai-base-url": value })).aiBaseUrl, expected);
+  }
+  for (const value of [
+    "",
+    "relative",
+    "ftp://proxy.example",
+    "https://user:fixture-password@proxy.example",
+    `https://proxy.example/${"x".repeat(2_000)}`,
+  ])
+    assert.throws(
+      () => readUrl(value, "endpoint"),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message.startsWith("endpoint") &&
+        !error.message.includes("fixture-password"),
+    );
+  assert.throws(() => readUrl("http://mcp.example", "MCP endpoint", true), /must use https/u);
 });

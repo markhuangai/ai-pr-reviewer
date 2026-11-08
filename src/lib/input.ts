@@ -118,7 +118,7 @@ function readOptionalInteger(
   return value;
 }
 
-function readUrl(value: unknown, path: string, requireHttps = false): string {
+export function readUrl(value: unknown, path: string, requireHttps = false): string {
   const text = readString(value, path, MAX_URL_LENGTH);
   let url: URL;
   try {

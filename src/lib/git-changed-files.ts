@@ -3,10 +3,11 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 
 import { cancellationReason, throwIfAborted } from "./bootstrap/cancellation.js";
-import type { ChangedFile, PullRequestContext } from "./types.js";
+import type { ChangedFile, PullRequestContext, ReviewFinding } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_LOCAL_CHANGED_FILES = 3_000;
+const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_LOCAL_METADATA_BYTES = 32 * 1024 * 1024;
 const MAX_LOCAL_DIFF_LINE_BYTES = 1_000_000;
 const MAX_LOCAL_ADDED_LINES_PER_FILE = 1_000_000;
@@ -420,4 +421,19 @@ export async function readPullRequestFilesFromSnapshots(
     throw new Error("Git returned an incomplete pull request file list.");
   }
   return files;
+}
+
+export function validAddedLineLocation(
+  finding: ReviewFinding,
+  files: readonly ChangedFile[],
+): boolean {
+  if (finding.path === undefined || finding.line === undefined) return false;
+  const file = files.find((candidate) => candidate.path === finding.path);
+  if (file === undefined) return false;
+  const endLine = finding.endLine ?? finding.line;
+  if (endLine < finding.line || endLine - finding.line + 1 > MAX_FINDING_RANGE_LENGTH) return false;
+  for (let line = finding.line; line <= endLine; line += 1) {
+    if (!file.addedLines.has(line)) return false;
+  }
+  return true;
 }

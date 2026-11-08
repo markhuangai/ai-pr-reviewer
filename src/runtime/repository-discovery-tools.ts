@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import { jsonToolResult } from "./agent-review-tools.js";
-import type { ReviewQueryReaderStore } from "./review-context-tools.js";
+import type { RepositoryDiscoveryTool, ReviewQueryReaderStore } from "./review-context-tools.js";
 import type { RepositoryQuerySource, RepositorySnapshot } from "./repository-snapshot.js";
 import { tool, type ReviewTool } from "./review-tool.js";
 
@@ -17,10 +17,11 @@ export function createRepositoryDiscoveryTools({
   signal?: AbortSignal | undefined;
 }): readonly ReviewTool[] {
   const page = async (
+    tool: RepositoryDiscoveryTool,
     source: Promise<RepositoryQuerySource>,
     selector: Record<string, unknown>,
   ) => {
-    const query = readers.createSource(await source, "discovery", { selector });
+    const query = readers.createSource(await source, "discovery", { selector }, tool);
     return readers.readPage(query.cursor, "discovery", { selector });
   };
   const inactive = () => ({
@@ -40,7 +41,7 @@ export function createRepositoryDiscoveryTools({
         if (!isActive()) return inactive();
         const selector = { revision, ...(path === undefined ? {} : { path }) };
         return cursor === undefined
-          ? page(snapshot.list(revision, path), selector)
+          ? page("list_repository_files", snapshot.list(revision, path), selector)
           : readers.readPage(cursor, "discovery", { selector });
       },
       { alwaysLoad: true },
@@ -64,7 +65,7 @@ export function createRepositoryDiscoveryTools({
             ...jsonToolResult({ error: "Search patterns cannot contain NUL." }),
             isError: true,
           };
-        return page(snapshot.search(revision, pattern, paths), selector);
+        return page("search_repository", snapshot.search(revision, pattern, paths), selector);
       },
       { alwaysLoad: true },
     ),

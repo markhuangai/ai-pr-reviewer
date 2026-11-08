@@ -1,3 +1,5 @@
+import type { McpToolPolicy } from "../src/lib/types.js";
+import { CodexSession } from "../src/runtime/codex-session.js";
 import { strict as assert } from "node:assert";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
@@ -330,15 +332,29 @@ test(
       [
         tool("denied", "Denied tool", {}, () => Promise.reject(new Error("Denied tool executed"))),
         tool("ask", "Ask tool", {}, () => Promise.reject(new Error("Ask tool executed"))),
+        ...["org_blocked", "org_ask", "mixed", "default", "allowed"].map((name) =>
+          tool(name, name, {}, () => Promise.resolve({ content: [] })),
+        ),
       ],
       (definition, args) => definition.handler(args),
     );
     t.after(() => bridge.close());
+    const policies: McpToolPolicy[] = [
+      { name: "denied", permission_policy: "always_deny" },
+      { name: "ask", permission_policy: "always_ask" },
+      { name: "org_blocked", org_max_permission: "blocked" },
+      { name: "org_ask", org_max_permission: "ask" },
+      { name: "mixed", permission_policy: "always_allow", org_max_permission: "blocked" },
+      { name: "default" },
+      { name: "allowed", permission_policy: "always_allow", org_max_permission: "allow" },
+    ];
+    const seen = new Set<string>();
     const script = completeReviewScript();
     const fixture = await modelFixture(t, (request) => {
-      assert.ok(
-        toolNames(request.body).every((name) => !name.endsWith("denied") && !name.endsWith("ask")),
-      );
+      const names = toolNames(request.body);
+      for (const policy of policies.slice(0, 5))
+        assert.ok(names.every((name) => !name.endsWith("__" + policy.name)));
+      for (const name of names) seen.add(name);
       return script(request);
     });
     const result = await nativeReview(t, fixture.url, {
@@ -347,14 +363,13 @@ test(
           type: "http",
           url: bridge.url,
           headers: { Authorization: "Bearer " + bridge.token },
-          tools: [
-            { name: "denied", permission_policy: "always_deny" },
-            { name: "ask", permission_policy: "always_ask" },
-          ],
+          tools: policies,
         },
       },
     });
     assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
+    for (const name of ["default", "allowed"])
+      assert.ok([...seen].some((seenName) => seenName.endsWith("__" + name)));
   },
 );
 
@@ -817,3 +832,67 @@ test(
     assert.equal(review.event, "APPROVE");
   },
 );
+
+test("native event guard applies each denied-policy field without broadening defaults", async (t) => {
+  const cases: { policy: McpToolPolicy; denied: boolean }[] = [
+    { policy: { name: "candidate", permission_policy: "always_deny" }, denied: true },
+    { policy: { name: "candidate", permission_policy: "always_ask" }, denied: true },
+    { policy: { name: "candidate", org_max_permission: "blocked" }, denied: true },
+    { policy: { name: "candidate", org_max_permission: "ask" }, denied: true },
+    {
+      policy: { name: "candidate", permission_policy: "always_allow", org_max_permission: "ask" },
+      denied: true,
+    },
+    {
+      policy: { name: "candidate", permission_policy: "always_ask", org_max_permission: "allow" },
+      denied: true,
+    },
+    { policy: { name: "candidate" }, denied: false },
+    {
+      policy: { name: "candidate", permission_policy: "always_allow", org_max_permission: "allow" },
+      denied: false,
+    },
+    { policy: { name: "other", permission_policy: "always_deny" }, denied: false },
+  ];
+  for (const { policy, denied } of cases) {
+    const session = new CodexSession({
+      config: reviewConfig({
+        executor: "codex",
+        mcpServers: {
+          external: { type: "http", url: "https://external.example", tools: [policy] },
+        },
+      }),
+      cwd: process.cwd(),
+      options: { mcpServers: { external: { type: "http", url: "https://external.example" } } },
+      tools: [],
+      outputServerName: "review_output",
+      prompt: {
+        [Symbol.asyncIterator]: () => ({
+          next: () => Promise.resolve({ done: true as const, value: undefined }),
+        }),
+      },
+    });
+    t.after(() => session.close());
+    const event = {
+      type: "mcpToolCall",
+      server: "external",
+      tool: "candidate",
+      id: "policy-event",
+      arguments: {},
+    };
+    if (denied)
+      await assert.rejects(
+        session["item"]("item/started", event),
+        /unconfigured MCP tool: external.candidate/u,
+      );
+    else await session["item"]("item/started", event);
+    await assert.rejects(
+      session["item"]("item/started", { ...event, server: "unconfigured" }),
+      /unconfigured MCP tool/u,
+    );
+    await assert.rejects(
+      session["item"]("item/started", { ...event, server: "review_output" }),
+      /unconfigured MCP tool/u,
+    );
+  }
+});

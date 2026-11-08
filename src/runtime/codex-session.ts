@@ -19,6 +19,17 @@ import type { ReviewSession, ReviewSessionInput } from "./review-session.js";
 import type { ReviewTool } from "./review-tool.js";
 import { codexProviderError } from "./session-recovery.js";
 
+import type { McpToolPolicy } from "../lib/types.js";
+
+function deniedMcpToolPolicy(policy: McpToolPolicy): boolean {
+  return (
+    policy.permission_policy === "always_deny" ||
+    policy.permission_policy === "always_ask" ||
+    policy.org_max_permission === "blocked" ||
+    policy.org_max_permission === "ask"
+  );
+}
+
 type Message = SDKMessage | SDKActiveGoalMessage;
 
 class SessionMessages implements AsyncIterable<Message> {
@@ -261,13 +272,7 @@ export class CodexSession implements ReviewSession {
         default_tools_approval_mode: "approve",
         env_http_headers: headers,
         disabled_tools: (server.tools ?? [])
-          .filter(
-            (policy) =>
-              policy.permission_policy === "always_deny" ||
-              policy.permission_policy === "always_ask" ||
-              policy.org_max_permission === "blocked" ||
-              policy.org_max_permission === "ask",
-          )
+          .filter(deniedMcpToolPolicy)
           .map((policy) => policy.name),
         ...(server.timeout === undefined ? {} : { tool_timeout_sec: server.timeout / 1_000 }),
       };
@@ -696,14 +701,7 @@ export class CodexSession implements ReviewSession {
       if (
         (!internal && !this.externalServers().some(([name]) => name === server)) ||
         (internal && !this.input.tools.some((definition) => definition.name === tool)) ||
-        policies.some(
-          (policy) =>
-            policy.name === tool &&
-            (policy.permission_policy === "always_deny" ||
-              policy.permission_policy === "always_ask" ||
-              policy.org_max_permission === "blocked" ||
-              policy.org_max_permission === "ask"),
-        )
+        policies.some((policy) => policy.name === tool && deniedMcpToolPolicy(policy))
       ) {
         throw new Error("Codex attempted an unconfigured MCP tool: " + server + "." + tool);
       }

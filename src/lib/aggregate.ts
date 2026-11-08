@@ -1,3 +1,4 @@
+import { validAddedLineLocation as verifyLocation } from "./git-changed-files.js";
 import { incompleteGoalDetails } from "./review-status.js";
 import { createHash } from "node:crypto";
 import { escapeHtmlText, escapeMarkdownText } from "./redaction.js";
@@ -25,7 +26,6 @@ import type { ContextFileIdentityByGoal } from "./context-files.js";
 import { markdownFenceLength, MAX_INLINE_REVIEW_COMMENT_LENGTH } from "./types.js";
 const MAX_REVIEW_BODY_LENGTH = 60_000;
 const MAX_MERGED_FINDING_BODY_LENGTH = 16_000;
-const MAX_FINDING_RANGE_LENGTH = 1_000;
 const MAX_INLINE_COMMENTS = 25;
 const MAX_RUN_SUMMARY_BYTES = 1_000_000;
 const MAX_TOKEN_USAGE_DETAILS_LENGTH = 20_000;
@@ -249,26 +249,6 @@ function aggregateTokenUsage(
     complete,
     ...(pricing === undefined ? {} : { currency: pricing.currency, estimatedCost }),
   };
-}
-
-function changedFileFor(
-  path: string | undefined,
-  files: readonly ChangedFile[],
-): ChangedFile | undefined {
-  if (!path) return undefined;
-  return files.find((file) => file.path === path);
-}
-
-function verifyLocation(finding: ReviewFinding, files: readonly ChangedFile[]): boolean {
-  if (finding.path === undefined || finding.line === undefined) return false;
-  const file = changedFileFor(finding.path, files);
-  if (!file || file.addedLines.size === 0) return false;
-  const endLine = finding.endLine ?? finding.line;
-  if (endLine < finding.line || endLine - finding.line + 1 > MAX_FINDING_RANGE_LENGTH) return false;
-  for (let line = finding.line; line <= endLine; line += 1) {
-    if (!file.addedLines.has(line)) return false;
-  }
-  return true;
 }
 
 function missingReviewCoverage(

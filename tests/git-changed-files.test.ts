@@ -1,3 +1,7 @@
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
+import { makeReplayRepository, commitFixtureSnapshot } from "./git-test-helpers.js";
+import { readGitMergeBase } from "../src/lib/git-changed-files.js";
+import { resolveMergeBase } from "../src/runtime/agent-review-tools.js";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -450,4 +454,46 @@ test("does not infer unchanged lines from merged zero-context hunks", async (t) 
     baseSha,
   );
   assert.deepEqual([...(files[0]?.addedLines ?? [])], [1, 3]);
+});
+
+test("runtime merge-base alias retains real Git results, causal failures, and abort identity", async (t) => {
+  const { root, temporaryRoot, baseSha, headSha } = await makeReplayRepository(t);
+  assert.equal(resolveMergeBase, readGitMergeBase);
+  assert.equal(await resolveMergeBase(root, baseSha, headSha), baseSha);
+  const unrelated = await commitFixtureSnapshot(root, temporaryRoot);
+  const lines: string[] = [];
+  const diagnostics = new DiagnosticLogger({
+    component: "action",
+    write: (line) => lines.push(line),
+  });
+  for (const target of [unrelated, "f".repeat(40)]) {
+    await assert.rejects(
+      diagnostics.withSpan(
+        { phase: "review", operation: "review.diff", purpose: "resolve captured merge base" },
+        () => resolveMergeBase(root, baseSha, target),
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /Git changed-file metadata failed/u);
+        assert.ok(error.cause instanceof Error);
+        return true;
+      },
+    );
+  }
+  assert.ok(
+    lines.some(
+      (line) =>
+        line.includes('"outcome":"failure"') &&
+        line.includes('"cause"') &&
+        line.includes('"operation_id"'),
+    ),
+  );
+  t.diagnostic(lines.join("\n"));
+  const controller = new AbortController();
+  const reason = new Error("cancel merge-base fixture");
+  controller.abort(reason);
+  await assert.rejects(
+    resolveMergeBase(root, baseSha, headSha, controller.signal),
+    (error: unknown) => error === reason,
+  );
 });

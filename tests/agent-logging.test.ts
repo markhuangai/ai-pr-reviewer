@@ -1,3 +1,4 @@
+import { DiagnosticLogger } from "../src/lib/diagnostics.js";
 import {
   agentInternals,
   assert,
@@ -861,4 +862,54 @@ test("records successful compaction and minimal lifecycle messages", () => {
   assert.equal(state.compactionSuccesses, 1);
   assert.equal(state.turnResults, 1);
   assert.match(lines.join("\n"), /compaction-result details:.*"result":"success"/u);
+});
+
+test("shared secret matching preserves both diagnostic consumers' token boundaries", (t) => {
+  const cases = [
+    { value: "a data a1 /a/", secrets: ["", "a"], expected: "[REDACTED] data a1 /[REDACTED]/" },
+    {
+      value: "token-value token",
+      secrets: ["token", "token-value"],
+      expected: "[REDACTED] [REDACTED]",
+    },
+    { value: "abc abcdef xabc", secrets: ["abc"], expected: "[REDACTED] abcdef xabc" },
+    { value: "a.b [a.b]", secrets: ["a.b"], expected: "[REDACTED] [[REDACTED]]" },
+    { value: "éaé 🙂a🙂", secrets: ["a"], expected: "é[REDACTED]é 🙂[REDACTED]🙂" },
+    { value: "xabcdefghy", secrets: ["abcdefgh"], expected: "x[REDACTED]y" },
+    { value: "safe", secrets: ["", ""], expected: "safe" },
+  ];
+  for (const { value, secrets, expected } of cases) {
+    const diagnostics: string[] = [];
+    const logger = new DiagnosticLogger({
+      component: "consumer",
+      secrets,
+      write: (line) => diagnostics.push(line),
+    });
+    logger.event(
+      "test",
+      { phase: "review", operation: "keep-operation", purpose: "redaction parity" },
+      "success",
+      "keep-id",
+      { reason: value },
+    );
+    const record = JSON.parse(
+      String(diagnostics[0]).slice(String(diagnostics[0]).indexOf("{")),
+    ) as { operation_id: string; details: { reason: string } };
+    assert.equal(record.operation_id, "keep-id");
+    assert.equal(record.details.reason, expected);
+    const agent: string[] = [];
+    writeReviewDiagnostic(
+      0,
+      "review-result",
+      { status: "completed", reason: value },
+      secrets,
+      (line) => agent.push(line),
+    );
+    const details = JSON.parse(
+      agent.map((line) => line.slice(line.indexOf(": ") + 2)).join(""),
+    ) as { status: string; reason: string };
+    assert.equal(details.status, "completed");
+    assert.equal(details.reason, expected);
+    if (value === "token-value token") t.diagnostic([...diagnostics, ...agent].join("\n"));
+  }
 });

@@ -684,3 +684,67 @@ test("briefing and paginated discussion recovery supplies exact calls without sp
   assert.equal(result.diagnostics?.validationFailures, 0);
   assert.equal(result.submission?.findings.length, 1);
 });
+
+test("real rejected-anchor recovery emits enough default logs to diagnose and repair", async (t) => {
+  const repository = await makeRepository(t, (root) =>
+    writeFile(join(root, "review.txt"), "changed line\n"),
+  );
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const lines: string[] = [];
+  const capture = t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    lines.push(String(chunk));
+    return true;
+  });
+  const query = reviewProtocolQuery(async function* (protocol) {
+    yield* protocolBriefing(protocol);
+    const response = yield* protocol.call("read_pr_diff", {});
+    assert.equal(protocolDocument(response).done, true);
+    const state = yield* recoveryState(protocol);
+    const evidence = state.evidence.find((reference) => reference.kind === "repository_diff");
+    assert.ok(evidence);
+    const candidate = recoverySubmission(evidence.id);
+    const findings = candidate.findings as Record<string, unknown>[];
+    const rejected = yield* protocol.call("submit_review", {
+      ...candidate,
+      findings: findings.map((finding) => ({ ...finding, line: 2 })),
+    });
+    assert.equal(rejected.isError, true);
+    const repair = yield* recoveryState(protocol);
+    assert.ok(repair.gaps.some((gap) => gap.category === "location"));
+    assert.equal((yield* protocol.call("submit_review", candidate)).isError, undefined);
+    yield protocolResult();
+  });
+  const result = await runReviewGoal(
+    "anchor diagnostic",
+    0,
+    repository.context,
+    await readPullRequestFilesFromSnapshots(
+      repository.context,
+      repository.root,
+      repository.baseSha,
+    ),
+    emptyConversation,
+    reviewConfig({ interactWithPullRequest: true }),
+    diff,
+    repository.root,
+    query,
+  );
+  capture.mock.restore();
+  assert.equal(result.status, "completed", result.error ?? "Unexpected review result");
+  const output = lines.join("");
+  assert.match(output, /submission-decision/u);
+  assert.match(output, /"decision":"rejected"/u);
+  assert.match(output, /"categories":\["location"\]/u);
+  assert.match(output, /"toolCallId":/u);
+  assert.match(output, /"snapshotId":/u);
+  assert.match(output, /review.txt/u);
+  assert.match(output, /"path":"review.txt","line":2/u);
+  assert.match(output, /"decision":"accepted"/u);
+  for (const line of lines) t.diagnostic(line.trim());
+});
