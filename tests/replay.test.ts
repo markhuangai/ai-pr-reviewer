@@ -711,8 +711,8 @@ test("replay URL schemas and effective settings share the Action URL policy", as
       mcpServers: { external: { type: "http", url: raw } },
     },
   });
-  assert.equal(parsed.config.aiBaseUrl, normalized);
-  assert.equal(parsed.config.mcpServers.external?.url, normalized);
+  assert.equal(parsed.config.aiBaseUrl, raw.trim());
+  assert.equal(parsed.config.mcpServers.external?.url, raw.trim());
   for (const invalid of [
     "relative",
     "ftp://proxy.example",
@@ -801,4 +801,69 @@ test("replay URL schemas and effective settings share the Action URL policy", as
       return true;
     },
   );
+});
+
+test("replay keeps original endpoint spellings redacted while normalizing effective URLs", async (t) => {
+  const { root, context } = await makeReplayRepository(t);
+  const rawAi = "https://proxy.example/v1///?route=private-model";
+  const rawMcp = 'https://mcp.example/tools///?tenant="private-route"';
+  const original = `${rawAi} ${rawMcp}`;
+  const previous = {
+    secret: process.env.AI_PR_REVIEWER_SECRET,
+    url: process.env.AI_PR_REVIEWER_BASE_URL,
+  };
+  process.env.AI_PR_REVIEWER_SECRET = "fixture-replay-secret";
+  process.env.AI_PR_REVIEWER_BASE_URL = rawAi;
+  t.after(() => {
+    for (const [name, value] of [
+      ["AI_PR_REVIEWER_SECRET", previous.secret],
+      ["AI_PR_REVIEWER_BASE_URL", previous.url],
+    ] as const) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
+  });
+  for (const source of ["case", "environment"]) {
+    const input = parseReplayCase({
+      version: 1,
+      caseId: "raw-endpoint-redaction",
+      labels: { endpoints: [rawAi, rawMcp], [rawMcp]: "kept" },
+      context: { ...context, title: original, body: original },
+      config: {
+        model: "fixture",
+        reviewPrompts: [{ prompt: "Review" }],
+        ...(source === "case" ? { aiBaseUrl: ` ${rawAi} ` } : {}),
+        mcpServers: { external: { type: "http", url: ` ${rawMcp} ` } },
+      },
+    });
+    assert.equal(input.config.mcpServers.external?.url, rawMcp);
+    let calls = 0;
+    const runner: ReplayRunner = (reviewContext, _files, _conversation, config) => {
+      calls++;
+      assert.equal(config.aiBaseUrl, "https://proxy.example/v1?route=private-model");
+      assert.equal(
+        config.mcpServers.external?.url,
+        "https://mcp.example/tools?tenant=%22private-route%22",
+      );
+      assert.equal(reviewContext.title, "[REDACTED] [REDACTED]");
+      assert.equal(reviewContext.body, "[REDACTED] [REDACTED]");
+      return Promise.resolve({
+        goals: [
+          {
+            prompt: "redaction",
+            status: "completed" as const,
+            submission: { summary: original, findings: [], limitations: [] },
+          },
+        ],
+      });
+    };
+    const output = await replayCase(input, root, runner);
+    assert.equal(calls, 1);
+    assert.deepEqual(output.labels, {
+      endpoints: ["[REDACTED]", "[REDACTED]"],
+      "[REDACTED]": "kept",
+    });
+    assert.equal(output.goals[0]?.submission?.summary, "[REDACTED] [REDACTED]");
+    assert.doesNotMatch(serializeReplayOutput(output), /private-model|private-route/u);
+  }
 });

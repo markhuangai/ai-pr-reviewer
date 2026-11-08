@@ -615,3 +615,20 @@ test("shared URL policy normalizes only pathname slashes and preserves query dat
     );
   assert.throws(() => readUrl("http://mcp.example", "MCP endpoint", true), /must use https/u);
 });
+
+test("secret candidates retain original endpoint spellings and JSON-escaped forms", () => {
+  const original = 'https://mcp.example/tools///?tenant="private-route"';
+  const config = readReviewConfig(
+    reader({
+      "github-pat": "fixture-token",
+      "ai-secret": "fixture-secret",
+      "ai-base-url": "https://model.example/v1",
+      model: "fixture",
+      "review-prompts": '[{"prompt":"Review"}]',
+    }),
+  );
+  const candidates = reviewSecretCandidates(config, [original]);
+  assert.ok(candidates.includes(original));
+  assert.ok(candidates.includes(JSON.stringify(original).slice(1, -1)));
+  assert.ok(candidates.includes(config.aiBaseUrl));
+});

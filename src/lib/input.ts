@@ -200,9 +200,16 @@ function jsonSecretCandidate(value: string): string {
   return JSON.stringify(value).slice(1, -1);
 }
 
-export function reviewSecretCandidates(config: ReviewConfig): readonly string[] {
+export function reviewSecretCandidates(
+  config: ReviewConfig,
+  originalEndpoints: readonly string[] = [],
+): readonly string[] {
   const servers = Object.values(config.mcpServers);
-  const endpoints = [config.aiBaseUrl, ...servers.map((server) => server.url)];
+  const endpoints = [
+    config.aiBaseUrl,
+    ...servers.map((server) => server.url),
+    ...originalEndpoints,
+  ];
   const candidates = [
     config.githubToken,
     config.aiSecret,

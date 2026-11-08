@@ -33,7 +33,9 @@ const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 function replayUrlSchema(requireHttps = false) {
   return z.string().transform((value, context) => {
     try {
-      return readUrl(value, "URL", requireHttps);
+      readUrl(value, "URL", requireHttps);
+      // Retain recorded spellings for redaction until the effective configuration is normalized.
+      return value.trim();
     } catch (error) {
       context.addIssue({ code: "custom", message: (error as Error).message });
       return z.NEVER;
@@ -318,7 +320,7 @@ function replayMcpServers(servers: ReplayCase["config"]["mcpServers"]): ReviewCo
       name,
       {
         type: server.type,
-        url: server.url,
+        url: readUrl(server.url, `mcp-servers.${name}.url`, true),
         ...(server.headers === undefined ? {} : { headers: server.headers }),
         ...(server.tools === undefined
           ? {}
@@ -340,7 +342,10 @@ function replayMcpServers(servers: ReplayCase["config"]["mcpServers"]): ReviewCo
   );
 }
 
-function replayConfig(input: ReplayCase["config"]): ReviewConfig {
+function replayConfig(input: ReplayCase["config"]): {
+  readonly config: ReviewConfig;
+  readonly originalEndpoints: readonly string[];
+} {
   const aiSecret =
     process.env.AI_PR_REVIEWER_SECRET ??
     (input.executor === "claude" ? process.env.ANTHROPIC_API_KEY : undefined);
@@ -356,7 +361,7 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
     process.env.AI_PR_REVIEWER_BASE_URL ??
     (input.executor === "claude" ? "https://api.anthropic.com" : undefined);
   if (aiBaseUrl === undefined) throw new Error("Codex replay requires an explicit proxy base URL.");
-  return {
+  const config: ReviewConfig = {
     executor: input.executor,
     githubToken: "",
     aiBaseUrl: readUrl(
@@ -377,6 +382,13 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
     interactWithPullRequest: input.interactWithPullRequest,
     mcpServers: replayMcpServers(input.mcpServers),
   };
+  return {
+    config,
+    originalEndpoints: [
+      aiBaseUrl.trim(),
+      ...Object.values(input.mcpServers).map((server) => server.url),
+    ],
+  };
 }
 
 function redactJson(value: unknown, secrets: readonly string[]): unknown {
@@ -396,8 +408,8 @@ export async function replayCase(
   const context = pullRequestContext(input.context);
   const mergeBaseSha = await verifyCheckout(checkout, context);
   const root = await realpath(checkout);
-  const config = replayConfig(input.config);
-  const secrets = reviewSecretCandidates(config);
+  const { config, originalEndpoints } = replayConfig(input.config);
+  const secrets = reviewSecretCandidates(config, originalEndpoints);
   const files = await readPullRequestFilesFromCheckout(context, root);
   const contextFiles = await prepareContextFiles(config.reviewPrompts, root);
   let run: ReviewGoalsResult;
