@@ -11,10 +11,12 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
 import type { PullRequestContext, ReviewSourceRange } from "../lib/types.js";
-import { readPullRequestFilesFromSnapshots } from "../lib/git-changed-files.js";
+import { readGitMergeBase, readPullRequestFilesFromSnapshots } from "../lib/git-changed-files.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
 import { streamGitToFile, diffArguments, indexDiff } from "./git-stream.js";
 import type { ChangedDiffLine } from "./review-coverage.js";
+
+export { readGitMergeBase as resolveMergeBase };
 
 const DIFF_PAGE_BYTES = 4 * 1024;
 const CONVERSATION_PAGE_BYTES = 4 * 1024;
@@ -634,34 +636,6 @@ export async function resolveCommit(
   return resolved;
 }
 
-export async function resolveMergeBase(
-  cwd: string,
-  baseSha: string,
-  headSha: string,
-  signal?: AbortSignal,
-): Promise<string> {
-  throwIfAborted(signal);
-  let stdout: string;
-  try {
-    ({ stdout } = await execFileAsync("git", ["merge-base", baseSha, headSha], {
-      cwd,
-      encoding: "utf8",
-      maxBuffer: MAX_GIT_STDERR_BYTES,
-      ...(signal === undefined ? {} : { signal }),
-    }));
-  } catch (error) {
-    throwIfAborted(signal);
-    throw new Error(`Could not resolve the pull request merge base: ${errorMessage(error)}`, {
-      cause: error,
-    });
-  }
-  const mergeBase = stdout.trim();
-  if (!COMMIT_SHA_PATTERN.test(mergeBase)) {
-    throw new Error("Git returned an invalid pull request merge base.");
-  }
-  return mergeBase;
-}
-
 async function streamGitDiff(
   cwd: string,
   mergeBaseSha: string,
@@ -703,7 +677,7 @@ export async function createPullRequestDiff(
     "Pull request head SHA",
     signal,
   );
-  const mergeBaseSha = await resolveMergeBase(repositoryRoot, baseSha, headSha, signal);
+  const mergeBaseSha = await readGitMergeBase(repositoryRoot, baseSha, headSha, signal);
   return captureSnapshotDiff(context, repositoryRoot, temporaryRoot, mergeBaseSha, signal);
 }
 

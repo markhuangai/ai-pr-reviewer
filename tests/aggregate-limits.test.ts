@@ -1,3 +1,4 @@
+import { invalidInteractiveFindingLocations } from "../src/runtime/review-submission.js";
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
@@ -913,4 +914,56 @@ test("Claude fingerprints stay unchanged while Codex execution distinguishes rev
   assert.equal(reviewMarker(context, { ...config, executor: "claude" }), existing);
   const codex = { ...config, executor: "codex" as const };
   assert.notEqual(reviewMarker(context, codex), existing);
+});
+
+test("submission and aggregation enforce the same added-line boundaries", () => {
+  const baseFile = files[0];
+  assert.ok(baseFile);
+  const changed = {
+    ...baseFile,
+    path: "new.ts",
+    previousPath: "old.ts",
+    status: "renamed",
+    addedLines: new Set(Array.from({ length: 1_001 }, (_, index) => index + 1)),
+  };
+  const deletion = {
+    ...changed,
+    path: "deleted.ts",
+    status: "removed",
+    addedLines: new Set<number>(),
+  };
+  const sparse = { ...changed, path: "sparse.ts", addedLines: new Set([1, 3]) };
+  const changedFiles = [changed, deletion, sparse];
+  const cases = [
+    { location: {}, valid: false },
+    { location: { path: "new.ts" }, valid: false },
+    { location: { path: "unknown.ts", line: 1 }, valid: false },
+    { location: { path: "old.ts", line: 1 }, valid: false },
+    { location: { path: "deleted.ts", line: 1 }, valid: false },
+    { location: { path: "sparse.ts", line: 1, endLine: 3 }, valid: false },
+    { location: { path: "new.ts", line: 2, endLine: 1 }, valid: false },
+    { location: { path: "new.ts", line: 1, endLine: 1_000 }, valid: true },
+    { location: { path: "new.ts", line: 1, endLine: 1_001 }, valid: false },
+    { location: { path: "new.ts", line: 1_001 }, valid: true },
+  ];
+  for (const { location, valid } of cases) {
+    const finding = {
+      title: "Check range",
+      severity: "HIGH" as const,
+      body: "Verify this range.",
+      ...location,
+    };
+    const submission = { summary: "checked", findings: [finding], limitations: [] };
+    assert.equal(invalidInteractiveFindingLocations(submission, changedFiles).length === 0, valid);
+    const review = aggregateReview(context, config, changedFiles, [
+      {
+        prompt: "location",
+        status: "completed",
+        inspection: { observedPaths: changedFiles.map((file) => file.path), missingPaths: [] },
+        submission,
+      },
+    ]);
+    assert.equal(review.findings[0]?.locationVerified, valid);
+    assert.equal(review.inlineFindings.length, valid ? 1 : 0);
+  }
 });

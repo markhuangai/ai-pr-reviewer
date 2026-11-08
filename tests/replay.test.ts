@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
 import {
@@ -651,5 +652,218 @@ test("direct canonical and symlinked replay launchers execute while imports stay
     );
     assert.equal(stdout.trim(), "imported");
     assert.doesNotMatch(stderr, /Usage: npm run replay:review/u);
+  }
+});
+
+test("replay URL schemas and effective settings share the Action URL policy", async (t) => {
+  const { root, temporaryRoot, baseSha, headSha } = await makeReplayRepository(t);
+  const input = {
+    version: 1,
+    caseId: "url-policy",
+    context: {
+      repository: "owner/repository",
+      owner: "owner",
+      name: "repository",
+      number: 1,
+      baseSha,
+      headSha,
+      baseRef: "main",
+      title: "URL policy",
+      htmlUrl: "https://github.com/owner/repository/pull/1",
+    },
+    config: {
+      model: "test-model",
+      reviewPrompts: [{ prompt: "Review" }],
+      parallelCount: 1,
+      maxTurns: 5,
+    },
+  };
+  const previous = Object.fromEntries(
+    ["AI_PR_REVIEWER_SECRET", "AI_PR_REVIEWER_BASE_URL", "ANTHROPIC_API_KEY"].map((key) => [
+      key,
+      process.env[key],
+    ]),
+  );
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) Reflect.deleteProperty(process.env, key);
+      else process.env[key] = value;
+    }
+  });
+  process.env.AI_PR_REVIEWER_SECRET = "replay-fixture-secret";
+  Reflect.deleteProperty(process.env, "ANTHROPIC_API_KEY");
+  let observedUrl = "";
+  let calls = 0;
+  const runner: ReplayRunner = (_context, _files, _conversation, config) => {
+    calls++;
+    observedUrl = config.aiBaseUrl;
+    return Promise.resolve({ goals: [] });
+  };
+  const run = (config: Record<string, unknown>) =>
+    replayCase(parseReplayCase({ ...input, config: { ...input.config, ...config } }), root, runner);
+  const raw = "  https://proxy.example/v1///?q=/  ";
+  const normalized = "https://proxy.example/v1?q=/";
+  const parsed = parseReplayCase({
+    ...input,
+    config: {
+      ...input.config,
+      aiBaseUrl: raw,
+      mcpServers: { external: { type: "http", url: raw } },
+    },
+  });
+  assert.equal(parsed.config.aiBaseUrl, raw.trim());
+  assert.equal(parsed.config.mcpServers.external?.url, raw.trim());
+  for (const invalid of [
+    "relative",
+    "ftp://proxy.example",
+    "https://user:fixture-password@proxy.example",
+    `https://proxy.example/${"x".repeat(2_000)}`,
+  ]) {
+    for (const config of [
+      { aiBaseUrl: invalid },
+      { mcpServers: { external: { type: "http", url: invalid } } },
+    ])
+      assert.throws(
+        () => parseReplayCase({ ...input, config: { ...input.config, ...config } }),
+        (error: unknown) =>
+          error instanceof z.ZodError && !error.message.includes("fixture-password"),
+      );
+  }
+  assert.throws(
+    () =>
+      parseReplayCase({
+        ...input,
+        config: {
+          ...input.config,
+          mcpServers: { external: { type: "http", url: "http://mcp.example" } },
+        },
+      }),
+    z.ZodError,
+  );
+  process.env.AI_PR_REVIEWER_BASE_URL = "https://user:fixture-password@invalid.example";
+  await run({ aiBaseUrl: raw });
+  assert.equal(observedUrl, normalized);
+  const beforeRejected = calls;
+  await assert.rejects(
+    run({}),
+    (error: unknown) =>
+      error instanceof Error &&
+      /AI_PR_REVIEWER_BASE_URL.*URL credentials/u.test(error.message) &&
+      !error.message.includes("fixture-password"),
+  );
+  assert.equal(calls, beforeRejected);
+  process.env.AI_PR_REVIEWER_BASE_URL = raw;
+  await run({ executor: "codex" });
+  assert.equal(observedUrl, normalized);
+  Reflect.deleteProperty(process.env, "AI_PR_REVIEWER_BASE_URL");
+  await run({});
+  assert.equal(observedUrl, "https://api.anthropic.com/");
+  await assert.rejects(run({ executor: "codex" }), /explicit proxy base URL/u);
+  for (const invalid of [
+    "ftp://invalid.example",
+    "",
+    `https://proxy.example/${"x".repeat(2_000)}`,
+  ]) {
+    process.env.AI_PR_REVIEWER_BASE_URL = invalid;
+    await assert.rejects(run({}), /AI_PR_REVIEWER_BASE_URL/u);
+  }
+  const casePath = join(temporaryRoot, "url-case.json");
+  await writeFile(casePath, JSON.stringify(input));
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../scripts/replay-review.js", import.meta.url)),
+        "--case",
+        casePath,
+        "--checkout",
+        root,
+        "--output",
+        join(temporaryRoot, "url-result.json"),
+      ],
+      {
+        env: {
+          ...process.env,
+          AI_PR_REVIEWER_BASE_URL: "https://user:fixture-password@invalid.example",
+        },
+      },
+    ),
+    (error: unknown) => {
+      const stderr = (error as { stderr: string }).stderr;
+      assert.match(stderr, /AI_PR_REVIEWER_BASE_URL must not contain URL credentials/u);
+      assert.doesNotMatch(stderr, /fixture-password|user:|invalid.example/u);
+      t.diagnostic(
+        stderr
+          .split("\n")
+          .filter((line) => line.startsWith("Error:"))
+          .join("\n"),
+      );
+      return true;
+    },
+  );
+});
+
+test("replay keeps original endpoint spellings redacted while normalizing effective URLs", async (t) => {
+  const { root, context } = await makeReplayRepository(t);
+  const rawAi = "https://proxy.example/v1///?route=private-model";
+  const rawMcp = 'https://mcp.example/tools///?tenant="private-route"';
+  const original = `${rawAi} ${rawMcp}`;
+  const previous = {
+    secret: process.env.AI_PR_REVIEWER_SECRET,
+    url: process.env.AI_PR_REVIEWER_BASE_URL,
+  };
+  process.env.AI_PR_REVIEWER_SECRET = "fixture-replay-secret";
+  process.env.AI_PR_REVIEWER_BASE_URL = rawAi;
+  t.after(() => {
+    for (const [name, value] of [
+      ["AI_PR_REVIEWER_SECRET", previous.secret],
+      ["AI_PR_REVIEWER_BASE_URL", previous.url],
+    ] as const) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
+  });
+  for (const source of ["case", "environment"]) {
+    const input = parseReplayCase({
+      version: 1,
+      caseId: "raw-endpoint-redaction",
+      labels: { endpoints: [rawAi, rawMcp], [rawMcp]: "kept" },
+      context: { ...context, title: original, body: original },
+      config: {
+        model: "fixture",
+        reviewPrompts: [{ prompt: "Review" }],
+        ...(source === "case" ? { aiBaseUrl: ` ${rawAi} ` } : {}),
+        mcpServers: { external: { type: "http", url: ` ${rawMcp} ` } },
+      },
+    });
+    assert.equal(input.config.mcpServers.external?.url, rawMcp);
+    let calls = 0;
+    const runner: ReplayRunner = (reviewContext, _files, _conversation, config) => {
+      calls++;
+      assert.equal(config.aiBaseUrl, "https://proxy.example/v1?route=private-model");
+      assert.equal(
+        config.mcpServers.external?.url,
+        "https://mcp.example/tools?tenant=%22private-route%22",
+      );
+      assert.equal(reviewContext.title, "[REDACTED] [REDACTED]");
+      assert.equal(reviewContext.body, "[REDACTED] [REDACTED]");
+      return Promise.resolve({
+        goals: [
+          {
+            prompt: "redaction",
+            status: "completed" as const,
+            submission: { summary: original, findings: [], limitations: [] },
+          },
+        ],
+      });
+    };
+    const output = await replayCase(input, root, runner);
+    assert.equal(calls, 1);
+    assert.deepEqual(output.labels, {
+      endpoints: ["[REDACTED]", "[REDACTED]"],
+      "[REDACTED]": "kept",
+    });
+    assert.equal(output.goals[0]?.submission?.summary, "[REDACTED] [REDACTED]");
+    assert.doesNotMatch(serializeReplayOutput(output), /private-model|private-route/u);
   }
 });

@@ -680,6 +680,17 @@ test("requires inspection despite declared limitations and validates summary loc
     fix: "Handle the error.",
   };
   assert.deepEqual(gaps({ ...small, findings: [supported] }), []);
+  assert.deepEqual(gaps({ ...small, findings: [{ ...supported, path: changedFile.path }] }), []);
+  assert.ok(
+    reviewSubmissionGaps(
+      { ...small, findings: [supported] },
+      [changedFile],
+      ledger,
+      true,
+      true,
+      () => [],
+    ).length > 0,
+  );
   for (const location of [
     { path: "unrelated.ts" },
     { line: 1 },

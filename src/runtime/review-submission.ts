@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validAddedLineLocation } from "../lib/git-changed-files.js";
 import type { SDKMessage, SDKActiveGoalMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
@@ -313,18 +314,6 @@ export function toSubmission(input: SubmissionInput): GoalSubmission {
     };
   });
   return { summary: input.summary, findings, limitations: input.limitations };
-}
-
-function validAddedLineLocation(finding: ReviewFinding, files: readonly ChangedFile[]): boolean {
-  if (finding.path === undefined || finding.line === undefined) return false;
-  const file = files.find((candidate) => candidate.path === finding.path);
-  if (file === undefined) return false;
-  const endLine = finding.endLine ?? finding.line;
-  if (endLine < finding.line || endLine - finding.line + 1 > 1_000) return false;
-  for (let line = finding.line; line <= endLine; line += 1) {
-    if (!file.addedLines.has(line)) return false;
-  }
-  return true;
 }
 
 export function invalidInteractiveFindingLocations(

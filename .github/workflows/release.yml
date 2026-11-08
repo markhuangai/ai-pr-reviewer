@@ -110,6 +110,7 @@ jobs:
           generated=(
             dist/bootstrap.js
             dist/lib/diagnostics.js
+            dist/lib/redaction.js
             dist/lib/bootstrap/archive.js
             dist/lib/bootstrap/cancellation.js
             dist/lib/bootstrap/version.js

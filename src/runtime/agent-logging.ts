@@ -1,4 +1,7 @@
 import * as core from "@actions/core";
+import { redact as redactAgentLog } from "../lib/redaction.js";
+
+export { redactAgentLog };
 import type {
   SDKActiveGoalMessage,
   SDKMessage,
@@ -87,25 +90,6 @@ export function acceptedSubmissionDetails(
     ...(status.error === undefined ? {} : { mcp_status_error: status.error }),
     token_accounting_complete: tokenAccountingComplete,
   };
-}
-
-function redactAgentLogSecret(value: string, secret: string): string {
-  if (secret.length < 8 && /^[A-Za-z0-9]+$/u.test(secret)) {
-    const pattern = new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(secret)}(?![A-Za-z0-9])`, "gu");
-    return value.replace(pattern, "[REDACTED]");
-  }
-  return value.split(secret).join("[REDACTED]");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
-
-export function redactAgentLog(value: string, secrets: readonly string[]): string {
-  return secrets
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length)
-    .reduce((result, secret) => redactAgentLogSecret(result, secret), value);
 }
 
 function projectCompleteAgentLogValue(

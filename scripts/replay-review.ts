@@ -10,7 +10,7 @@ import { aggregateReview } from "../src/lib/aggregate.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { readGitMergeBase } from "../src/lib/git-changed-files.js";
 import { readPullRequestFilesFromCheckout } from "../src/lib/github-api.js";
-import { REVIEW_INPUT_LIMITS, reviewSecretCandidates } from "../src/lib/input.js";
+import { readUrl, REVIEW_INPUT_LIMITS, reviewSecretCandidates } from "../src/lib/input.js";
 import {
   mapConversationBodies,
   type ReviewConversationSnapshot,
@@ -30,26 +30,20 @@ import { isWithinRepository } from "../src/runtime/agent-review-tools.js";
 
 const execFileAsync = promisify(execFile);
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
-const httpUrlSchema = z
-  .string()
-  .trim()
-  .max(REVIEW_INPUT_LIMITS.maxUrlLength)
-  .pipe(z.url())
-  .refine((value) => {
-    const url = new URL(value);
-    return (
-      (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password
-    );
+function replayUrlSchema(requireHttps = false) {
+  return z.string().transform((value, context) => {
+    try {
+      readUrl(value, "URL", requireHttps);
+      // Retain recorded spellings for redaction until the effective configuration is normalized.
+      return value.trim();
+    } catch (error) {
+      context.addIssue({ code: "custom", message: (error as Error).message });
+      return z.NEVER;
+    }
   });
-const mcpUrlSchema = z
-  .string()
-  .trim()
-  .max(REVIEW_INPUT_LIMITS.maxUrlLength)
-  .pipe(z.url())
-  .refine((value) => {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password;
-  });
+}
+const httpUrlSchema = replayUrlSchema();
+const mcpUrlSchema = replayUrlSchema(true);
 
 const contextSchema = z
   .object({
@@ -326,7 +320,7 @@ function replayMcpServers(servers: ReplayCase["config"]["mcpServers"]): ReviewCo
       name,
       {
         type: server.type,
-        url: server.url,
+        url: readUrl(server.url, `mcp-servers.${name}.url`, true),
         ...(server.headers === undefined ? {} : { headers: server.headers }),
         ...(server.tools === undefined
           ? {}
@@ -348,7 +342,10 @@ function replayMcpServers(servers: ReplayCase["config"]["mcpServers"]): ReviewCo
   );
 }
 
-function replayConfig(input: ReplayCase["config"]): ReviewConfig {
+function replayConfig(input: ReplayCase["config"]): {
+  readonly config: ReviewConfig;
+  readonly originalEndpoints: readonly string[];
+} {
   const aiSecret =
     process.env.AI_PR_REVIEWER_SECRET ??
     (input.executor === "claude" ? process.env.ANTHROPIC_API_KEY : undefined);
@@ -364,10 +361,13 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
     process.env.AI_PR_REVIEWER_BASE_URL ??
     (input.executor === "claude" ? "https://api.anthropic.com" : undefined);
   if (aiBaseUrl === undefined) throw new Error("Codex replay requires an explicit proxy base URL.");
-  return {
+  const config: ReviewConfig = {
     executor: input.executor,
     githubToken: "",
-    aiBaseUrl,
+    aiBaseUrl: readUrl(
+      aiBaseUrl,
+      input.aiBaseUrl !== undefined ? "config.aiBaseUrl" : "AI_PR_REVIEWER_BASE_URL",
+    ),
     aiSecret,
     model: input.model,
     ...(input.effort === undefined ? {} : { effort: input.effort }),
@@ -381,6 +381,13 @@ function replayConfig(input: ReplayCase["config"]): ReviewConfig {
     autoApprove: input.autoApprove,
     interactWithPullRequest: input.interactWithPullRequest,
     mcpServers: replayMcpServers(input.mcpServers),
+  };
+  return {
+    config,
+    originalEndpoints: [
+      aiBaseUrl.trim(),
+      ...Object.values(input.mcpServers).map((server) => server.url),
+    ],
   };
 }
 
@@ -401,8 +408,8 @@ export async function replayCase(
   const context = pullRequestContext(input.context);
   const mergeBaseSha = await verifyCheckout(checkout, context);
   const root = await realpath(checkout);
-  const config = replayConfig(input.config);
-  const secrets = reviewSecretCandidates(config);
+  const { config, originalEndpoints } = replayConfig(input.config);
+  const secrets = reviewSecretCandidates(config, originalEndpoints);
   const files = await readPullRequestFilesFromCheckout(context, root);
   const contextFiles = await prepareContextFiles(config.reviewPrompts, root);
   let run: ReviewGoalsResult;

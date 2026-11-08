@@ -1,4 +1,7 @@
 import { strict as assert } from "node:assert";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
@@ -54,6 +57,7 @@ test("copies bootstrap files, lists archive entries, normalizes modes, and write
   await writeFile(join(source, "lib/bootstrap/archive.js"), "archive\n");
   await writeFile(join(source, "lib/bootstrap/cancellation.js"), "cancellation\n");
   await writeFile(join(source, "lib/diagnostics.js"), "diagnostics\n");
+  await writeFile(join(source, "lib/redaction.js"), "redaction\n");
   await writeFile(join(source, "lib/bootstrap/version.js"), "version\n");
   await copyBootstrap(source, destination);
   assert.equal(await readFile(join(destination, "bootstrap.js"), "utf8"), "bootstrap\n");
@@ -63,6 +67,8 @@ test("copies bootstrap files, lists archive entries, normalizes modes, and write
     "cancellation\n",
   );
   assert.equal(await readFile(join(destination, "lib/diagnostics.js"), "utf8"), "diagnostics\n");
+
+  assert.equal(await readFile(join(destination, "lib/redaction.js"), "utf8"), "redaction\n");
 
   const archiveRoot = join(root, "archive");
   await mkdir(join(archiveRoot, "nested"), { recursive: true });
@@ -487,4 +493,29 @@ test("runs the guarded runtime entry worker", async () => {
     return Promise.resolve();
   });
   assert.equal(calls, 1);
+});
+
+test("copied bootstrap imports standalone compiled dependencies and redacts real output", async (t) => {
+  const root = await temporaryDirectory("ai-pr-reviewer-standalone-bootstrap-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "package.json"), '{"type":"module"}\n');
+  const destination = join(root, "dist");
+  await copyBootstrap(fileURLToPath(new URL("../src", import.meta.url)), destination);
+  const script = `
+    await import(${JSON.stringify(pathToFileURL(join(destination, "bootstrap.js")).href)});
+    const { DiagnosticLogger } = await import(${JSON.stringify(pathToFileURL(join(destination, "lib/diagnostics.js")).href)});
+    new DiagnosticLogger({component:"standalone",secrets:["fixture-secret"]}).event(
+      "verified", {phase:"bootstrap",operation:"import",purpose:"dependency closure"},
+      "success", "standalone-id", {reason:"fixture-secret safe-state"});
+  `;
+  const { stdout, stderr } = await promisify(execFile)(
+    process.execPath,
+    ["--input-type=module", "-e", script],
+    { cwd: root },
+  );
+  assert.equal(stderr, "");
+  assert.doesNotMatch(stdout, /fixture-secret/u);
+  assert.match(stdout, /\[REDACTED\] safe-state/u);
+  assert.match(stdout, /standalone-id/u);
+  t.diagnostic(stdout.trim());
 });
