@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type {
@@ -24,6 +25,7 @@ import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
 import { aggregateReview, buildReviewBody } from "../src/lib/aggregate.js";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import { emptyConversation } from "./agent-test-helpers.js";
+import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
 import { makeReplayRepository } from "./git-test-helpers.js";
 import {
   protocolBriefing,
@@ -329,6 +331,135 @@ test("new authorized context pages keep a long investigation progressing", async
   assert.equal(result.diagnostics?.stallRecoveries, 0);
 });
 
+let readCallSequence = 0;
+
+function readCall(tool_name: string, tool_input: unknown, tool_response: unknown) {
+  return { tool_name, tool_input, tool_use_id: `native-read-${++readCallSequence}`, tool_response };
+}
+
+test("joins interleaved native Read results by call ID and accounts for overlapping ranges", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-native-read-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const caller = join(root, "caller.ts");
+  const guard = join(root, "guard.ts");
+  await writeFile(caller, "first\r\n\tsecond\r\nthird\r\nfourth");
+  await writeFile(guard, "guard");
+  const ledger = new ReviewEvidenceLedger(root);
+  const first = readCall(
+    "Read",
+    { file_path: caller, offset: 1, limit: 2 },
+    {
+      type: "text",
+      file: {
+        filePath: caller,
+        content: "first\r\n\tsecond\r",
+        startLine: 1,
+        numLines: 2,
+        totalLines: 4,
+      },
+    },
+  );
+  const overlapping = readCall(
+    "Read",
+    { file_path: caller, offset: 2, limit: 2 },
+    {
+      type: "text",
+      file: {
+        filePath: caller,
+        content: "\tsecond\r\nthird\r",
+        startLine: 2,
+        numLines: 2,
+        totalLines: 4,
+      },
+    },
+  );
+  const other = readCall(
+    "Read",
+    { file_path: guard },
+    {
+      type: "text",
+      file: { filePath: guard, content: "guard", startLine: 1, numLines: 1, totalLines: 1 },
+    },
+  );
+  for (const read of [overlapping, other, first]) ledger.observeNativeRead(read);
+  const observed = ledger.observeBatch([
+    { ...first, tool_response: "1:first\n2:\tsecond" },
+    { ...other, tool_response: "1\tguard" },
+    { ...overlapping, tool_response: "2\t\tsecond\n3\tthird" },
+  ]);
+  assert.deepEqual(
+    observed.map(({ path, status }) => [path, status]),
+    [
+      ["caller.ts", "complete"],
+      ["guard.ts", "complete"],
+      ["caller.ts", "complete"],
+    ],
+  );
+  assert.deepEqual(
+    ledger.deliveries.map(({ newLines, repeatedLines }) => [newLines, repeatedLines]),
+    [
+      [2, 0],
+      [1, 0],
+      [1, 1],
+    ],
+  );
+  assert.equal(ledger.uniqueNativeLines, 4);
+});
+
+test("withholds native Read credit for missing, conflicting, incomplete or failed delivery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ai-pr-reviewer-unverified-read-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "source.ts");
+  await writeFile(path, "first\nsecond");
+  const input = { file_path: path };
+  const file = {
+    filePath: path,
+    content: "first\nsecond",
+    startLine: 1,
+    numLines: 2,
+    totalLines: 2,
+  };
+  const metadata = { type: "text", file };
+  const valid = "1\tfirst\n2\tsecond";
+  const ledger = new ReviewEvidenceLedger(root);
+  for (const [responses, delivery, status, reason] of [
+    [[], valid, "partial", /metadata was missing/u],
+    [[metadata, metadata], valid, "partial", /metadata was missing/u],
+    [
+      [{ ...metadata, file: { ...file, filePath: join(root, "other.ts") } }],
+      valid,
+      "partial",
+      /did not match the path and range/u,
+    ],
+    [
+      [{ ...metadata, file: { ...file, startLine: 2 } }],
+      valid,
+      "partial",
+      /did not match the path and range/u,
+    ],
+    [
+      [{ ...metadata, file: { ...file, truncatedByTokenCap: true } }],
+      valid,
+      "partial",
+      /was truncated/u,
+    ],
+    [[metadata], "1\tfirst", "partial", /did not match its metadata/u],
+    [[metadata], valid.replace("second", "altered"), "partial", /did not match its metadata/u],
+    [[metadata], { content: valid, is_error: true }, "failed", /Source tool failed/u],
+  ] as const) {
+    const read = readCall("Read", input, delivery);
+    for (const result of responses) ledger.observeNativeRead({ ...read, tool_response: result });
+    const [reference] = ledger.observeBatch([read]);
+    assert.equal(reference?.status, status);
+    const report = ledger.deliveries[0];
+    assert.equal(report?.toolCallId, read.tool_use_id);
+    assert.equal(report?.newLines, 0);
+    assert.equal(report?.repeatedLines, 0);
+    assert.match(String(report?.reason), reason);
+  }
+  assert.equal(ledger.uniqueNativeLines, 0);
+});
+
 for (const repeated of [false, true]) {
   test(`${repeated ? "repeated" : "new"} native caller reads ${repeated ? "trigger recovery" : "reset progress"} after the required sweep`, async (t) => {
     const repository = await recoveryRepository(t);
@@ -345,32 +476,36 @@ for (const repeated of [false, true]) {
       yield* protocolBriefing(protocol);
       yield* protocol.call("read_pr_diff", { remaining: true });
       const deliver = async (startLine: number) => {
-        const observation: HookInput = {
-          hook_event_name: "PostToolBatch",
+        const common = {
           session_id: "native-progress",
           transcript_path: "",
           cwd: repository.root,
-          tool_calls: [
-            {
-              tool_name: "Read",
-              tool_use_id: `native-${Date.now()}`,
-              tool_input: { file_path: path, offset: startLine, limit: 1 },
-              tool_response: {
-                type: "text",
-                file: {
-                  filePath: path,
-                  content: lines[startLine - 1],
-                  numLines: 1,
-                  startLine,
-                  totalLines: lines.length,
-                },
-              },
-            },
-          ],
         };
-        for (const matcher of protocol.options.hooks?.PostToolBatch ?? [])
-          for (const hook of matcher.hooks)
-            await hook(observation, undefined, { signal: new AbortController().signal });
+        const call = {
+          tool_name: "Read",
+          tool_use_id: `native-${Date.now()}`,
+          tool_input: { file_path: path, offset: startLine, limit: 1 },
+        };
+        const content = lines[startLine - 1];
+        for (const observation of [
+          {
+            ...common,
+            ...call,
+            hook_event_name: "PostToolUse",
+            tool_response: {
+              type: "text",
+              file: { filePath: path, content, numLines: 1, startLine, totalLines: lines.length },
+            },
+          },
+          {
+            ...common,
+            hook_event_name: "PostToolBatch",
+            tool_calls: [{ ...call, tool_response: `${startLine}\t${content}` }],
+          },
+        ] satisfies HookInput[])
+          for (const matcher of protocol.options.hooks?.[observation.hook_event_name] ?? [])
+            for (const hook of matcher.hooks)
+              await hook(observation, undefined, { signal: new AbortController().signal });
       };
       await deliver(1);
       for (let minute = 1; minute <= (repeated ? 10 : 16); minute++) {

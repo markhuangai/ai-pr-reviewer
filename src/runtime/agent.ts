@@ -207,6 +207,10 @@ export async function runReviewGoal(
       evidenceLedger.issued.size > sharedSeed.evidence.references.length,
   });
   const evidenceHook: HookCallback = (input) => {
+    if (input.hook_event_name === "PostToolUse" && input.tool_name === "Read") {
+      evidenceLedger.observeNativeRead(input);
+      return Promise.resolve({ continue: true });
+    }
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
     const references = evidenceLedger.observeBatch(input.tool_calls);
     recovery.observeProgress(inspectionProgress());
@@ -962,6 +966,7 @@ export async function runReviewGoal(
     );
   } finally {
     monitor?.stop();
+    evidenceLedger.clearPendingNativeReads();
     void closeSession();
     signal?.removeEventListener("abort", abortTurn);
     writeAgentSessionEndLog(
