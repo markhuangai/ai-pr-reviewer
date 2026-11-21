@@ -10,7 +10,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewConversationSnapshot } from "../lib/review-context.js";
-import type { PullRequestContext, ReviewSourceRange } from "../lib/types.js";
+import type { PullRequestContext, ReviewEvidenceBounds, ReviewSourceRange } from "../lib/types.js";
 import { readGitMergeBase, readPullRequestFilesFromSnapshots } from "../lib/git-changed-files.js";
 import { errorMessage, isRecord } from "./agent-logging.js";
 import { streamGitToFile, diffArguments, indexDiff } from "./git-stream.js";
@@ -124,6 +124,140 @@ async function allowsRepositoryPath(cwd: string, candidate: string): Promise<boo
   } catch {
     return true;
   }
+}
+
+export function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function hasTruncationMarker(value: unknown): boolean {
+  if (typeof value === "string") return /\[output truncated(?: at [^\]]+)?\]/iu.test(value);
+  if (Array.isArray(value)) return value.some(hasTruncationMarker);
+  if (!isRecord(value)) return false;
+  if (
+    value.truncated === true ||
+    value.truncatedByTokenCap === true ||
+    value.countIsComplete === false
+  )
+    return true;
+  return ["content", "text", "file"].some((key) => hasTruncationMarker(value[key]));
+}
+
+function nativeReadDeliveryMatches(
+  response: unknown,
+  content: string,
+  startLine: number,
+  numLines: number,
+  totalLines: number,
+): boolean {
+  const text = isRecord(response) ? response.content : response;
+  if (typeof text !== "string") return false;
+  if (content === "" && totalLines <= 1)
+    return (
+      text ===
+      "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>"
+    );
+
+  const lines = content.split("\n");
+  const deliveredLines = text.split("\n");
+  // Claude can use a colon as the line-number separator for tab-indented content.
+  const separator = text.startsWith(`${startLine}\t`) ? "\t" : ":";
+  return (
+    lines.length === numLines &&
+    deliveredLines.length === numLines &&
+    lines.every(
+      (line, index) =>
+        deliveredLines[index] === `${startLine + index}${separator}${line.replace(/\r$/u, "")}`,
+    )
+  );
+}
+
+export function nativeQueryAssessment(
+  cwd: string,
+  name: string,
+  inputValue: unknown,
+  result: Readonly<Record<string, unknown>> | undefined,
+  response: unknown,
+  nativeReadResult: Readonly<Record<string, unknown>> | undefined,
+): { readonly partial: boolean; readonly bounds?: ReviewEvidenceBounds; readonly reason?: string } {
+  if (!isRecord(inputValue) || (name !== "Read" && name !== "Grep")) return { partial: false };
+  if (name === "Read") {
+    const structuredDelivery = result?.type === "text" && isRecord(result.file);
+    const metadata = structuredDelivery ? result : nativeReadResult;
+    const file = metadata?.type === "text" && isRecord(metadata.file) ? metadata.file : undefined;
+    const content = file?.content;
+    const startLine = nonnegativeInteger(file?.startLine);
+    const numLines = nonnegativeInteger(file?.numLines);
+    const totalLines = nonnegativeInteger(file?.totalLines);
+    const offset = inputValue.offset === undefined ? 1 : nonnegativeInteger(inputValue.offset);
+    const limit = inputValue.limit === undefined ? undefined : nonnegativeInteger(inputValue.limit);
+    const truncated = hasTruncationMarker(metadata) || hasTruncationMarker(response);
+    const verified =
+      file !== undefined &&
+      typeof content === "string" &&
+      typeof file.filePath === "string" &&
+      typeof inputValue.file_path === "string" &&
+      resolve(cwd, file.filePath) === resolve(cwd, inputValue.file_path) &&
+      startLine !== undefined &&
+      startLine >= 1 &&
+      startLine === offset &&
+      numLines !== undefined &&
+      totalLines !== undefined &&
+      (numLines === 0
+        ? totalLines === 0 && startLine === 1
+        : startLine + numLines - 1 <= totalLines) &&
+      (inputValue.limit === undefined || (limit !== undefined && limit > 0 && numLines <= limit)) &&
+      inputValue.pages === undefined;
+    let reason: string | undefined;
+    if (truncated) reason = "Native Read output was truncated.";
+    else if (!verified)
+      reason = "Native Read metadata was missing or did not match the path and range.";
+    else if (
+      !structuredDelivery &&
+      !nativeReadDeliveryMatches(response, content, startLine, numLines, totalLines)
+    )
+      reason = "Delivered native Read text did not match its metadata.";
+    return {
+      partial: reason !== undefined,
+      ...(reason === undefined ? {} : { reason }),
+      bounds: {
+        ...(offset === undefined ? {} : { offset }),
+        ...(limit === undefined ? {} : { limit }),
+        ...(verified ? { startLine, numLines, totalLines } : {}),
+        ...(truncated ? { truncated: true } : {}),
+      },
+    };
+  }
+
+  const offset = nonnegativeInteger(inputValue.offset) ?? nonnegativeInteger(result?.appliedOffset);
+  const limit =
+    nonnegativeInteger(inputValue.head_limit) ?? nonnegativeInteger(result?.appliedLimit);
+  const count = nonnegativeInteger(result?.mode === "content" ? result.numLines : result?.numFiles);
+  const total = nonnegativeInteger(
+    result?.mode === "content" ? result.totalLines : result?.totalFiles,
+  );
+  const truncated =
+    hasTruncationMarker(result) ||
+    (offset !== undefined && offset > 0) ||
+    (total !== undefined && count !== undefined && total > count) ||
+    (limit !== undefined &&
+      limit > 0 &&
+      count !== undefined &&
+      count >= limit &&
+      total === undefined);
+  return {
+    partial:
+      truncated ||
+      offset === undefined ||
+      limit === undefined ||
+      count === undefined ||
+      (typeof inputValue.head_limit === "number" && inputValue.head_limit > 0),
+    bounds: {
+      ...(offset === undefined ? {} : { offset }),
+      ...(limit === undefined ? {} : { headLimit: limit }),
+      ...(truncated ? { truncated: true } : {}),
+    },
+  };
 }
 
 export const repositoryReadHook: HookCallback = async (input: HookInput) => {

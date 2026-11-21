@@ -27,13 +27,21 @@ export interface ModelRequest {
   readonly body: Record<string, unknown>;
 }
 
+interface ModelToolCall {
+  readonly tool: string;
+  readonly args: Record<string, unknown>;
+}
+
 export type ModelReply =
-  | {
-      readonly tool: string;
-      readonly args: Record<string, unknown>;
+  | (ModelToolCall & {
       readonly inputTokens?: number;
       readonly cachedInputTokens?: number;
       readonly input?: string;
+    })
+  | {
+      readonly claudeTools: readonly ModelToolCall[];
+      readonly inputTokens?: number;
+      readonly cachedInputTokens?: number;
     }
   | { readonly text: string; readonly inputTokens?: number; readonly cachedInputTokens?: number }
   | { readonly error: number }
@@ -111,9 +119,10 @@ function respond(
     { error: number } | { disconnect: true } | { interruptStream: true } | { wait: true }
   >,
 ): void {
+  const availableTools = wireTools(body);
   const tool =
     "tool" in reply
-      ? wireTools(body).find(
+      ? availableTools.find(
           (item) => item.name === reply.tool || item.name.endsWith("__" + reply.tool),
         )
       : undefined;
@@ -133,22 +142,29 @@ function respond(
   const id = "resp_" + randomUUID().replaceAll("-", "");
   const callId = "call_" + randomUUID().replaceAll("-", "");
   if (Array.isArray(body.messages) && typeof body.max_tokens === "number") {
+    const calls = "claudeTools" in reply ? reply.claudeTools : "tool" in reply ? [reply] : [];
     const content =
-      tool === undefined
-        ? { type: "text", text: "text" in reply ? reply.text : "" }
-        : {
-            type: "tool_use",
-            id: callId,
-            name: tool.name,
-            input: "args" in reply ? reply.args : {},
-          };
+      calls.length === 0
+        ? [{ type: "text" as const, text: "text" in reply ? reply.text : "" }]
+        : calls.map(({ tool: name, args }, index) => {
+            const exposed = availableTools.find(
+              (item) => item.name === name || item.name.endsWith("__" + name),
+            );
+            assert.ok(exposed, "The real Claude request must expose " + name);
+            return {
+              type: "tool_use" as const,
+              id: `${callId}_${index}`,
+              name: exposed.name,
+              input: args,
+            };
+          });
     const message = {
       id,
       type: "message",
       role: "assistant",
       model: body.model,
-      content: [content],
-      stop_reason: tool === undefined ? "end_turn" : "tool_use",
+      content,
+      stop_reason: calls.length === 0 ? "end_turn" : "tool_use",
       stop_sequence: null,
       usage: {
         input_tokens: reply.inputTokens ?? 100,
@@ -174,23 +190,22 @@ function respond(
         usage: { ...message.usage, output_tokens: 0 },
       },
     });
-    event("content_block_start", {
-      type: "content_block_start",
-      index: 0,
-      content_block: tool === undefined ? { type: "text", text: "" } : { ...content, input: {} },
-    });
-    event("content_block_delta", {
-      type: "content_block_delta",
-      index: 0,
-      delta:
-        tool === undefined
-          ? { type: "text_delta", text: "text" in reply ? reply.text : "" }
-          : {
-              type: "input_json_delta",
-              partial_json: JSON.stringify("args" in reply ? reply.args : {}),
-            },
-    });
-    event("content_block_stop", { type: "content_block_stop", index: 0 });
+    for (const [index, block] of content.entries()) {
+      event("content_block_start", {
+        type: "content_block_start",
+        index,
+        content_block: block.type === "text" ? { ...block, text: "" } : { ...block, input: {} },
+      });
+      event("content_block_delta", {
+        type: "content_block_delta",
+        index,
+        delta:
+          block.type === "text"
+            ? { type: "text_delta", text: block.text }
+            : { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+      });
+      event("content_block_stop", { type: "content_block_stop", index });
+    }
     event("message_delta", {
       type: "message_delta",
       delta: { stop_reason: message.stop_reason, stop_sequence: null },
@@ -200,6 +215,7 @@ function respond(
     response.end();
     return;
   }
+  assert.ok(!("claudeTools" in reply), "Batched fixture calls require the Claude Messages API.");
   response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
   if (Array.isArray(body.messages)) {
     const chunk = (delta: unknown, finish: string | null = null) =>

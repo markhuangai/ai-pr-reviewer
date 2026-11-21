@@ -430,7 +430,12 @@ export function makeOptions(
           ? []
           : [{ matcher: `^mcp__${outputServerName}__submit_review$`, hooks: [submissionHook] }]),
       ],
-      ...(evidenceHook === undefined ? {} : { PostToolBatch: [{ hooks: [evidenceHook] }] }),
+      ...(evidenceHook === undefined
+        ? {}
+        : {
+            PostToolUse: [{ matcher: "^Read$", hooks: [evidenceHook] }],
+            PostToolBatch: [{ hooks: [evidenceHook] }],
+          }),
     },
     persistSession: false,
     settings: { autoCompactEnabled: true, precomputeCompactionEnabled: true },

@@ -8,7 +8,6 @@ import type {
   ChangedFile,
   ReviewFindingEvidence,
   ReviewInspection,
-  ReviewEvidenceBounds,
   ReviewEvidenceReference,
   ReviewFinding,
   ReviewSourceRange,
@@ -17,6 +16,8 @@ import {
   isGitMetadataPath,
   isWithinRepository,
   mergeDeliveredRanges,
+  nativeQueryAssessment,
+  nonnegativeInteger,
   type DiffFileSpan,
 } from "./agent-review-tools.js";
 
@@ -118,10 +119,6 @@ function expiredCursorFailure(result: Readonly<Record<string, unknown>> | undefi
   );
 }
 
-function nonnegativeInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
 const sourceRangeSchema = z
   .object({
     paths: z.array(pathSchema).min(1).max(2),
@@ -132,93 +129,6 @@ const sourceRangeSchema = z
   .strict()
   .refine((range) => range.start <= range.end && range.end <= range.totalBytes);
 const sourceRangesSchema = z.array(sourceRangeSchema).max(3_000);
-
-function hasTruncationMarker(value: unknown): boolean {
-  if (typeof value === "string") return /\[output truncated(?: at [^\]]+)?\]/iu.test(value);
-  if (Array.isArray(value)) return value.some(hasTruncationMarker);
-  if (!isRecord(value)) return false;
-  if (
-    value.truncated === true ||
-    value.truncatedByTokenCap === true ||
-    value.countIsComplete === false
-  )
-    return true;
-  return ["content", "text", "file"].some((key) => hasTruncationMarker(value[key]));
-}
-
-function nativeQueryAssessment(
-  cwd: string,
-  name: string,
-  inputValue: unknown,
-  result: Readonly<Record<string, unknown>> | undefined,
-): { readonly partial: boolean; readonly bounds?: ReviewEvidenceBounds } {
-  if (!isRecord(inputValue) || (name !== "Read" && name !== "Grep")) return { partial: false };
-  if (name === "Read") {
-    const file = result !== undefined && isRecord(result.file) ? result.file : undefined;
-    const startLine = nonnegativeInteger(file?.startLine);
-    const numLines = nonnegativeInteger(file?.numLines);
-    const totalLines = nonnegativeInteger(file?.totalLines);
-    const offset = inputValue.offset === undefined ? 1 : nonnegativeInteger(inputValue.offset);
-    const limit = inputValue.limit === undefined ? undefined : nonnegativeInteger(inputValue.limit);
-    const truncated = hasTruncationMarker(result);
-    const verified =
-      file !== undefined &&
-      result?.type === "text" &&
-      typeof file.content === "string" &&
-      typeof file.filePath === "string" &&
-      typeof inputValue.file_path === "string" &&
-      resolve(cwd, file.filePath) === resolve(cwd, inputValue.file_path) &&
-      startLine !== undefined &&
-      startLine >= 1 &&
-      startLine === offset &&
-      numLines !== undefined &&
-      totalLines !== undefined &&
-      (numLines === 0
-        ? totalLines === 0 && startLine === 1
-        : startLine + numLines - 1 <= totalLines) &&
-      (inputValue.limit === undefined || (limit !== undefined && limit > 0 && numLines <= limit)) &&
-      inputValue.pages === undefined;
-    return {
-      partial: !verified || truncated,
-      bounds: {
-        ...(offset === undefined ? {} : { offset }),
-        ...(limit === undefined ? {} : { limit }),
-        ...(verified ? { startLine, numLines, totalLines } : {}),
-        ...(truncated ? { truncated: true } : {}),
-      },
-    };
-  }
-
-  const offset = nonnegativeInteger(inputValue.offset) ?? nonnegativeInteger(result?.appliedOffset);
-  const limit =
-    nonnegativeInteger(inputValue.head_limit) ?? nonnegativeInteger(result?.appliedLimit);
-  const count = nonnegativeInteger(result?.mode === "content" ? result.numLines : result?.numFiles);
-  const total = nonnegativeInteger(
-    result?.mode === "content" ? result.totalLines : result?.totalFiles,
-  );
-  const truncated =
-    hasTruncationMarker(result) ||
-    (offset !== undefined && offset > 0) ||
-    (total !== undefined && count !== undefined && total > count) ||
-    (limit !== undefined &&
-      limit > 0 &&
-      count !== undefined &&
-      count >= limit &&
-      total === undefined);
-  return {
-    partial:
-      truncated ||
-      offset === undefined ||
-      limit === undefined ||
-      count === undefined ||
-      (typeof inputValue.head_limit === "number" && inputValue.head_limit > 0),
-    bounds: {
-      ...(offset === undefined ? {} : { offset }),
-      ...(limit === undefined ? {} : { headLimit: limit }),
-      ...(truncated ? { truncated: true } : {}),
-    },
-  };
-}
 
 function repositoryRelativePath(cwd: string, value: unknown): string | undefined {
   if (!isText(value) || value.length === 0 || value.includes("\0")) return undefined;
@@ -365,6 +275,10 @@ export class ReviewEvidenceLedger {
     }
   >();
   private readonly nativeDelivered = new Map<string, [number, number][]>();
+  private readonly nativeReadResults = new Map<
+    string,
+    Readonly<Record<string, unknown>> | undefined
+  >();
   readonly coverage: ReviewCoverageTracker;
   private requiredBytes = 0;
   uniqueSourceBytes = 0;
@@ -565,11 +479,31 @@ export class ReviewEvidenceLedger {
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;
   }
+
+  observeNativeRead(call: RepositoryReviewToolCall): void {
+    if (this.observedCalls.has(call.tool_use_id)) return;
+    const result = toolResponseDocument(call.tool_response);
+    this.nativeReadResults.set(
+      call.tool_use_id,
+      this.nativeReadResults.has(call.tool_use_id) ||
+        explicitToolFailure(call.tool_response) ||
+        explicitToolFailure(result)
+        ? undefined
+        : result,
+    );
+  }
+
+  clearPendingNativeReads(): void {
+    this.nativeReadResults.clear();
+  }
+
   observeBatch(calls: readonly RepositoryReviewToolCall[]): readonly ReviewEvidenceReference[] {
     this.deliveries = [];
     const observed: ReviewEvidenceReference[] = [];
     const expired = new Set<string>();
     for (const call of calls) {
+      const nativeReadResult = this.nativeReadResults.get(call.tool_use_id);
+      this.nativeReadResults.delete(call.tool_use_id);
       if (this.observedCalls.has(call.tool_use_id)) continue;
       this.observedCalls.add(call.tool_use_id);
       const source = this.source(call);
@@ -590,6 +524,8 @@ export class ReviewEvidenceLedger {
         call.tool_name,
         call.tool_input,
         result,
+        call.tool_response,
+        nativeReadResult,
       );
       const malformedPage =
         fixedPage &&
@@ -758,6 +694,10 @@ export class ReviewEvidenceLedger {
             this.requiredBytes += newLines;
           this.nativeDelivered.set(key, update.intervals);
         }
+        const reason =
+          reference.status === "failed"
+            ? "Source tool failed or returned an invalid page."
+            : nativeAssessment.reason;
         this.deliveries.push({
           toolCallId: call.tool_use_id,
           query: cursor ?? call.tool_use_id,
@@ -768,11 +708,10 @@ export class ReviewEvidenceLedger {
           revision: reference.revision,
           status: reference.status,
           range: reference.bounds,
-          newLines,
-          repeatedLines,
-          ...(reference.status === "failed"
-            ? { reason: "Source tool failed or returned an invalid page." }
-            : {}),
+          newLines: reference.kind === "repository_read" ? (newLines ?? 0) : newLines,
+          repeatedLines:
+            reference.kind === "repository_read" ? (repeatedLines ?? 0) : repeatedLines,
+          ...(reason === undefined ? {} : { reason }),
           evidenceRef: reference.id,
         });
       }
