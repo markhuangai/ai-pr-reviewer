@@ -25,20 +25,20 @@
   },
   "dependencies": {
     "@actions/core": "3.0.1",
-    "@anthropic-ai/claude-agent-sdk": "0.3.296",
-    "@anthropic-ai/sdk": "0.133.0",
-    "@modelcontextprotocol/sdk": "1.32.1",
-    "@openai/codex": "0.162.1",
+    "@anthropic-ai/claude-agent-sdk": "0.3.325",
+    "@anthropic-ai/sdk": "1.8.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@openai/codex": "0.169.0",
     "yaml": "2.9.1",
-    "zod": "4.6.6"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "26.6.5",
-    "eslint": "10.12.0",
-    "prettier": "3.9.10",
+    "@types/node": "26.6.6",
+    "eslint": "10.15.0",
+    "prettier": "3.10.1",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.71.1"
+    "typescript-eslint": "8.72.2"
   },
   "overrides": {
     "@hono/node-server": "2.1.0",
