@@ -533,8 +533,42 @@ export async function runReviewGoal(
       }
     };
     const readMcpStatus = () => readAcceptedSubmissionMcpStatus(readMcpFailures);
+    const resultAfterClose = (
+      status: AcceptedSubmissionMcpStatus,
+      tokenComplete: boolean,
+      stopReason?: string,
+      failed = false,
+    ): GoalResult => {
+      const providerFailure = runner.acceptedProviderFailure?.failure;
+      if (providerFailure !== undefined) runner.phase = "provider-error";
+      const mustFail = failed || providerFailure !== undefined;
+      if (submission !== undefined && !mustFail)
+        return withDiagnostics(
+          acceptedSubmissionResult(goal, submission, status, tokenUsageState.models, tokenComplete),
+        );
+      const error =
+        providerFailure?.message ?? stopReason ?? "The review closed without a submission.";
+      const retained = submission ?? retainedSubmission();
+      const mcpFailed = status.error !== undefined || status.failures.length > 0;
+      return withDiagnostics(
+        withTokenUsage(
+          {
+            prompt: goal,
+            status: mustFail || mcpFailed || retained === undefined ? "failed" : "incomplete",
+            ...(retained === undefined ? {} : { submission: retained }),
+            error:
+              delivery !== undefined
+                ? `Review stopped (${runner.phase}${mcpFailed ? "; MCP status failed" : ""}).`
+                : mcpFailed
+                  ? `${error}; configured MCP status: ${status.error ?? status.failures}`
+                  : error,
+          },
+          tokenUsageState.models,
+          tokenComplete && providerFailure === undefined,
+        ),
+      );
+    };
     const finalizeAccepted = async (
-      acceptedSubmission: GoalSubmission,
       terminal: SDKResultMessage | undefined,
       interrupted = false,
     ): Promise<GoalResult> => {
@@ -545,26 +579,23 @@ export async function runReviewGoal(
             ? "finalizing-interrupted-submission"
             : "checking-mcp-status";
       const status = await runner.finish(readMcpStatus);
-      const tokenComplete = terminal !== undefined && tokenUsageState.latestSnapshotValid;
+      const lateProviderFailure = runner.acceptedProviderFailure;
+      const terminalSubtype = lateProviderFailure?.subtype ?? terminal?.subtype;
+      const tokenComplete =
+        terminal !== undefined &&
+        lateProviderFailure === undefined &&
+        tokenUsageState.latestSnapshotValid;
       writeMonitorEvent(
         "submission-finalized",
         acceptedSubmissionDetails(
           runner.recoveryCount,
-          terminal !== undefined,
-          terminal?.subtype,
+          terminalSubtype !== undefined,
+          terminalSubtype,
           status,
           tokenComplete,
         ),
       );
-      return withDiagnostics(
-        acceptedSubmissionResult(
-          goal,
-          acceptedSubmission,
-          status,
-          tokenUsageState.models,
-          tokenComplete,
-        ),
-      );
+      return resultAfterClose(status, tokenComplete);
     };
     const finalizeUnaccepted = async (
       error: string,
@@ -576,29 +607,7 @@ export async function runReviewGoal(
           ? () => Promise.resolve<AcceptedSubmissionMcpStatus>({ checked: false, failures: "" })
           : readMcpStatus,
       );
-      if (submission !== undefined && !failed)
-        return withDiagnostics(
-          acceptedSubmissionResult(goal, submission, status, tokenUsageState.models, tokenComplete),
-        );
-      const retained = submission ?? retainedSubmission();
-      const mcpFailed = status.error !== undefined || status.failures.length > 0;
-      return withDiagnostics(
-        withTokenUsage(
-          {
-            prompt: goal,
-            status: failed || mcpFailed || retained === undefined ? "failed" : "incomplete",
-            ...(retained === undefined ? {} : { submission: retained }),
-            error:
-              delivery !== undefined
-                ? `Review stopped (${runner.phase}${mcpFailed ? "; MCP status failed" : ""}).`
-                : mcpFailed
-                  ? `${error}; configured MCP status: ${status.error ?? status.failures}`
-                  : error,
-          },
-          tokenUsageState.models,
-          tokenComplete,
-        ),
-      );
+      return resultAfterClose(status, tokenComplete, error, failed);
     };
     throwIfAborted(signal);
     startReviewPrompt(
@@ -647,7 +656,7 @@ export async function runReviewGoal(
       }
       if (outcome.kind === "accepted-after-grace") {
         if (submission === undefined) throw new Error("The accepted review is unavailable.");
-        return await finalizeAccepted(submission, undefined);
+        return await finalizeAccepted(undefined);
       }
       if (outcome.kind === "recovery-exhausted") {
         runner.phase = recovery.exhaustionReason ?? "repair-exhausted";
@@ -675,7 +684,7 @@ export async function runReviewGoal(
           result_subtype: result.subtype,
           submission_accepted: submission !== undefined,
         });
-        if (submission !== undefined) return await finalizeAccepted(submission, result, true);
+        if (submission !== undefined) return await finalizeAccepted(result, true);
         if (result.subtype === "error_max_turns" || recovery.exhausted) {
           runner.phase =
             result.subtype === "error_max_turns"
@@ -725,7 +734,7 @@ export async function runReviewGoal(
           result.subtype !== "error_max_turns",
         );
       }
-      if (submission !== undefined) return await finalizeAccepted(submission, result);
+      if (submission !== undefined) return await finalizeAccepted(result);
       const nextContext = continueSweep ? delivery?.nextMessage() : undefined;
       if (nextContext !== undefined) {
         const message = makeUserMessage(nextContext.text);
