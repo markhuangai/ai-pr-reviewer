@@ -42,14 +42,9 @@ import {
 } from "./agent-logging.js";
 import type { PullRequestDiffArtifact } from "./agent-review-tools.js";
 import {
-  PromptStream,
   REVIEW_SYSTEM_PROMPT,
-  closeSdkSession,
-  createDeferred,
-  createReviewSessionRecoveryMonitor,
   interactiveSubmissionSchema,
   makeOptions,
-  makeUserMessage,
   repairPrompt,
   reviewSessionSnapshot,
   reviewSubmissionRejection,
@@ -57,7 +52,6 @@ import {
   submissionSchema,
   toSubmission,
   type AgentQuery,
-  type SdkSessionMonitor,
   createReviewGoalsRunner,
 } from "./agent-session.js";
 import {
@@ -76,16 +70,8 @@ import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snaps
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
 import { ReviewContextDelivery } from "./review-context-delivery.js";
-import {
-  ProviderRecovery,
-  waitForProviderRetry,
-  type SessionRecoveryFailure,
-} from "./session-recovery.js";
-import {
-  createReviewSession,
-  createReviewMcpServers,
-  type ReviewSession,
-} from "./review-session.js";
+import { createReviewSession, createReviewMcpServers } from "./review-session.js";
+import { SessionRunner, createDeferred, makeUserMessage } from "./session-runner.js";
 import {
   assertDiscoverySnapshot,
   assertIndependentSession,
@@ -121,8 +107,6 @@ export async function runReviewGoal(
   let submission: GoalSubmission | undefined;
   const startedAt = Date.now();
   const recovery = new ReviewSubmissionRecovery(config.maxTurns);
-  const provider = new ProviderRecovery();
-  const accepted = createDeferred<undefined>();
   const recoveryExhausted = createDeferred<undefined>();
   const submissionName = "mcp__review_output__submit_review";
   let validationGaps: readonly ReviewValidationGap[] = [];
@@ -189,8 +173,8 @@ export async function runReviewGoal(
     logSecrets,
     privateContext: sharedContext !== undefined,
     sessionRecovery: () => ({
-      ...provider.diagnostics,
-      stallRecoveries: monitor?.recoveryCount ?? 0,
+      ...runner.providerDiagnostics,
+      stallRecoveries: runner.recoveryCount,
       ...(firstSubmissionMs === undefined ? {} : { firstSubmissionMs }),
       ...(delivery === undefined ? {} : { contextHandoffs: delivery.handoffs }),
     }),
@@ -208,7 +192,7 @@ export async function runReviewGoal(
     await delivery?.refresh();
     const references = evidenceLedger.observeBatch(input.tool_calls);
     recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
-    monitor?.observeProgress();
+    runner.observeProgress();
     const deliveredInspection = inspectionDetails();
     for (const delivery of evidenceLedger.deliveries)
       logDiagnostic("source-delivery", { ...delivery, ...deliveredInspection });
@@ -277,7 +261,6 @@ export async function runReviewGoal(
   );
   if (sharedSeed !== undefined && sharedContext === undefined)
     briefingReader.inherit(sharedSeed.briefing);
-  let monitor: SdkSessionMonitor | undefined;
   const delivery =
     sharedContext === undefined || sharedSeed === undefined
       ? undefined
@@ -289,7 +272,9 @@ export async function runReviewGoal(
           (event, details) => {
             writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
-          () => monitor?.rebaseProgress(),
+          () => {
+            runner.rebaseProgress();
+          },
         );
   const advanceContextTool = delivery?.advanceTool(
     () => reviewPromptActive && submission === undefined,
@@ -362,14 +347,13 @@ export async function runReviewGoal(
           );
         });
       submission = candidate;
-      accepted.resolve(undefined);
+      runner.acceptOutput();
       logDiagnostic("submission-decision", {
         decision: "accepted",
         ...inspectionDetails(),
         ...recoveryDetails(),
         limitations: candidate.limitations,
       });
-      monitor?.acceptSubmission();
       return Promise.resolve({ content: [{ type: "text", text: "Review submission accepted." }] });
     },
     { alwaysLoad: true },
@@ -388,45 +372,57 @@ export async function runReviewGoal(
     "review",
     delivery !== undefined,
   );
-  const input = new PromptStream();
+  const writeMonitorEvent = (event: string, details: Readonly<Record<string, unknown>>): void => {
+    writeAgentMonitorEvent(
+      goalIndex,
+      event,
+      delivery === undefined || details.error === undefined
+        ? details
+        : { ...details, error: "Runtime request failed." },
+      logSecrets,
+    );
+  };
+  const runner: SessionRunner = new SessionRunner({
+    signal,
+    streamEnded: `The ${config.executor ?? "claude"} message stream ended before a terminal result.`,
+    write: writeMonitorEvent,
+    watchdog: {
+      kind: "review",
+      activity: (message) => sdkSessionActivity(message, toolUses),
+      progress: () =>
+        inspectionProgress() +
+        evidenceLedger.uniqueSourceBytes +
+        evidenceLedger.uniqueNativeLines +
+        goalTools.contextPages(),
+      snapshot: () => ({
+        ...reviewSessionSnapshot(
+          runner.phase,
+          lifecycle,
+          recovery.repairAttempts,
+          submission !== undefined,
+          runner.awaitingInterruptedTurn,
+          delivery === undefined,
+        ),
+        ...inspectionDetails(),
+        ...recoveryDetails(),
+      }),
+    },
+  });
   const queueMessage = (text: string, label: string): void => {
     const message = makeUserMessage(text);
-    input.push(message);
+    runner.prompts.push(message);
     if (delivery === undefined)
       logAgentEventSafely(goalIndex, logSecrets, (write) => {
         logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
       });
   };
-  let turn = createDeferred<SDKResultMessage>();
-  let readerFailure: Error | undefined;
-  let reader: Promise<void> | undefined;
-  let session: ReviewSession | undefined;
-  let sessionPhase = "starting";
-  const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
-  let sessionClosed = false;
-  let closedOperation: void | Promise<void>;
-  const stalledSubmission = createDeferred<undefined>();
-  const recoveryFailure = createDeferred<SessionRecoveryFailure>();
-  const closeSession = (): void | Promise<void> => {
-    if (session === undefined || sessionClosed) return closedOperation;
-    sessionClosed = true;
-    return (closedOperation = session.close());
-  };
-  let shutdown: Promise<void> | undefined;
   let confirmClosed: (() => void) | undefined;
-  const finishSession = async (): Promise<void> => {
-    monitor?.stop();
-    sessionState.expectedSessionClose = true;
-    input.finish();
-    await (shutdown ??= closeSdkSession(closeSession, reader).then(() => confirmClosed?.()));
-    if (readerFailure !== undefined) throw readerFailure;
-  };
   const tokenUsageState: {
     models: readonly ReviewModelUsage[];
     latestSnapshotValid: boolean;
   } = { models: [], latestSnapshotValid: false };
   const withDiagnostics = (result: GoalResult): GoalResult =>
-    finalizeDiagnostics(result, sessionPhase, validationGaps);
+    finalizeDiagnostics(result, runner.phase, validationGaps);
   const retainedSubmission = (): GoalSubmission | undefined =>
     retainReviewSubmission(
       recovery.latestInput,
@@ -435,14 +431,8 @@ export async function runReviewGoal(
       config.interactWithPullRequest,
       submissionGaps(recovery.latestInput),
       (finding) => briefingReader.complete && unreadFindingPaths([finding]).length === 0,
-      `Required inspection stopped: ${recovery.exhaustionReason ?? sessionPhase}.`,
+      `Required inspection stopped: ${recovery.exhaustionReason ?? runner.phase}.`,
     );
-  const abortTurn = (): void => {
-    input.finish();
-    turn.reject(signal?.reason ?? new Error("The pull request review was cancelled."));
-  };
-  signal?.addEventListener("abort", abortTurn, { once: true });
-  if (signal?.aborted) abortTurn();
   try {
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
@@ -458,29 +448,75 @@ export async function runReviewGoal(
           write,
         );
     });
-    session = createReviewSession(queryAgent, {
-      config,
-      ...forkSessionOptions(sharedSeed),
-      ...(delivery === undefined ? {} : { contextDelivery: delivery }),
-      cwd,
-      tools: reviewTools,
-      outputServerName,
-      isAccepted: () => submission !== undefined,
-      prompt: input,
-      options: makeOptions(
-        config,
-        cwd,
-        mcpServers,
-        outputServerName,
-        contextFiles.length > 0,
-        abortController,
-        effectiveSystemPrompt,
-        evidenceHook,
-        submissionHook,
-      ),
-    });
-    const activeSession = session;
-    confirmClosed = sharedSeed?.retainSession();
+    const activeSession = runner.start(
+      (prompt) => {
+        const session = createReviewSession(queryAgent, {
+          config,
+          ...forkSessionOptions(sharedSeed),
+          ...(delivery === undefined ? {} : { contextDelivery: delivery }),
+          cwd,
+          tools: reviewTools,
+          outputServerName,
+          isAccepted: () => submission !== undefined,
+          prompt,
+          options: makeOptions(
+            config,
+            cwd,
+            mcpServers,
+            outputServerName,
+            contextFiles.length > 0,
+            abortController,
+            effectiveSystemPrompt,
+            evidenceHook,
+            submissionHook,
+          ),
+        });
+        confirmClosed = sharedSeed?.retainSession();
+        return session;
+      },
+      (message, providerFailure) => {
+        assertIndependentSession(message, sharedSeed);
+        if (message.type !== "active_goal" && delivery === undefined)
+          logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
+        logAgentEventSafely(goalIndex, logSecrets, (write) => {
+          logAgentLifecycleMessage(
+            message,
+            goalIndex,
+            logSecrets,
+            lifecycle,
+            delivery === undefined
+              ? write
+              : (line) => {
+                  if (
+                    !line.includes("turn-result errors:") &&
+                    !line.includes("compaction-result error:") &&
+                    !line.includes("goal-iteration details:")
+                  )
+                    write(line);
+                },
+          );
+        });
+        if (isReviewActive()) recovery.observeMessage(message, observeRejection);
+        if (message.type !== "result") return;
+        if (
+          delivery !== undefined &&
+          config.executor !== "codex" &&
+          message.subtype === "success" &&
+          message.num_turns === 0 &&
+          !delivery.advanceRequested &&
+          !runner.awaitingInterruptedTurn &&
+          providerFailure === undefined
+        )
+          return false;
+        const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
+        tokenUsageState.latestSnapshotValid =
+          modelUsageSince(snapshot, tokenUsageState.models) !== undefined;
+        if (snapshot !== undefined && tokenUsageState.latestSnapshotValid)
+          tokenUsageState.models = snapshot;
+        if (providerFailure !== undefined) tokenUsageState.latestSnapshotValid = false;
+        return undefined;
+      },
+    );
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
     const readMcpFailures = async (): Promise<readonly string[]> => {
       try {
@@ -496,17 +532,50 @@ export async function runReviewGoal(
         throw new Error("Could not verify configured MCP server status.", { cause: error });
       }
     };
+    const readMcpStatus = () => readAcceptedSubmissionMcpStatus(readMcpFailures);
+    const finalizeAccepted = async (
+      acceptedSubmission: GoalSubmission,
+      terminal: SDKResultMessage | undefined,
+      interrupted = false,
+    ): Promise<GoalResult> => {
+      runner.phase =
+        terminal === undefined
+          ? "finalizing-accepted-submission"
+          : interrupted
+            ? "finalizing-interrupted-submission"
+            : "checking-mcp-status";
+      const status = await runner.finish(readMcpStatus);
+      const tokenComplete = terminal !== undefined && tokenUsageState.latestSnapshotValid;
+      writeMonitorEvent(
+        "submission-finalized",
+        acceptedSubmissionDetails(
+          runner.recoveryCount,
+          terminal !== undefined,
+          terminal?.subtype,
+          status,
+          tokenComplete,
+        ),
+      );
+      return withDiagnostics(
+        acceptedSubmissionResult(
+          goal,
+          acceptedSubmission,
+          status,
+          tokenUsageState.models,
+          tokenComplete,
+        ),
+      );
+    };
     const finalizeUnaccepted = async (
       error: string,
       tokenComplete: boolean,
       failed = false,
     ): Promise<GoalResult> => {
-      monitor?.stop();
-      const status: AcceptedSubmissionMcpStatus = failed
-        ? { checked: false, failures: "" }
-        : await readAcceptedSubmissionMcpStatus(readMcpFailures);
-      await finishSession();
-      throwIfAborted(signal);
+      const status = await runner.finish(
+        failed
+          ? () => Promise.resolve<AcceptedSubmissionMcpStatus>({ checked: false, failures: "" })
+          : readMcpStatus,
+      );
       if (submission !== undefined && !failed)
         return withDiagnostics(
           acceptedSubmissionResult(goal, submission, status, tokenUsageState.models, tokenComplete),
@@ -521,146 +590,19 @@ export async function runReviewGoal(
             ...(retained === undefined ? {} : { submission: retained }),
             error:
               delivery !== undefined
-                ? `Review stopped (${sessionPhase}${mcpFailed ? "; MCP status failed" : ""}).`
+                ? `Review stopped (${runner.phase}${mcpFailed ? "; MCP status failed" : ""}).`
                 : mcpFailed
                   ? `${error}; configured MCP status: ${status.error ?? status.failures}`
                   : error,
           },
           tokenUsageState.models,
-          tokenComplete && readerFailure === undefined,
+          tokenComplete,
         ),
       );
     };
-    let stalledMcpStatus = { checked: false, failures: "" };
-    let stalledSubmissionFinalization: Promise<void> | undefined;
-    const activeMonitor = createReviewSessionRecoveryMonitor({
-      progress: () =>
-        inspectionProgress() +
-        evidenceLedger.uniqueSourceBytes +
-        evidenceLedger.uniqueNativeLines +
-        goalTools.contextPages(),
-      onRecoveryFailure: (reason) => {
-        recoveryFailure.resolve(reason);
-      },
-      snapshot: () => ({
-        ...reviewSessionSnapshot(
-          sessionPhase,
-          lifecycle,
-          recovery.repairAttempts,
-          submission !== undefined,
-          sessionState.stallBoundaryPending,
-          delivery === undefined,
-        ),
-        ...inspectionDetails(),
-        ...recoveryDetails(),
-      }),
-      write: (event, details) => {
-        writeAgentMonitorEvent(
-          goalIndex,
-          event,
-          delivery === undefined || details.error === undefined
-            ? details
-            : { ...details, error: "Runtime request failed." },
-          logSecrets,
-        );
-      },
-      hasAcceptedSubmission: () => submission !== undefined,
-      setPhase: (phase) => {
-        sessionPhase = phase;
-      },
-      finishAcceptedInput: () => {
-        sessionState.expectedSessionClose = true;
-        input.finish();
-      },
-      markBoundaryPending: () => {
-        sessionState.stallBoundaryPending = true;
-        sessionPhase = "waiting-for-interrupted-turn-boundary";
-      },
-      interrupt: () => activeSession.interrupt(),
-      finalizeAcceptedSubmission: () => {
-        stalledSubmission.resolve(undefined);
-        stalledSubmissionFinalization = (async () => {
-          stalledMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
-          await finishSession();
-        })();
-        void stalledSubmissionFinalization.catch((error: unknown) => {
-          turn.reject(error);
-        });
-      },
-    });
-    monitor = activeMonitor;
-    activeMonitor.start();
-    sessionPhase = "waiting-for-sdk-message";
-    reader = (async () => {
-      try {
-        for await (const message of activeSession) {
-          assertIndependentSession(message, sharedSeed);
-          provider.observe(message);
-          activeMonitor.observe(sdkSessionActivity(message, toolUses));
-          if (message.type !== "active_goal" && delivery === undefined)
-            logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
-          logAgentEventSafely(goalIndex, logSecrets, (write) => {
-            logAgentLifecycleMessage(
-              message,
-              goalIndex,
-              logSecrets,
-              lifecycle,
-              delivery !== undefined
-                ? (line) => {
-                    if (
-                      !line.includes("turn-result errors:") &&
-                      !line.includes("compaction-result error:") &&
-                      !line.includes("goal-iteration details:")
-                    )
-                      write(line);
-                  }
-                : write,
-            );
-          });
-          if (isReviewActive()) recovery.observeMessage(message, observeRejection);
-          if (message.type === "result") {
-            if (
-              delivery !== undefined &&
-              config.executor !== "codex" &&
-              message.subtype === "success" &&
-              message.num_turns === 0 &&
-              !delivery.advanceRequested &&
-              !sessionState.stallBoundaryPending &&
-              provider.failure(message) === undefined
-            )
-              continue;
-            if (submission !== undefined) activeMonitor.stop();
-            const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
-            tokenUsageState.latestSnapshotValid =
-              modelUsageSince(snapshot, tokenUsageState.models) !== undefined;
-            if (snapshot !== undefined && tokenUsageState.latestSnapshotValid)
-              tokenUsageState.models = snapshot;
-            if (provider.failure(message) !== undefined)
-              tokenUsageState.latestSnapshotValid = false;
-            const completedTurn = turn;
-            turn = createDeferred<SDKResultMessage>();
-            completedTurn.resolve(message);
-          }
-        }
-      } catch (error) {
-        readerFailure = error instanceof Error ? error : new Error(errorMessage(error));
-        turn.reject(readerFailure);
-      } finally {
-        if (signal?.aborted) turn.reject(signal.reason);
-        else if (!sessionState.expectedSessionClose && readerFailure === undefined) {
-          turn.reject(
-            new Error(
-              "The " +
-                (config.executor ?? "claude") +
-                " message stream ended before a terminal result.",
-            ),
-          );
-        }
-      }
-    })();
     throwIfAborted(signal);
     startReviewPrompt(
-      input,
+      runner.prompts,
       goal,
       context,
       files,
@@ -687,17 +629,14 @@ export async function runReviewGoal(
         write,
       );
     });
-    sessionPhase = "waiting-for-turn-result";
+    runner.phase = "waiting-for-turn-result";
+    const exhausted = recoveryExhausted.promise.then(() => ({
+      kind: "recovery-exhausted" as const,
+    }));
     for (;;) {
-      const outcome = await Promise.race([
-        turn.promise.then((result) => ({ kind: "result" as const, result })),
-        recoveryExhausted.promise.then(() => ({ kind: "recovery-exhausted" as const })),
-        stalledSubmission.promise.then(() => ({ kind: "stalled-submission" as const })),
-        recoveryFailure.promise.then((reason) => ({ kind: "recovery-failed" as const, reason })),
-      ]);
-      throwIfAborted(signal);
+      const outcome = await runner.waitForTurn(exhausted);
       if (outcome.kind === "recovery-failed") {
-        sessionPhase = outcome.reason;
+        runner.phase = outcome.reason;
         return await finalizeUnaccepted(
           outcome.reason === "interrupt-timeout"
             ? "The stalled session did not finish its interrupted turn within 30 seconds."
@@ -706,44 +645,15 @@ export async function runReviewGoal(
           true,
         );
       }
-      if (outcome.kind === "stalled-submission" || stalledSubmissionFinalization !== undefined) {
-        const acceptedSubmission = submission;
-        if (acceptedSubmission === undefined) {
-          throw new Error("The SDK session closed for stall recovery without an accepted review.");
-        }
-        activeMonitor.stop();
-        sessionPhase = "finalizing-accepted-submission";
-        if (stalledSubmissionFinalization !== undefined) await stalledSubmissionFinalization;
-        await finishSession();
-        throwIfAborted(signal);
-        writeAgentMonitorEvent(
-          goalIndex,
-          "submission-finalized",
-          acceptedSubmissionDetails(
-            activeMonitor.recoveryCount,
-            false,
-            undefined,
-            stalledMcpStatus,
-            false,
-          ),
-          logSecrets,
-        );
-        return withDiagnostics(
-          acceptedSubmissionResult(
-            goal,
-            acceptedSubmission,
-            stalledMcpStatus,
-            tokenUsageState.models,
-            false,
-          ),
-        );
+      if (outcome.kind === "accepted-after-grace") {
+        if (submission === undefined) throw new Error("The accepted review is unavailable.");
+        return await finalizeAccepted(submission, undefined);
       }
       if (outcome.kind === "recovery-exhausted") {
-        sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
-        return await finalizeUnaccepted(`Review recovery stopped: ${sessionPhase}.`, false);
+        runner.phase = recovery.exhaustionReason ?? "repair-exhausted";
+        return await finalizeUnaccepted(`Review recovery stopped: ${runner.phase}.`, false);
       }
-      const { result } = outcome;
-      const providerFailure = provider.failure(result);
+      const { result, providerFailure, interrupted } = outcome;
       const continueSweep = await delivery?.boundary();
       const claudeNativeTurns = activeSession.nativeModelTurns?.();
       if (
@@ -752,61 +662,22 @@ export async function runReviewGoal(
           (claudeNativeTurns === config.maxTurns && submission === undefined)) &&
         providerFailure === undefined
       ) {
-        sessionPhase = "max-turns-exhausted";
+        runner.phase = "max-turns-exhausted";
         return await finalizeUnaccepted(
           "The review reached the configured runtime turn limit.",
           tokenUsageState.latestSnapshotValid,
           submission !== undefined,
         );
       }
-      const interrupted = sessionState.stallBoundaryPending;
-      if (interrupted) {
-        activeMonitor.interruptedTurnFinished();
-        sessionState.stallBoundaryPending = false;
-      }
       if (interrupted && providerFailure === undefined) {
-        writeAgentMonitorEvent(
-          goalIndex,
-          "interrupted-turn-boundary",
-          {
-            recovery: activeMonitor.recoveryCount,
-            result_subtype: result.subtype,
-            submission_accepted: submission !== undefined,
-          },
-          logSecrets,
-        );
-        if (submission !== undefined) {
-          const acceptedSubmission = submission;
-          sessionPhase = "finalizing-interrupted-submission";
-          activeMonitor.stop();
-          const interruptedMcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
-          throwIfAborted(signal);
-          await finishSession();
-          throwIfAborted(signal);
-          writeAgentMonitorEvent(
-            goalIndex,
-            "submission-finalized",
-            acceptedSubmissionDetails(
-              activeMonitor.recoveryCount,
-              true,
-              result.subtype,
-              interruptedMcpStatus,
-              readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-            ),
-            logSecrets,
-          );
-          return withDiagnostics(
-            acceptedSubmissionResult(
-              goal,
-              acceptedSubmission,
-              interruptedMcpStatus,
-              tokenUsageState.models,
-              readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-            ),
-          );
-        }
+        writeMonitorEvent("interrupted-turn-boundary", {
+          recovery: runner.recoveryCount,
+          result_subtype: result.subtype,
+          submission_accepted: submission !== undefined,
+        });
+        if (submission !== undefined) return await finalizeAccepted(submission, result, true);
         if (result.subtype === "error_max_turns" || recovery.exhausted) {
-          sessionPhase =
+          runner.phase =
             result.subtype === "error_max_turns"
               ? "max-turns-exhausted"
               : (recovery.exhaustionReason ?? "repair-exhausted");
@@ -815,71 +686,38 @@ export async function runReviewGoal(
             tokenUsageState.latestSnapshotValid,
           );
         }
-        sessionPhase = "waiting-for-continuation-result";
+        runner.phase = "waiting-for-continuation-result";
         queueMessage(
           "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
-          `stall-continuation-${activeMonitor.recoveryCount}`,
+          `stall-continuation-${runner.recoveryCount}`,
         );
-        writeAgentMonitorEvent(
-          goalIndex,
-          "continuation-queued",
-          {
-            recovery: activeMonitor.recoveryCount,
-            interrupted_result_subtype: result.subtype,
-            repair_attempts: recovery.repairAttempts,
-          },
-          logSecrets,
-        );
+        writeMonitorEvent("continuation-queued", {
+          recovery: runner.recoveryCount,
+          interrupted_result_subtype: result.subtype,
+          repair_attempts: recovery.repairAttempts,
+        });
         continue;
       }
       if (providerFailure !== undefined) {
         recovery.finishProviderTurn();
-        const delay = submission === undefined ? provider.retryDelay(providerFailure) : undefined;
-        if (delay === undefined) {
-          sessionPhase =
-            providerFailure.retryable && submission === undefined
-              ? "provider-retries-exhausted"
-              : "provider-error";
+        const retry = await runner.retry(providerFailure);
+        if (retry !== "retry") {
+          runner.phase = retry;
           return await finalizeUnaccepted(
             providerFailure.message,
             tokenUsageState.latestSnapshotValid,
             true,
           );
         }
-        sessionPhase = "waiting-for-provider-retry";
-        activeMonitor.pause();
-        writeAgentMonitorEvent(
-          goalIndex,
-          "provider-retry",
-          {
-            retry: provider.retries,
-            max_retries: 2,
-            retry_delay_ms: delay,
-            error_status: providerFailure.status,
-            error: providerFailure.category,
-          },
-          logSecrets,
-        );
-        await waitForProviderRetry(delay, signal, accepted.promise);
-        throwIfAborted(signal);
-        activeMonitor.resume();
-        if (submission !== undefined) {
-          sessionPhase = "provider-error";
-          return await finalizeUnaccepted(
-            providerFailure.message,
-            tokenUsageState.latestSnapshotValid,
-            true,
-          );
-        }
-        sessionPhase = "waiting-for-continuation-result";
+        runner.phase = "waiting-for-continuation-result";
         queueMessage(
           "The model provider request failed temporarily. Continue the same review from the existing evidence and exact next calls in read_review_state, then submit through submit_review.",
-          `provider-retry-${provider.retries}`,
+          `provider-retry-${runner.providerDiagnostics.providerRetries}`,
         );
         continue;
       }
       if (result.subtype !== "success") {
-        sessionPhase =
+        runner.phase =
           result.subtype === "error_max_turns" ? "max-turns-exhausted" : "finalizing-failed-turn";
         return await finalizeUnaccepted(
           result.errors.join("; ") || `${config.executor ?? "claude"} returned ${result.subtype}.`,
@@ -887,40 +725,24 @@ export async function runReviewGoal(
           result.subtype !== "error_max_turns",
         );
       }
-      if (submission !== undefined) {
-        sessionPhase = "checking-mcp-status";
-        activeMonitor.stop();
-        const mcpStatus = await readAcceptedSubmissionMcpStatus(readMcpFailures);
-        throwIfAborted(signal);
-        await finishSession();
-        throwIfAborted(signal);
-        return withDiagnostics(
-          acceptedSubmissionResult(
-            goal,
-            submission,
-            mcpStatus,
-            tokenUsageState.models,
-            readerFailure === undefined && tokenUsageState.latestSnapshotValid,
-          ),
-        );
-      }
+      if (submission !== undefined) return await finalizeAccepted(submission, result);
       const nextContext = continueSweep ? delivery?.nextMessage() : undefined;
       if (nextContext !== undefined) {
         const message = makeUserMessage(nextContext.text);
-        input.push(nextContext.packet ? { ...message, client_composed: true } : message);
+        runner.prompts.push(nextContext.packet ? { ...message, client_composed: true } : message);
         continue;
       }
       recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
       const recoveryKind = recovery.finishTurn();
       if (recovery.exhausted) {
-        sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
+        runner.phase = recovery.exhaustionReason ?? "repair-exhausted";
         return await finalizeUnaccepted(
-          `Review recovery stopped: ${sessionPhase}.`,
+          `Review recovery stopped: ${runner.phase}.`,
           tokenUsageState.latestSnapshotValid,
         );
       }
       throwIfAborted(signal);
-      sessionPhase = "waiting-for-repair-result";
+      runner.phase = "waiting-for-repair-result";
       queueMessage(
         repairPrompt(
           recoveryKind === "inspection"
@@ -937,20 +759,20 @@ export async function runReviewGoal(
     }
   } catch (error) {
     if (
-      !sessionPhase.startsWith("provider-") &&
-      sessionPhase !== "interrupt-timeout" &&
-      sessionPhase !== "stall-recovery-exhausted"
+      !runner.phase.startsWith("provider-") &&
+      runner.phase !== "interrupt-timeout" &&
+      runner.phase !== "stall-recovery-exhausted"
     )
-      sessionPhase = "failed";
-    let failure = readerFailure?.message ?? errorMessage(error);
+      runner.phase = "failed";
+    let failure = runner.readerFailure?.message ?? errorMessage(error);
     try {
-      await finishSession();
+      await runner.close();
     } catch (cleanupError) {
       if (cleanupError !== error)
         failure += `; session cleanup failed: ${errorMessage(cleanupError)}`;
     }
     throwIfAborted(signal);
-    if (delivery !== undefined) failure = `Review stopped (${sessionPhase}).`;
+    if (delivery !== undefined) failure = `Review stopped (${runner.phase}).`;
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       write(agentLogLine(goalIndex, "session", "failure", "error", failure, logSecrets));
     });
@@ -968,17 +790,16 @@ export async function runReviewGoal(
       ),
     );
   } finally {
-    monitor?.stop();
+    runner.dispose();
+    if (runner.closed) confirmClosed?.();
     evidenceLedger.clearPendingNativeReads();
-    void closeSession();
-    signal?.removeEventListener("abort", abortTurn);
     writeAgentSessionEndLog(
       goalIndex,
       lifecycle,
       reviewPromptActive,
       recovery.repairAttempts,
       submission !== undefined,
-      monitor?.recoveryCount ?? 0,
+      runner.recoveryCount,
       logSecrets,
     );
     await runAgentCleanup(

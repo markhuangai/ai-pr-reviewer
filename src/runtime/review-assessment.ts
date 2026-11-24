@@ -281,6 +281,7 @@ export class ReviewEvidenceLedger {
   >();
   readonly coverage: ReviewCoverageTracker;
   private requiredBytes = 0;
+  private cachedInspectionProgress: number | undefined;
   uniqueSourceBytes = 0;
   uniqueNativeLines = 0;
   repeatedSourceBytes = 0;
@@ -323,6 +324,7 @@ export class ReviewEvidenceLedger {
     if (this.sequence !== 0 || source.identity !== this.checkpoint().identity)
       throw new Error("Shared evidence does not match this immutable review snapshot.");
     const state = structuredClone(source);
+    this.cachedInspectionProgress = undefined;
     this.sequence = state.sequence;
     for (const [key, value] of state.references) this.references.set(key, value);
     for (const [key, value] of state.delivered) this.delivered.set(key, value);
@@ -336,7 +338,8 @@ export class ReviewEvidenceLedger {
   }
 
   get inspectionProgress(): number {
-    return this.requiredBytes + reviewInspection(this.files, this.references).observedPaths.length;
+    return (this.cachedInspectionProgress ??=
+      this.requiredBytes + reviewInspection(this.files, this.references).observedPaths.length);
   }
 
   get inspection(): ReviewInspection {
@@ -487,6 +490,7 @@ export class ReviewEvidenceLedger {
   }
 
   confirmContextRanges(packetId: string, ranges: readonly ReviewSourceRange[]): void {
+    this.cachedInspectionProgress = undefined;
     this.deliveries = [];
     this.observeRanges(
       { kind: "repository_diff", ...this.snapshot },
@@ -506,6 +510,7 @@ export class ReviewEvidenceLedger {
     this.queries.clear();
     this.clearPendingNativeReads();
     this.requiredBytes = 0;
+    this.cachedInspectionProgress = 0;
     this.uniqueSourceBytes = 0;
     this.uniqueNativeLines = 0;
     this.repeatedSourceBytes = 0;
@@ -535,6 +540,7 @@ export class ReviewEvidenceLedger {
   }
 
   observeBatch(calls: readonly RepositoryReviewToolCall[]): readonly ReviewEvidenceReference[] {
+    this.cachedInspectionProgress = undefined;
     this.deliveries = [];
     const observed: ReviewEvidenceReference[] = [];
     const expired = new Set<string>();

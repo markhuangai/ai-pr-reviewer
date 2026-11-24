@@ -28,7 +28,11 @@ import {
 } from "./codex-test-helpers.js";
 import { makeReplayRepository, makeDiffFromSnapshots } from "./git-test-helpers.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { createDeferred, createReviewGoalsRunner } from "../src/runtime/agent-session.js";
+import {
+  createDeferred,
+  createReviewGoalsRunner,
+  type AgentQuery,
+} from "../src/runtime/agent-session.js";
 import { modelUsageSince } from "../src/runtime/shared-discovery.js";
 import { historyText } from "./codex-test-helpers.js";
 import { CodexSession } from "../src/runtime/codex-session.js";
@@ -448,6 +452,57 @@ test(
     assert.deepEqual(await readdir(temporary), []);
   },
 );
+
+test("discovery preserves cancellation and retains storage when close fails", async (t) => {
+  const temporary = await isolatedTemporaryRoot(t);
+  const repository = await makeReplayRepository(t);
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    repository.temporaryRoot,
+  );
+  t.after(() => diff.cleanup());
+  const controller = new AbortController();
+  const cancellation = new Error("Cancel discovery fixture");
+  const started = createDeferred<undefined>();
+  let closes = 0;
+  const queryAgent = (({ prompt }: Parameters<AgentQuery>[0]) => ({
+    async *[Symbol.asyncIterator]() {
+      assert.ok(typeof prompt !== "string");
+      const messages = prompt[Symbol.asyncIterator]();
+      await messages.next();
+      started.resolve(undefined);
+      await messages.next();
+      yield* [];
+    },
+    close: () => {
+      closes++;
+      throw new Error("Discovery fixture close failed");
+    },
+    interrupt: () => Promise.resolve(undefined),
+  })) as unknown as AgentQuery;
+  const running = runSharedDiscovery({
+    context: repository.context,
+    files: [file],
+    conversation: emptyConversation,
+    config: reviewConfig(),
+    diff,
+    cwd: repository.root,
+    queryAgent,
+    abortController: controller,
+    briefing,
+  });
+  const rejected = assert.rejects(running, (error: unknown) => error === cancellation);
+  await started.promise;
+  controller.abort(cancellation);
+  await rejected;
+  assert.equal(closes, 1);
+  assert.deepEqual(
+    (await readdir(temporary)).map((name) => name.startsWith("ai-pr-reviewer-discovery-")),
+    [true],
+  );
+});
 
 for (const executor of ["claude", "codex"] as const) {
   test(

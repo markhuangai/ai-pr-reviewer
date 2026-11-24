@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   HookCallback,
-  SDKResultMessage,
   SDKMessage,
   SDKActiveGoalMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -35,15 +34,8 @@ import {
   jsonToolResult,
   type PullRequestDiffArtifact,
 } from "./agent-review-tools.js";
-import {
-  PromptStream,
-  REVIEW_SYSTEM_PROMPT,
-  closeSdkSession,
-  createDeferred,
-  makeOptions,
-  makeUserMessage,
-  type AgentQuery,
-} from "./agent-session.js";
+import { REVIEW_SYSTEM_PROMPT, makeOptions, type AgentQuery } from "./agent-session.js";
+import { SessionRunner, createDeferred, makeUserMessage } from "./session-runner.js";
 import { ReviewEvidenceLedger } from "./review-assessment.js";
 import {
   ReviewQueryReaderStore,
@@ -56,11 +48,9 @@ import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snaps
 import {
   createReviewMcpServers,
   createReviewSession,
-  type ReviewSession,
   type ReviewSessionInput,
 } from "./review-session.js";
 import { tool, type ReviewTool } from "./review-tool.js";
-import { ProviderRecovery, waitForProviderRetry } from "./session-recovery.js";
 import { ReviewContextDelivery } from "./review-context-delivery.js";
 import type { SharedReviewContext } from "./review-context-packets.js";
 import { evidenceRefSchema } from "./review-evidence-schema.js";
@@ -206,33 +196,33 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
       : `${sharedContext.packets.length === 0 ? "The shared packet is unavailable; first call read_change_overview." : "Start from the shared packet."} Trace relevant callers, tests and earlier decisions using focused reads; no full source sweep is needed. Supply observations with host-issued source evidenceRefs and an explicit unknowns array.`;
   const startedAt = Date.now();
   const controller = new AbortController();
-  const cancel = () => {
-    controller.abort(input.abortController?.signal.reason);
-  };
-  input.abortController?.signal.addEventListener("abort", cancel, { once: true });
-  if (input.abortController?.signal.aborted) cancel();
   const signal = controller.signal;
-  const timedOut = new Error("Shared discovery exceeded its ten-minute deadline.");
-  const deadline = setTimeout(() => {
-    controller.abort(timedOut);
-  }, DISCOVERY_LIMITS.milliseconds);
+  const parentSignal = input.abortController?.signal;
+  const secrets = reviewSecretCandidates(config);
+  const log = (event: string, details: Readonly<Record<string, unknown>>): void => {
+    writeNamedSessionLifecycleLog("discovery", event, details, secrets);
+  };
+  const runner = new SessionRunner({
+    signal: parentSignal,
+    streamEnded: "Discovery ended before a terminal result.",
+    write: log,
+    deadline: {
+      controller,
+      milliseconds: DISCOVERY_LIMITS.milliseconds,
+      reason: new Error("Shared discovery exceeded its ten-minute deadline."),
+    },
+  });
   let sessionHome: string | undefined;
-  let session: ReviewSession | undefined;
-  let reader: Promise<void> | undefined;
   let sessionId: string | undefined;
   let map: string | undefined;
   let compactions = 0;
   let models: readonly ReviewModelUsage[] = [];
   let accountingComplete = false;
-  const provider = new ProviderRecovery();
   let termination = "failed";
-  let terminal = createDeferred<SDKResultMessage>();
-  const accepted = createDeferred<undefined>();
-  const interrupted = createDeferred<undefined>();
+  const interrupted = createDeferred<{ kind: "budget" }>();
   const budget = new DiscoveryReadBudget(() => {
-    interrupted.resolve(undefined);
+    interrupted.resolve({ kind: "budget" });
   });
-  const prompts = new PromptStream();
   const snapshot = new RepositorySnapshot(
     cwd,
     context.baseSha,
@@ -255,30 +245,28 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     signal,
     () => ledger.deliveryEpoch,
   );
-  const secrets = reviewSecretCandidates(config);
   let resourceCleanup: Promise<unknown> | undefined;
   const cleanupResources = () =>
     (resourceCleanup ??= Promise.all([...readers.cleanupOperations(), snapshot.cleanup()]));
-  const lifecycle = { closed: false };
-  let shutdown: Promise<void> | undefined;
+  const reportCleanupFailure = (event: string, error: unknown, storageRetained: boolean): void => {
+    log(event, {
+      session_id: sessionId,
+      outcome: "failed",
+      termination: parentSignal?.aborted ? "cancelled" : termination,
+      storage_retained: storageRetained,
+      error: sharedContext === undefined ? errorMessage(error) : "Discovery cleanup failed.",
+    });
+    throwIfAborted(parentSignal);
+  };
   const children = new Set<symbol>();
-  const close = async () => {
-    prompts.finish();
-    const active = session;
-    if (active !== undefined) await (shutdown ??= closeSdkSession(() => active.close(), reader));
-    lifecycle.closed = true;
-  };
-  const abort = () => {
-    terminal.reject(signal.reason ?? new Error("Shared discovery was cancelled."));
-  };
-  signal.addEventListener("abort", abort, { once: true });
   try {
     throwIfAborted(signal);
     const temp = process.env.RUNNER_TEMP?.trim() || tmpdir();
     await mkdir(temp, { recursive: true });
     if (isWithinRepository(await realpath(cwd), await realpath(temp)))
       throw new Error("Shared discovery storage must be outside the reviewed checkout.");
-    sessionHome = await mkdtemp(join(temp, "ai-pr-reviewer-discovery-"));
+    const discoveryHome = await mkdtemp(join(temp, "ai-pr-reviewer-discovery-"));
+    sessionHome = discoveryHome;
     const guidance =
       sharedContext === undefined
         ? (briefing.repositoryGuidance ?? (await repositoryGuidanceForRun(diff, snapshot, files)))
@@ -405,7 +393,7 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
             content: [{ type: "text", text: "The full handoff must fit in 8 KiB." }],
           };
         map = handoff;
-        accepted.resolve(undefined);
+        runner.acceptOutput();
         return Promise.resolve({
           content: [{ type: "text", text: "Discovery change map accepted. Stop now." }],
           _meta: { "claude/endTurn": true },
@@ -500,39 +488,30 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     );
     options.tools = [];
     options.allowedTools = tools.map((definition) => "mcp__review_output__" + definition.name);
-    session = createReviewSession(queryAgent, {
-      config: discoveryConfig,
-      cwd,
-      prompt: prompts,
-      options,
-      tools,
-      outputServerName: "review_output",
-      sessionHome,
-      isAccepted: () => map !== undefined,
-      ...(delivery === undefined ? {} : { contextDelivery: delivery }),
-    });
-    const activeSession = session;
-    reader = (async () => {
-      try {
-        for await (const message of activeSession) {
-          provider.observe(message);
-          if (message.type === "system" && message.subtype === "init")
-            sessionId = message.session_id;
-          if (message.type === "system" && message.subtype === "compact_boundary") compactions++;
-          if (message.type === "result") {
-            const latest = modelUsageSnapshot(message.modelUsage);
-            accountingComplete = modelUsageSince(latest, models) !== undefined;
-            if (latest !== undefined && accountingComplete) models = latest;
-            if (provider.failure(message) !== undefined) accountingComplete = false;
-            terminal.resolve(message);
-          }
-        }
-        if (!lifecycle.closed)
-          terminal.reject(new Error("Discovery ended before a terminal result."));
-      } catch (error) {
-        terminal.reject(error);
-      }
-    })();
+    runner.start(
+      (prompt) =>
+        createReviewSession(queryAgent, {
+          config: discoveryConfig,
+          cwd,
+          prompt,
+          options,
+          tools,
+          outputServerName: "review_output",
+          sessionHome: discoveryHome,
+          isAccepted: () => map !== undefined,
+          ...(delivery === undefined ? {} : { contextDelivery: delivery }),
+        }),
+      (message, failure) => {
+        if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+        if (message.type === "system" && message.subtype === "compact_boundary") compactions++;
+        if (message.type !== "result") return;
+        const latest = modelUsageSnapshot(message.modelUsage);
+        accountingComplete = modelUsageSince(latest, models) !== undefined;
+        if (latest !== undefined && accountingComplete) models = latest;
+        if (failure !== undefined) accountingComplete = false;
+        return undefined;
+      },
+    );
     let wrapping = false;
     const hostRounds = config.executor === "codex" ? normalTurns : 1;
     let continuation: string | undefined;
@@ -546,7 +525,7 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
           { reads_allowed: false },
           secrets,
         );
-      prompts.push(
+      runner.prompts.push(
         makeUserMessage(
           continuation ??
             (turn === 0
@@ -555,54 +534,24 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
         ),
       );
       continuation = undefined;
-      const outcome = await Promise.race([
-        terminal.promise.then((value) => ({ kind: "result" as const, value })),
-        ...(wrapping || config.executor !== "codex"
-          ? []
-          : [interrupted.promise.then(() => ({ kind: "budget" as const }))]),
-      ]);
-      let result: SDKResultMessage;
+      let outcome = await runner.waitForTurn(
+        wrapping || config.executor !== "codex" ? undefined : interrupted.promise,
+      );
       if (outcome.kind === "budget") {
         wrapping = true;
-        const interruptedTurn = terminal;
-        void activeSession.interrupt().catch((error: unknown) => {
-          interruptedTurn.reject(error);
-        });
-        result = await interruptedTurn.promise;
-      } else result = outcome.value;
-      throwIfAborted(signal);
-      const failure = provider.failure(result);
-      if (failure !== undefined) {
-        const delay = map === undefined ? provider.retryDelay(failure) : undefined;
-        if (delay === undefined) {
-          termination =
-            failure.retryable && map === undefined
-              ? "provider-retries-exhausted"
-              : "provider-error";
-          throw new Error("Discovery failed: " + failure.message);
-        }
-        writeNamedSessionLifecycleLog(
-          "discovery",
-          "provider-retry",
-          {
-            retry: provider.retries,
-            max_retries: 2,
-            retry_delay_ms: delay,
-            error_status: failure.status,
-            error: failure.category,
-          },
-          secrets,
-        );
-        await waitForProviderRetry(delay, signal, accepted.promise);
-        throwIfAborted(signal);
-        if (map !== undefined) {
-          termination = "provider-error";
-          throw new Error("Discovery failed: " + failure.message);
+        outcome = await runner.interruptAndWait();
+      }
+      if (outcome.kind !== "result") throw new Error("Discovery ended without a terminal result.");
+      const { result, providerFailure } = outcome;
+      if (providerFailure !== undefined) {
+        const retry = await runner.retry(providerFailure);
+        if (retry !== "retry") {
+          termination = retry;
+          throw new Error("Discovery failed: " + providerFailure.message);
         }
         continuation = budget.exhausted
           ? "The provider is available for another attempt. Finish the change map using only evidence already delivered; no further reads are allowed. Call finish_discovery now."
           : "The provider request failed temporarily. Continue orientation from evidence already delivered, respecting the remaining read budget, then call finish_discovery.";
-        terminal = createDeferred<SDKResultMessage>();
         continue;
       }
       if (result.subtype !== "success" && result.subtype !== "error_max_turns")
@@ -611,8 +560,9 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
         if (sessionId === undefined)
           throw new Error("Discovery returned no resumable session identity.");
         await delivery?.boundary();
-        await close();
+        await runner.close();
         await cleanupResources();
+        throwIfAborted(signal);
         const retainedHome = sessionHome;
         const report: DiscoveryResult = {
           status: "completed",
@@ -655,7 +605,6 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
         };
       }
       turn = result.subtype === "error_max_turns" && !finishingOnly ? hostRounds : turn + 1;
-      terminal = createDeferred<SDKResultMessage>();
     }
     termination = "finish-exhausted";
     throw new Error(
@@ -664,18 +613,27 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
   } catch (error) {
     let failure = errorMessage(error);
     try {
-      await close();
+      await runner.close();
     } catch (closeError) {
-      failure += "; cleanup failed: " + errorMessage(closeError);
+      if (closeError !== error) failure += "; cleanup failed: " + errorMessage(closeError);
     }
     if (sharedContext !== undefined) failure = `Discovery stopped (${termination}).`;
-    if (!lifecycle.closed && session !== undefined)
+    if (runner.hasSession && !runner.closed) {
+      reportCleanupFailure("cleanup", failure, true);
       throw new Error(
         failure + "; discovery storage retained because parent shutdown is unproven.",
         { cause: error },
       );
-    if (sessionHome !== undefined) await rm(sessionHome, { recursive: true, force: true });
-    throwIfAborted(input.abortController?.signal);
+    }
+    if (sessionHome !== undefined) {
+      try {
+        await rm(sessionHome, { recursive: true, force: true });
+      } catch (cleanupError) {
+        reportCleanupFailure("storage-cleanup", cleanupError, true);
+        throw cleanupError;
+      }
+    }
+    throwIfAborted(parentSignal);
     const report: DiscoveryResult = {
       status: "failed",
       error: failure,
@@ -691,10 +649,11 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     writeNamedSessionLifecycleLog("discovery", "result", report, secrets);
     return { result: report, cleanup: () => Promise.resolve() };
   } finally {
-    clearTimeout(deadline);
-    signal.removeEventListener("abort", abort);
-    input.abortController?.signal.removeEventListener("abort", cancel);
-    await cleanupResources();
+    runner.dispose();
+    await cleanupResources().catch((error: unknown) => {
+      reportCleanupFailure("resource-cleanup", error, runner.hasSession && !runner.closed);
+      throw error;
+    });
   }
 }
 

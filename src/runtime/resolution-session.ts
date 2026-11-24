@@ -6,8 +6,6 @@ import {
   type HookCallback,
   type McpServerConfig,
   type Options,
-  type SDKActiveGoalMessage,
-  type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -18,23 +16,13 @@ import type { ReviewLifecycleThreadRecord } from "../lib/github-review-lifecycle
 import { reviewSecretCandidates } from "../lib/input.js";
 import { redact } from "../lib/redaction.js";
 import type { PullRequestContext, ReviewConfig } from "../lib/types.js";
-import {
-  errorMessage,
-  isRecord,
-  sdkSessionActivity,
-  writeNamedSessionLifecycleLog,
-} from "./agent-logging.js";
+import { errorMessage, isRecord, writeNamedSessionLifecycleLog } from "./agent-logging.js";
 import { repositoryReadHook } from "./agent-review-tools.js";
-import {
-  PromptStream,
-  SDK_SESSION_STALL_MS,
-  SdkSessionMonitor,
-  closeSdkSession,
-  makeUserMessage,
-  safeAgentEnvironment,
-} from "./agent-session.js";
+import { safeAgentEnvironment } from "./agent-session.js";
+import { SDK_SESSION_STALL_MS, type ProviderFailure } from "./session-recovery.js";
+import { SessionRunner, makeUserMessage } from "./session-runner.js";
 import { tool, toClaudeTool } from "./review-tool.js";
-import { createReviewSession, type ReviewSession } from "./review-session.js";
+import { createReviewSession } from "./review-session.js";
 import { RepositorySnapshot } from "./repository-snapshot.js";
 import { ReviewQueryReaderStore } from "./review-context-tools.js";
 import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
@@ -149,23 +137,6 @@ function resolutionReadEvidenceHook(targetPath: string, evidence: { read: boolea
   };
 }
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolvePromise: (value: T) => void = () => undefined;
-  let rejectPromise: (error: unknown) => void = () => undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  void promise.catch(() => undefined);
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
-}
-
 function optionsForResolution(
   config: ReviewConfig,
   cwd: string,
@@ -278,7 +249,7 @@ export async function verifyResolution(
         });
       }
       resolution = parsed.data;
-      monitor?.acceptSubmission();
+      runner.acceptOutput();
       return Promise.resolve({ content: [{ type: "text", text: "Resolution accepted." }] });
     },
     { alwaysLoad: true },
@@ -326,240 +297,130 @@ export async function verifyResolution(
     tools: resolutionTools.map(toClaudeTool),
     alwaysLoad: true,
   });
-  const input = new PromptStream();
-  let resultTurn = deferred<SDKResultMessage>();
-  let reader: Promise<void> | undefined;
-  let readerFailure: Error | undefined;
-  let session: ReviewSession | undefined;
-  let monitor: SdkSessionMonitor | undefined;
-  let sessionPhase = "starting";
   let repairAttempts = 0;
-  const sessionState = {
-    stallBoundaryPending: false,
-    expectedSessionClose: false,
-    finalizing: false,
-  };
-  let sessionClosed = false;
-  let closedOperation: void | Promise<void>;
   let sessionId: string | undefined;
-  let activeGoal = false;
   let activeGoalReason: string | undefined;
-  const stalledResolution = deferred<undefined>();
+  let activeGoal = false;
   const sessionLabel = `resolution ${verifierIndex + 1}`;
-  let writeMonitorEvent: (event: string, details: Readonly<Record<string, unknown>>) => void = () =>
-    undefined;
-  const closeSession = (): void | Promise<void> => {
-    if (session === undefined || sessionClosed) return closedOperation;
-    sessionClosed = true;
-    return (closedOperation = session.close());
+  const writeMonitorEvent = (event: string, details: Readonly<Record<string, unknown>>): void => {
+    try {
+      writeNamedSessionLifecycleLog(sessionLabel, event, details, logSecrets);
+    } catch {
+      // Diagnostic logging must not change a verifier result.
+    }
   };
-  let shutdown: Promise<void> | undefined;
-  const finishSession = async (): Promise<void> => {
-    monitor?.stop();
-    sessionState.expectedSessionClose = true;
-    input.finish();
-    await (shutdown ??= closeSdkSession(closeSession, reader));
-    if (readerFailure !== undefined) throw readerFailure;
-  };
-  const abortTurn = (): void => {
-    input.finish();
-    resultTurn.reject(signal?.reason ?? new Error("Resolution verification was cancelled."));
-  };
-  signal?.addEventListener("abort", abortTurn, { once: true });
-  if (signal?.aborted) abortTurn();
-  try {
-    throwIfAborted(signal);
-    session = createReviewSession(queryAgent, {
-      config,
-      cwd,
-      tools: resolutionTools,
-      outputServerName: "resolution_output",
-      isAccepted: () => resolution !== undefined,
-      ...(snapshot === undefined
-        ? {}
-        : {
-            cleanup: async () => {
-              await Promise.all([...readers.cleanupOperations(), snapshot.cleanup()]);
-            },
-          }),
-      prompt: input,
-      options: optionsForResolution(
-        config,
-        cwd,
-        abortController,
-        outputServer,
-        resolutionReadEvidenceHook(safeThread.path, readEvidence),
-      ),
-    });
-    const activeSession = session;
-    writeMonitorEvent = (event: string, details: Readonly<Record<string, unknown>>): void => {
-      try {
-        writeNamedSessionLifecycleLog(sessionLabel, event, details, logSecrets);
-      } catch {
-        // Diagnostic logging must not change a verifier result.
-      }
-    };
-    const finalizeResolution = (): void => {
-      if (sessionState.finalizing) return;
-      sessionState.finalizing = true;
-      sessionState.expectedSessionClose = true;
-      input.finish();
-      stalledResolution.resolve(undefined);
-      writeMonitorEvent("interrupt-started", { verdict_accepted: true });
-      void Promise.resolve()
-        .then(() => activeSession.interrupt())
-        .then(
-          () => {
-            writeMonitorEvent("interrupt-finished", { verdict_accepted: true });
-          },
-          (error: unknown) => {
-            writeMonitorEvent("interrupt-failed", { error: errorMessage(error) });
-          },
-        );
-    };
-    const activeMonitor = new SdkSessionMonitor({
+  const runner: SessionRunner = new SessionRunner({
+    signal,
+    streamEnded: "The verifier session ended before returning a result.",
+    write: writeMonitorEvent,
+    watchdog: {
+      kind: "resolution",
       snapshot: () => ({
-        phase: sessionPhase,
+        phase: runner.phase,
         verdict_accepted: resolution !== undefined,
-        awaiting_interrupted_turn_boundary: sessionState.stallBoundaryPending,
+        awaiting_interrupted_turn_boundary: runner.awaitingInterruptedTurn,
         session_id: sessionId,
         active_goal: activeGoal,
         ...(activeGoalReason === undefined ? {} : { active_goal_reason: activeGoalReason }),
         repair_attempts: repairAttempts,
       }),
-      write: writeMonitorEvent,
-      onSubmissionDeadline: finalizeResolution,
-      onStall: (stall) => {
-        if (resolution !== undefined) {
-          finalizeResolution();
-          return;
-        }
-        sessionPhase = "interrupting-stalled-turn";
-        writeMonitorEvent("interrupt-started", {
-          recovery: stall.recovery,
-          elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs,
-          verdict_accepted: false,
-        });
-        sessionState.stallBoundaryPending = true;
-        sessionPhase = "waiting-for-interrupted-turn-boundary";
-        void activeSession
-          .interrupt()
-          .then(() => {
-            writeMonitorEvent("interrupt-finished", { recovery: stall.recovery });
-          })
-          .catch((error: unknown) => {
-            writeMonitorEvent("interrupt-failed", {
-              recovery: stall.recovery,
-              error: errorMessage(error),
-            });
-          });
-      },
+    },
+  });
+  const failProvider = (failure: ProviderFailure, subtype: SDKResultMessage["subtype"]): never => {
+    runner.phase = "provider-error";
+    writeMonitorEvent("provider-error", {
+      result_subtype: subtype,
+      category: failure.category,
+      error_status: failure.status,
+      retryable: failure.retryable,
+      verdict_accepted: resolution !== undefined,
     });
-    monitor = activeMonitor;
-    activeMonitor.start();
-    sessionPhase = "waiting-for-sdk-message";
-    reader = (async () => {
-      try {
-        for await (const message of activeSession as AsyncIterable<
-          SDKMessage | SDKActiveGoalMessage
-        >) {
-          activeMonitor.observe(sdkSessionActivity(message));
-          if (message.type === "system" && message.subtype === "init") {
-            sessionId = message.session_id;
-          }
-          if (message.type === "active_goal") {
-            if (message.value === null) {
-              activeGoal = false;
-              activeGoalReason = undefined;
-            } else {
-              activeGoal = true;
-              if (message.value.last_reason === undefined) activeGoalReason = undefined;
-              else activeGoalReason = message.value.last_reason;
-            }
-            writeMonitorEvent(message.value === null ? "goal-cleared" : "goal-iteration", {
-              active_goal: activeGoal,
-              ...(activeGoalReason === undefined ? {} : { active_goal_reason: activeGoalReason }),
-              ...(message.value === null ? {} : { iterations: message.value.iterations }),
-            });
-          }
-          if (message.type === "result") {
-            if (resolution !== undefined) activeMonitor.stop();
-            const completedTurn = resultTurn;
-            resultTurn = deferred<SDKResultMessage>();
-            completedTurn.resolve(message);
-          }
-        }
-      } catch (error) {
-        readerFailure = error instanceof Error ? error : new Error(errorMessage(error));
-        resultTurn.reject(readerFailure);
-      } finally {
-        if (!sessionState.expectedSessionClose && readerFailure === undefined) {
-          resultTurn.reject(new Error("The verifier session ended before returning a result."));
-        }
-      }
-    })();
-    const initial = makeUserMessage(resolutionPrompt(context, safeThread));
-    input.push(initial);
-    sessionPhase = "waiting-for-turn-result";
-    for (;;) {
-      const outcome = await Promise.race([
-        resultTurn.promise.then((result) => ({ kind: "result" as const, result })),
-        stalledResolution.promise.then(() => ({ kind: "stalled-resolution" as const })),
-      ]);
-      throwIfAborted(signal);
-      if (outcome.kind === "stalled-resolution" || sessionState.finalizing) {
-        const acceptedResolution = resolution;
-        if (acceptedResolution === undefined) {
-          throw new Error(
-            "The SDK verifier closed for stall recovery without an accepted verdict.",
-          );
-        }
-        await finishSession();
-        throwIfAborted(signal);
-        writeMonitorEvent("verdict-finalized", {
-          recovery: activeMonitor.recoveryCount,
-          terminal_sdk_result: false,
+    throw new Error(failure.message);
+  };
+  const finalizeVerdict = async (
+    accepted: ResolutionInput,
+    terminal?: SDKResultMessage,
+  ): Promise<ResolutionVerification> => {
+    await runner.close();
+    throwIfAborted(signal);
+    const failure = runner.acceptedProviderFailure;
+    if (failure !== undefined) failProvider(failure.failure, failure.subtype);
+    writeMonitorEvent("verdict-finalized", {
+      recovery: runner.recoveryCount,
+      terminal_sdk_result: terminal !== undefined,
+      terminal_sdk_result_subtype: terminal?.subtype,
+    });
+    return { status: "completed", ...accepted };
+  };
+  try {
+    runner.start(
+      (prompt) =>
+        createReviewSession(queryAgent, {
+          config,
+          cwd,
+          tools: resolutionTools,
+          outputServerName: "resolution_output",
+          isAccepted: () => resolution !== undefined,
+          ...(snapshot === undefined
+            ? {}
+            : {
+                cleanup: async () => {
+                  await Promise.all([...readers.cleanupOperations(), snapshot.cleanup()]);
+                },
+              }),
+          prompt,
+          options: optionsForResolution(
+            config,
+            cwd,
+            abortController,
+            outputServer,
+            resolutionReadEvidenceHook(safeThread.path, readEvidence),
+          ),
+        }),
+      (message) => {
+        if (message.type === "system" && message.subtype === "init") sessionId = message.session_id;
+        if (message.type !== "active_goal") return;
+        activeGoal = message.value !== null;
+        activeGoalReason = message.value?.last_reason;
+        writeMonitorEvent(activeGoal ? "goal-iteration" : "goal-cleared", {
+          active_goal: activeGoal,
+          ...(activeGoalReason === undefined ? {} : { active_goal_reason: activeGoalReason }),
+          ...(message.value === null ? {} : { iterations: message.value.iterations }),
         });
-        return {
-          status: "completed",
-          verdict: acceptedResolution.verdict,
-          confidence: acceptedResolution.confidence,
-          rationale: acceptedResolution.rationale,
-        };
+        return undefined;
+      },
+    );
+    throwIfAborted(signal);
+    runner.prompts.push(makeUserMessage(resolutionPrompt(context, safeThread)));
+    runner.phase = "waiting-for-turn-result";
+    for (;;) {
+      const outcome = await runner.waitForTurn();
+      if (outcome.kind === "recovery-failed") throw new Error(outcome.reason);
+      if (outcome.kind === "accepted-after-grace") {
+        if (resolution === undefined)
+          throw new Error("The accepted verifier verdict is unavailable.");
+        return await finalizeVerdict(resolution);
       }
-      const { result } = outcome;
-      if (sessionState.stallBoundaryPending) {
-        sessionState.stallBoundaryPending = false;
+      const { result, providerFailure, interrupted } = outcome;
+      if (providerFailure !== undefined) failProvider(providerFailure, result.subtype);
+      if (interrupted) {
         writeMonitorEvent("interrupted-turn-boundary", {
-          recovery: activeMonitor.recoveryCount,
+          recovery: runner.recoveryCount,
           result_subtype: result.subtype,
           verdict_accepted: resolution !== undefined,
         });
         if (resolution !== undefined) {
-          const acceptedResolution = resolution;
-          sessionPhase = "finalizing-interrupted-verdict";
-          await finishSession();
-          throwIfAborted(signal);
-          writeMonitorEvent("verdict-finalized", {
-            recovery: activeMonitor.recoveryCount,
-            terminal_sdk_result: true,
-            terminal_sdk_result_subtype: result.subtype,
-          });
-          return {
-            status: "completed",
-            verdict: acceptedResolution.verdict,
-            confidence: acceptedResolution.confidence,
-            rationale: acceptedResolution.rationale,
-          };
+          runner.phase = "finalizing-interrupted-verdict";
+          return await finalizeVerdict(resolution, result);
         }
-        sessionPhase = "waiting-for-continuation-result";
-        input.push(
+        runner.phase = "waiting-for-continuation-result";
+        runner.prompts.push(
           makeUserMessage(
             `The previous turn was interrupted after ${SDK_SESSION_STALL_MS} ms without an SDK message. Continue the same resolution verification from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.`,
           ),
         );
         writeMonitorEvent("continuation-queued", {
-          recovery: activeMonitor.recoveryCount,
+          recovery: runner.recoveryCount,
           interrupted_result_subtype: result.subtype,
           repair_attempts: repairAttempts,
         });
@@ -573,71 +434,39 @@ export async function verifyResolution(
           resolution !== undefined
         )
       ) {
-        await finishSession();
-        throwIfAborted(signal);
-        writeMonitorEvent("failure", {
-          phase: sessionPhase,
-          result_subtype: result.subtype,
-          error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
-        });
-        return {
-          status: "failed",
-          error: result.errors.join("; ") || `Claude returned ${result.subtype}.`,
-        };
+        const executor = config.executor === "codex" ? "Codex" : "Claude";
+        throw new Error(result.errors.join("; ") || `${executor} returned ${result.subtype}.`);
       }
-      if (resolution !== undefined) {
-        await finishSession();
-        throwIfAborted(signal);
-        return {
-          status: "completed",
-          verdict: resolution.verdict,
-          confidence: resolution.confidence,
-          rationale: resolution.rationale,
-        };
-      }
-      if (repairAttempts >= MAX_RESOLUTION_REPAIR_ATTEMPTS) {
-        await finishSession();
-        throwIfAborted(signal);
-        writeMonitorEvent("failure", {
-          phase: sessionPhase,
-          error: "The verifier did not submit a resolution verdict.",
-        });
-        return { status: "failed", error: "The verifier did not submit a resolution verdict." };
-      }
+      if (resolution !== undefined) return await finalizeVerdict(resolution, result);
+      if (repairAttempts >= MAX_RESOLUTION_REPAIR_ATTEMPTS)
+        throw new Error("The verifier did not submit a resolution verdict.");
       repairAttempts += 1;
-      sessionPhase = "waiting-for-repair-result";
-      input.push(makeUserMessage(resolutionRepairPrompt(repairAttempts)));
+      runner.phase = "waiting-for-repair-result";
+      runner.prompts.push(makeUserMessage(resolutionRepairPrompt(repairAttempts)));
     }
   } catch (error) {
-    let failure = readerFailure?.message ?? errorMessage(error);
+    let failure = runner.readerFailure?.message ?? errorMessage(error);
     try {
-      await finishSession();
+      await runner.close();
     } catch (cleanupError) {
       if (cleanupError !== error)
         failure += `; session cleanup failed: ${errorMessage(cleanupError)}`;
     }
     throwIfAborted(signal);
     writeMonitorEvent("failure", {
-      phase: sessionPhase,
+      phase: runner.phase,
       error: failure,
     });
-    return {
-      status: "failed",
-      error: failure,
-    };
+    return { status: "failed", error: failure };
   } finally {
-    sessionState.expectedSessionClose = true;
-    monitor?.stop();
-    input.finish();
-    void closeSession();
-    signal?.removeEventListener("abort", abortTurn);
-    writeMonitorEvent("cleanup", { outcome: "success" });
+    runner.dispose();
+    writeMonitorEvent("cleanup", { outcome: runner.closed ? "success" : "failed" });
     writeMonitorEvent("end", {
-      phase: sessionPhase,
+      phase: runner.phase,
       session_id: sessionId,
       verdict_accepted: resolution !== undefined,
       repair_attempts: repairAttempts,
-      stall_recoveries: monitor?.recoveryCount ?? 0,
+      stall_recoveries: runner.recoveryCount,
     });
   }
 }

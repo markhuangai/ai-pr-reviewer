@@ -777,6 +777,8 @@ test("bounds verifier completion while preserving failures and cancellation", as
   for (const mode of [
     "activity",
     "provider-failure",
+    "provider-error-success-subtype",
+    "provider-error-during-close",
     "reader-timeout",
     "reader-failure",
     "natural-reader-failure",
@@ -796,8 +798,18 @@ test("bounds verifier completion while preserving failures and cancellation", as
       const controller = new AbortController();
       let closes = 0;
       let interrupts = 0;
-      const natural = mode === "provider-failure" || mode === "natural-reader-failure";
+      const natural =
+        mode === "provider-failure" ||
+        mode === "provider-error-success-subtype" ||
+        mode === "natural-reader-failure";
       const readerFails = mode.endsWith("reader-failure") || mode === "cancellation";
+      const providerError = {
+        ...resolutionResult(1),
+        subtype: "success",
+        is_error: true,
+        api_error_status: 503,
+        result: "Model provider unavailable",
+      } as SDKResultMessage;
       const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
         async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage | SDKActiveGoalMessage> {
           const messages = input.prompt[Symbol.asyncIterator]();
@@ -826,13 +838,18 @@ test("bounds verifier completion while preserving failures and cancellation", as
             observed.resolve(undefined);
           }
           if (natural) {
-            yield resolutionResult(
-              1,
-              mode === "provider-failure" ? "error_during_execution" : "success",
-            );
+            if (mode === "provider-error-success-subtype") {
+              yield providerError;
+            } else {
+              yield resolutionResult(
+                1,
+                mode === "provider-failure" ? "error_during_execution" : "success",
+              );
+            }
             terminal.resolve(undefined);
           }
           await closed.promise;
+          if (mode === "provider-error-during-close") yield providerError;
           assert.equal((await messages.next()).done, true);
           if (readerFails) throw new Error("verifier reader failed during shutdown");
         },
@@ -880,11 +897,13 @@ test("bounds verifier completion while preserving failures and cancellation", as
         ? /verifier reader failed during shutdown/u
         : mode === "provider-failure"
           ? /interrupted 1/u
-          : mode === "reader-timeout"
-            ? /reader did not stop within 5000 ms/u
-            : mode === "close-failure"
-              ? /verifier close failed/u
-              : undefined;
+          : mode === "provider-error-success-subtype" || mode === "provider-error-during-close"
+            ? /Model provider unavailable/u
+            : mode === "reader-timeout"
+              ? /reader did not stop within 5000 ms/u
+              : mode === "close-failure"
+                ? /verifier close failed/u
+                : undefined;
       assert.equal(result.status, expectedError === undefined ? "completed" : "failed");
       if (expectedError !== undefined) assert.match(result.error ?? "", expectedError);
       else
