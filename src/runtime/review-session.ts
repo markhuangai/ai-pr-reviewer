@@ -42,7 +42,7 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
   if (input.config.executor === "codex") return new CodexSession(input);
   const delivery = input.contextDelivery;
   const boundedGoal = delivery !== undefined && input.forkFrom !== undefined;
-  const forkReady = createDeferred<undefined>();
+  const forkReady = createDeferred<boolean>();
   const responseIds = new Set<string>();
   async function* withContext(): AsyncGenerator<SDKUserMessage> {
     let first = true;
@@ -51,8 +51,10 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
         first = false;
         if (boundedGoal) {
           yield { ...message, shouldQuery: false };
-          await Promise.race([forkReady.promise, wait(3_000, undefined, { ref: false })]);
+          const ready = await Promise.race([forkReady.promise, wait(3_000, true, { ref: false })]);
+          if (!ready || closing || input.options.abortController?.signal.aborted) return;
           await delivery.refresh();
+          if (closing || input.options.abortController?.signal.aborted) return;
           const packet = delivery.stage();
           if (packet !== undefined)
             yield { ...makeUserMessage(packet.text), client_composed: true, shouldQuery: false };
@@ -172,7 +174,7 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
         if (message.type === "system" && message.subtype === "init")
           delivery?.history.attach({ sessionId: message.session_id, executor: "claude" });
         if (boundedGoal && message.type === "result" && message.num_turns === 0)
-          forkReady.resolve(undefined);
+          forkReady.resolve(message.subtype === "success" && !message.is_error);
         if (
           boundedGoal &&
           message.type === "assistant" &&
@@ -189,6 +191,7 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
     close: () =>
       (shutdown ??= (async () => {
         closing = true;
+        forkReady.resolve(false);
         session.close();
         // The SDK's seven-second kill fallback exceeds the host's five-second closure deadline.
         const kill = setTimeout(() => {
