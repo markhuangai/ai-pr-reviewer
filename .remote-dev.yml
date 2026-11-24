@@ -1,0 +1,4 @@
+allowed-actors: [Z-M-Huang]
+user-level-md-url: https://raw.githubusercontent.com/Z-M-Huang/golden-CLAUDE.md/2672323b1e53aef19fae939dc9bd258397db9ef8/CLAUDE.md
+auto-continue: true
+max-continuations: 3
