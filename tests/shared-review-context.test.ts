@@ -49,7 +49,7 @@ const file: ChangedFile = {
 };
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 
-function providerPackets(body: Record<string, unknown>): Record<string, unknown>[] {
+function providerPacketMessages(body: Record<string, unknown>) {
   const messages = body.messages ?? body.input;
   if (!Array.isArray(messages)) return [];
   const packets = messages.flatMap((message: unknown) => {
@@ -62,15 +62,19 @@ function providerPackets(body: Record<string, unknown>): Record<string, unknown>
       const packet: unknown = JSON.parse(text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
       assert.ok(isRecord(packet) && Array.isArray(packet.pages));
       assert.ok(packet.pages.length <= 4);
-      return [packet];
+      return [{ packet, text }];
     });
   });
   assert.equal(
-    new Set(packets.map(({ id }) => id)).size,
+    new Set(packets.map(({ text }) => text)).size,
     packets.length,
     "Native input must not contain duplicate shared packets.",
   );
   return packets;
+}
+
+function providerPackets(body: Record<string, unknown>): Record<string, unknown>[] {
+  return providerPacketMessages(body).map(({ packet }) => packet);
 }
 
 function digestRanges(ranges: readonly ReviewSourceRange[]): string {
@@ -423,6 +427,84 @@ for (const executor of ["claude", "codex"] as const) {
 
 for (const executor of ["claude", "codex"] as const) {
   test(
+    `real ${executor} fork receives its first packet when discovery retained no raw source`,
+    { timeout: 120_000 },
+    async (t) => {
+      await isolatedTemporaryRoot(t);
+      const repository = await makeReplayRepository(t);
+      const labels = ["REPLAY_FORK_ALPHA", "REPLAY_FORK_BETA"];
+      const arrived = new Set<string>();
+      const upstream = await modelFixture(t, ({ body }) => {
+        const history = historyText(body);
+        const packets = providerPackets(body);
+        const goal = labels.find((label) => history.includes(label));
+        if (goal === undefined) {
+          assert.deepEqual(
+            packets,
+            [],
+            "The parent must have no raw packets for the fork to inherit.",
+          );
+          return history.includes("Discovery change map accepted.")
+            ? { text: "Orientation complete." }
+            : {
+                tool: "finish_discovery",
+                args: { changeMap: "The source must be reviewed in each fork." },
+              };
+        }
+        assert.equal(
+          packets.length,
+          1,
+          "The child must receive the missing packet at activation, exactly once.",
+        );
+        arrived.add(goal);
+        return history.includes("Review submission accepted.")
+          ? { text: "Review complete." }
+          : {
+              tool: "submit_review",
+              args: {
+                summary: "Reviewed the source independently.",
+                findings: [],
+                limitations: [],
+              },
+            };
+      });
+      const runner = createReviewGoalsRunner(
+        runReviewGoal,
+        query,
+        async ({ sharedContext, ...input }) => {
+          assert.ok(sharedContext);
+          const result = await runSharedDiscovery(input);
+          assert.ok(result.seed);
+          return { ...result, seed: { ...result.seed, sharedContext } };
+        },
+      );
+      const run = await runner(
+        repository.context,
+        [file],
+        emptyConversation,
+        reviewConfig({
+          executor,
+          aiBaseUrl: executor === "claude" ? upstream.url.replace(/\/v1$/u, "") : upstream.url,
+          model: executor === "claude" ? "claude-sonnet-4-5" : "gpt-6.1-sol",
+          maxTurns: 12,
+          parallelCount: 1,
+          reviewPrompts: labels.map((prompt) => ({ prompt, files: [] })),
+        }),
+        [[], []],
+        repository.root,
+        undefined,
+        undefined,
+        { ...briefing, repositoryGuidance: [] },
+      );
+      assert.deepEqual([...arrived], labels);
+      assert.deepEqual(
+        run.goals.map(({ status }) => status),
+        ["completed", "completed"],
+      );
+    },
+  );
+
+  test(
     `real ${executor} shared packets isolate goal-private reads and provider errors`,
     { timeout: 120_000 },
     async (t) => {
@@ -737,7 +819,8 @@ test(
     let probed = false;
     let lostRaw = false;
     let prematureSubmission = false;
-    const visible = new Set<unknown>();
+    let restoredRaw = false;
+    const visible = new Map<unknown, string>();
     const submission = {
       tool: "submit_review",
       args: { summary: "Reviewed the source.", findings: [], limitations: [] },
@@ -757,29 +840,34 @@ test(
             };
       }
       if (history.includes("Review submission accepted.")) return { text: "Review complete." };
-      const packets = providerPackets(body);
-      if (history.includes("COMPACT_SWEEP_GOAL") && !compacted)
-        for (const packet of packets) visible.add(packet.id);
+      const messages = providerPacketMessages(body);
+      const compactGoal = history.includes("COMPACT_SWEEP_GOAL");
+      if (compactGoal && !compacted)
+        for (const { packet, text } of messages) visible.set(packet.id, text);
       const missing =
-        history.includes("COMPACT_SWEEP_GOAL") &&
+        compactGoal &&
         compacted &&
-        [...visible].some((id) => !packets.some((packet) => packet.id === id));
+        [...visible].some(
+          ([id, text]) =>
+            !messages.some((message) => message.packet.id === id && message.text === text),
+        );
       if (missing && !prematureSubmission) {
         lostRaw = true;
         prematureSubmission = true;
         return submission;
       }
-      if (packets.at(-1)?.more === true && (!probed || history.includes("CONTROL_SWEEP_GOAL")))
+      if (messages.at(-1)?.packet.more === true && (!probed || !compactGoal))
         return { tool: "advance_review_context", args: {} };
-      if (history.includes("COMPACT_SWEEP_GOAL") && !probed) {
+      if (compactGoal && !probed) {
         probed = true;
         return { tool: "read_review_state", args: {}, inputTokens: 300_000 };
       }
-      if (missing || packets.length === 0) {
-        if (!historyDocuments(body).some((doc) => doc.remaining === true && doc.done === true))
-          return { tool: "read_pr_diff", args: { remaining: true } };
-        if (!historyDocuments(body).some((doc) => Array.isArray(doc.records) && doc.done === true))
-          return { tool: "read_review_briefing", args: {} };
+      if (compactGoal && prematureSubmission) {
+        const sweepComplete = history.includes(
+          "Shared context sweep ended. Outstanding checks: verify relevant callers",
+        );
+        if (missing || !sweepComplete) return { tool: "advance_review_context", args: {} };
+        restoredRaw = true;
       }
       return submission;
     });
@@ -806,6 +894,11 @@ test(
     );
     assert.equal(compacted, true);
     assert.equal(lostRaw, true, "Native compaction must omit at least one raw packet.");
+    assert.equal(
+      restoredRaw,
+      true,
+      "Every missing packet must return in native user-role input before submission.",
+    );
     assert.equal(
       run.goals[0]?.diagnostics?.inspectionContinuations,
       1,

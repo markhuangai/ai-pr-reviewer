@@ -443,9 +443,14 @@ export class CodexSession implements ReviewSession {
             .map((server) => server.name + ": " + (server.error ?? server.status))
             .join("; "),
       );
+    if (goal !== undefined && this.input.forkFrom !== undefined)
+      await this.rpc("thread/inject_items", {
+        threadId: this.threadId,
+        items: [{ type: "message", role: "user", content: [{ type: "input_text", text: review }] }],
+      });
     await this.process.drain();
     await delivery?.refresh();
-    const activation = delivery?.stage(this.input.inheritedPackets);
+    const activation = delivery?.stage();
     if (activation !== undefined) {
       try {
         await this.rpc("thread/inject_items", {
@@ -464,13 +469,6 @@ export class CodexSession implements ReviewSession {
       }
     }
     if (goal !== undefined) {
-      if (this.input.forkFrom !== undefined)
-        await this.rpc("thread/inject_items", {
-          threadId: this.threadId,
-          items: [
-            { type: "message", role: "user", content: [{ type: "input_text", text: review }] },
-          ],
-        });
       this.objective = goal;
       this.goalActive = true;
       await this.rpc("thread/goal/set", {

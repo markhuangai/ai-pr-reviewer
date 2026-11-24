@@ -95,7 +95,6 @@ export interface SharedReviewSeed {
   readonly briefing: ReturnType<ReviewBriefingReader["checkpoint"]>;
   readonly evidence: ReturnType<ReviewEvidenceLedger["checkpoint"]>;
   readonly sharedContext?: SharedReviewContext;
-  readonly confirmedPackets?: readonly string[];
 }
 
 export interface SharedDiscovery {
@@ -623,12 +622,7 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
             },
             briefing: briefingReader.checkpoint(),
             evidence: ledger.checkpoint(),
-            ...(sharedContext === undefined || delivery === undefined
-              ? {}
-              : {
-                  sharedContext,
-                  confirmedPackets: delivery.confirmedPackets,
-                }),
+            ...(sharedContext === undefined ? {} : { sharedContext }),
           },
           cleanup: async () => {
             if (children.size > 0)

@@ -458,14 +458,7 @@ export async function runReviewGoal(
     session = createReviewSession(queryAgent, {
       config,
       ...forkSessionOptions(sharedSeed),
-      ...(delivery === undefined
-        ? {}
-        : {
-            contextDelivery: delivery,
-            ...(sharedSeed?.confirmedPackets === undefined
-              ? {}
-              : { inheritedPackets: sharedSeed.confirmedPackets }),
-          }),
+      ...(delivery === undefined ? {} : { contextDelivery: delivery }),
       cwd,
       tools: reviewTools,
       outputServerName,

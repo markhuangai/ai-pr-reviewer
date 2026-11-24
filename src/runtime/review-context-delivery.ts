@@ -28,10 +28,6 @@ export class ReviewContextDelivery {
     this.history = new ReviewContextHistory(home, prepared.packets);
   }
 
-  get confirmedPackets(): readonly string[] {
-    return [...this.confirmed];
-  }
-
   get pending(): boolean {
     return this.prepared.packets.some(
       ({ id }) => !this.confirmed.has(id) && !this.deferred.has(id),
@@ -46,10 +42,10 @@ export class ReviewContextDelivery {
     return this.packetBoundaryPending || this.sweeping || this.advanceRequested;
   }
 
-  stage(inherited: readonly string[] = []): ReviewContextPacket | undefined {
+  stage(): ReviewContextPacket | undefined {
     if (this.inFlight !== undefined) return undefined;
     const packet = this.prepared.packets.find(
-      ({ id }) => !this.confirmed.has(id) && !inherited.includes(id) && !this.deferred.has(id),
+      ({ id }) => !this.confirmed.has(id) && !this.deferred.has(id),
     );
     if (packet === undefined) return undefined;
     this.inFlight = packet;

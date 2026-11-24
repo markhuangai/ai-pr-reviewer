@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { setTimeout as wait } from "node:timers/promises";
 import type {
   McpServerConfig,
   Options,
@@ -14,7 +15,7 @@ import { toClaudeTool } from "./review-tool.js";
 import type { ReviewTool } from "./review-tool.js";
 import { CodexSession } from "./codex-session.js";
 import type { ReviewContextDelivery } from "./review-context-delivery.js";
-import { makeUserMessage } from "./agent-session.js";
+import { createDeferred, makeUserMessage } from "./agent-session.js";
 
 export type ReviewSession = AsyncIterable<SDKMessage | SDKActiveGoalMessage> &
   Pick<Query, "interrupt" | "mcpServerStatus"> & {
@@ -35,24 +36,31 @@ export interface ReviewSessionInput {
   readonly forkFrom?: string;
   readonly inheritedUsage?: GoalTokenUsage;
   readonly contextDelivery?: ReviewContextDelivery;
-  readonly inheritedPackets?: readonly string[];
 }
 
 export function createReviewSession(query: AgentQuery, input: ReviewSessionInput): ReviewSession {
   if (input.config.executor === "codex") return new CodexSession(input);
   const delivery = input.contextDelivery;
   const boundedGoal = delivery !== undefined && input.forkFrom !== undefined;
+  const forkReady = createDeferred<undefined>();
   const responseIds = new Set<string>();
-  async function* withContext() {
+  async function* withContext(): AsyncGenerator<SDKUserMessage> {
     let first = true;
     for await (const message of input.prompt) {
       if (first) {
         first = false;
-        const packet = delivery?.stage(input.inheritedPackets);
+        if (boundedGoal) {
+          yield { ...message, shouldQuery: false };
+          await Promise.race([forkReady.promise, wait(3_000, undefined, { ref: false })]);
+          await delivery.refresh();
+          const packet = delivery.stage();
+          if (packet !== undefined)
+            yield { ...makeUserMessage(packet.text), client_composed: true, shouldQuery: false };
+          continue;
+        }
+        const packet = delivery?.stage();
         if (packet !== undefined) {
-          const user = { ...makeUserMessage(packet.text), client_composed: true as const };
-          if (input.forkFrom !== undefined) yield { ...user, shouldQuery: false };
-          else if (typeof message.message.content === "string") {
+          if (typeof message.message.content === "string") {
             yield {
               ...message,
               client_composed: true as const,
@@ -163,6 +171,8 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init")
           delivery?.history.attach({ sessionId: message.session_id, executor: "claude" });
+        if (boundedGoal && message.type === "result" && message.num_turns === 0)
+          forkReady.resolve(undefined);
         if (
           boundedGoal &&
           message.type === "assistant" &&
