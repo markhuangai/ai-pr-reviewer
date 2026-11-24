@@ -489,6 +489,7 @@ export function startReviewPrompt(
     input.push(reviewMessage);
   }
   activate();
+  if (contextHandoff !== undefined) return;
   logAgentEventSafely(
     goalIndex,
     secrets,
@@ -501,8 +502,7 @@ export function startReviewPrompt(
     goalIndex,
     secrets,
     (safeWrite) => {
-      if (contextHandoff === undefined)
-        logQueuedUserMessage(reviewMessage, "review", goalIndex, secrets, safeWrite);
+      logQueuedUserMessage(reviewMessage, "review", goalIndex, secrets, safeWrite);
     },
     write,
   );

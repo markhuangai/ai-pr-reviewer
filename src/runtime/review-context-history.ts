@@ -85,7 +85,7 @@ export class ReviewContextHistory {
         confirmed.clear();
         pending.clear();
       };
-      let correctSession = transcript.executor === "claude";
+      let correctSession = false;
       const codexItem = (item: unknown) => {
         if (!isRecord(item)) return;
         if (item.type === "message" && item.role === "user") user(item.content);
@@ -110,7 +110,7 @@ export class ReviewContextHistory {
           if (!isRecord(entry)) continue;
           if (transcript.executor === "codex") {
             if (entry.type === "session_meta" && isRecord(entry.payload)) {
-              if (!correctSession && entry.payload.id !== transcript.sessionId) return undefined;
+              if (entry.payload.id !== transcript.sessionId) return undefined;
               correctSession = true;
             } else if (correctSession && entry.type === "response_item") codexItem(entry.payload);
             else if (correctSession && entry.type === "compacted" && isRecord(entry.payload)) {
@@ -118,26 +118,28 @@ export class ReviewContextHistory {
               if (Array.isArray(entry.payload.replacement_history))
                 for (const item of entry.payload.replacement_history) codexItem(item);
             }
-          } else if (entry.type === "system" && entry.subtype === "compact_boundary") {
-            reset();
-          } else if (
-            isRecord(entry.message) &&
-            entry.isSidechain !== true &&
-            entry.isSynthetic !== true
-          ) {
-            if (
-              entry.type === "user" &&
-              entry.message.role === "user" &&
-              entry.isCompactSummary !== true
-            )
-              user(entry.message.content);
-            if (
-              entry.type === "assistant" &&
-              entry.message.role === "assistant" &&
-              entry.isApiErrorMessage !== true &&
-              entry.message.model !== "<synthetic>"
-            )
-              acknowledge();
+          } else if (entry.sessionId === transcript.sessionId) {
+            correctSession = true;
+            if (entry.type === "system" && entry.subtype === "compact_boundary") reset();
+            else if (
+              isRecord(entry.message) &&
+              entry.isSidechain !== true &&
+              entry.isSynthetic !== true
+            ) {
+              if (
+                entry.type === "user" &&
+                entry.message.role === "user" &&
+                entry.isCompactSummary !== true
+              )
+                user(entry.message.content);
+              if (
+                entry.type === "assistant" &&
+                entry.message.role === "assistant" &&
+                entry.isApiErrorMessage !== true &&
+                entry.message.model !== "<synthetic>"
+              )
+                acknowledge();
+            }
           }
         }
       } finally {
@@ -150,7 +152,7 @@ export class ReviewContextHistory {
       return confirmed;
     } catch (error) {
       if (isRecord(error) && error.code === "ENOENT") return undefined;
-      throw new Error("Could not verify the native review context transcript.");
+      throw new Error("Could not verify the native review context transcript.", { cause: error });
     }
   }
 }

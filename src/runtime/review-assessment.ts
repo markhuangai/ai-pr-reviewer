@@ -343,6 +343,16 @@ export class ReviewEvidenceLedger {
     return reviewInspection(this.files, this.references);
   }
 
+  diffRangeDigest(): string {
+    const ranges = [...this.delivered.values()]
+      .filter(({ source }) => source.kind === "repository_diff")
+      .map(({ range, intervals }) => [range.paths, range.totalBytes, intervals] as const)
+      .sort(([left], [right]) =>
+        Buffer.compare(Buffer.from(JSON.stringify(left)), Buffer.from(JSON.stringify(right))),
+      );
+    return createHash("sha256").update(JSON.stringify(ranges)).digest("hex");
+  }
+
   get finalInspection(): ReviewInspection {
     return this.coverage.inspection(
       this.inspection,

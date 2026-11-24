@@ -40,11 +40,7 @@ import {
   type AgentToolUse,
   type AcceptedSubmissionMcpStatus,
 } from "./agent-logging.js";
-import {
-  PullRequestConversationReader,
-  type PullRequestDiffArtifact,
-  PullRequestDiffReader,
-} from "./agent-review-tools.js";
+import type { PullRequestDiffArtifact } from "./agent-review-tools.js";
 import {
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
@@ -73,17 +69,9 @@ import {
   ReviewSubmissionRecovery,
   investigationOnly,
   retainReviewSubmission,
-  unreadReviewFindingPaths,
-  reviewSubmissionGaps,
   reviewSubmissionRejectionResult,
 } from "./review-submission.js";
-import {
-  ReviewQueryReaderStore,
-  createReviewStateTool,
-  createReviewThreadTool,
-  createReviewContextTools,
-  createReviewSourceTools,
-} from "./review-context-tools.js";
+import { createReviewGoalTools } from "./review-goal-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
@@ -98,7 +86,6 @@ import {
   createReviewMcpServers,
   type ReviewSession,
 } from "./review-session.js";
-import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
 import {
   assertDiscoverySnapshot,
   assertIndependentSession,
@@ -183,11 +170,11 @@ export async function runReviewGoal(
   const effectiveSystemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT;
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
-  const conversationReader = new PullRequestConversationReader(conversation);
   const reviewSnapshot = { mergeBaseSha: diff.mergeBaseSha, headSha: context.headSha };
   const evidenceLedger = new ReviewEvidenceLedger(cwd, files, reviewSnapshot, diff.files);
   if (sharedSeed !== undefined && sharedContext === undefined)
     evidenceLedger.inherit(sharedSeed.evidence);
+  let firstSubmissionMs: number | undefined;
   const {
     inspectionDetails,
     recoveryDetails,
@@ -200,9 +187,12 @@ export async function runReviewGoal(
     recovery,
     startedAt,
     logSecrets,
+    privateContext: sharedContext !== undefined,
     sessionRecovery: () => ({
       ...provider.diagnostics,
       stallRecoveries: monitor?.recoveryCount ?? 0,
+      ...(firstSubmissionMs === undefined ? {} : { firstSubmissionMs }),
+      ...(delivery === undefined ? {} : { contextHandoffs: delivery.handoffs }),
     }),
     sourceContextDelivered: () =>
       sharedSeed === undefined ||
@@ -246,6 +236,7 @@ export async function runReviewGoal(
   const submissionHook: HookCallback = async (input) => {
     if (input.hook_event_name !== "PreToolUse" || !reviewPromptActive || submission !== undefined)
       return Promise.resolve({ continue: true });
+    firstSubmissionMs ??= Date.now() - startedAt;
     await delivery?.refresh();
     recovery.observeUse(input.tool_use_id, input.tool_input);
     return Promise.resolve({
@@ -294,167 +285,33 @@ export async function runReviewGoal(
           sharedSeed.sessionHome,
           briefingReader,
           evidenceLedger,
-          (event, details) => writeAgentMonitorEvent(goalIndex, event, details, logSecrets),
-        );
-  let contextBoundaryRequested = false;
-  let contextCueSent = false;
-  let claudeHandoffTurns = 0;
-  const submissionCue = () => {
-    const missing = evidenceLedger.inspection.missingPaths;
-    const checks = [
-      ...(briefingReader.complete
-        ? []
-        : ["finish unread briefing pages with read_review_briefing"]),
-      ...(missing.length === 0
-        ? []
-        : ["finish unread changed ranges with read_pr_diff remaining=true"]),
-      "verify relevant callers, tests and prior discussion before reporting findings",
-    ];
-    return `Shared context sweep ended. Outstanding checks: ${checks.join("; ")}. Use read_review_state for exact gaps or evidence references as needed. Then call submit_review for this same goal, even when findings are empty.`;
-  };
-  const advanceContextTool =
-    delivery === undefined
-      ? undefined
-      : tool(
-          "advance_review_context",
-          "Confirm you have considered the current shared packet and ask the host to continue the same review with the next unread packet. Do not combine with other calls. When the sweep ends, complete outstanding checks and call submit_review.",
-          {},
-          async () => {
-            throwIfAborted(signal);
-            await delivery.refresh();
-            if (!reviewPromptActive || submission !== undefined)
-              return {
-                isError: true,
-                content: [{ type: "text", text: "There is no active review context sweep." }],
-              };
-            if (!delivery.sweeping) {
-              contextCueSent = true;
-              return { content: [{ type: "text", text: submissionCue() }] };
-            }
-            if (contextBoundaryRequested)
-              return { content: [{ type: "text", text: "The next packet is already scheduled." }] };
-            contextBoundaryRequested = true;
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "Context advance acknowledged. Wait for the host to deliver the next unread packet.",
-                },
-              ],
-              _meta: { "claude/endTurn": true, context_advance: true },
-            };
+          (event, details) => {
+            writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
-          { alwaysLoad: true },
         );
-  const discussionQueryCursors = new Map<string, string>();
-  const queryReaderDiscussionKeys = new Map<string, string>();
-  const detachDiscussionQuery = (cursor: string): void => {
-    const discussionKey = queryReaderDiscussionKeys.get(cursor);
-    queryReaderDiscussionKeys.delete(cursor);
-    if (discussionKey !== undefined && discussionQueryCursors.get(discussionKey) === cursor)
-      discussionQueryCursors.delete(discussionKey);
-  };
-  const queryReaders = new ReviewQueryReaderStore(detachDiscussionQuery, signal);
-  const discussionReadPaths = new Set<string>();
-  const discussionReadThreadIds = new Set<number>();
-  const discussionPages = new Set<string>();
-  let contextPages = 0;
-  const inspectionProgress = () =>
-    evidenceLedger.inspectionProgress + briefingReader.deliveredPages + discussionPages.size;
-  const discussionPathScopes = new Map<string, string>();
-  for (const file of files) {
-    discussionPathScopes.set(file.path, file.path);
-    if (file.previousPath !== undefined) discussionPathScopes.set(file.previousPath, file.path);
-  }
-  const discussionPathScope = (path: string): string => discussionPathScopes.get(path) ?? path;
-  const contextReaders = new Map(
-    contextFiles.map((file) => [
-      file.path,
-      { file, reader: new PullRequestDiffReader(file.snapshotPath, file.sizeBytes, signal) },
-    ]),
+  let claudeNativeTurns = 0;
+  const advanceContextTool = delivery?.advanceTool(
+    () => reviewPromptActive && submission === undefined,
+    signal,
   );
-  if (contextReaders.size !== contextFiles.length) {
-    throw new Error("A review goal must not contain duplicate prepared context files.");
-  }
-  const { conversationTool, briefingTool, contextFileTool } = createReviewContextTools({
-    isActive: () => reviewPromptActive,
-    signal,
-    briefingReader,
-    conversationReader,
-    contextReaders,
-    onConversationComplete: () => {
-      for (const entry of conversation.entries)
-        if (entry.kind === "inline_thread")
-          discussionReadPaths.add(discussionPathScope(entry.path));
-    },
-    onDiscussionPage: (page) => {
-      discussionPages.add(`conversation:${page}`);
-    },
-    onContextPage: () => {
-      contextPages++;
-    },
-  });
-  const reviewStateTool = createReviewStateTool({
-    signal,
-    isActive: () => reviewPromptActive,
+  const goalTools = createReviewGoalTools({
+    context,
     files,
-    headSha: context.headSha,
-    mergeBaseSha: diff.mergeBaseSha,
-    briefingComplete: () => briefingReader.complete,
-    ledger: evidenceLedger,
-    readers: queryReaders,
-    recovery,
+    conversation,
+    config,
+    contextFiles,
     diff,
+    repositorySnapshot,
+    evidenceLedger,
+    briefingReader,
+    signal,
+    isReviewActive,
+    recovery,
     onSnapshot: (details) => {
       logDiagnostic("recovery-decision", details);
     },
-    gaps: () => (recovery.submissionAttempts === 0 ? [] : submissionGaps(recovery.latestInput)),
   });
-  const { diffTool, repositoryFileTool } = createReviewSourceTools({
-    signal,
-    isActive: isReviewActive,
-    diff,
-    headSha: context.headSha,
-    queryReaders,
-    repositorySnapshot,
-    ledger: evidenceLedger,
-  });
-  const discussionThreadTool = createReviewThreadTool({
-    isActive: isReviewActive,
-    signal,
-    conversation,
-    queryReaders,
-    discussionPathScope,
-    discussionReadPaths,
-    discussionReadThreadIds,
-    discussionQueryCursors,
-    queryReaderDiscussionKeys,
-    onPage: (selector, page) => {
-      discussionPages.add(`${JSON.stringify(selector)}:${page}`);
-    },
-  });
-  const unreadFindingPaths = (findings: readonly unknown[]): readonly string[] =>
-    unreadReviewFindingPaths(
-      findings,
-      conversation,
-      discussionPathScope,
-      discussionReadPaths,
-      discussionReadThreadIds,
-    );
-  function submissionGaps(input: unknown): readonly ReviewValidationGap[] {
-    return reviewSubmissionGaps(
-      input,
-      files,
-      evidenceLedger,
-      config.interactWithPullRequest,
-      briefingReader.complete,
-      unreadFindingPaths,
-      (path) =>
-        queryReaders.continuation(
-          discussionQueryCursors.get(`path:${discussionPathScope(path)}`) ?? "",
-        ) ?? { tool: "read_pr_threads", arguments: { path } },
-    );
-  }
+  const { submissionGaps, unreadFindingPaths, inspectionProgress } = goalTools;
   const outputTool = tool(
     "submit_review",
     "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host requires a changed-code scan. Validation allows one initial failure plus five corrections; inspection has separate bounded recovery.",
@@ -516,28 +373,15 @@ export async function runReviewGoal(
   );
   const outputServerName = "review_output";
   const reviewTools = [
-    briefingTool,
-    reviewStateTool,
-    conversationTool,
-    diffTool,
-    repositoryFileTool,
-    discussionThreadTool,
-    ...(contextFileTool === undefined ? [] : [contextFileTool]),
+    ...goalTools.tools,
     ...(advanceContextTool === undefined ? [] : [advanceContextTool]),
     outputTool,
-    ...(config.executor !== "codex"
-      ? []
-      : createRepositoryDiscoveryTools({
-          snapshot: repositorySnapshot,
-          readers: queryReaders,
-          isActive: isReviewActive,
-          signal,
-        })),
+    ...goalTools.repositoryTools,
   ];
   const mcpServers = createReviewMcpServers(
     config,
     reviewTools,
-    contextFileTool !== undefined,
+    goalTools.hasContextFiles,
     "review",
     delivery !== undefined,
   );
@@ -545,9 +389,10 @@ export async function runReviewGoal(
   const queueMessage = (text: string, label: string): void => {
     const message = makeUserMessage(text);
     input.push(message);
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
-    });
+    if (delivery === undefined)
+      logAgentEventSafely(goalIndex, logSecrets, (write) => {
+        logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
+      });
   };
   let turn = createDeferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
@@ -600,15 +445,16 @@ export async function runReviewGoal(
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(goalIndex, "start", { prompt_gate: "closed" }, logSecrets, write);
-      writeCompleteAgentLog(
-        goalIndex,
-        "system message",
-        "review",
-        "text",
-        effectiveSystemPrompt,
-        logSecrets,
-        write,
-      );
+      if (delivery === undefined)
+        writeCompleteAgentLog(
+          goalIndex,
+          "system message",
+          "review",
+          "text",
+          effectiveSystemPrompt,
+          logSecrets,
+          write,
+        );
     });
     session = createReviewSession(queryAgent, {
       config,
@@ -641,8 +487,20 @@ export async function runReviewGoal(
     const activeSession = session;
     confirmClosed = sharedSeed?.retainSession();
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
-    const readMcpFailures = (): Promise<readonly string[]> =>
-      readAcceptedSubmissionMcpFailures(() => activeSession.mcpServerStatus(), configuredMcpNames);
+    const readMcpFailures = async (): Promise<readonly string[]> => {
+      try {
+        const failures = await readAcceptedSubmissionMcpFailures(
+          () => activeSession.mcpServerStatus(),
+          configuredMcpNames,
+        );
+        return delivery !== undefined && failures.length > 0
+          ? ["Configured MCP servers are unavailable."]
+          : failures;
+      } catch (error) {
+        if (delivery === undefined) throw error;
+        throw new Error("Could not verify configured MCP server status.", { cause: error });
+      }
+    };
     const finalizeUnaccepted = async (
       error: string,
       tokenComplete: boolean,
@@ -666,9 +524,12 @@ export async function runReviewGoal(
             prompt: goal,
             status: failed || mcpFailed || retained === undefined ? "failed" : "incomplete",
             ...(retained === undefined ? {} : { submission: retained }),
-            error: mcpFailed
-              ? `${error}; configured MCP status: ${status.error ?? status.failures}`
-              : error,
+            error:
+              delivery !== undefined
+                ? `Review stopped (${sessionPhase}${mcpFailed ? "; MCP status failed" : ""}).`
+                : mcpFailed
+                  ? `${error}; configured MCP status: ${status.error ?? status.failures}`
+                  : error,
           },
           tokenUsageState.models,
           tokenComplete && readerFailure === undefined,
@@ -682,7 +543,7 @@ export async function runReviewGoal(
         inspectionProgress() +
         evidenceLedger.uniqueSourceBytes +
         evidenceLedger.uniqueNativeLines +
-        contextPages,
+        goalTools.contextPages(),
       onRecoveryFailure: (reason) => {
         recoveryFailure.resolve(reason);
       },
@@ -741,8 +602,7 @@ export async function runReviewGoal(
               goalIndex,
               logSecrets,
               lifecycle,
-              delivery !== undefined &&
-                (message.type === "active_goal" || message.type === "result")
+              delivery !== undefined
                 ? (line) => {
                     if (
                       !line.includes("turn-result errors:") &&
@@ -760,6 +620,7 @@ export async function runReviewGoal(
               config.executor !== "codex" &&
               message.subtype === "success" &&
               message.num_turns === 0 &&
+              !delivery.advanceRequested &&
               !sessionState.stallBoundaryPending &&
               provider.failure(message) === undefined
             )
@@ -880,9 +741,21 @@ export async function runReviewGoal(
       const { result } = outcome;
       const providerFailure = provider.failure(result);
       if (delivery !== undefined && config.executor !== "codex")
-        claudeHandoffTurns += result.num_turns;
-      const wasSweeping = delivery?.sweeping;
-      await delivery?.boundary();
+        claudeNativeTurns += result.num_turns;
+      const continueSweep = await delivery?.boundary();
+      if (
+        delivery !== undefined &&
+        config.executor !== "codex" &&
+        claudeNativeTurns >= config.maxTurns &&
+        submission === undefined &&
+        providerFailure === undefined
+      ) {
+        sessionPhase = "max-turns-exhausted";
+        return await finalizeUnaccepted(
+          "The review reached the configured runtime turn limit.",
+          tokenUsageState.latestSnapshotValid,
+        );
+      }
       const interrupted = sessionState.stallBoundaryPending;
       if (interrupted) {
         activeMonitor.interruptedTurnFinished();
@@ -1028,26 +901,11 @@ export async function runReviewGoal(
           ),
         );
       }
-      if (delivery !== undefined && (wasSweeping || contextBoundaryRequested)) {
-        if (claudeHandoffTurns >= config.maxTurns) {
-          sessionPhase = "max-turns-exhausted";
-          return await finalizeUnaccepted(
-            "The packet sweep reached the configured runtime turn limit.",
-            tokenUsageState.latestSnapshotValid,
-          );
-        }
-        contextBoundaryRequested = false;
-        const packet = delivery.stage();
-        if (packet !== undefined) {
-          delivery.handoffs++;
-          input.push({ ...makeUserMessage(packet.text), client_composed: true });
-          continue;
-        }
-        if (!contextCueSent) {
-          contextCueSent = true;
-          queueMessage(submissionCue(), "context-submission-cue");
-          continue;
-        }
+      const nextContext = continueSweep ? delivery?.nextMessage() : undefined;
+      if (nextContext !== undefined) {
+        const message = makeUserMessage(nextContext.text);
+        input.push(nextContext.packet ? { ...message, client_composed: true } : message);
+        continue;
       }
       recovery.observeProgress(inspectionProgress());
       const recoveryKind = recovery.finishTurn();
@@ -1089,6 +947,7 @@ export async function runReviewGoal(
         failure += `; session cleanup failed: ${errorMessage(cleanupError)}`;
     }
     throwIfAborted(signal);
+    if (delivery !== undefined) failure = `Review stopped (${sessionPhase}).`;
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       write(agentLogLine(goalIndex, "session", "failure", "error", failure, logSecrets));
     });
@@ -1120,13 +979,7 @@ export async function runReviewGoal(
       logSecrets,
     );
     await runAgentCleanup(
-      [
-        ...Array.from(contextReaders.values(), ({ reader: contextReader }) =>
-          contextReader.close(),
-        ),
-        ...queryReaders.cleanupOperations(),
-        repositorySnapshot.cleanup(),
-      ],
+      [...goalTools.cleanupOperations(), repositorySnapshot.cleanup()],
       goalIndex,
       logSecrets,
     );

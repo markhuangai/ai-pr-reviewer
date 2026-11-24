@@ -602,9 +602,10 @@ export class CodexSession implements ReviewSession {
       }
     } else if (method === "turn/completed") {
       if (!isRecord(params.turn)) throw new Error("Malformed Codex completion.");
-      if (this.activeTurn !== undefined && this.activeTurn !== params.turn.id) return;
+      if (this.activeTurn === undefined || this.activeTurn !== params.turn.id) return;
       this.activeTurn = undefined;
       if (this.limited) return;
+      if (params.turn.status === "completed") await this.input.contextDelivery?.refresh();
       if (params.turn.status === "failed") {
         const error = isRecord(params.turn.error) ? params.turn.error.message : undefined;
         this.result(
@@ -619,7 +620,7 @@ export class CodexSession implements ReviewSession {
       } else if (
         params.turn.status === "completed" &&
         this.goalActive &&
-        this.input.contextDelivery?.sweeping &&
+        this.input.contextDelivery?.needsBoundary &&
         !this.input.isAccepted?.()
       ) {
         this.contextPaused = true;
@@ -707,7 +708,7 @@ export class CodexSession implements ReviewSession {
               };
       }
     } else if (method === "item/started" || method === "item/completed") {
-      await this.item(method, params.item);
+      await this.item(method, params.item, params.turnId);
     } else if (method === "error") {
       if (params.willRetry === true) {
         this.emit({
@@ -730,7 +731,7 @@ export class CodexSession implements ReviewSession {
     }
   }
 
-  private async item(method: string, item: unknown): Promise<void> {
+  private async item(method: string, item: unknown, turnId?: unknown): Promise<void> {
     if (!isRecord(item) || typeof item.type !== "string") throw new Error("Malformed Codex item.");
     if (item.type === "mcpToolCall") {
       const server = String(item.server);
@@ -841,6 +842,8 @@ export class CodexSession implements ReviewSession {
         internal &&
         tool === "advance_review_context" &&
         meta.context_advance === true &&
+        this.activeTurn !== undefined &&
+        this.activeTurn === turnId &&
         !this.input.isAccepted?.()
       ) {
         this.contextPaused = true;

@@ -44,7 +44,7 @@ export type ModelReply =
       readonly cachedInputTokens?: number;
     }
   | { readonly text: string; readonly inputTokens?: number; readonly cachedInputTokens?: number }
-  | { readonly error: number }
+  | { readonly error: number; readonly message?: string }
   | { readonly disconnect: true }
   | { readonly interruptStream: true }
   | { readonly wait: true };
@@ -422,7 +422,10 @@ export async function modelFixture(
         response.writeHead(reply.error, { "Content-Type": "application/json" });
         response.end(
           JSON.stringify({
-            error: { type: "fixture_error", message: "Controlled upstream failure." },
+            error: {
+              type: "fixture_error",
+              message: reply.message ?? "Controlled upstream failure.",
+            },
           }),
         );
         return;

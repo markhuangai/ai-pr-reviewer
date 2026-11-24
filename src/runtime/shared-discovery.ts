@@ -293,7 +293,9 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
             sessionHome,
             briefingReader,
             ledger,
-            (event, detail) => writeNamedSessionLifecycleLog("discovery", event, detail, secrets),
+            (event, detail) => {
+              writeNamedSessionLifecycleLog("discovery", event, detail, secrets);
+            },
           );
     const { briefingTool } = createReviewContextTools({
       isActive: () => map === undefined,
@@ -619,6 +621,7 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     } catch (closeError) {
       failure += "; cleanup failed: " + errorMessage(closeError);
     }
+    if (sharedContext !== undefined) failure = `Discovery stopped (${termination}).`;
     if (!lifecycle.closed && session !== undefined)
       throw new Error(
         failure + "; discovery storage retained because parent shutdown is unproven.",
