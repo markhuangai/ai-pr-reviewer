@@ -343,6 +343,16 @@ export class ReviewEvidenceLedger {
     return reviewInspection(this.files, this.references);
   }
 
+  diffRangeDigest(): string {
+    const ranges = [...this.delivered.values()]
+      .filter(({ source }) => source.kind === "repository_diff")
+      .map(({ range, intervals }) => [range.paths, range.totalBytes, intervals] as const)
+      .sort(([left], [right]) =>
+        Buffer.compare(Buffer.from(JSON.stringify(left)), Buffer.from(JSON.stringify(right))),
+      );
+    return createHash("sha256").update(JSON.stringify(ranges)).digest("hex");
+  }
+
   get finalInspection(): ReviewInspection {
     return this.coverage.inspection(
       this.inspection,
@@ -475,6 +485,33 @@ export class ReviewEvidenceLedger {
     }
     return observed;
   }
+
+  confirmContextRanges(packetId: string, ranges: readonly ReviewSourceRange[]): void {
+    this.deliveries = [];
+    this.observeRanges(
+      { kind: "repository_diff", ...this.snapshot },
+      ranges,
+      packetId,
+      undefined,
+      1,
+    );
+  }
+
+  resetDelivery(): void {
+    this.deliveryEpoch++;
+    this.references.clear();
+    this.delivered.clear();
+    this.nativeDelivered.clear();
+    this.cursors.clear();
+    this.queries.clear();
+    this.clearPendingNativeReads();
+    this.requiredBytes = 0;
+    this.uniqueSourceBytes = 0;
+    this.uniqueNativeLines = 0;
+    this.repeatedSourceBytes = 0;
+  }
+
+  deliveryEpoch = 0;
 
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;
@@ -805,7 +842,17 @@ export class ReviewEvidenceLedger {
     });
   }
 
-  renderReferences(references: readonly ReviewEvidenceReference[], limit = 1_400): string {
+  renderReferences(
+    references: readonly ReviewEvidenceReference[],
+    limit = 1_400,
+    lookup = "read_review_state",
+  ): string {
+    const { text, shown } = this.renderReferencePage(references, limit);
+    const omitted = references.length - shown;
+    return `${text}${omitted > 0 ? `\n${omitted} additional references are omitted; call ${lookup} to retrieve existing evidence without rereading source.` : ""}`;
+  }
+
+  renderReferencePage(references: readonly ReviewEvidenceReference[], limit = 1_400) {
     const lines: string[] = [];
     let used = 0;
     for (const reference of references) {
@@ -824,8 +871,10 @@ export class ReviewEvidenceLedger {
       lines.push(line);
       used += line.length + 1;
     }
-    const omitted = references.length - lines.length;
-    return `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}${omitted > 0 ? `\n${omitted} additional references are omitted; call read_review_state to retrieve existing evidence without rereading source.` : ""}`;
+    return {
+      text: `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}`,
+      shown: lines.length,
+    };
   }
 
   private source(

@@ -44,7 +44,7 @@ export type ModelReply =
       readonly cachedInputTokens?: number;
     }
   | { readonly text: string; readonly inputTokens?: number; readonly cachedInputTokens?: number }
-  | { readonly error: number }
+  | { readonly error: number; readonly message?: string }
   | { readonly disconnect: true }
   | { readonly interruptStream: true }
   | { readonly wait: true };
@@ -103,7 +103,12 @@ export function historyDocuments(body: Record<string, unknown>): Record<string, 
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item);
     } else if (isRecord(value)) {
-      if (Array.isArray(value.records) || typeof value.done === "boolean") documents.push(value);
+      if (
+        Array.isArray(value.records) ||
+        typeof value.done === "boolean" ||
+        typeof value.references === "string"
+      )
+        documents.push(value);
       for (const child of Object.values(value)) visit(child);
     }
   };
@@ -422,7 +427,10 @@ export async function modelFixture(
         response.writeHead(reply.error, { "Content-Type": "application/json" });
         response.end(
           JSON.stringify({
-            error: { type: "fixture_error", message: "Controlled upstream failure." },
+            error: {
+              type: "fixture_error",
+              message: reply.message ?? "Controlled upstream failure.",
+            },
           }),
         );
         return;
@@ -601,6 +609,7 @@ export function sharedReviewScript({
   exhaust = false,
   compact = false,
   partial = false,
+  recoverMissingDiff = false,
 } = {}) {
   const shared = goalCount > 1;
   let discoveryStep = 0;
@@ -626,6 +635,8 @@ export function sharedReviewScript({
         return {
           tool: "finish_discovery",
           args: {
+            observations: [],
+            unknowns: ["Surrounding callers were not read."],
             changeMap:
               "Intent: add a value to review.txt. Area: the text consumer. Entry points and tests need further investigation. Unknowns: surrounding consumers were not read.",
           },
@@ -640,6 +651,8 @@ export function sharedReviewScript({
         {
           tool: "finish_discovery",
           args: {
+            observations: [],
+            unknowns: ["Surrounding callers were not read."],
             changeMap:
               "Intent: append a value in review.txt. Area: the text consumer. Entry point: review.txt. Tests and consumers remain unknown; reviewers must investigate independently.",
           },
@@ -675,6 +688,21 @@ export function sharedReviewScript({
     }
     if (history.includes("Review submission accepted.")) return { text: "Review complete." };
     const step = steps.get(label) ?? 0;
+    if (recoverMissingDiff && step >= 2) {
+      const documents = historyDocuments(body);
+      const state = documents.findLast(({ inspection }) => isRecord(inspection));
+      const coverage = state?.inspection;
+      const lastPage = documents.findLast(({ remaining }) => remaining === true);
+      if (
+        isRecord(coverage) &&
+        typeof coverage.missing === "number" &&
+        coverage.missing > 0 &&
+        lastPage?.done !== true
+      ) {
+        reads.push({ goal: label, tool: "read_pr_diff" });
+        return { tool: "read_pr_diff", args: { remaining: true } };
+      }
+    }
     steps.set(label, step + 1);
     const calls: ModelReply[] = [
       { tool: "read_review_briefing", args: {} },

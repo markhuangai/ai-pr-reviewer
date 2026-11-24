@@ -115,7 +115,12 @@ export class ReviewBriefingReader {
     files: readonly ChangedFile[],
     conversation: ReviewConversationSnapshot,
     briefing: ReviewBriefing,
+    prepared?: ReviewBriefingReader,
   ) {
+    if (prepared !== undefined) {
+      this.pages = prepared.pages;
+      return;
+    }
     const records: Record<string, unknown>[] = [
       {
         kind: "pull_request",
@@ -238,6 +243,25 @@ export class ReviewBriefingReader {
 
   get deliveredPages(): number {
     return this.delivered.size;
+  }
+
+  stagedPages(): readonly ReviewBriefingPage[] {
+    return this.pages.map((records, index) => ({
+      page: index + 1,
+      totalPages: this.pages.length,
+      records,
+      done: index + 1 === this.pages.length,
+    }));
+  }
+
+  confirmPage(page: number): void {
+    if (!Number.isInteger(page) || page < 1 || page > this.pages.length)
+      throw new Error("Invalid staged review briefing page.");
+    this.delivered.add(page);
+  }
+
+  resetDelivery(): void {
+    this.delivered.clear();
   }
 
   checkpoint() {

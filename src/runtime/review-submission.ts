@@ -44,6 +44,7 @@ export class ReviewSubmissionRecovery {
   private recoveryKind: "inspection" | "validation" = "inspection";
   private progress = 0;
   private previousProgress = 0;
+  private deliveryEpoch = 0;
   validationFailures = 0;
   inspectionContinuations = 0;
   consecutiveNoProgress = 0;
@@ -53,7 +54,13 @@ export class ReviewSubmissionRecovery {
 
   constructor(readonly maxCycles = 100) {}
 
-  observeProgress(value: number): void {
+  observeProgress(value: number, deliveryEpoch = 0): void {
+    if (deliveryEpoch !== this.deliveryEpoch) {
+      this.deliveryEpoch = deliveryEpoch;
+      this.progress = 0;
+      this.previousProgress = 0;
+      this.consecutiveNoProgress = 0;
+    }
     this.progress = Math.max(this.progress, value);
   }
 

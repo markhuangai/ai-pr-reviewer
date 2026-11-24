@@ -473,6 +473,8 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           const result = await tools.finish_discovery.handler({
             changeMap:
               "Intent and affected paths are in the overview. Callers and tests remain unknown.",
+            observations: [],
+            unknowns: ["Callers and tests remain unknown."],
           });
           assert.equal(result.isError, undefined);
           yield {
@@ -483,7 +485,11 @@ export function fakeAgentQuery(scenario: FakeQueryScenario): AgentQuery {
           } as SDKResultMessage;
           return;
         }
-        const reviewMessage = await messages.next();
+        if (goalMessage.value.shouldQuery === false)
+          yield { type: "result", subtype: "success", num_turns: 0 } as SDKResultMessage;
+        let reviewMessage = await messages.next();
+        if (!reviewMessage.done && reviewMessage.value.client_composed === true)
+          reviewMessage = await messages.next();
         assert.equal(reviewMessage.done, false);
         scenario.inspectPrompts?.([goalMessage.value, reviewMessage.value]);
         if (preflight !== undefined) {

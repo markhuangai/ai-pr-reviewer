@@ -123,9 +123,15 @@ export function reviewProtocolQuery(
     };
     return {
       async *[Symbol.asyncIterator]() {
-        assert.equal((await messages.next()).done, false);
+        const first = await messages.next();
+        assert.equal(first.done, false);
         const discovery = options.allowedTools?.includes("mcp__review_output__finish_discovery");
-        if (!discovery) assert.equal((await messages.next()).done, false);
+        if (!discovery) {
+          if (first.value.shouldQuery === false) yield { ...protocolResult(), num_turns: 0 };
+          let review = await messages.next();
+          if (!review.done && review.value.client_composed === true) review = await messages.next();
+          assert.equal(review.done, false);
+        }
         await server.connect(serverTransport);
         await client.connect(clientTransport);
         try {
@@ -139,6 +145,8 @@ export function reviewProtocolQuery(
             yield* protocol.call("finish_discovery", {
               changeMap:
                 "Intent and affected paths are in the overview. Callers and tests remain unknown.",
+              observations: [],
+              unknowns: ["Callers and tests remain unknown."],
             });
             yield protocolResult();
           } else yield* exercise(protocol);

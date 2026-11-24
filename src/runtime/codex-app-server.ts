@@ -53,6 +53,44 @@ interface PendingRequest {
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
+export class CodexRpcError extends Error {}
+
+export class CodexSessionMessages<Message> implements AsyncIterable<Message> {
+  private readonly pending: Message[] = [];
+  private wake: (() => void) | undefined;
+  private ended = false;
+  private error: Error | undefined;
+
+  push(message: Message): void {
+    if (this.ended) return;
+    this.pending.push(message);
+    this.wake?.();
+  }
+
+  finish(error?: Error): void {
+    if (error !== undefined) this.error = error;
+    this.ended = true;
+    this.wake?.();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<Message> {
+    for (;;) {
+      const message = this.pending.shift();
+      if (message !== undefined) {
+        yield message;
+        continue;
+      }
+      if (this.ended) {
+        if (this.error !== undefined) throw this.error;
+        return;
+      }
+      await new Promise<void>((resolveWake) => {
+        this.wake = resolveWake;
+      });
+    }
+  }
+}
+
 export class CodexAppServer {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, PendingRequest>();
@@ -153,9 +191,9 @@ export class CodexAppServer {
       if (pending === undefined) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (isRecord(message.error)) {
+      if (isRecord(message.error) && typeof message.error.code === "number") {
         pending.reject(
-          new Error(
+          new CodexRpcError(
             typeof message.error.message === "string" ? message.error.message : "Codex RPC failed.",
           ),
         );

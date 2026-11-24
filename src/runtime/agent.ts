@@ -40,11 +40,7 @@ import {
   type AgentToolUse,
   type AcceptedSubmissionMcpStatus,
 } from "./agent-logging.js";
-import {
-  PullRequestConversationReader,
-  type PullRequestDiffArtifact,
-  PullRequestDiffReader,
-} from "./agent-review-tools.js";
+import type { PullRequestDiffArtifact } from "./agent-review-tools.js";
 import {
   PromptStream,
   REVIEW_SYSTEM_PROMPT,
@@ -73,20 +69,13 @@ import {
   ReviewSubmissionRecovery,
   investigationOnly,
   retainReviewSubmission,
-  unreadReviewFindingPaths,
-  reviewSubmissionGaps,
   reviewSubmissionRejectionResult,
 } from "./review-submission.js";
-import {
-  ReviewQueryReaderStore,
-  createReviewStateTool,
-  createReviewThreadTool,
-  createReviewContextTools,
-  createReviewSourceTools,
-} from "./review-context-tools.js";
+import { createReviewGoalTools } from "./review-goal-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
+import { ReviewContextDelivery } from "./review-context-delivery.js";
 import {
   ProviderRecovery,
   waitForProviderRetry,
@@ -97,7 +86,6 @@ import {
   createReviewMcpServers,
   type ReviewSession,
 } from "./review-session.js";
-import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
 import {
   assertDiscoverySnapshot,
   assertIndependentSession,
@@ -129,6 +117,7 @@ export async function runReviewGoal(
   const signal = abortController?.signal;
   throwIfAborted(signal);
   assertDiscoverySnapshot(sharedSeed, context, conversation, briefing);
+  const sharedContext = sharedSeed?.sharedContext;
   let submission: GoalSubmission | undefined;
   const startedAt = Date.now();
   const recovery = new ReviewSubmissionRecovery(config.maxTurns);
@@ -154,7 +143,7 @@ export async function runReviewGoal(
               : [],
           )
         : [];
-    recovery.observeProgress(inspectionProgress());
+    recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
     const changed = recovery.reject(
       id,
       recordedCategories.length > 0
@@ -181,10 +170,11 @@ export async function runReviewGoal(
   const effectiveSystemPrompt = config.systemPrompt ?? REVIEW_SYSTEM_PROMPT;
   const toolUses = new Map<string, AgentToolUse>();
   const lifecycle = createAgentLifecycleState();
-  const conversationReader = new PullRequestConversationReader(conversation);
   const reviewSnapshot = { mergeBaseSha: diff.mergeBaseSha, headSha: context.headSha };
   const evidenceLedger = new ReviewEvidenceLedger(cwd, files, reviewSnapshot, diff.files);
-  if (sharedSeed !== undefined) evidenceLedger.inherit(sharedSeed.evidence);
+  if (sharedSeed !== undefined && sharedContext === undefined)
+    evidenceLedger.inherit(sharedSeed.evidence);
+  let firstSubmissionMs: number | undefined;
   const {
     inspectionDetails,
     recoveryDetails,
@@ -197,23 +187,27 @@ export async function runReviewGoal(
     recovery,
     startedAt,
     logSecrets,
+    privateContext: sharedContext !== undefined,
     sessionRecovery: () => ({
       ...provider.diagnostics,
       stallRecoveries: monitor?.recoveryCount ?? 0,
+      ...(firstSubmissionMs === undefined ? {} : { firstSubmissionMs }),
+      ...(delivery === undefined ? {} : { contextHandoffs: delivery.handoffs }),
     }),
     sourceContextDelivered: () =>
       sharedSeed === undefined ||
       lifecycle.sessionId !== undefined ||
       evidenceLedger.issued.size > sharedSeed.evidence.references.length,
   });
-  const evidenceHook: HookCallback = (input) => {
+  const evidenceHook: HookCallback = async (input) => {
     if (input.hook_event_name === "PostToolUse" && input.tool_name === "Read") {
       evidenceLedger.observeNativeRead(input);
       return Promise.resolve({ continue: true });
     }
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
+    await delivery?.refresh();
     const references = evidenceLedger.observeBatch(input.tool_calls);
-    recovery.observeProgress(inspectionProgress());
+    recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
     monitor?.observeProgress();
     const deliveredInspection = inspectionDetails();
     for (const delivery of evidenceLedger.deliveries)
@@ -239,9 +233,11 @@ export async function runReviewGoal(
       },
     });
   };
-  const submissionHook: HookCallback = (input) => {
+  const submissionHook: HookCallback = async (input) => {
     if (input.hook_event_name !== "PreToolUse" || !reviewPromptActive || submission !== undefined)
       return Promise.resolve({ continue: true });
+    firstSubmissionMs ??= Date.now() - startedAt;
+    await delivery?.refresh();
     recovery.observeUse(input.tool_use_id, input.tool_input);
     return Promise.resolve({
       continue: true,
@@ -265,143 +261,82 @@ export async function runReviewGoal(
     signal,
   );
   const repositoryGuidance =
-    briefing.repositoryGuidance ??
-    (await repositoryGuidanceForRun(diff, repositorySnapshot, files));
-  const briefingReader = new ReviewBriefingReader(context, files, conversation, {
-    ...briefing,
-    repositoryGuidance,
-  });
-  if (sharedSeed !== undefined) briefingReader.inherit(sharedSeed.briefing);
-  const discussionQueryCursors = new Map<string, string>();
-  const queryReaderDiscussionKeys = new Map<string, string>();
-  const detachDiscussionQuery = (cursor: string): void => {
-    const discussionKey = queryReaderDiscussionKeys.get(cursor);
-    queryReaderDiscussionKeys.delete(cursor);
-    if (discussionKey !== undefined && discussionQueryCursors.get(discussionKey) === cursor)
-      discussionQueryCursors.delete(discussionKey);
-  };
-  const queryReaders = new ReviewQueryReaderStore(detachDiscussionQuery, signal);
-  const discussionReadPaths = new Set<string>();
-  const discussionReadThreadIds = new Set<number>();
-  const discussionPages = new Set<string>();
-  let contextPages = 0;
-  const inspectionProgress = () =>
-    evidenceLedger.inspectionProgress + briefingReader.deliveredPages + discussionPages.size;
-  const discussionPathScopes = new Map<string, string>();
-  for (const file of files) {
-    discussionPathScopes.set(file.path, file.path);
-    if (file.previousPath !== undefined) discussionPathScopes.set(file.previousPath, file.path);
-  }
-  const discussionPathScope = (path: string): string => discussionPathScopes.get(path) ?? path;
-  const contextReaders = new Map(
-    contextFiles.map((file) => [
-      file.path,
-      { file, reader: new PullRequestDiffReader(file.snapshotPath, file.sizeBytes, signal) },
-    ]),
-  );
-  if (contextReaders.size !== contextFiles.length) {
-    throw new Error("A review goal must not contain duplicate prepared context files.");
-  }
-  const { conversationTool, briefingTool, contextFileTool } = createReviewContextTools({
-    isActive: () => reviewPromptActive,
-    signal,
-    briefingReader,
-    conversationReader,
-    contextReaders,
-    onConversationComplete: () => {
-      for (const entry of conversation.entries)
-        if (entry.kind === "inline_thread")
-          discussionReadPaths.add(discussionPathScope(entry.path));
-    },
-    onDiscussionPage: (page) => {
-      discussionPages.add(`conversation:${page}`);
-    },
-    onContextPage: () => {
-      contextPages++;
-    },
-  });
-  const reviewStateTool = createReviewStateTool({
-    signal,
-    isActive: () => reviewPromptActive,
+    sharedContext === undefined
+      ? (briefing.repositoryGuidance ??
+        (await repositoryGuidanceForRun(diff, repositorySnapshot, files)))
+      : undefined;
+  const briefingReader = new ReviewBriefingReader(
+    context,
     files,
-    headSha: context.headSha,
-    mergeBaseSha: diff.mergeBaseSha,
-    briefingComplete: () => briefingReader.complete,
-    ledger: evidenceLedger,
-    readers: queryReaders,
-    recovery,
+    conversation,
+    {
+      ...briefing,
+      ...(repositoryGuidance === undefined ? {} : { repositoryGuidance }),
+    },
+    sharedContext?.briefing,
+  );
+  if (sharedSeed !== undefined && sharedContext === undefined)
+    briefingReader.inherit(sharedSeed.briefing);
+  let monitor: SdkSessionMonitor | undefined;
+  const delivery =
+    sharedContext === undefined || sharedSeed === undefined
+      ? undefined
+      : new ReviewContextDelivery(
+          sharedContext,
+          sharedSeed.sessionHome,
+          briefingReader,
+          evidenceLedger,
+          (event, details) => {
+            writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
+          },
+          () => monitor?.rebaseProgress(),
+        );
+  const advanceContextTool = delivery?.advanceTool(
+    () => reviewPromptActive && submission === undefined,
+    signal,
+  );
+  const goalTools = createReviewGoalTools({
+    context,
+    files,
+    conversation,
+    config,
+    contextFiles,
     diff,
+    repositorySnapshot,
+    evidenceLedger,
+    briefingReader,
+    signal,
+    isReviewActive,
+    recovery,
     onSnapshot: (details) => {
       logDiagnostic("recovery-decision", details);
     },
-    gaps: () => (recovery.submissionAttempts === 0 ? [] : submissionGaps(recovery.latestInput)),
   });
-  const { diffTool, repositoryFileTool } = createReviewSourceTools({
-    signal,
-    isActive: isReviewActive,
-    diff,
-    headSha: context.headSha,
-    queryReaders,
-    repositorySnapshot,
-    ledger: evidenceLedger,
-  });
-  const discussionThreadTool = createReviewThreadTool({
-    isActive: isReviewActive,
-    signal,
-    conversation,
-    queryReaders,
-    discussionPathScope,
-    discussionReadPaths,
-    discussionReadThreadIds,
-    discussionQueryCursors,
-    queryReaderDiscussionKeys,
-    onPage: (selector, page) => {
-      discussionPages.add(`${JSON.stringify(selector)}:${page}`);
-    },
-  });
-  const unreadFindingPaths = (findings: readonly unknown[]): readonly string[] =>
-    unreadReviewFindingPaths(
-      findings,
-      conversation,
-      discussionPathScope,
-      discussionReadPaths,
-      discussionReadThreadIds,
-    );
-  function submissionGaps(input: unknown): readonly ReviewValidationGap[] {
-    return reviewSubmissionGaps(
-      input,
-      files,
-      evidenceLedger,
-      config.interactWithPullRequest,
-      briefingReader.complete,
-      unreadFindingPaths,
-      (path) =>
-        queryReaders.continuation(
-          discussionQueryCursors.get(`path:${discussionPathScope(path)}`) ?? "",
-        ) ?? { tool: "read_pr_threads", arguments: { path } },
-    );
-  }
+  const { submissionGaps, unreadFindingPaths, inspectionProgress } = goalTools;
   const outputTool = tool(
     "submit_review",
     "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host requires a changed-code scan. Validation allows one initial failure plus five corrections; inspection has separate bounded recovery.",
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
-    (input): Promise<CallToolResult> => {
+    async (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
-      if (!reviewPromptActive || submission !== undefined) {
+      const initialRejection = reviewSubmissionRejection(
+        reviewPromptActive,
+        submission !== undefined,
+      );
+      if (initialRejection === undefined && delivery !== undefined) {
+        await delivery.refresh();
+        throwIfAborted(signal);
+      }
+      const rejection =
+        initialRejection ?? reviewSubmissionRejection(reviewPromptActive, submission !== undefined);
+      if (rejection !== undefined) {
         return Promise.resolve({
-          content: [
-            {
-              type: "text",
-              text: reviewSubmissionRejection(
-                reviewPromptActive,
-                submission !== undefined,
-              ) as string,
-            },
-          ],
+          content: [{ type: "text", text: rejection }],
         });
       }
       validationGaps = submissionGaps(input);
       if (validationGaps.length > 0) {
+        recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
         const budget = recovery.rejectionBudget(validationGaps.map((gap) => gap.category));
         return Promise.resolve(
           reviewSubmissionRejectionResult(
@@ -414,17 +349,18 @@ export async function runReviewGoal(
         );
       }
       const candidate = toSubmission(submissionSchema.parse(input));
-      logAgentEventSafely(goalIndex, logSecrets, (write) => {
-        writeCompleteAgentLog(
-          goalIndex,
-          "review submission",
-          "submit_review",
-          "candidate",
-          candidate,
-          logSecrets,
-          write,
-        );
-      });
+      if (delivery === undefined)
+        logAgentEventSafely(goalIndex, logSecrets, (write) => {
+          writeCompleteAgentLog(
+            goalIndex,
+            "review submission",
+            "submit_review",
+            "candidate",
+            candidate,
+            logSecrets,
+            write,
+          );
+        });
       submission = candidate;
       accepted.resolve(undefined);
       logDiagnostic("submission-decision", {
@@ -440,37 +376,31 @@ export async function runReviewGoal(
   );
   const outputServerName = "review_output";
   const reviewTools = [
-    briefingTool,
-    reviewStateTool,
-    conversationTool,
-    diffTool,
-    repositoryFileTool,
-    discussionThreadTool,
-    ...(contextFileTool === undefined ? [] : [contextFileTool]),
+    ...goalTools.tools,
+    ...(advanceContextTool === undefined ? [] : [advanceContextTool]),
     outputTool,
-    ...(config.executor !== "codex"
-      ? []
-      : createRepositoryDiscoveryTools({
-          snapshot: repositorySnapshot,
-          readers: queryReaders,
-          isActive: isReviewActive,
-          signal,
-        })),
+    ...goalTools.repositoryTools,
   ];
-  const mcpServers = createReviewMcpServers(config, reviewTools, contextFileTool !== undefined);
+  const mcpServers = createReviewMcpServers(
+    config,
+    reviewTools,
+    goalTools.hasContextFiles,
+    "review",
+    delivery !== undefined,
+  );
   const input = new PromptStream();
   const queueMessage = (text: string, label: string): void => {
     const message = makeUserMessage(text);
     input.push(message);
-    logAgentEventSafely(goalIndex, logSecrets, (write) => {
-      logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
-    });
+    if (delivery === undefined)
+      logAgentEventSafely(goalIndex, logSecrets, (write) => {
+        logQueuedUserMessage(message, label, goalIndex, logSecrets, write);
+      });
   };
   let turn = createDeferred<SDKResultMessage>();
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
   let session: ReviewSession | undefined;
-  let monitor: SdkSessionMonitor | undefined;
   let sessionPhase = "starting";
   const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
   let sessionClosed = false;
@@ -517,19 +447,21 @@ export async function runReviewGoal(
     throwIfAborted(signal);
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(goalIndex, "start", { prompt_gate: "closed" }, logSecrets, write);
-      writeCompleteAgentLog(
-        goalIndex,
-        "system message",
-        "review",
-        "text",
-        effectiveSystemPrompt,
-        logSecrets,
-        write,
-      );
+      if (delivery === undefined)
+        writeCompleteAgentLog(
+          goalIndex,
+          "system message",
+          "review",
+          "text",
+          effectiveSystemPrompt,
+          logSecrets,
+          write,
+        );
     });
     session = createReviewSession(queryAgent, {
       config,
       ...forkSessionOptions(sharedSeed),
+      ...(delivery === undefined ? {} : { contextDelivery: delivery }),
       cwd,
       tools: reviewTools,
       outputServerName,
@@ -550,8 +482,20 @@ export async function runReviewGoal(
     const activeSession = session;
     confirmClosed = sharedSeed?.retainSession();
     const configuredMcpNames = new Set(Object.keys(config.mcpServers));
-    const readMcpFailures = (): Promise<readonly string[]> =>
-      readAcceptedSubmissionMcpFailures(() => activeSession.mcpServerStatus(), configuredMcpNames);
+    const readMcpFailures = async (): Promise<readonly string[]> => {
+      try {
+        const failures = await readAcceptedSubmissionMcpFailures(
+          () => activeSession.mcpServerStatus(),
+          configuredMcpNames,
+        );
+        return delivery !== undefined && failures.length > 0
+          ? ["Configured MCP servers are unavailable."]
+          : failures;
+      } catch (error) {
+        if (delivery === undefined) throw error;
+        throw new Error("Could not verify configured MCP server status.", { cause: error });
+      }
+    };
     const finalizeUnaccepted = async (
       error: string,
       tokenComplete: boolean,
@@ -575,9 +519,12 @@ export async function runReviewGoal(
             prompt: goal,
             status: failed || mcpFailed || retained === undefined ? "failed" : "incomplete",
             ...(retained === undefined ? {} : { submission: retained }),
-            error: mcpFailed
-              ? `${error}; configured MCP status: ${status.error ?? status.failures}`
-              : error,
+            error:
+              delivery !== undefined
+                ? `Review stopped (${sessionPhase}${mcpFailed ? "; MCP status failed" : ""}).`
+                : mcpFailed
+                  ? `${error}; configured MCP status: ${status.error ?? status.failures}`
+                  : error,
           },
           tokenUsageState.models,
           tokenComplete && readerFailure === undefined,
@@ -591,7 +538,7 @@ export async function runReviewGoal(
         inspectionProgress() +
         evidenceLedger.uniqueSourceBytes +
         evidenceLedger.uniqueNativeLines +
-        contextPages,
+        goalTools.contextPages(),
       onRecoveryFailure: (reason) => {
         recoveryFailure.resolve(reason);
       },
@@ -602,12 +549,20 @@ export async function runReviewGoal(
           recovery.repairAttempts,
           submission !== undefined,
           sessionState.stallBoundaryPending,
+          delivery === undefined,
         ),
         ...inspectionDetails(),
         ...recoveryDetails(),
       }),
       write: (event, details) => {
-        writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
+        writeAgentMonitorEvent(
+          goalIndex,
+          event,
+          delivery === undefined || details.error === undefined
+            ? details
+            : { ...details, error: "Runtime request failed." },
+          logSecrets,
+        );
       },
       hasAcceptedSubmission: () => submission !== undefined,
       setPhase: (phase) => {
@@ -642,13 +597,38 @@ export async function runReviewGoal(
           assertIndependentSession(message, sharedSeed);
           provider.observe(message);
           activeMonitor.observe(sdkSessionActivity(message, toolUses));
-          if (message.type !== "active_goal")
+          if (message.type !== "active_goal" && delivery === undefined)
             logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
           logAgentEventSafely(goalIndex, logSecrets, (write) => {
-            logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
+            logAgentLifecycleMessage(
+              message,
+              goalIndex,
+              logSecrets,
+              lifecycle,
+              delivery !== undefined
+                ? (line) => {
+                    if (
+                      !line.includes("turn-result errors:") &&
+                      !line.includes("compaction-result error:") &&
+                      !line.includes("goal-iteration details:")
+                    )
+                      write(line);
+                  }
+                : write,
+            );
           });
           if (isReviewActive()) recovery.observeMessage(message, observeRejection);
           if (message.type === "result") {
+            if (
+              delivery !== undefined &&
+              config.executor !== "codex" &&
+              message.subtype === "success" &&
+              message.num_turns === 0 &&
+              !delivery.advanceRequested &&
+              !sessionState.stallBoundaryPending &&
+              provider.failure(message) === undefined
+            )
+              continue;
             if (submission !== undefined) activeMonitor.stop();
             const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
             tokenUsageState.latestSnapshotValid =
@@ -696,6 +676,7 @@ export async function runReviewGoal(
       cwd,
       config.interactWithPullRequest,
       sharedSeed !== undefined,
+      sharedContext === undefined ? undefined : sharedSeed?.changeMap,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -763,6 +744,21 @@ export async function runReviewGoal(
       }
       const { result } = outcome;
       const providerFailure = provider.failure(result);
+      const continueSweep = await delivery?.boundary();
+      const claudeNativeTurns = activeSession.nativeModelTurns?.();
+      if (
+        claudeNativeTurns !== undefined &&
+        (claudeNativeTurns > config.maxTurns ||
+          (claudeNativeTurns === config.maxTurns && submission === undefined)) &&
+        providerFailure === undefined
+      ) {
+        sessionPhase = "max-turns-exhausted";
+        return await finalizeUnaccepted(
+          "The review reached the configured runtime turn limit.",
+          tokenUsageState.latestSnapshotValid,
+          submission !== undefined,
+        );
+      }
       const interrupted = sessionState.stallBoundaryPending;
       if (interrupted) {
         activeMonitor.interruptedTurnFinished();
@@ -908,7 +904,13 @@ export async function runReviewGoal(
           ),
         );
       }
-      recovery.observeProgress(inspectionProgress());
+      const nextContext = continueSweep ? delivery?.nextMessage() : undefined;
+      if (nextContext !== undefined) {
+        const message = makeUserMessage(nextContext.text);
+        input.push(nextContext.packet ? { ...message, client_composed: true } : message);
+        continue;
+      }
+      recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
       const recoveryKind = recovery.finishTurn();
       if (recovery.exhausted) {
         sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";
@@ -948,6 +950,7 @@ export async function runReviewGoal(
         failure += `; session cleanup failed: ${errorMessage(cleanupError)}`;
     }
     throwIfAborted(signal);
+    if (delivery !== undefined) failure = `Review stopped (${sessionPhase}).`;
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       write(agentLogLine(goalIndex, "session", "failure", "error", failure, logSecrets));
     });
@@ -979,13 +982,7 @@ export async function runReviewGoal(
       logSecrets,
     );
     await runAgentCleanup(
-      [
-        ...Array.from(contextReaders.values(), ({ reader: contextReader }) =>
-          contextReader.close(),
-        ),
-        ...queryReaders.cleanupOperations(),
-        repositorySnapshot.cleanup(),
-      ],
+      [...goalTools.cleanupOperations(), repositorySnapshot.cleanup()],
       goalIndex,
       logSecrets,
     );

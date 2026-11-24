@@ -47,6 +47,7 @@ export function writeReviewDiagnostic(
     "missingPaths",
     "uniqueSourceBytes",
     "repeatedSourceBytes",
+    "diffRangeDigest",
     "snapshotId",
     "briefingComplete",
     "nextCalls",
@@ -71,6 +72,8 @@ export function writeReviewDiagnostic(
     "providerRetries",
     "providerErrorStatus",
     "stallRecoveries",
+    "firstSubmissionMs",
+    "contextHandoffs",
   ]);
   const projected = Object.fromEntries(Object.entries(details).filter(([key]) => allowed.has(key)));
   logAgentEventSafely(
@@ -98,6 +101,7 @@ export function createReviewDiagnostics({
   recovery,
   startedAt,
   logSecrets,
+  privateContext = false,
   sourceContextDelivered,
   sessionRecovery,
 }: {
@@ -107,6 +111,7 @@ export function createReviewDiagnostics({
   recovery: ReviewSubmissionRecovery;
   startedAt: number;
   logSecrets: readonly string[];
+  privateContext?: boolean;
   sourceContextDelivered: () => boolean;
   sessionRecovery?: () => {
     providerRetries: number;
@@ -146,7 +151,11 @@ export function createReviewDiagnostics({
     writeReviewDiagnostic(
       goalIndex,
       event,
-      { elapsedMs: Date.now() - startedAt, ...details },
+      {
+        elapsedMs: Date.now() - startedAt,
+        ...details,
+        ...(privateContext ? { limitations: undefined, error: undefined, reason: undefined } : {}),
+      },
       logSecrets,
     );
   }
@@ -194,6 +203,7 @@ export function createReviewDiagnostics({
     }
     logDiagnostic("review-result", {
       ...inspectionDetails(),
+      diffRangeDigest: evidenceLedger.diffRangeDigest(),
       ...recoveryDetails(),
       missingPaths: inspection.missingPaths,
       termination: sessionPhase,

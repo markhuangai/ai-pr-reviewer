@@ -772,13 +772,18 @@ test("covers only exact repository paths unless a complete diff covers all chang
   );
 });
 
-test("keeps four structured state snapshots without advancing or evicting source cursors", async (t) => {
+test("keeps four state snapshots and restarts source cursors after their evidence resets", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "review-state-readers-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "source");
   const content = "source line\n".repeat(8_000);
   await writeFile(path, content);
-  const readers = new ReviewQueryReaderStore(() => undefined);
+  const ledger = new ReviewEvidenceLedger(root);
+  const readers = new ReviewQueryReaderStore(
+    () => undefined,
+    undefined,
+    () => ledger.deliveryEpoch,
+  );
   t.after(() => Promise.all(readers.cleanupOperations()));
   const source = { path, sizeBytes: Buffer.byteLength(content), cleanup: () => Promise.resolve() };
   const query = readers.createSource(source, "repository_file", {
@@ -793,7 +798,6 @@ test("keeps four structured state snapshots without advancing or evicting source
       revision: "base",
       kind: "text",
     });
-  const ledger = new ReviewEvidenceLedger(root);
   const recovery = new ReviewSubmissionRecovery();
   const state = createReviewStateTool({
     signal: undefined,
@@ -867,6 +871,44 @@ test("keeps four structured state snapshots without advancing or evicting source
     }),
   );
   assert.equal(resumed.page, 2);
+  const oldState = document(await state.handler({ paths: undefined, cursor: undefined }));
+  ledger.resetDelivery();
+  assert.equal(readers.has(query.cursor), false);
+  assert.deepEqual(readers.continuations(), []);
+  const staleState = await state.handler({ paths: undefined, cursor: String(oldState.nextCursor) });
+  assert.equal(staleState.isError, true);
+  const restart = await readers.readPage(query.cursor, "repository_file", {
+    revision: "head",
+    path: changedFile.path,
+  });
+  assert.equal(restart.isError, true);
+  assert.deepEqual(document(restart).nextCall, {
+    tool: "read_repository_file",
+    arguments: { revision: "head", path: changedFile.path },
+  });
+  assert.equal(document(restart).content, undefined);
+  const fresh = readers.createSource(source, "repository_file", {
+    path: changedFile.path,
+    revision: "head",
+  });
+  assert.equal(document(await readers.readPage(fresh.cursor, "repository_file")).page, 1);
+});
+
+test("counts new paged recovery progress after a delivery reset without extending the cycle cap", () => {
+  const recovery = new ReviewSubmissionRecovery(8);
+  recovery.observeProgress(100, 0);
+  recovery.finishTurn();
+  for (let page = 1; page <= 5; page++) {
+    recovery.observeProgress(page, 1);
+    recovery.finishTurn();
+    assert.equal(recovery.consecutiveNoProgress, 0);
+    assert.equal(recovery.exhausted, false);
+  }
+  recovery.finishTurn();
+  assert.equal(recovery.consecutiveNoProgress, 1);
+  recovery.observeProgress(1, 2);
+  recovery.finishTurn();
+  assert.equal(recovery.exhaustionReason, "recovery-limit");
 });
 
 test("reports both rename sides consistently for base, head, diff, and filtered recovery", async () => {
