@@ -317,18 +317,19 @@ export async function runReviewGoal(
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
     async (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
-      await delivery?.refresh();
-      if (!reviewPromptActive || submission !== undefined) {
+      const initialRejection = reviewSubmissionRejection(
+        reviewPromptActive,
+        submission !== undefined,
+      );
+      if (initialRejection === undefined && delivery !== undefined) {
+        await delivery.refresh();
+        throwIfAborted(signal);
+      }
+      const rejection =
+        initialRejection ?? reviewSubmissionRejection(reviewPromptActive, submission !== undefined);
+      if (rejection !== undefined) {
         return Promise.resolve({
-          content: [
-            {
-              type: "text",
-              text: reviewSubmissionRejection(
-                reviewPromptActive,
-                submission !== undefined,
-              ) as string,
-            },
-          ],
+          content: [{ type: "text", text: rejection }],
         });
       }
       validationGaps = submissionGaps(input);

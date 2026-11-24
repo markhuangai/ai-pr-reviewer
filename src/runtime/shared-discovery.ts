@@ -346,13 +346,13 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
         unknowns: z.array(z.string().trim().min(1).max(240)).max(8).optional(),
       },
       async ({ changeMap, observations, unknowns }) => {
+        if (delivery !== undefined) await delivery.refresh();
         throwIfAborted(signal);
         if (map !== undefined)
           return Promise.resolve({
             isError: true,
             content: [{ type: "text", text: "A change map has already been accepted." }],
           });
-        await delivery?.refresh();
         if (sharedContext !== undefined) {
           const valid =
             observations !== undefined &&
