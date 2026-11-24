@@ -1,9 +1,10 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKActiveGoalMessage, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { strict as assert } from "node:assert";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as wait } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
@@ -11,7 +12,7 @@ import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import type { ChangedFile, ReviewSourceRange } from "../src/lib/types.js";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import { mergeDeliveredRanges } from "../src/runtime/agent-review-tools.js";
-import { createReviewGoalsRunner } from "../src/runtime/agent-session.js";
+import { createDeferred, createReviewGoalsRunner } from "../src/runtime/agent-session.js";
 import { runReviewGoal, runReviewGoals } from "../src/runtime/agent.js";
 import { startCodexMcpServer } from "../src/runtime/codex-mcp-server.js";
 import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
@@ -23,6 +24,7 @@ import {
   stageReviewContext,
 } from "../src/runtime/review-context-packets.js";
 import { tool } from "../src/runtime/review-tool.js";
+import { SDK_SESSION_HEARTBEAT_MS } from "../src/runtime/session-recovery.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
 import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
 import {
@@ -514,6 +516,49 @@ for (const executor of ["claude", "codex"] as const) {
       const privateMarker = "FIXTURE_GOAL_PRIVATE_CONTENT";
       const externalMarker = "FIXTURE_EXTERNAL_MCP_RESULT";
       const errorMarker = "FIXTURE_PROVIDER_ECHO";
+      const reasonMarker = "FIXTURE_PRIVATE_GOAL_REASON";
+      const activeHeartbeat = createDeferred<undefined>();
+      let markedReason = false;
+      let sawActiveHeartbeat = false;
+      const queryWithPrivateReason: typeof query = (options) => {
+        const session = query(options);
+        const events = session[Symbol.asyncIterator]();
+        let injected = false;
+        session[Symbol.asyncIterator] = async function* () {
+          for (let next = await events.next(); !next.done; next = await events.next()) {
+            const message = next.value;
+            yield message;
+            if (
+              options.options?.forkSession === true &&
+              message.type === "assistant" &&
+              !injected
+            ) {
+              injected = true;
+              markedReason = true;
+              const goalEvent: SDKActiveGoalMessage = {
+                type: "active_goal",
+                uuid: message.uuid,
+                session_id: message.session_id,
+                value: {
+                  condition: "Review fixture.",
+                  iterations: 1,
+                  set_at: 0,
+                  tokens_at_start: 0,
+                  last_reason: reasonMarker,
+                },
+              };
+              yield goalEvent as unknown as SDKMessage;
+            }
+          }
+        };
+        return session;
+      };
+      if (executor === "claude") {
+        const schedule = setInterval;
+        t.mock.method(globalThis, "setInterval", (callback: () => void, milliseconds: number) =>
+          schedule(callback, milliseconds === SDK_SESSION_HEARTBEAT_MS ? 5 : milliseconds),
+        );
+      }
       await writeFile(privatePath, privateMarker);
       const goals = [
         { prompt: "PRIVATE_GOAL_ALPHA", files: [privatePath] },
@@ -533,10 +578,19 @@ for (const executor of ["claude", "codex"] as const) {
       t.after(() => mcp.close());
       const output: string[] = [];
       t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-        output.push(chunk.toString());
+        const line = chunk.toString();
+        output.push(line);
+        if (
+          markedReason &&
+          line.includes("session heartbeat details:") &&
+          line.includes('"active_goal":true')
+        ) {
+          sawActiveHeartbeat = true;
+          activeHeartbeat.resolve(undefined);
+        }
         return true;
       });
-      const upstream = await modelFixture(t, ({ body }) => {
+      const upstream = await modelFixture(t, async ({ body }) => {
         const history = historyText(body);
         if (history.includes("PRIVATE_GOAL_ALPHA")) {
           assert.ok(!history.includes("PRIVATE_GOAL_BETA"));
@@ -544,6 +598,7 @@ for (const executor of ["claude", "codex"] as const) {
           if (!history.includes(privateMarker))
             return { tool: "read_context_file", args: { path: privatePath } };
           if (!history.includes(externalMarker)) return { tool: "read_external_fixture", args: {} };
+          if (executor === "claude") await Promise.race([activeHeartbeat.promise, wait(500)]);
           return {
             tool: "submit_review",
             args: { summary: "Checked the fixture.", findings: [], limitations: [] },
@@ -589,7 +644,7 @@ for (const executor of ["claude", "codex"] as const) {
         }),
         privateFiles.filesByGoal,
         repository.root,
-        undefined,
+        executor === "claude" ? queryWithPrivateReason : undefined,
         undefined,
         { ...briefing, repositoryGuidance: [] },
       );
@@ -615,11 +670,13 @@ for (const executor of ["claude", "codex"] as const) {
       assert.ok(
         upstream.requests.some(({ body }) => historyText(body).includes("PRIVATE_GOAL_BETA")),
       );
+      if (executor === "claude") assert.ok(markedReason && sawActiveHeartbeat);
       for (const marker of [
         privatePath,
         privateMarker,
         externalMarker,
         errorMarker,
+        reasonMarker,
         ...goals.map(({ prompt }) => prompt),
       ])
         assert.ok(

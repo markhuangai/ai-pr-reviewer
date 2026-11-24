@@ -191,6 +191,7 @@ export function reviewSessionSnapshot(
   repairAttempts: number,
   submissionAccepted: boolean,
   awaitingInterruptedTurnBoundary: boolean,
+  includeGoalReason: boolean,
 ): Readonly<Record<string, unknown>> {
   return {
     phase,
@@ -198,7 +199,7 @@ export function reviewSessionSnapshot(
     awaiting_interrupted_turn_boundary: awaitingInterruptedTurnBoundary,
     session_id: lifecycle.sessionId,
     active_goal: lifecycle.activeGoal,
-    ...(lifecycle.activeGoalReason === undefined
+    ...(!includeGoalReason || lifecycle.activeGoalReason === undefined
       ? {}
       : { active_goal_reason: lifecycle.activeGoalReason }),
     goal_iterations: lifecycle.goalIterations,

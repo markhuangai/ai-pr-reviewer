@@ -13,7 +13,13 @@ import type {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import { isRecord } from "./agent-logging.js";
-import { CodexAppServer, codexExecutable, type CodexConfigValue } from "./codex-app-server.js";
+import {
+  CodexAppServer,
+  CodexRpcError,
+  CodexSessionMessages,
+  codexExecutable,
+  type CodexConfigValue,
+} from "./codex-app-server.js";
 import { startCodexMcpServer, type CodexMcpServer } from "./codex-mcp-server.js";
 import type { ReviewSession, ReviewSessionInput } from "./review-session.js";
 import type { ReviewTool } from "./review-tool.js";
@@ -32,42 +38,6 @@ function deniedMcpToolPolicy(policy: McpToolPolicy): boolean {
 
 type Message = SDKMessage | SDKActiveGoalMessage;
 
-class SessionMessages implements AsyncIterable<Message> {
-  private readonly pending: Message[] = [];
-  private wake: (() => void) | undefined;
-  private ended = false;
-  private error: Error | undefined;
-
-  push(message: Message): void {
-    if (this.ended) return;
-    this.pending.push(message);
-    this.wake?.();
-  }
-
-  finish(error?: Error): void {
-    if (error !== undefined) this.error = error;
-    this.ended = true;
-    this.wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<Message> {
-    for (;;) {
-      const message = this.pending.shift();
-      if (message !== undefined) {
-        yield message;
-        continue;
-      }
-      if (this.ended) {
-        if (this.error !== undefined) throw this.error;
-        return;
-      }
-      await new Promise<void>((resolveWake) => {
-        this.wake = resolveWake;
-      });
-    }
-  }
-}
-
 interface ToolDelivery {
   readonly name: string;
   readonly input: Record<string, unknown>;
@@ -75,7 +45,7 @@ interface ToolDelivery {
 }
 
 export class CodexSession implements ReviewSession {
-  private readonly messages = new SessionMessages();
+  private readonly messages = new CodexSessionMessages<Message>();
   private readonly pendingDeliveries = new Map<string, ToolDelivery>();
   private readonly failures = new Map<string, string>();
   private readonly controller = new AbortController();
@@ -175,11 +145,7 @@ export class CodexSession implements ReviewSession {
       if (message.done) return;
       throwIfAborted(this.controller.signal);
       if (this.limited) continue;
-      await this.rpc("turn/start", {
-        threadId: this.threadId,
-        input: [{ type: "text", text: this.promptText(message.value) }],
-        ...(this.input.config.effort === undefined ? {} : { effort: this.input.config.effort }),
-      });
+      if (!(await this.startContinuation(message.value))) continue;
       if (
         this.contextPaused &&
         !this.input.contextDelivery?.sweeping &&
@@ -190,6 +156,39 @@ export class CodexSession implements ReviewSession {
         this.goalActive = true;
       }
     }
+  }
+
+  private async startContinuation(message: SDKUserMessage): Promise<boolean> {
+    const delivery = this.input.contextDelivery;
+    let continuation = { text: this.promptText(message), packet: message.client_composed === true };
+    for (;;) {
+      try {
+        await this.startTurn(continuation.text);
+        return true;
+      } catch (error) {
+        if (!continuation.packet || delivery === undefined || !(error instanceof CodexRpcError))
+          throw error;
+        await this.process?.drain();
+        throwIfAborted(this.controller.signal);
+        if (this.activeTurn !== undefined) {
+          this.contextPaused = true;
+          await this.interrupt();
+          return false;
+        }
+        await delivery.boundary();
+        const next = delivery.nextMessage();
+        if (next === undefined) throw error;
+        continuation = next;
+      }
+    }
+  }
+
+  private startTurn(text: string): Promise<unknown> {
+    return this.rpc("turn/start", {
+      threadId: this.threadId,
+      input: [{ type: "text", text }],
+      ...(this.input.config.effort === undefined ? {} : { effort: this.input.config.effort }),
+    });
   }
 
   private promptText(message: SDKUserMessage): string {
@@ -463,7 +462,8 @@ export class CodexSession implements ReviewSession {
             },
           ],
         });
-      } catch {
+      } catch (error) {
+        if (!(error instanceof CodexRpcError)) throw error;
         throwIfAborted(this.controller.signal);
         await delivery?.boundary();
       }
@@ -476,13 +476,7 @@ export class CodexSession implements ReviewSession {
         objective: goal,
         status: "active",
       });
-    } else {
-      await this.rpc("turn/start", {
-        threadId: this.threadId,
-        input: [{ type: "text", text: review }],
-        ...(this.input.config.effort === undefined ? {} : { effort: this.input.config.effort }),
-      });
-    }
+    } else await this.startTurn(review);
   }
 
   private rpc(method: string, params: unknown): Promise<unknown> {

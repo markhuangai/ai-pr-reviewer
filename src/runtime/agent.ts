@@ -546,6 +546,7 @@ export async function runReviewGoal(
           recovery.repairAttempts,
           submission !== undefined,
           sessionState.stallBoundaryPending,
+          delivery === undefined,
         ),
         ...inspectionDetails(),
         ...recoveryDetails(),
