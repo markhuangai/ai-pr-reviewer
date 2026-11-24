@@ -352,16 +352,22 @@ for (const executor of ["claude", "codex"] as const) {
           "The child must receive the missing packet at activation, exactly once.",
         );
         arrived.add(goal);
-        return history.includes("Review submission accepted.")
-          ? { text: "Review complete." }
-          : {
-              tool: "submit_review",
-              args: {
-                summary: "Reviewed the source independently.",
-                findings: [],
-                limitations: [],
-              },
-            };
+        if (history.includes("Review submission accepted.")) return { text: "Review complete." };
+        if (history.includes("Continue required investigation")) {
+          const documents = historyDocuments(body);
+          if (!documents.some((doc) => doc.done === true && Array.isArray(doc.records)))
+            return { tool: "read_review_briefing", args: {} };
+          if (!documents.some((doc) => doc.done === true && doc.remaining === true))
+            return { tool: "read_pr_diff", args: { remaining: true } };
+        }
+        return {
+          tool: "submit_review",
+          args: {
+            summary: "Reviewed the source independently.",
+            findings: [],
+            limitations: [],
+          },
+        };
       });
       const runner = createReviewGoalsRunner(
         runReviewGoal,

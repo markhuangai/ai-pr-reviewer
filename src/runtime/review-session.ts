@@ -15,7 +15,7 @@ import { toClaudeTool } from "./review-tool.js";
 import type { ReviewTool } from "./review-tool.js";
 import { CodexSession } from "./codex-session.js";
 import type { ReviewContextDelivery } from "./review-context-delivery.js";
-import { createDeferred, makeUserMessage } from "./agent-session.js";
+import { createDeferred, makeUserMessage } from "./session-runner.js";
 
 export type ReviewSession = AsyncIterable<SDKMessage | SDKActiveGoalMessage> &
   Pick<Query, "interrupt" | "mcpServerStatus"> & {

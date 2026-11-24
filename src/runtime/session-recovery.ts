@@ -1,4 +1,4 @@
-import { errorMessage, isRecord } from "./agent-logging.js";
+import { isRecord } from "./agent-logging.js";
 import { randomInt } from "node:crypto";
 import type {
   SDKMessage,
@@ -432,65 +432,4 @@ export class SdkSessionMonitor {
         });
       });
   }
-}
-
-export interface ReviewSessionRecoveryMonitorOptions {
-  readonly snapshot: () => Readonly<Record<string, unknown>>;
-  readonly write: (event: string, details: Readonly<Record<string, unknown>>) => void;
-  readonly hasAcceptedSubmission: () => boolean;
-  readonly setPhase: (phase: string) => void;
-  readonly finishAcceptedInput: () => void;
-  readonly markBoundaryPending: () => void;
-  readonly interrupt: () => Promise<unknown>;
-  readonly finalizeAcceptedSubmission: () => void;
-  readonly progress: () => number;
-  readonly onRecoveryFailure: (reason: SessionRecoveryFailure) => void;
-}
-
-export function createReviewSessionRecoveryMonitor(
-  options: ReviewSessionRecoveryMonitorOptions,
-): SdkSessionMonitor {
-  let finalizing = false;
-  const recover = (stall?: SdkSessionStall): void => {
-    if (finalizing) return;
-    const submissionAccepted = options.hasAcceptedSubmission();
-    options.setPhase(submissionAccepted ? "finalizing-submission" : "interrupting-stalled-turn");
-    const details = {
-      recovery: stall?.recovery ?? 0,
-      ...(stall === undefined ? {} : { elapsed_since_sdk_message_ms: stall.elapsedSinceMessageMs }),
-      submission_accepted: submissionAccepted,
-    };
-    options.write("interrupt-started", details);
-    if (submissionAccepted) {
-      finalizing = true;
-      options.finishAcceptedInput();
-      options.finalizeAcceptedSubmission();
-    } else options.markBoundaryPending();
-    void Promise.resolve()
-      .then(options.interrupt)
-      .then((receipt) => {
-        const stillQueued =
-          isRecord(receipt) && Array.isArray(receipt.still_queued)
-            ? receipt.still_queued.length
-            : undefined;
-        options.write("interrupt-finished", {
-          recovery: details.recovery,
-          ...(stillQueued === undefined ? {} : { still_queued: stillQueued }),
-        });
-      })
-      .catch((error: unknown) => {
-        options.write("interrupt-failed", {
-          recovery: details.recovery,
-          error: errorMessage(error),
-        });
-      });
-  };
-  return new SdkSessionMonitor({
-    snapshot: options.snapshot,
-    write: options.write,
-    onStall: recover,
-    onSubmissionDeadline: recover,
-    progress: options.progress,
-    onRecoveryFailure: options.onRecoveryFailure,
-  });
 }

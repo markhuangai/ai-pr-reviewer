@@ -1,22 +1,13 @@
 import {
-  createReviewSessionRecoveryMonitor,
   SdkSessionMonitor,
   SDK_SESSION_HEARTBEAT_MS,
   SDK_SESSION_STALL_MS,
   SDK_SUBMISSION_GRACE_MS,
   SDK_SESSION_CLOSE_MS,
 } from "./session-recovery.js";
-export {
-  closeSdkSession,
-  createReviewSessionRecoveryMonitor,
-  SdkSessionMonitor,
-  SDK_SESSION_HEARTBEAT_MS,
-  SDK_SESSION_STALL_MS,
-  SDK_SUBMISSION_GRACE_MS,
-  SDK_SESSION_CLOSE_MS,
-} from "./session-recovery.js";
+import { makeUserMessage } from "./session-runner.js";
+export { createDeferred } from "./session-runner.js";
 import { ReviewBriefingReader } from "./review-briefing.js";
-import { randomUUID } from "node:crypto";
 
 import * as core from "@actions/core";
 import type {
@@ -99,23 +90,6 @@ const GOAL_CONDITION_SUFFIX = " [full goal is in the review prompt]";
 const CLAUDE_API_TIMEOUT_MS = 300_000;
 const CLAUDE_API_MAX_RETRIES = 1;
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-
-export function createDeferred<T>(): Deferred<T> {
-  let resolvePromise: (value: T) => void = () => undefined;
-  let rejectPromise: (error: unknown) => void = () => undefined;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  void promise.catch(() => undefined);
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
-}
-
 const SEVERITY_GUIDANCE = `- CRITICAL: a credible immediate risk of compromise, irreversible data loss, or broad outage.
 - HIGH: serious user, security, data, or reliability impact on a reachable path.
 - MODERATE: an actionable defect with bounded impact or a less likely trigger.
@@ -152,35 +126,6 @@ Use only authorized read-only tools. Never modify files, execute local commands 
 Keep epistemic labels and working analysis internal. Report each supported defect once with its concrete trigger or path, impact, and fix, using the required schema and submission tool. If nothing meets the proof bar, submit an empty findings list.`;
 
 export type AgentQuery = typeof sdkQuery;
-
-export class PromptStream implements AsyncIterable<SDKUserMessage> {
-  private readonly queue: SDKUserMessage[] = [];
-  private readonly waiters: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
-  private finished = false;
-
-  push(value: SDKUserMessage): void {
-    if (this.finished) throw new Error("Cannot add input after the review session has finished.");
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value });
-    else this.queue.push(value);
-  }
-
-  finish(): void {
-    this.finished = true;
-    while (this.waiters.length > 0) this.waiters.shift()?.({ done: true, value: undefined });
-  }
-
-  async next(): Promise<IteratorResult<SDKUserMessage>> {
-    const value = this.queue.shift();
-    if (value) return { done: false, value };
-    if (this.finished) return { done: true, value: undefined };
-    return new Promise<IteratorResult<SDKUserMessage>>((resolve) => this.waiters.push(resolve));
-  }
-
-  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
-    return this;
-  }
-}
 
 export function reviewSessionSnapshot(
   phase: string,
@@ -366,16 +311,6 @@ export function repairPrompt(
   return `Review recovery; ${label}: ${issue} ${nextAction} Submit a schema-valid object with summary, findings, and limitations. Each finding has title, severity, why, fix, evidenceRefs, countercheck, and counterevidenceRefs. ${interactWithPullRequest ? "Every finding needs a changed path and participating added line." : "Publication locations are optional; supplied locations must be valid."} Do not recreate a coverage table or invent evidence. Report scope or verification caveats in limitations with paths and reason; limitations do not waive the required checks. Severity must be ${SEVERITY_VALUES.join(", ")}.`;
 }
 
-export function makeUserMessage(text: string): SDKUserMessage {
-  return {
-    type: "user",
-    message: { role: "user", content: text },
-    parent_tool_use_id: null,
-    uuid: randomUUID(),
-    session_id: "",
-  };
-}
-
 export function makeOptions(
   config: ReviewConfig,
   cwd: string,
@@ -449,7 +384,7 @@ export function makeOptions(
 }
 
 export function startReviewPrompt(
-  input: Pick<PromptStream, "push">,
+  input: { push(message: SDKUserMessage): void },
   goal: string,
   context: PullRequestContext,
   files: readonly ChangedFile[],
@@ -680,7 +615,6 @@ export const agentInternals = {
   chunkAgentLogValue,
   completeAgentLogValue,
   createPullRequestDiff,
-  createReviewSessionRecoveryMonitor,
   reviewSessionSnapshot,
   createAgentLifecycleState,
   goalCommand,

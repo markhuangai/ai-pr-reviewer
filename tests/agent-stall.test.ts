@@ -500,6 +500,7 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
     "activity",
     "natural",
     "provider-failure",
+    "provider-failure-during-mcp-status",
     "mcp-failure",
     "mcp-auth",
     "missing",
@@ -522,16 +523,19 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
   ] as const) {
     await t.test(mode, async (st) => {
       st.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+      const lateProviderFailure = mode === "provider-failure-during-mcp-status";
       const logs: string[] = [];
+      const write = process.stdout.write.bind(process.stdout);
       st.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
         logs.push(chunk.toString());
-        return true;
+        return lateProviderFailure ? write(chunk) : true;
       });
       const ready = manualSignal<undefined>();
       const activity = manualSignal<undefined>();
       const observed = manualSignal<undefined>();
       const terminal = manualSignal<undefined>();
       const statusStarted = manualSignal<undefined>();
+      const providerFailed = manualSignal<undefined>();
       const closing = manualSignal<undefined>();
       const closed = manualSignal<undefined>();
       const controller = new AbortController();
@@ -577,6 +581,18 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
             );
             terminal.resolve(undefined);
           }
+          if (lateProviderFailure) {
+            await statusStarted.promise;
+            const result = resultMessage(1);
+            assert.ok(result.subtype === "success");
+            yield {
+              ...result,
+              is_error: true,
+              api_error_status: 503,
+              result: "Provider returned an error during MCP status",
+            };
+            providerFailed.resolve(undefined);
+          }
           await closed.promise;
           assert.equal((await messages.next()).done, true);
           if (readerFails) throw new Error("reader failed during shutdown");
@@ -584,6 +600,8 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
         mcpServerStatus: () => {
           checks += 1;
           statusStarted.resolve(undefined);
+          if (lateProviderFailure)
+            return providerFailed.promise.then(() => [{ name: "security", status: "connected" }]);
           if (pendingStatus) return new Promise<readonly never[]>(() => undefined);
           if (unavailable === "missing") return Promise.resolve([]);
           if (["pending", "disabled", "unknown"].includes(unavailable)) {
@@ -663,21 +681,27 @@ test("bounds accepted goal finalization without hiding failures", async (t) => {
         ? /reader failed during shutdown/u
         : mode === "provider-failure"
           ? /interrupted 1/u
-          : ["missing", "pending", "disabled", "unknown"].includes(unavailable)
-            ? /Configured MCP server failure: security: (status unavailable|pending|disabled|unknown)/u
-            : mode === "mcp-failure" || mode === "mcp-auth"
-              ? /context unavailable/u
-              : pendingStatus
-                ? /MCP status check timed out after 30000 ms/u
-                : mode === "reader-timeout"
-                  ? /reader did not stop within 5000 ms/u
-                  : mode === "close-failure"
-                    ? /close failed/u
-                    : undefined;
+          : lateProviderFailure
+            ? /Provider returned an error during MCP status/u
+            : ["missing", "pending", "disabled", "unknown"].includes(unavailable)
+              ? /Configured MCP server failure: security: (status unavailable|pending|disabled|unknown)/u
+              : mode === "mcp-failure" || mode === "mcp-auth"
+                ? /context unavailable/u
+                : pendingStatus
+                  ? /MCP status check timed out after 30000 ms/u
+                  : mode === "reader-timeout"
+                    ? /reader did not stop within 5000 ms/u
+                    : mode === "close-failure"
+                      ? /close failed/u
+                      : undefined;
       assert.equal(result.status, expectedError === undefined ? "completed" : "failed");
       if (expectedError !== undefined) assert.match(result.error ?? "", expectedError);
       assert.equal(result.submission?.summary, "Accepted evidence");
       assert.equal(result.tokenUsage?.complete, natural && !readerFails);
+      if (lateProviderFailure) {
+        assert.equal(result.diagnostics?.termination, "provider-error");
+        assert.equal(result.diagnostics?.providerErrorStatus, 503);
+      }
       assert.equal(closes, 1);
       assert.equal(checks, mode === "provider-failure" ? 0 : 1);
       assert.equal(interrupts, natural ? 0 : 1);
