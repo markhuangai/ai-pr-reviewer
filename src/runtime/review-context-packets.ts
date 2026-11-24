@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
 import type { ReviewSourceRange } from "../lib/types.js";
+import { isRecord } from "./agent-logging.js";
 import { RepositoryFilePageReader, type PullRequestDiffArtifact } from "./agent-review-tools.js";
 import type { ReviewBriefingReader } from "./review-briefing.js";
 
@@ -34,6 +36,7 @@ export async function stageReviewContext(
   headSha: string,
   signal?: AbortSignal,
 ): Promise<SharedReviewContext> {
+  throwIfAborted(signal);
   const snapshot = createHash("sha256")
     .update(JSON.stringify([diff.mergeBaseSha, headSha, briefing.checkpoint().identity]))
     .digest("hex");
@@ -99,6 +102,10 @@ export async function stageReviewContext(
         sourceBytes: ranges.reduce((sum, range) => sum + range.end - range.start, 0),
       });
     }
+  } catch (error) {
+    throwIfAborted(signal);
+    if (!isRecord(error) || (error.syscall !== "open" && error.syscall !== "read")) throw error;
+    return { snapshot, briefing, packets: [] };
   } finally {
     await reader.close();
   }

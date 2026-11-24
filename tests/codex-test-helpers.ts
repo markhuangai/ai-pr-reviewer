@@ -103,7 +103,12 @@ export function historyDocuments(body: Record<string, unknown>): Record<string, 
     } else if (Array.isArray(value)) {
       for (const item of value) visit(item);
     } else if (isRecord(value)) {
-      if (Array.isArray(value.records) || typeof value.done === "boolean") documents.push(value);
+      if (
+        Array.isArray(value.records) ||
+        typeof value.done === "boolean" ||
+        typeof value.references === "string"
+      )
+        documents.push(value);
       for (const child of Object.values(value)) visit(child);
     }
   };
@@ -604,6 +609,7 @@ export function sharedReviewScript({
   exhaust = false,
   compact = false,
   partial = false,
+  recoverMissingDiff = false,
 } = {}) {
   const shared = goalCount > 1;
   let discoveryStep = 0;
@@ -682,6 +688,21 @@ export function sharedReviewScript({
     }
     if (history.includes("Review submission accepted.")) return { text: "Review complete." };
     const step = steps.get(label) ?? 0;
+    if (recoverMissingDiff && step >= 2) {
+      const documents = historyDocuments(body);
+      const state = documents.findLast(({ inspection }) => isRecord(inspection));
+      const coverage = state?.inspection;
+      const lastPage = documents.findLast(({ remaining }) => remaining === true);
+      if (
+        isRecord(coverage) &&
+        typeof coverage.missing === "number" &&
+        coverage.missing > 0 &&
+        lastPage?.done !== true
+      ) {
+        reads.push({ goal: label, tool: "read_pr_diff" });
+        return { tool: "read_pr_diff", args: { remaining: true } };
+      }
+    }
     steps.set(label, step + 1);
     const calls: ModelReply[] = [
       { tool: "read_review_briefing", args: {} },

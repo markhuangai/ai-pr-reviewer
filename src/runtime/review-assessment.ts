@@ -842,7 +842,17 @@ export class ReviewEvidenceLedger {
     });
   }
 
-  renderReferences(references: readonly ReviewEvidenceReference[], limit = 1_400): string {
+  renderReferences(
+    references: readonly ReviewEvidenceReference[],
+    limit = 1_400,
+    lookup = "read_review_state",
+  ): string {
+    const { text, shown } = this.renderReferencePage(references, limit);
+    const omitted = references.length - shown;
+    return `${text}${omitted > 0 ? `\n${omitted} additional references are omitted; call ${lookup} to retrieve existing evidence without rereading source.` : ""}`;
+  }
+
+  renderReferencePage(references: readonly ReviewEvidenceReference[], limit = 1_400) {
     const lines: string[] = [];
     let used = 0;
     for (const reference of references) {
@@ -861,8 +871,10 @@ export class ReviewEvidenceLedger {
       lines.push(line);
       used += line.length + 1;
     }
-    const omitted = references.length - lines.length;
-    return `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}${omitted > 0 ? `\n${omitted} additional references are omitted; call read_review_state to retrieve existing evidence without rereading source.` : ""}`;
+    return {
+      text: `Host-issued evidence references (status is per observed page):\n${lines.join("\n")}`,
+      shown: lines.length,
+    };
   }
 
   private source(

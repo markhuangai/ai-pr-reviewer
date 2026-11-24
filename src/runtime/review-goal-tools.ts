@@ -60,7 +60,11 @@ export function createReviewGoalTools({
     if (discussionKey !== undefined && discussionQueryCursors.get(discussionKey) === cursor)
       discussionQueryCursors.delete(discussionKey);
   };
-  const queryReaders = new ReviewQueryReaderStore(detachDiscussionQuery, signal);
+  const queryReaders = new ReviewQueryReaderStore(
+    detachDiscussionQuery,
+    signal,
+    () => evidenceLedger.deliveryEpoch,
+  );
   const discussionReadPaths = new Set<string>();
   const discussionReadThreadIds = new Set<number>();
   const discussionPages = new Set<string>();

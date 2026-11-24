@@ -36,6 +36,7 @@ export type RepositoryDiscoveryTool = "list_repository_files" | "search_reposito
 
 export interface QueryReaderEntry {
   readonly reader: StringPageReader | RepositoryFilePageReader;
+  readonly deliveryEpoch: number;
   readonly kind: QueryReaderKind;
   readonly discoveryTool?: RepositoryDiscoveryTool;
   readonly metadata: Readonly<Record<string, unknown>>;
@@ -49,10 +50,11 @@ export class ReviewQueryReaderStore {
   constructor(
     private readonly onRemove: (cursor: string) => void,
     private readonly signal?: AbortSignal,
+    private readonly deliveryEpoch = () => 0,
   ) {}
 
   has(cursor: string): boolean {
-    return this.readers.has(cursor);
+    return this.readers.get(cursor)?.deliveryEpoch === this.deliveryEpoch();
   }
 
   createString(
@@ -64,7 +66,7 @@ export class ReviewQueryReaderStore {
     this.makeRoom();
     const cursor = randomUUID();
     const reader = new StringPageReader(content);
-    this.readers.set(cursor, { reader, kind, metadata });
+    this.readers.set(cursor, { reader, kind, metadata, deliveryEpoch: this.deliveryEpoch() });
     if (onComplete !== undefined) this.completions.set(cursor, onComplete);
     return { cursor, reader };
   }
@@ -89,6 +91,7 @@ export class ReviewQueryReaderStore {
     this.readers.set(cursor, {
       reader,
       kind,
+      deliveryEpoch: this.deliveryEpoch(),
       metadata: { ...metadata, sizeBytes: source.sizeBytes },
       ...(discoveryTool === undefined ? {} : { discoveryTool }),
       cleanup: source.cleanup,
@@ -110,7 +113,12 @@ export class ReviewQueryReaderStore {
       this.signal,
       spans,
     );
-    this.readers.set(cursor, { reader, kind: "diff", metadata });
+    this.readers.set(cursor, {
+      reader,
+      kind: "diff",
+      metadata,
+      deliveryEpoch: this.deliveryEpoch(),
+    });
     return { cursor, reader };
   }
 
@@ -122,6 +130,13 @@ export class ReviewQueryReaderStore {
     const entry = this.readers.get(cursor);
     if (entry === undefined)
       return this.invalidCursor("The cursor is unknown, expired, or already complete.");
+    const expired = async (): Promise<CallToolResult> => {
+      const result = this.invalidCursor("The cursor's evidence was reset.", cursor);
+      this.completions.delete(cursor);
+      await this.finish(cursor);
+      return result;
+    };
+    if (!this.has(cursor)) return expired();
     if (entry.kind !== kind)
       return this.invalidCursor(`This cursor belongs to ${entry.kind}, not ${kind}.`, cursor);
     if (
@@ -142,6 +157,7 @@ export class ReviewQueryReaderStore {
       );
     }
     const page = await entry.reader.readNext({ ...entry.metadata, nextCursor: cursor });
+    if (entry.deliveryEpoch !== this.deliveryEpoch()) return expired();
     if (page.done) await this.finish(cursor);
     return jsonToolResult({
       ...entry.metadata,
@@ -186,27 +202,31 @@ export class ReviewQueryReaderStore {
     const entry = this.readers.get(cursor);
     if (entry === undefined) return undefined;
     const metadata = entry.metadata;
+    const continuation = this.has(cursor) ? { cursor } : {};
     if (entry.kind === "discovery") {
       if (entry.discoveryTool === undefined)
         throw new Error("Discovery reader has no originating tool.");
       return {
         tool: entry.discoveryTool,
-        arguments: { ...(metadata.selector as Record<string, unknown>), cursor },
+        arguments: { ...(metadata.selector as Record<string, unknown>), ...continuation },
       };
     }
     if (entry.kind === "thread")
       return {
         tool: "read_pr_threads",
-        arguments: { ...(metadata.selector as Record<string, unknown>), cursor },
+        arguments: { ...(metadata.selector as Record<string, unknown>), ...continuation },
       };
     if (entry.kind === "repository_file")
       return {
         tool: "read_repository_file",
-        arguments: { revision: metadata.revision, path: metadata.path, cursor },
+        arguments: { revision: metadata.revision, path: metadata.path, ...continuation },
       };
     return {
       tool: "read_pr_diff",
-      arguments: { ...(metadata.paths === undefined ? {} : { paths: metadata.paths }), cursor },
+      arguments: {
+        ...(metadata.paths === undefined ? {} : { paths: metadata.paths }),
+        ...continuation,
+      },
     };
   }
 
@@ -217,7 +237,11 @@ export class ReviewQueryReaderStore {
     ledger: ReviewEvidenceLedger,
   ): number | undefined {
     const entry = this.readers.get(cursor);
-    if (entry === undefined || !(entry.reader instanceof RepositoryFilePageReader))
+    if (
+      !this.has(cursor) ||
+      entry === undefined ||
+      !(entry.reader instanceof RepositoryFilePageReader)
+    )
       return undefined;
     if (entry.kind === "diff") {
       const remaining = entry.reader.remainingFile(path);
@@ -245,6 +269,7 @@ export class ReviewQueryReaderStore {
     paths: readonly string[] = [],
   ): readonly { tool: string; arguments: Record<string, unknown> }[] {
     return [...this.readers].flatMap(([cursor, entry]) => {
+      if (!this.has(cursor)) return [];
       const metadata = entry.metadata;
       if (
         paths.length > 0 &&
@@ -455,7 +480,7 @@ export function createReviewStateTool({
 }) {
   const snapshots = new Map<
     string,
-    { paths: readonly string[]; pages: readonly Record<string, unknown>[] }
+    { paths: readonly string[]; pages: readonly Record<string, unknown>[]; deliveryEpoch: number }
   >();
   const failure = (message: string): CallToolResult => ({
     ...jsonToolResult({ error: message }),
@@ -479,6 +504,7 @@ export function createReviewStateTool({
           const page = Number(pageText);
           if (
             snapshot === undefined ||
+            snapshot.deliveryEpoch !== ledger.deliveryEpoch ||
             !Number.isSafeInteger(page) ||
             page < 1 ||
             page > snapshot.pages.length
@@ -695,7 +721,7 @@ export function createReviewStateTool({
           if (snapshots.size < 4) break;
           snapshots.delete(oldest);
         }
-        snapshots.set(id, { paths: selection, pages });
+        snapshots.set(id, { paths: selection, pages, deliveryEpoch: ledger.deliveryEpoch });
         onSnapshot?.({
           snapshotId: id,
           ...header,

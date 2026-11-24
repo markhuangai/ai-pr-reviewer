@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import {
   completeReviewScript,
+  historyDocuments,
   historyText,
   isolatedTemporaryRoot,
   modelFixture,
@@ -150,7 +151,7 @@ for (const kind of ["cliproxyapi", "litellm"] as const) {
     "forked multi-goal Codex reviews through " + images[kind],
     { timeout: 300_000 },
     async (t) => {
-      const script = sharedReviewScript();
+      const script = sharedReviewScript({ recoverMissingDiff: true });
       const fixture = await modelFixture(t, script.next);
       const url = await proxyFixture(t, kind, fixture.port);
       const { run } = await sharedReviewRun(t, url, "codex", script, {
@@ -158,6 +159,31 @@ for (const kind of ["cliproxyapi", "litellm"] as const) {
         model: "gpt-6.1-sol-fixture-alias",
       });
       assert.equal(run.discovery?.status, "completed");
+      if (kind === "cliproxyapi") {
+        assert.deepEqual(
+          script.reads
+            .filter(({ tool }) => tool === "read_pr_diff")
+            .map(({ goal }) => goal)
+            .sort(),
+          ["ALPHA", "BETA", "GAMMA"],
+          "Every fork must recover unconfirmed source through the paged tool.",
+        );
+        for (const goal of ["ALPHA", "BETA", "GAMMA"])
+          assert.ok(
+            fixture.requests.some(
+              ({ body }) =>
+                historyText(body).includes(`GOAL_${goal}`) &&
+                historyDocuments(body).some(
+                  ({ nextCall }) =>
+                    isRecord(nextCall) &&
+                    nextCall.tool === "read_pr_diff" &&
+                    isRecord(nextCall.arguments) &&
+                    nextCall.arguments.remaining === true,
+                ),
+            ),
+            `Missing unread-diff recovery assignment for ${goal}`,
+          );
+      }
       for (const { body } of fixture.requests) assertToolHistory(body);
     },
   );

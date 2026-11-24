@@ -143,7 +143,7 @@ export async function runReviewGoal(
               : [],
           )
         : [];
-    recovery.observeProgress(inspectionProgress());
+    recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
     const changed = recovery.reject(
       id,
       recordedCategories.length > 0
@@ -207,7 +207,7 @@ export async function runReviewGoal(
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
     await delivery?.refresh();
     const references = evidenceLedger.observeBatch(input.tool_calls);
-    recovery.observeProgress(inspectionProgress());
+    recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
     monitor?.observeProgress();
     const deliveredInspection = inspectionDetails();
     for (const delivery of evidenceLedger.deliveries)
@@ -334,6 +334,7 @@ export async function runReviewGoal(
       }
       validationGaps = submissionGaps(input);
       if (validationGaps.length > 0) {
+        recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
         const budget = recovery.rejectionBudget(validationGaps.map((gap) => gap.category));
         return Promise.resolve(
           reviewSubmissionRejectionResult(
@@ -908,7 +909,7 @@ export async function runReviewGoal(
         input.push(nextContext.packet ? { ...message, client_composed: true } : message);
         continue;
       }
-      recovery.observeProgress(inspectionProgress());
+      recovery.observeProgress(inspectionProgress(), evidenceLedger.deliveryEpoch);
       const recoveryKind = recovery.finishTurn();
       if (recovery.exhausted) {
         sessionPhase = recovery.exhaustionReason ?? "repair-exhausted";

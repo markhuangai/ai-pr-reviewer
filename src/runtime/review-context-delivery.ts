@@ -10,8 +10,9 @@ export class ReviewContextDelivery {
   private readonly confirmed = new Set<string>();
   private readonly everConfirmed = new Set<string>();
   private inFlight: ReviewContextPacket | undefined;
-  private attempted = new Set<string>();
-  private deferred = new Set<string>();
+  private readonly attempted = new Set<string>();
+  private readonly replayed = new Set<string>();
+  private readonly deferred = new Set<string>();
   private refreshOperation: Promise<void> = Promise.resolve();
   private cueSent = false;
   private packetBoundaryPending = false;
@@ -50,6 +51,8 @@ export class ReviewContextDelivery {
     if (packet === undefined) return undefined;
     this.inFlight = packet;
     this.packetBoundaryPending = true;
+    const replay = this.attempted.has(packet.id) || this.everConfirmed.has(packet.id);
+    if (replay) this.replayed.add(packet.id);
     this.log("context-packet-queued", {
       snapshot: this.prepared.snapshot,
       run: process.env.GITHUB_RUN_ID,
@@ -57,7 +60,7 @@ export class ReviewContextDelivery {
       packet: packet.id,
       bytes: packet.sourceBytes,
       wireBytes: packet.wireBytes,
-      replay: this.attempted.has(packet.id),
+      replay,
     });
     this.attempted.add(packet.id);
     return packet;
@@ -66,7 +69,8 @@ export class ReviewContextDelivery {
   refresh(): Promise<void> {
     const result = this.refreshOperation.then(async () => {
       const verified = await this.history.confirmed();
-      if ([...this.confirmed].some((id) => !verified?.has(id))) {
+      const lost = new Set([...this.confirmed].filter((id) => !verified?.has(id)));
+      if (lost.size > 0) {
         this.log(
           verified === undefined
             ? "context-packet-verification-unavailable"
@@ -76,7 +80,12 @@ export class ReviewContextDelivery {
         this.ledger.resetDelivery();
         this.briefing.resetDelivery();
         this.confirmed.clear();
-        this.deferred.clear();
+        this.cueSent = false;
+        this.packetBoundaryPending = true;
+        for (const packet of this.prepared.packets) {
+          if (!this.replayed.has(packet.id) || !lost.has(packet.id)) continue;
+          this.defer(packet, "replay-limit");
+        }
       }
       if (verified === undefined) return;
       for (const packet of this.prepared.packets) {
@@ -115,18 +124,24 @@ export class ReviewContextDelivery {
     const packet = this.inFlight;
     if (packet !== undefined) {
       this.inFlight = undefined;
-      this.deferred.add(packet.id);
-      this.log("context-packet-unconfirmed", {
-        snapshot: this.prepared.snapshot,
-        run: process.env.GITHUB_RUN_ID,
-        attempt: process.env.GITHUB_RUN_ATTEMPT,
-        packet: packet.id,
-        unreadBytes: packet.sourceBytes,
-        fallback: "paged tools",
-      });
+      this.defer(packet, "no-native-receipt");
     }
+    const continueSweep = wasSweeping || this.needsBoundary;
     this.packetBoundaryPending = false;
-    return wasSweeping || this.needsBoundary;
+    return continueSweep;
+  }
+
+  private defer(packet: ReviewContextPacket, reason: string): void {
+    this.deferred.add(packet.id);
+    this.log("context-packet-unconfirmed", {
+      snapshot: this.prepared.snapshot,
+      run: process.env.GITHUB_RUN_ID,
+      attempt: process.env.GITHUB_RUN_ATTEMPT,
+      packet: packet.id,
+      unreadBytes: packet.sourceBytes,
+      fallback: "paged tools",
+      reason,
+    });
   }
 
   nextMessage(): { text: string; packet: boolean } | undefined {

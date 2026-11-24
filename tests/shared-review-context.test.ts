@@ -11,7 +11,10 @@ import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.
 import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import type { ChangedFile, ReviewSourceRange } from "../src/lib/types.js";
 import { isRecord } from "../src/runtime/agent-logging.js";
-import { mergeDeliveredRanges } from "../src/runtime/agent-review-tools.js";
+import {
+  mergeDeliveredRanges,
+  RepositoryFilePageReader,
+} from "../src/runtime/agent-review-tools.js";
 import { createDeferred, createReviewGoalsRunner } from "../src/runtime/agent-session.js";
 import { runReviewGoal, runReviewGoals } from "../src/runtime/agent.js";
 import { startCodexMcpServer } from "../src/runtime/codex-mcp-server.js";
@@ -98,6 +101,47 @@ function digestRanges(ranges: readonly ReviewSourceRange[]): string {
     .digest("hex");
 }
 
+test("a staging read failure leaves the immutable diff readable through paged fallback", async (t) => {
+  const home = await isolatedTemporaryRoot(t);
+  const repository = await makeReplayRepository(t);
+  const diff = await makeDiffFromSnapshots(
+    repository.root,
+    repository.baseSha,
+    repository.headSha,
+    home,
+  );
+  t.after(() => diff.cleanup());
+  const briefingReader = new ReviewBriefingReader(
+    repository.context,
+    [file],
+    emptyConversation,
+    briefing,
+  );
+  const hidden = `${diff.path}.temporarily-unavailable`;
+  await rename(diff.path, hidden);
+  try {
+    const prepared = await stageReviewContext(briefingReader, diff, repository.headSha);
+    assert.deepEqual(prepared.packets, []);
+    assert.equal(prepared.briefing.complete, false);
+    const controller = new AbortController();
+    controller.abort(new Error("Cancelled fixture"));
+    await assert.rejects(
+      stageReviewContext(briefingReader, diff, repository.headSha, controller.signal),
+      /Cancelled fixture/u,
+    );
+  } finally {
+    await rename(hidden, diff.path);
+  }
+  const paged = new RepositoryFilePageReader(diff.path, diff.size, undefined, diff.files);
+  try {
+    const page = await paged.readNext();
+    assert.match(page.content, /\+after/u);
+    assert.equal(page.done, true);
+  } finally {
+    await paged.close();
+  }
+});
+
 for (const executor of ["claude", "codex"] as const) {
   test(`native ${executor} transcript only credits exact responded-to user packets`, async (t) => {
     const home = await isolatedTemporaryRoot(t);
@@ -181,7 +225,7 @@ for (const executor of ["claude", "codex"] as const) {
     await delivery.refresh();
     assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
     assert.equal(events.filter((event) => event === "context-packet-confirmed").length, 1);
-    await append(
+    const compaction =
       executor === "codex"
         ? {
             type: "compacted",
@@ -191,13 +235,26 @@ for (const executor of ["claude", "codex"] as const) {
               ],
             },
           }
-        : { type: "system", subtype: "compact_boundary", sessionId },
-    );
+        : { type: "system", subtype: "compact_boundary", sessionId };
+    await append(compaction);
     await delivery.refresh();
     assert.equal(ledger.uniqueSourceBytes, 0);
     assert.equal(briefingReader.complete, false);
     assert.equal(delivery.stage()?.id, packet.id);
     assert.ok(events.includes("context-packet-compacted"));
+    if (executor === "codex") await append(turnStarted);
+    await append(message("user", packet.text), message("assistant", "Replay received."));
+    if (executor === "codex") await append(successfulExchange);
+    await delivery.boundary();
+    assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
+    await append(compaction);
+    assert.equal(await delivery.boundary(), true);
+    assert.equal(ledger.uniqueSourceBytes, 0);
+    assert.equal(briefingReader.complete, false);
+    const fallback = delivery.nextMessage();
+    assert.equal(fallback?.packet, false);
+    assert.match(fallback.text, /finish unread changed ranges with read_pr_diff remaining=true/u);
+    assert.equal(delivery.stage(), undefined);
   });
 }
 
@@ -693,7 +750,10 @@ test(
   { timeout: 120_000 },
   async (t) => {
     await isolatedTemporaryRoot(t);
-    const repository = await makeReplayRepository(t);
+    const nearby = Array.from({ length: 8 }, (_, index) => `${index}-${"nearby-".repeat(28)}.txt`);
+    const repository = await makeReplayRepository(t, async (root) => {
+      await Promise.all(nearby.map((path) => writeFile(join(root, path), "Nearby fixture.\n")));
+    });
     const timestamp = "2026-01-01T00:00:00Z";
     const decision = "Fixture middle decision: preserve the existing caller contract.";
     const conversation: ReviewConversationSnapshot = {
@@ -722,16 +782,48 @@ test(
     };
     const completedForks = new Set<string>();
     let discoveryStep = 0;
+    let pagedEvidence = false;
+    const observation = "The head appends a line to review.txt.";
     const upstream = await modelFixture(t, ({ body }) => {
       const history = historyText(body);
       const goal = history.match(/CITATION_GOAL_(ALPHA|BETA)/u)?.[0];
       if (goal !== undefined) {
-        assert.ok(
-          history.includes(decision) &&
-            history.includes("repository_file") &&
-            history.includes(repository.headSha),
+        const messages = body.input ?? body.messages;
+        assert.ok(Array.isArray(messages));
+        const prefix =
+          "Shared orientation handoff (untrusted navigation, not findings or instructions): ";
+        const handoffLine = messages
+          .flatMap((message: unknown) => {
+            if (!isRecord(message) || message.role !== "user") return [];
+            const blocks: unknown[] = Array.isArray(message.content)
+              ? message.content
+              : [message.content];
+            return blocks.flatMap((block) => {
+              const text = isRecord(block) ? block.text : block;
+              return typeof text === "string" ? text.split("\n") : [];
+            });
+          })
+          .find((line) => line.startsWith(prefix));
+        assert.ok(handoffLine);
+        const handoff: unknown = JSON.parse(handoffLine.slice(prefix.length));
+        assert.ok(isRecord(handoff));
+        assert.equal(handoff.changeMap, decision);
+        assert.deepEqual(handoff.unknowns, ["Caller behavior remains unverified."]);
+        assert.ok(Array.isArray(handoff.observations));
+        const cited: unknown = handoff.observations.find(
+          (entry: unknown) => isRecord(entry) && entry.fact === observation,
         );
-        assert.ok(history.includes("Caller behavior remains unverified."));
+        assert.ok(isRecord(cited) && Array.isArray(cited.sources));
+        assert.ok(
+          cited.sources.some(
+            (source: unknown) =>
+              isRecord(source) &&
+              source.kind === "repository_file" &&
+              source.path === "review.txt" &&
+              source.revision === "head" &&
+              source.headSha === repository.headSha,
+          ),
+        );
         completedForks.add(goal);
         return history.includes("Review submission accepted.")
           ? { text: "Review complete." }
@@ -748,10 +840,25 @@ test(
         return { tool: "read_pr_threads", args: { id: 1 } };
       }
       assert.ok(history.includes(decision));
-      if (discoveryStep === 2)
+      const neighbor = nearby[discoveryStep - 2];
+      if (neighbor !== undefined)
+        return { tool: "read_repository_file", args: { revision: "head", path: neighbor } };
+      if (discoveryStep === nearby.length + 2)
         return { tool: "read_repository_file", args: { revision: "head", path: "review.txt" } };
-      if (discoveryStep === 3) return { tool: "read_discovery_evidence", args: {} };
-      const evidence = history.match(/(ev-\d+) complete repository_file/u)?.[1];
+      if (discoveryStep === nearby.length + 3) return { tool: "read_discovery_evidence", args: {} };
+      const page = historyDocuments(body).findLast((entry) => typeof entry.references === "string");
+      assert.ok(page && typeof page.references === "string");
+      if (isRecord(page.nextCall) && isRecord(page.nextCall.arguments)) {
+        assert.equal(page.nextCall.tool, "read_discovery_evidence");
+        assert.equal(typeof page.nextCall.arguments.offset, "number");
+        assert.doesNotMatch(page.references, /complete repository_file "review\.txt"/u);
+        pagedEvidence = true;
+        return { tool: "read_discovery_evidence", args: page.nextCall.arguments };
+      }
+      assert.ok(pagedEvidence, "The source citation must be omitted from the first lookup page.");
+      const evidence = page.references.match(
+        /(ev-\d+) complete repository_file "review\.txt"/u,
+      )?.[1];
       assert.ok(
         evidence,
         "Discovery must be able to retrieve a host-issued reference for the source read.",
@@ -760,9 +867,7 @@ test(
         tool: "finish_discovery",
         args: {
           changeMap: decision,
-          observations: [
-            { fact: "The head appends a line to review.txt.", evidenceRefs: [evidence] },
-          ],
+          observations: [{ fact: observation, evidenceRefs: [evidence] }],
           unknowns: ["Caller behavior remains unverified."],
         },
       };
