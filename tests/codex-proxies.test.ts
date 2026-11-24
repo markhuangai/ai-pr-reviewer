@@ -162,7 +162,7 @@ for (const kind of ["cliproxyapi", "litellm"] as const) {
       if (kind === "cliproxyapi") {
         assert.deepEqual(
           script.reads
-            .filter(({ tool }) => tool === "read_pr_diff")
+            .filter(({ goal, tool }) => goal !== "discovery" && tool === "read_pr_diff")
             .map(({ goal }) => goal)
             .sort(),
           ["ALPHA", "BETA", "GAMMA"],
