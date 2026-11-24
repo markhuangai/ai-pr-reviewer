@@ -8,6 +8,7 @@ import { tool } from "./review-tool.js";
 export class ReviewContextDelivery {
   readonly history: ReviewContextHistory;
   private readonly confirmed = new Set<string>();
+  private readonly everConfirmed = new Set<string>();
   private inFlight: ReviewContextPacket | undefined;
   private attempted = new Set<string>();
   private deferred = new Set<string>();
@@ -69,14 +70,19 @@ export class ReviewContextDelivery {
   refresh(): Promise<void> {
     const result = this.refreshOperation.then(async () => {
       const verified = await this.history.confirmed();
-      if (verified === undefined) return;
-      if ([...this.confirmed].some((id) => !verified.has(id))) {
-        this.log("context-packet-compacted", { snapshot: this.prepared.snapshot });
+      if ([...this.confirmed].some((id) => !verified?.has(id))) {
+        this.log(
+          verified === undefined
+            ? "context-packet-verification-unavailable"
+            : "context-packet-compacted",
+          { snapshot: this.prepared.snapshot },
+        );
         this.ledger.resetDelivery();
         this.briefing.resetDelivery();
         this.confirmed.clear();
         this.deferred.clear();
       }
+      if (verified === undefined) return;
       for (const packet of this.prepared.packets) {
         if (!verified.has(packet.id) || this.confirmed.has(packet.id)) continue;
         const before = this.ledger.uniqueSourceBytes;
@@ -87,13 +93,17 @@ export class ReviewContextDelivery {
         this.deferred.delete(packet.id);
         if (this.inFlight?.id === packet.id) this.inFlight = undefined;
         const confirmedBytes = this.ledger.uniqueSourceBytes - before;
+        const repeatedBytes = this.everConfirmed.has(packet.id)
+          ? packet.sourceBytes
+          : packet.sourceBytes - confirmedBytes;
+        this.everConfirmed.add(packet.id);
         this.log("context-packet-confirmed", {
           snapshot: this.prepared.snapshot,
           run: process.env.GITHUB_RUN_ID,
           attempt: process.env.GITHUB_RUN_ATTEMPT,
           packet: packet.id,
           confirmedBytes,
-          repeatedBytes: packet.sourceBytes - confirmedBytes,
+          repeatedBytes,
           inherited: !this.attempted.has(packet.id),
           missingPaths: this.ledger.inspection.missingPaths,
         });

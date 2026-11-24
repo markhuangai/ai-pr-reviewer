@@ -49,6 +49,7 @@ import {
   ReviewQueryReaderStore,
   createReviewContextTools,
   createReviewSourceTools,
+  createReviewThreadTool,
 } from "./review-context-tools.js";
 import { createRepositoryDiscoveryTools } from "./repository-discovery-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
@@ -378,10 +379,19 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
               ],
             };
         }
+        const citedObservations = observations?.map(({ fact, evidenceRefs }) => ({
+          fact,
+          sources: evidenceRefs.flatMap((id) => {
+            const reference = ledger.issued.get(id);
+            if (reference === undefined) return [];
+            const { kind, path, paths, revision, bounds, mergeBaseSha, headSha } = reference;
+            return [{ kind, path, paths, revision, bounds, mergeBaseSha, headSha }];
+          }),
+        }));
         const handoff =
           sharedContext === undefined
             ? changeMap
-            : JSON.stringify({ changeMap, observations, unknowns });
+            : JSON.stringify({ changeMap, observations: citedObservations, unknowns });
         if (Buffer.byteLength(handoff) > DISCOVERY_LIMITS.changeMapBytes)
           return {
             isError: true,
@@ -401,6 +411,28 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
       briefingTool,
       source.diffTool,
       source.repositoryFileTool,
+      tool(
+        "read_discovery_evidence",
+        "List bounded host-issued references for source already inspected during discovery.",
+        {},
+        () =>
+          Promise.resolve(
+            jsonToolResult({ references: ledger.renderReferences([...ledger.issued.values()]) }),
+          ),
+      ),
+      createReviewThreadTool({
+        isActive: () => map === undefined,
+        signal,
+        conversation,
+        queryReaders: readers,
+        discussionPathScope: (path) =>
+          files.find((file) => file.previousPath === path)?.path ?? path,
+        discussionReadPaths: new Set(),
+        discussionReadThreadIds: new Set(),
+        discussionQueryCursors: new Map(),
+        queryReaderDiscussionKeys: new Map(),
+        onPage: () => undefined,
+      }),
       ...createRepositoryDiscoveryTools({
         snapshot,
         readers,

@@ -299,9 +299,14 @@ export function createReviewSourceTools({
   ledger: ReviewEvidenceLedger;
 }) {
   const emitted: ReviewSourceRange[] = [];
+  let deliveryEpoch = ledger.deliveryEpoch;
   let automaticRead: Promise<void> = Promise.resolve();
   const readRemaining = async (): Promise<CallToolResult> => {
     throwIfAborted(signal);
+    if (deliveryEpoch !== ledger.deliveryEpoch) {
+      emitted.length = 0;
+      deliveryEpoch = ledger.deliveryEpoch;
+    }
     const missing = ledger.inspection.missingPaths;
     const spans = diff.files.flatMap((span) =>
       ledger.remainingDiffRanges(span, emitted, missing).map((range) => ({

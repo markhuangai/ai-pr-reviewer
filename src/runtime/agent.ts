@@ -289,7 +289,6 @@ export async function runReviewGoal(
             writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
         );
-  let claudeNativeTurns = 0;
   const advanceContextTool = delivery?.advanceTool(
     () => reviewPromptActive && submission === undefined,
     signal,
@@ -559,7 +558,14 @@ export async function runReviewGoal(
         ...recoveryDetails(),
       }),
       write: (event, details) => {
-        writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
+        writeAgentMonitorEvent(
+          goalIndex,
+          event,
+          delivery === undefined || details.error === undefined
+            ? details
+            : { ...details, error: "Runtime request failed." },
+          logSecrets,
+        );
       },
       hasAcceptedSubmission: () => submission !== undefined,
       setPhase: (phase) => {
@@ -606,6 +612,7 @@ export async function runReviewGoal(
                 ? (line) => {
                     if (
                       !line.includes("turn-result errors:") &&
+                      !line.includes("compaction-result error:") &&
                       !line.includes("goal-iteration details:")
                     )
                       write(line);
@@ -740,20 +747,19 @@ export async function runReviewGoal(
       }
       const { result } = outcome;
       const providerFailure = provider.failure(result);
-      if (delivery !== undefined && config.executor !== "codex")
-        claudeNativeTurns += result.num_turns;
       const continueSweep = await delivery?.boundary();
+      const claudeNativeTurns = activeSession.nativeModelTurns?.();
       if (
-        delivery !== undefined &&
-        config.executor !== "codex" &&
-        claudeNativeTurns >= config.maxTurns &&
-        submission === undefined &&
+        claudeNativeTurns !== undefined &&
+        (claudeNativeTurns > config.maxTurns ||
+          (claudeNativeTurns === config.maxTurns && submission === undefined)) &&
         providerFailure === undefined
       ) {
         sessionPhase = "max-turns-exhausted";
         return await finalizeUnaccepted(
           "The review reached the configured runtime turn limit.",
           tokenUsageState.latestSnapshotValid,
+          submission !== undefined,
         );
       }
       const interrupted = sessionState.stallBoundaryPending;

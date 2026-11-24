@@ -498,6 +498,7 @@ export class ReviewEvidenceLedger {
   }
 
   resetDelivery(): void {
+    this.deliveryEpoch++;
     this.references.clear();
     this.delivered.clear();
     this.nativeDelivered.clear();
@@ -509,6 +510,8 @@ export class ReviewEvidenceLedger {
     this.uniqueNativeLines = 0;
     this.repeatedSourceBytes = 0;
   }
+
+  deliveryEpoch = 0;
 
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;

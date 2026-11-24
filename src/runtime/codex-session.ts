@@ -402,6 +402,7 @@ export class CodexSession implements ReviewSession {
     delivery?.history.attach({
       sessionId: this.threadId,
       executor: "codex",
+      ...(this.input.forkFrom === undefined ? {} : { forkedFrom: this.input.forkFrom }),
       ...(typeof started.thread.path === "string" ? { path: started.thread.path } : {}),
     });
     if (
@@ -444,18 +445,24 @@ export class CodexSession implements ReviewSession {
       );
     await this.process.drain();
     await delivery?.refresh();
-    const activation = delivery?.stage();
-    if (activation !== undefined)
-      await this.rpc("thread/inject_items", {
-        threadId: this.threadId,
-        items: [
-          {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: activation.text }],
-          },
-        ],
-      });
+    const activation = delivery?.stage(this.input.inheritedPackets);
+    if (activation !== undefined) {
+      try {
+        await this.rpc("thread/inject_items", {
+          threadId: this.threadId,
+          items: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: activation.text }],
+            },
+          ],
+        });
+      } catch {
+        throwIfAborted(this.controller.signal);
+        await delivery?.boundary();
+      }
+    }
     if (goal !== undefined) {
       if (this.input.forkFrom !== undefined)
         await this.rpc("thread/inject_items", {

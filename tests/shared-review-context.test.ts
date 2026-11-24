@@ -7,6 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
+import type { ReviewConversationSnapshot } from "../src/lib/review-context.js";
 import type { ChangedFile, ReviewSourceRange } from "../src/lib/types.js";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import { mergeDeliveredRanges } from "../src/runtime/agent-review-tools.js";
@@ -51,7 +52,7 @@ const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 function providerPackets(body: Record<string, unknown>): Record<string, unknown>[] {
   const messages = body.messages ?? body.input;
   if (!Array.isArray(messages)) return [];
-  return messages.flatMap((message: unknown) => {
+  const packets = messages.flatMap((message: unknown) => {
     if (!isRecord(message) || message.role !== "user") return [];
     const blocks: unknown[] = Array.isArray(message.content) ? message.content : [message.content];
     return blocks.flatMap((block) => {
@@ -64,6 +65,12 @@ function providerPackets(body: Record<string, unknown>): Record<string, unknown>
       return [packet];
     });
   });
+  assert.equal(
+    new Set(packets.map(({ id }) => id)).size,
+    packets.length,
+    "Native input must not contain duplicate shared packets.",
+  );
+  return packets;
 }
 
 function digestRanges(ranges: readonly ReviewSourceRange[]): string {
@@ -117,6 +124,7 @@ for (const executor of ["claude", "codex"] as const) {
     assert.ok(packet);
     assert.equal(delivery.stage(), undefined);
     const sessionId = randomUUID();
+    const turnId = randomUUID();
     const path = join(home, `${sessionId}.jsonl`);
     delivery.history.attach({ executor, sessionId, path });
     const append = async (...entries: Record<string, unknown>[]) => {
@@ -126,7 +134,18 @@ for (const executor of ["claude", "codex"] as const) {
       executor === "codex"
         ? { type: "response_item", payload: { type: "message", role, content } }
         : { type: role, sessionId: id, message: { role, content } };
-    if (executor === "codex") await append({ type: "session_meta", payload: { id: sessionId } });
+    const successfulExchange = {
+      type: "token_usage_record",
+      payload: {
+        thread_id: sessionId,
+        session_id: sessionId,
+        turn_id: turnId,
+        response_id: randomUUID(),
+      },
+    };
+    const turnStarted = { type: "event_msg", payload: { type: "task_started", turn_id: turnId } };
+    if (executor === "codex")
+      await append({ type: "session_meta", payload: { id: sessionId } }, turnStarted);
     else await append(message("user", packet.text, randomUUID()));
     await append(
       message("assistant", packet.text),
@@ -136,15 +155,23 @@ for (const executor of ["claude", "codex"] as const) {
     await append(message("user", packet.text));
     if (executor === "claude")
       await append({ ...message("assistant", "API error."), isApiErrorMessage: true });
+    else
+      await append(
+        message("assistant", "Partial response."),
+        { type: "event_msg", payload: { type: "error" } },
+        { type: "event_msg", payload: { type: "task_complete" } },
+      );
     await delivery.boundary();
     assert.equal(ledger.uniqueSourceBytes, 0);
     assert.equal(briefingReader.complete, false);
     assert.ok(events.includes("context-packet-unconfirmed"));
     await append(message("assistant", "Received."));
+    if (executor === "codex") await append(successfulExchange);
     await delivery.refresh();
     assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
     assert.equal(briefingReader.complete, true);
     await append(message("user", packet.text), message("assistant", "Received again."));
+    if (executor === "codex") await append(successfulExchange);
     await delivery.refresh();
     assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
     assert.equal(events.filter((event) => event === "context-packet-confirmed").length, 1);
@@ -310,6 +337,7 @@ for (const executor of ["claude", "codex"] as const) {
                   return {
                     claudeTools: [
                       { tool: "read_review_state", args: {} },
+                      { tool: "advance_review_context", args: {} },
                       { tool: "advance_review_context", args: {} },
                     ],
                   };
@@ -522,13 +550,198 @@ for (const executor of ["claude", "codex"] as const) {
 }
 
 test(
+  "real Codex discovery hands off prior decisions and immutable source citations",
+  { timeout: 120_000 },
+  async (t) => {
+    await isolatedTemporaryRoot(t);
+    const repository = await makeReplayRepository(t);
+    const timestamp = "2026-01-01T00:00:00Z";
+    const decision = "Fixture middle decision: preserve the existing caller contract.";
+    const conversation: ReviewConversationSnapshot = {
+      ...emptyConversation,
+      digest: "fixture-decision",
+      entries: [
+        {
+          kind: "inline_thread",
+          id: 1,
+          path: "review.txt",
+          rootAvailable: true,
+          createdAt: timestamp,
+          isResolved: false,
+          isOutdated: false,
+          messages: ["Start of the discussion.", decision, "End of the discussion."].map(
+            (body, index) => ({
+              id: index + 1,
+              authorRole: "human" as const,
+              body,
+              createdAt: timestamp,
+              updatedAt: timestamp,
+            }),
+          ),
+        },
+      ],
+    };
+    const completedForks = new Set<string>();
+    let discoveryStep = 0;
+    const upstream = await modelFixture(t, ({ body }) => {
+      const history = historyText(body);
+      const goal = history.match(/CITATION_GOAL_(ALPHA|BETA)/u)?.[0];
+      if (goal !== undefined) {
+        assert.ok(
+          history.includes(decision) &&
+            history.includes("repository_file") &&
+            history.includes(repository.headSha),
+        );
+        assert.ok(history.includes("Caller behavior remains unverified."));
+        completedForks.add(goal);
+        return history.includes("Review submission accepted.")
+          ? { text: "Review complete." }
+          : {
+              tool: "submit_review",
+              args: { summary: "Checked the source independently.", findings: [], limitations: [] },
+            };
+      }
+      if (history.includes("Discovery change map accepted."))
+        return { text: "Orientation complete." };
+      discoveryStep++;
+      if (discoveryStep === 1) {
+        assert.ok(!history.includes(decision), "The packet contains only a discussion index.");
+        return { tool: "read_pr_threads", args: { id: 1 } };
+      }
+      assert.ok(history.includes(decision));
+      if (discoveryStep === 2)
+        return { tool: "read_repository_file", args: { revision: "head", path: "review.txt" } };
+      if (discoveryStep === 3) return { tool: "read_discovery_evidence", args: {} };
+      const evidence = history.match(/(ev-\d+) complete repository_file/u)?.[1];
+      assert.ok(
+        evidence,
+        "Discovery must be able to retrieve a host-issued reference for the source read.",
+      );
+      return {
+        tool: "finish_discovery",
+        args: {
+          changeMap: decision,
+          observations: [
+            { fact: "The head appends a line to review.txt.", evidenceRefs: [evidence] },
+          ],
+          unknowns: ["Caller behavior remains unverified."],
+        },
+      };
+    });
+    const run = await runReviewGoals(
+      repository.context,
+      [file],
+      conversation,
+      reviewConfig({
+        executor: "codex",
+        aiBaseUrl: upstream.url,
+        model: "gpt-6.1-sol",
+        maxTurns: 12,
+        reviewPrompts: ["CITATION_GOAL_ALPHA", "CITATION_GOAL_BETA"].map((prompt) => ({
+          prompt,
+          files: [],
+        })),
+        parallelCount: 1,
+      }),
+      [[], []],
+      repository.root,
+      undefined,
+      undefined,
+      { ...briefing, repositoryGuidance: [] },
+    );
+    assert.equal(completedForks.size, 2);
+    assert.deepEqual(
+      run.goals.map(({ status }) => status),
+      ["completed", "completed"],
+    );
+  },
+);
+
+test(
+  "real Claude caps native turns across continued source tool use",
+  { timeout: 120_000 },
+  async (t) => {
+    await isolatedTemporaryRoot(t);
+    const repository = await makeReplayRepository(t);
+    let boundedExchanges = 0;
+    const upstream = await modelFixture(t, ({ body }) => {
+      const history = historyText(body);
+      if (history.includes("TURN_BUDGET_GOAL")) {
+        if (toolNames(body).length === 0) return { text: "The goal remains incomplete." };
+        boundedExchanges++;
+        if (boundedExchanges === 1) return { text: "Continue the independent review." };
+        return { tool: "read_review_state", args: {} };
+      }
+      if (history.includes("Review submission accepted.")) return { text: "Review completed." };
+      if (history.includes("CONTROL_REVIEW_GOAL"))
+        return {
+          tool: "submit_review",
+          args: { summary: "Reviewed independently.", findings: [], limitations: [] },
+        };
+      return {
+        tool: "finish_discovery",
+        args: { changeMap: "Inspect review.txt.", observations: [], unknowns: [] },
+      };
+    });
+    const run = await runReviewGoals(
+      repository.context,
+      [file],
+      emptyConversation,
+      reviewConfig({
+        executor: "claude",
+        aiBaseUrl: upstream.url.replace(/\/v1$/u, ""),
+        model: "claude-sonnet-4-5",
+        maxTurns: 2,
+        reviewPrompts: ["TURN_BUDGET_GOAL", "CONTROL_REVIEW_GOAL"].map((prompt) => ({
+          prompt,
+          files: [],
+        })),
+        parallelCount: 1,
+      }),
+      [[], []],
+      repository.root,
+      undefined,
+      undefined,
+      { ...briefing, repositoryGuidance: [] },
+    );
+    assert.equal(boundedExchanges, 2);
+    assert.equal(run.goals[0]?.diagnostics?.termination, "max-turns-exhausted");
+    assert.equal(run.goals[1]?.status, "completed");
+  },
+);
+
+test(
   "real Codex compacts a packet sweep without accepting summary-only coverage",
   { timeout: 120_000 },
   async (t) => {
     await isolatedTemporaryRoot(t);
     const repository = await makeReplayRepository(t);
+    await writeFile(
+      join(repository.root, "overflow.txt"),
+      `${"compaction fixture text ".repeat(8)}\n`.repeat(2_100),
+    );
+    const context = {
+      ...repository.context,
+      headSha: await commitFixtureSnapshot(
+        repository.root,
+        repository.temporaryRoot,
+        repository.headSha,
+      ),
+    };
+    const files = await readPullRequestFilesFromSnapshots(
+      context,
+      repository.root,
+      repository.baseSha,
+    );
     let compacted = false;
     let probed = false;
+    let lostRaw = false;
+    let prematureSubmission = false;
+    const visible = new Set<unknown>();
+    const submission = {
+      tool: "submit_review",
+      args: { summary: "Reviewed the source.", findings: [], limitations: [] },
+    } as const;
     const upstream = await modelFixture(t, ({ body }) => {
       const history = historyText(body);
       if (toolNames(body).length === 0) {
@@ -544,30 +757,41 @@ test(
             };
       }
       if (history.includes("Review submission accepted.")) return { text: "Review complete." };
+      const packets = providerPackets(body);
+      if (history.includes("COMPACT_SWEEP_GOAL") && !compacted)
+        for (const packet of packets) visible.add(packet.id);
+      const missing =
+        history.includes("COMPACT_SWEEP_GOAL") &&
+        compacted &&
+        [...visible].some((id) => !packets.some((packet) => packet.id === id));
+      if (missing && !prematureSubmission) {
+        lostRaw = true;
+        prematureSubmission = true;
+        return submission;
+      }
+      if (packets.at(-1)?.more === true && (!probed || history.includes("CONTROL_SWEEP_GOAL")))
+        return { tool: "advance_review_context", args: {} };
       if (history.includes("COMPACT_SWEEP_GOAL") && !probed) {
         probed = true;
         return { tool: "read_review_state", args: {}, inputTokens: 300_000 };
       }
-      if (providerPackets(body).length === 0) {
+      if (missing || packets.length === 0) {
         if (!historyDocuments(body).some((doc) => doc.remaining === true && doc.done === true))
           return { tool: "read_pr_diff", args: { remaining: true } };
         if (!historyDocuments(body).some((doc) => Array.isArray(doc.records) && doc.done === true))
           return { tool: "read_review_briefing", args: {} };
       }
-      return {
-        tool: "submit_review",
-        args: { summary: "Reviewed the source.", findings: [], limitations: [] },
-      };
+      return submission;
     });
     const run = await runReviewGoals(
-      repository.context,
-      [file],
+      context,
+      files,
       emptyConversation,
       reviewConfig({
         executor: "codex",
         aiBaseUrl: upstream.url,
         model: "gpt-6.1-sol",
-        maxTurns: 20,
+        maxTurns: 50,
         reviewPrompts: ["COMPACT_SWEEP_GOAL", "CONTROL_SWEEP_GOAL"].map((prompt) => ({
           prompt,
           files: [],
@@ -581,6 +805,12 @@ test(
       { ...briefing, repositoryGuidance: [] },
     );
     assert.equal(compacted, true);
+    assert.equal(lostRaw, true, "Native compaction must omit at least one raw packet.");
+    assert.equal(
+      run.goals[0]?.diagnostics?.inspectionContinuations,
+      1,
+      "A summary-only submission must be rejected before recovering source.",
+    );
     assert.deepEqual(
       run.goals.map(({ status }) => status),
       ["completed", "completed"],

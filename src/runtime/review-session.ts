@@ -17,7 +17,10 @@ import type { ReviewContextDelivery } from "./review-context-delivery.js";
 import { makeUserMessage } from "./agent-session.js";
 
 export type ReviewSession = AsyncIterable<SDKMessage | SDKActiveGoalMessage> &
-  Pick<Query, "interrupt" | "mcpServerStatus"> & { close(): void | Promise<void> };
+  Pick<Query, "interrupt" | "mcpServerStatus"> & {
+    close(): void | Promise<void>;
+    nativeModelTurns?: () => number;
+  };
 
 export interface ReviewSessionInput {
   readonly config: ReviewConfig;
@@ -38,6 +41,8 @@ export interface ReviewSessionInput {
 export function createReviewSession(query: AgentQuery, input: ReviewSessionInput): ReviewSession {
   if (input.config.executor === "codex") return new CodexSession(input);
   const delivery = input.contextDelivery;
+  const boundedGoal = delivery !== undefined && input.forkFrom !== undefined;
+  const responseIds = new Set<string>();
   async function* withContext() {
     let first = true;
     for await (const message of input.prompt) {
@@ -74,6 +79,51 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
     prompt: delivery === undefined ? input.prompt : withContext(),
     options: {
       ...input.options,
+      ...(boundedGoal
+        ? {
+            hooks: {
+              ...input.options.hooks,
+              PreToolUse: [
+                ...(input.options.hooks?.PreToolUse ?? []),
+                {
+                  hooks: [
+                    () =>
+                      Promise.resolve(
+                        responseIds.size <= input.config.maxTurns
+                          ? {}
+                          : {
+                              continue: false,
+                              stopReason: "The configured native turn limit was reached.",
+                              hookSpecificOutput: {
+                                hookEventName: "PreToolUse",
+                                permissionDecision: "deny",
+                                permissionDecisionReason:
+                                  "The configured native turn limit was reached.",
+                              },
+                            },
+                      ),
+                  ],
+                },
+              ],
+              PostToolBatch: [
+                ...(input.options.hooks?.PostToolBatch ?? []),
+                {
+                  hooks: [
+                    () =>
+                      Promise.resolve(
+                        responseIds.size >= input.config.maxTurns
+                          ? {
+                              continue: false,
+                              stopReason: "The configured native turn limit was reached.",
+                            }
+                          : {},
+                      ),
+                  ],
+                },
+              ],
+            },
+          }
+        : {}),
       ...(input.sessionHome === undefined
         ? {}
         : {
@@ -108,10 +158,19 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
   });
   if (input.sessionHome === undefined) return session;
   return {
+    ...(boundedGoal ? { nativeModelTurns: () => responseIds.size } : {}),
     async *[Symbol.asyncIterator]() {
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init")
           delivery?.history.attach({ sessionId: message.session_id, executor: "claude" });
+        if (
+          boundedGoal &&
+          message.type === "assistant" &&
+          message.parent_tool_use_id === null &&
+          message.message.model !== "<synthetic>" &&
+          message.error === undefined
+        )
+          responseIds.add(message.message.id);
         yield message;
       }
     },
