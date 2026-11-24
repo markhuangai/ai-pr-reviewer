@@ -43,6 +43,7 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
   const delivery = input.contextDelivery;
   const boundedGoal = delivery !== undefined && input.forkFrom !== undefined;
   const forkReady = createDeferred<boolean>();
+  const activationClosed = () => closing || input.options.abortController?.signal.aborted === true;
   const responseIds = new Set<string>();
   async function* withContext(): AsyncGenerator<SDKUserMessage> {
     let first = true;
@@ -52,9 +53,9 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
         if (boundedGoal) {
           yield { ...message, shouldQuery: false };
           const ready = await Promise.race([forkReady.promise, wait(3_000, true, { ref: false })]);
-          if (!ready || closing || input.options.abortController?.signal.aborted) return;
+          if (!ready || activationClosed()) return;
           await delivery.refresh();
-          if (closing || input.options.abortController?.signal.aborted) return;
+          if (activationClosed()) return;
           const packet = delivery.stage();
           if (packet !== undefined)
             yield { ...makeUserMessage(packet.text), client_composed: true, shouldQuery: false };
