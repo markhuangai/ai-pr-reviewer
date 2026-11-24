@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
+import { globSync } from "node:fs";
 import { appendFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +17,7 @@ import {
   REVIEW_CONTEXT_PACKET_PREFIX,
   stageReviewContext,
 } from "../src/runtime/review-context-packets.js";
+import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
 import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
 import {
   historyDocuments,
@@ -196,6 +199,80 @@ for (const executor of ["claude", "codex"] as const) {
     assert.equal(delivery.stage(), undefined);
   });
 }
+
+test(
+  "real Codex discovery rejects stale source cursors when packet verification is lost",
+  { timeout: 120_000 },
+  async (t) => {
+    const home = await isolatedTemporaryRoot(t);
+    const path = "reference.txt";
+    const repository = await makeReplayRepository(t, (root) =>
+      writeFile(join(root, path), "Repository context for the cursor.\n".repeat(1_000)),
+    );
+    const { context, root, baseSha, headSha } = repository;
+    const files = await readPullRequestFilesFromSnapshots(context, root, baseSha);
+    const diff = await makeDiffFromSnapshots(root, baseSha, headSha, home);
+    t.after(() => diff.cleanup());
+    const sharedContext = await stageReviewContext(
+      new ReviewBriefingReader(context, files, emptyConversation, briefing),
+      diff,
+      headSha,
+    );
+    const selection = { revision: "head", path };
+    let step = 0;
+    let cursor: string | undefined;
+    let rejected = false;
+    const upstream = await modelFixture(t, async ({ body }) => {
+      switch (step++) {
+        case 0:
+          return { tool: "read_repository_file", args: selection };
+        case 1: {
+          const page = historyDocuments(body).find((document) => document.path === path);
+          assert.ok(typeof page?.nextCursor === "string");
+          cursor = page.nextCursor;
+          const sessions = globSync("ai-pr-reviewer-discovery-*/sessions/**/*.jsonl", {
+            cwd: home,
+          });
+          assert.equal(sessions.length, 1);
+          const [transcript] = sessions;
+          assert.ok(transcript);
+          const session = join(home, transcript);
+          await rename(session, session + ".unavailable");
+          return { tool: "read_discovery_evidence", args: {} };
+        }
+        case 2:
+          return { tool: "read_repository_file", args: { ...selection, cursor } };
+        case 3:
+          assert.ok(
+            historyText(body).includes("The cursor's evidence was reset."),
+            "The stale cursor must return a restart instruction.",
+          );
+          rejected = true;
+          return {
+            tool: "finish_discovery",
+            args: { changeMap: "Inspect the changed text.", observations: [], unknowns: [] },
+          };
+        default:
+          return { text: "Discovery complete." };
+      }
+    });
+    const discovery = await runSharedDiscovery({
+      context,
+      files,
+      conversation: emptyConversation,
+      config: reviewConfig({ executor: "codex", aiBaseUrl: upstream.url, model: "gpt-6.1-sol" }),
+      diff,
+      cwd: root,
+      queryAgent: query,
+      abortController: undefined,
+      briefing,
+      sharedContext,
+    });
+    t.after(() => discovery.cleanup());
+    assert.equal(discovery.result.status, "completed");
+    assert.equal(rejected, true);
+  },
+);
 
 test(
   "real Codex recovers a rejected overflow turn with unread paged source",

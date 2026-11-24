@@ -286,6 +286,11 @@ export class SdkSessionMonitor {
     this.armProgressWatchdog();
   }
 
+  rebaseProgress(): void {
+    // Evidence loss changes the baseline without extending the inspection deadline.
+    this.progress = this.options.progress?.() ?? 0;
+  }
+
   pause(): void {
     if (this.stopped || this.pausedAt !== undefined) return;
     this.pausedAt = this.clock.now();

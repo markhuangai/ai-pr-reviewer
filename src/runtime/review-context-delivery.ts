@@ -25,6 +25,7 @@ export class ReviewContextDelivery {
     private readonly briefing: ReviewBriefingReader,
     private readonly ledger: ReviewEvidenceLedger,
     private readonly log: (event: string, detail: Record<string, unknown>) => void,
+    private readonly onEvidenceReset?: () => void,
   ) {
     this.history = new ReviewContextHistory(home, prepared.packets);
   }
@@ -87,9 +88,8 @@ export class ReviewContextDelivery {
           this.defer(packet, "replay-limit");
         }
       }
-      if (verified === undefined) return;
       for (const packet of this.prepared.packets) {
-        if (!verified.has(packet.id) || this.confirmed.has(packet.id)) continue;
+        if (!verified?.has(packet.id) || this.confirmed.has(packet.id)) continue;
         const before = this.ledger.uniqueSourceBytes;
         this.ledger.confirmContextRanges(packet.id, packet.ranges);
         for (const page of packet.pages)
@@ -113,6 +113,7 @@ export class ReviewContextDelivery {
           missingPaths: this.ledger.inspection.missingPaths,
         });
       }
+      if (lost.size > 0) this.onEvidenceReset?.();
     });
     this.refreshOperation = result.catch(() => undefined);
     return result;

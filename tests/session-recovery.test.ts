@@ -12,6 +12,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   ProviderRecovery,
+  SDK_INSPECTION_STALL_MS,
   SdkSessionMonitor,
   waitForProviderRetry,
 } from "../src/runtime/session-recovery.js";
@@ -247,6 +248,43 @@ test("inspection progress bounds busy sessions and interrupted turns", async (t)
   t.mock.timers.tick(1);
   assert.deepEqual(failures, ["interrupt-timeout"]);
   monitor.stop();
+});
+
+test("inspection watchdog counts reads below a reset baseline without counting the reset", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout", "setInterval"], now: 0 });
+  let progress = 100;
+  const stalls: (string | undefined)[] = [];
+  const monitor = new SdkSessionMonitor({
+    snapshot: () => ({}),
+    write: () => undefined,
+    progress: () => progress,
+    stallMs: 2 * SDK_INSPECTION_STALL_MS,
+    onStall: ({ reason }) => {
+      stalls.push(reason);
+    },
+  });
+  t.after(() => {
+    monitor.stop();
+  });
+  monitor.start();
+  t.mock.timers.tick(SDK_INSPECTION_STALL_MS - 60_000);
+  progress = 0;
+  monitor.rebaseProgress();
+  t.mock.timers.tick(30_000);
+  progress = 1;
+  monitor.observeProgress();
+  t.mock.timers.tick(SDK_INSPECTION_STALL_MS - 60_000);
+  await Promise.resolve();
+  assert.deepEqual(stalls, []);
+
+  progress = 0;
+  monitor.rebaseProgress();
+  t.mock.timers.tick(59_999);
+  await Promise.resolve();
+  assert.deepEqual(stalls, []);
+  t.mock.timers.tick(1);
+  await Promise.resolve();
+  assert.deepEqual(stalls, ["inspection"]);
 });
 
 test("two stalled-turn recoveries are allowed and backoff pauses both watchdogs", async (t) => {

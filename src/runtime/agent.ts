@@ -277,6 +277,7 @@ export async function runReviewGoal(
   );
   if (sharedSeed !== undefined && sharedContext === undefined)
     briefingReader.inherit(sharedSeed.briefing);
+  let monitor: SdkSessionMonitor | undefined;
   const delivery =
     sharedContext === undefined || sharedSeed === undefined
       ? undefined
@@ -288,6 +289,7 @@ export async function runReviewGoal(
           (event, details) => {
             writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
+          () => monitor?.rebaseProgress(),
         );
   const advanceContextTool = delivery?.advanceTool(
     () => reviewPromptActive && submission === undefined,
@@ -399,7 +401,6 @@ export async function runReviewGoal(
   let readerFailure: Error | undefined;
   let reader: Promise<void> | undefined;
   let session: ReviewSession | undefined;
-  let monitor: SdkSessionMonitor | undefined;
   let sessionPhase = "starting";
   const sessionState = { stallBoundaryPending: false, expectedSessionClose: false };
   let sessionClosed = false;

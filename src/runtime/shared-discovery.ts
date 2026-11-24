@@ -241,7 +241,6 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
     files,
     signal,
   );
-  const readers = new ReviewQueryReaderStore(() => undefined, signal);
   const ledger = new ReviewEvidenceLedger(
     cwd,
     files,
@@ -250,6 +249,11 @@ export async function runSharedDiscovery(input: DiscoveryInput): Promise<SharedD
       headSha: context.headSha,
     },
     diff.files,
+  );
+  const readers = new ReviewQueryReaderStore(
+    () => undefined,
+    signal,
+    () => ledger.deliveryEpoch,
   );
   const secrets = reviewSecretCandidates(config);
   let resourceCleanup: Promise<unknown> | undefined;
