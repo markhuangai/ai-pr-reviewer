@@ -13,6 +13,8 @@ import { createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { toClaudeTool } from "./review-tool.js";
 import type { ReviewTool } from "./review-tool.js";
 import { CodexSession } from "./codex-session.js";
+import type { ReviewContextDelivery } from "./review-context-delivery.js";
+import { makeUserMessage } from "./agent-session.js";
 
 export type ReviewSession = AsyncIterable<SDKMessage | SDKActiveGoalMessage> &
   Pick<Query, "interrupt" | "mcpServerStatus"> & { close(): void | Promise<void> };
@@ -29,16 +31,47 @@ export interface ReviewSessionInput {
   readonly sessionHome?: string;
   readonly forkFrom?: string;
   readonly inheritedUsage?: GoalTokenUsage;
+  readonly contextDelivery?: ReviewContextDelivery;
+  readonly inheritedPackets?: readonly string[];
 }
 
 export function createReviewSession(query: AgentQuery, input: ReviewSessionInput): ReviewSession {
   if (input.config.executor === "codex") return new CodexSession(input);
+  const delivery = input.contextDelivery;
+  async function* withContext() {
+    let first = true;
+    for await (const message of input.prompt) {
+      if (first) {
+        first = false;
+        const packet = delivery?.stage(input.inheritedPackets);
+        if (packet !== undefined) {
+          const user = { ...makeUserMessage(packet.text), client_composed: true as const };
+          if (input.forkFrom !== undefined) yield { ...user, shouldQuery: false };
+          else if (typeof message.message.content === "string") {
+            yield {
+              ...message,
+              client_composed: true as const,
+              message: {
+                role: "user" as const,
+                content: [
+                  { type: "text" as const, text: message.message.content },
+                  { type: "text" as const, text: packet.text },
+                ],
+              },
+            };
+            continue;
+          }
+        }
+      }
+      yield message;
+    }
+  }
   let child: ChildProcessWithoutNullStreams | undefined;
   let exited: Promise<void> | undefined;
   let closing = false;
   let shutdown: Promise<void> | undefined;
   const session = query({
-    prompt: input.prompt,
+    prompt: delivery === undefined ? input.prompt : withContext(),
     options: {
       ...input.options,
       ...(input.sessionHome === undefined
@@ -75,7 +108,13 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
   });
   if (input.sessionHome === undefined) return session;
   return {
-    [Symbol.asyncIterator]: () => session[Symbol.asyncIterator](),
+    async *[Symbol.asyncIterator]() {
+      for await (const message of session) {
+        if (message.type === "system" && message.subtype === "init")
+          delivery?.history.attach({ sessionId: message.session_id, executor: "claude" });
+        yield message;
+      }
+    },
     interrupt: () => session.interrupt(),
     mcpServerStatus: () => session.mcpServerStatus(),
     close: () =>
@@ -100,6 +139,7 @@ export function createReviewMcpServers(
   tools: readonly ReviewTool[],
   hasContextFiles: boolean,
   phase: "review" | "discovery" = "review",
+  hasContextPackets = false,
 ): Record<string, McpServerConfig> {
   const mcpServers: Record<string, McpServerConfig> = {
     ["review_output"]: createSdkMcpServer({
@@ -108,9 +148,11 @@ export function createReviewMcpServers(
       instructions:
         phase === "discovery"
           ? "Start with read_change_overview, selectively inspect fixed-revision source, and finish_discovery with a bounded neutral change map and explicit unknowns. The complete briefing and diff are optional during orientation; every child review independently completes required coverage."
-          : !hasContextFiles
-            ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads."
-            : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads.",
+          : hasContextPackets
+            ? "Inspect the shared user-role packets. When more=true, call advance_review_context when ready for the next packet. Use the paged tools for targeted investigation or unconfirmed ranges. After the sweep, complete outstanding checks and call submit_review."
+            : !hasContextFiles
+              ? "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads."
+              : "Call read_review_briefing until done=true, then investigate with the repository and Git tools. Optionally call read_context_file only for an authorized path relevant to the goal. Read prior discussion and the diff as needed before submitting the complete review. Recover existing evidence and validation gaps with read_review_state after compaction or rejection; validation allows five corrections, while required inspection has separate bounded recovery. Refresh state after recovery pages to avoid overlapping reads.",
       tools: tools.map(toClaudeTool),
       alwaysLoad: true,
     }),

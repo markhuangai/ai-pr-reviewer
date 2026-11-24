@@ -626,6 +626,8 @@ export function sharedReviewScript({
         return {
           tool: "finish_discovery",
           args: {
+            observations: [],
+            unknowns: ["Surrounding callers were not read."],
             changeMap:
               "Intent: add a value to review.txt. Area: the text consumer. Entry points and tests need further investigation. Unknowns: surrounding consumers were not read.",
           },
@@ -640,6 +642,8 @@ export function sharedReviewScript({
         {
           tool: "finish_discovery",
           args: {
+            observations: [],
+            unknowns: ["Surrounding callers were not read."],
             changeMap:
               "Intent: append a value in review.txt. Area: the text consumer. Entry point: review.txt. Tests and consumers remain unknown; reviewers must investigate independently.",
           },

@@ -87,6 +87,7 @@ import {
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
+import { ReviewContextDelivery } from "./review-context-delivery.js";
 import {
   ProviderRecovery,
   waitForProviderRetry,
@@ -129,6 +130,7 @@ export async function runReviewGoal(
   const signal = abortController?.signal;
   throwIfAborted(signal);
   assertDiscoverySnapshot(sharedSeed, context, conversation, briefing);
+  const sharedContext = sharedSeed?.sharedContext;
   let submission: GoalSubmission | undefined;
   const startedAt = Date.now();
   const recovery = new ReviewSubmissionRecovery(config.maxTurns);
@@ -184,7 +186,8 @@ export async function runReviewGoal(
   const conversationReader = new PullRequestConversationReader(conversation);
   const reviewSnapshot = { mergeBaseSha: diff.mergeBaseSha, headSha: context.headSha };
   const evidenceLedger = new ReviewEvidenceLedger(cwd, files, reviewSnapshot, diff.files);
-  if (sharedSeed !== undefined) evidenceLedger.inherit(sharedSeed.evidence);
+  if (sharedSeed !== undefined && sharedContext === undefined)
+    evidenceLedger.inherit(sharedSeed.evidence);
   const {
     inspectionDetails,
     recoveryDetails,
@@ -206,12 +209,13 @@ export async function runReviewGoal(
       lifecycle.sessionId !== undefined ||
       evidenceLedger.issued.size > sharedSeed.evidence.references.length,
   });
-  const evidenceHook: HookCallback = (input) => {
+  const evidenceHook: HookCallback = async (input) => {
     if (input.hook_event_name === "PostToolUse" && input.tool_name === "Read") {
       evidenceLedger.observeNativeRead(input);
       return Promise.resolve({ continue: true });
     }
     if (input.hook_event_name !== "PostToolBatch") return Promise.resolve({ continue: true });
+    await delivery?.refresh();
     const references = evidenceLedger.observeBatch(input.tool_calls);
     recovery.observeProgress(inspectionProgress());
     monitor?.observeProgress();
@@ -239,9 +243,10 @@ export async function runReviewGoal(
       },
     });
   };
-  const submissionHook: HookCallback = (input) => {
+  const submissionHook: HookCallback = async (input) => {
     if (input.hook_event_name !== "PreToolUse" || !reviewPromptActive || submission !== undefined)
       return Promise.resolve({ continue: true });
+    await delivery?.refresh();
     recovery.observeUse(input.tool_use_id, input.tool_input);
     return Promise.resolve({
       continue: true,
@@ -265,13 +270,82 @@ export async function runReviewGoal(
     signal,
   );
   const repositoryGuidance =
-    briefing.repositoryGuidance ??
-    (await repositoryGuidanceForRun(diff, repositorySnapshot, files));
-  const briefingReader = new ReviewBriefingReader(context, files, conversation, {
-    ...briefing,
-    repositoryGuidance,
-  });
-  if (sharedSeed !== undefined) briefingReader.inherit(sharedSeed.briefing);
+    sharedContext === undefined
+      ? (briefing.repositoryGuidance ??
+        (await repositoryGuidanceForRun(diff, repositorySnapshot, files)))
+      : undefined;
+  const briefingReader = new ReviewBriefingReader(
+    context,
+    files,
+    conversation,
+    {
+      ...briefing,
+      ...(repositoryGuidance === undefined ? {} : { repositoryGuidance }),
+    },
+    sharedContext?.briefing,
+  );
+  if (sharedSeed !== undefined && sharedContext === undefined)
+    briefingReader.inherit(sharedSeed.briefing);
+  const delivery =
+    sharedContext === undefined || sharedSeed === undefined
+      ? undefined
+      : new ReviewContextDelivery(
+          sharedContext,
+          sharedSeed.sessionHome,
+          briefingReader,
+          evidenceLedger,
+          (event, details) => writeAgentMonitorEvent(goalIndex, event, details, logSecrets),
+        );
+  let contextBoundaryRequested = false;
+  let contextCueSent = false;
+  let claudeHandoffTurns = 0;
+  const submissionCue = () => {
+    const missing = evidenceLedger.inspection.missingPaths;
+    const checks = [
+      ...(briefingReader.complete
+        ? []
+        : ["finish unread briefing pages with read_review_briefing"]),
+      ...(missing.length === 0
+        ? []
+        : ["finish unread changed ranges with read_pr_diff remaining=true"]),
+      "verify relevant callers, tests and prior discussion before reporting findings",
+    ];
+    return `Shared context sweep ended. Outstanding checks: ${checks.join("; ")}. Use read_review_state for exact gaps or evidence references as needed. Then call submit_review for this same goal, even when findings are empty.`;
+  };
+  const advanceContextTool =
+    delivery === undefined
+      ? undefined
+      : tool(
+          "advance_review_context",
+          "Confirm you have considered the current shared packet and ask the host to continue the same review with the next unread packet. Do not combine with other calls. When the sweep ends, complete outstanding checks and call submit_review.",
+          {},
+          async () => {
+            throwIfAborted(signal);
+            await delivery.refresh();
+            if (!reviewPromptActive || submission !== undefined)
+              return {
+                isError: true,
+                content: [{ type: "text", text: "There is no active review context sweep." }],
+              };
+            if (!delivery.sweeping) {
+              contextCueSent = true;
+              return { content: [{ type: "text", text: submissionCue() }] };
+            }
+            if (contextBoundaryRequested)
+              return { content: [{ type: "text", text: "The next packet is already scheduled." }] };
+            contextBoundaryRequested = true;
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: "Context advance acknowledged. Wait for the host to deliver the next unread packet.",
+                },
+              ],
+              _meta: { "claude/endTurn": true, context_advance: true },
+            };
+          },
+          { alwaysLoad: true },
+        );
   const discussionQueryCursors = new Map<string, string>();
   const queryReaderDiscussionKeys = new Map<string, string>();
   const detachDiscussionQuery = (cursor: string): void => {
@@ -385,8 +459,9 @@ export async function runReviewGoal(
     "submit_review",
     "Submit summary, findings with their own evidenceRefs, countercheck and counterevidenceRefs, and limitations. The host requires a changed-code scan. Validation allows one initial failure plus five corrections; inspection has separate bounded recovery.",
     (config.interactWithPullRequest ? interactiveSubmissionSchema : submissionSchema).shape,
-    (input): Promise<CallToolResult> => {
+    async (input): Promise<CallToolResult> => {
       throwIfAborted(signal);
+      await delivery?.refresh();
       if (!reviewPromptActive || submission !== undefined) {
         return Promise.resolve({
           content: [
@@ -414,17 +489,18 @@ export async function runReviewGoal(
         );
       }
       const candidate = toSubmission(submissionSchema.parse(input));
-      logAgentEventSafely(goalIndex, logSecrets, (write) => {
-        writeCompleteAgentLog(
-          goalIndex,
-          "review submission",
-          "submit_review",
-          "candidate",
-          candidate,
-          logSecrets,
-          write,
-        );
-      });
+      if (delivery === undefined)
+        logAgentEventSafely(goalIndex, logSecrets, (write) => {
+          writeCompleteAgentLog(
+            goalIndex,
+            "review submission",
+            "submit_review",
+            "candidate",
+            candidate,
+            logSecrets,
+            write,
+          );
+        });
       submission = candidate;
       accepted.resolve(undefined);
       logDiagnostic("submission-decision", {
@@ -447,6 +523,7 @@ export async function runReviewGoal(
     repositoryFileTool,
     discussionThreadTool,
     ...(contextFileTool === undefined ? [] : [contextFileTool]),
+    ...(advanceContextTool === undefined ? [] : [advanceContextTool]),
     outputTool,
     ...(config.executor !== "codex"
       ? []
@@ -457,7 +534,13 @@ export async function runReviewGoal(
           signal,
         })),
   ];
-  const mcpServers = createReviewMcpServers(config, reviewTools, contextFileTool !== undefined);
+  const mcpServers = createReviewMcpServers(
+    config,
+    reviewTools,
+    contextFileTool !== undefined,
+    "review",
+    delivery !== undefined,
+  );
   const input = new PromptStream();
   const queueMessage = (text: string, label: string): void => {
     const message = makeUserMessage(text);
@@ -530,6 +613,14 @@ export async function runReviewGoal(
     session = createReviewSession(queryAgent, {
       config,
       ...forkSessionOptions(sharedSeed),
+      ...(delivery === undefined
+        ? {}
+        : {
+            contextDelivery: delivery,
+            ...(sharedSeed?.confirmedPackets === undefined
+              ? {}
+              : { inheritedPackets: sharedSeed.confirmedPackets }),
+          }),
       cwd,
       tools: reviewTools,
       outputServerName,
@@ -642,13 +733,37 @@ export async function runReviewGoal(
           assertIndependentSession(message, sharedSeed);
           provider.observe(message);
           activeMonitor.observe(sdkSessionActivity(message, toolUses));
-          if (message.type !== "active_goal")
+          if (message.type !== "active_goal" && delivery === undefined)
             logAgentMessageSafely(message, goalIndex, logSecrets, toolUses);
           logAgentEventSafely(goalIndex, logSecrets, (write) => {
-            logAgentLifecycleMessage(message, goalIndex, logSecrets, lifecycle, write);
+            logAgentLifecycleMessage(
+              message,
+              goalIndex,
+              logSecrets,
+              lifecycle,
+              delivery !== undefined &&
+                (message.type === "active_goal" || message.type === "result")
+                ? (line) => {
+                    if (
+                      !line.includes("turn-result errors:") &&
+                      !line.includes("goal-iteration details:")
+                    )
+                      write(line);
+                  }
+                : write,
+            );
           });
           if (isReviewActive()) recovery.observeMessage(message, observeRejection);
           if (message.type === "result") {
+            if (
+              delivery !== undefined &&
+              config.executor !== "codex" &&
+              message.subtype === "success" &&
+              message.num_turns === 0 &&
+              !sessionState.stallBoundaryPending &&
+              provider.failure(message) === undefined
+            )
+              continue;
             if (submission !== undefined) activeMonitor.stop();
             const snapshot = sharedModelUsage(message.modelUsage, config.executor, sharedSeed);
             tokenUsageState.latestSnapshotValid =
@@ -696,6 +811,7 @@ export async function runReviewGoal(
       cwd,
       config.interactWithPullRequest,
       sharedSeed !== undefined,
+      sharedContext === undefined ? undefined : sharedSeed?.changeMap,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -763,6 +879,10 @@ export async function runReviewGoal(
       }
       const { result } = outcome;
       const providerFailure = provider.failure(result);
+      if (delivery !== undefined && config.executor !== "codex")
+        claudeHandoffTurns += result.num_turns;
+      const wasSweeping = delivery?.sweeping;
+      await delivery?.boundary();
       const interrupted = sessionState.stallBoundaryPending;
       if (interrupted) {
         activeMonitor.interruptedTurnFinished();
@@ -907,6 +1027,27 @@ export async function runReviewGoal(
             readerFailure === undefined && tokenUsageState.latestSnapshotValid,
           ),
         );
+      }
+      if (delivery !== undefined && (wasSweeping || contextBoundaryRequested)) {
+        if (claudeHandoffTurns >= config.maxTurns) {
+          sessionPhase = "max-turns-exhausted";
+          return await finalizeUnaccepted(
+            "The packet sweep reached the configured runtime turn limit.",
+            tokenUsageState.latestSnapshotValid,
+          );
+        }
+        contextBoundaryRequested = false;
+        const packet = delivery.stage();
+        if (packet !== undefined) {
+          delivery.handoffs++;
+          input.push({ ...makeUserMessage(packet.text), client_composed: true });
+          continue;
+        }
+        if (!contextCueSent) {
+          contextCueSent = true;
+          queueMessage(submissionCue(), "context-submission-cue");
+          continue;
+        }
       }
       recovery.observeProgress(inspectionProgress());
       const recoveryKind = recovery.finishTurn();

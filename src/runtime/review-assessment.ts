@@ -476,6 +476,30 @@ export class ReviewEvidenceLedger {
     return observed;
   }
 
+  confirmContextRanges(packetId: string, ranges: readonly ReviewSourceRange[]): void {
+    this.deliveries = [];
+    this.observeRanges(
+      { kind: "repository_diff", ...this.snapshot },
+      ranges,
+      packetId,
+      undefined,
+      1,
+    );
+  }
+
+  resetDelivery(): void {
+    this.references.clear();
+    this.delivered.clear();
+    this.nativeDelivered.clear();
+    this.cursors.clear();
+    this.queries.clear();
+    this.clearPendingNativeReads();
+    this.requiredBytes = 0;
+    this.uniqueSourceBytes = 0;
+    this.uniqueNativeLines = 0;
+    this.repeatedSourceBytes = 0;
+  }
+
   get issued(): ReadonlyMap<string, ReviewEvidenceReference> {
     return this.references;
   }

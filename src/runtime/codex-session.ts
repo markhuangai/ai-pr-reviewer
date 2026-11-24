@@ -87,6 +87,7 @@ export class CodexSession implements ReviewSession {
   private home: string | undefined;
   private threadId = "";
   private activeTurn: string | undefined;
+  private contextPaused = false;
   private turns = 0;
   private closing = false;
   private limited = false;
@@ -179,6 +180,15 @@ export class CodexSession implements ReviewSession {
         input: [{ type: "text", text: this.promptText(message.value) }],
         ...(this.input.config.effort === undefined ? {} : { effort: this.input.config.effort }),
       });
+      if (
+        this.contextPaused &&
+        !this.input.contextDelivery?.sweeping &&
+        this.objective !== undefined
+      ) {
+        this.contextPaused = false;
+        await this.rpc("thread/goal/set", { threadId: this.threadId, status: "active" });
+        this.goalActive = true;
+      }
     }
   }
 
@@ -388,6 +398,12 @@ export class CodexSession implements ReviewSession {
       (this.threadId === this.input.forkFrom || started.thread.forkedFromId !== this.input.forkFrom)
     )
       throw new Error("Codex did not acknowledge an independent fork of the discovery thread.");
+    const delivery = this.input.contextDelivery;
+    delivery?.history.attach({
+      sessionId: this.threadId,
+      executor: "codex",
+      ...(typeof started.thread.path === "string" ? { path: started.thread.path } : {}),
+    });
     if (
       started.approvalPolicy !== "never" ||
       !isRecord(started.sandbox) ||
@@ -427,6 +443,19 @@ export class CodexSession implements ReviewSession {
             .join("; "),
       );
     await this.process.drain();
+    await delivery?.refresh();
+    const activation = delivery?.stage();
+    if (activation !== undefined)
+      await this.rpc("thread/inject_items", {
+        threadId: this.threadId,
+        items: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: activation.text }],
+          },
+        ],
+      });
     if (goal !== undefined) {
       if (this.input.forkFrom !== undefined)
         await this.rpc("thread/inject_items", {
@@ -572,8 +601,9 @@ export class CodexSession implements ReviewSession {
         this.result("error_max_turns", "Codex exceeded the configured app-server turn limit.");
       }
     } else if (method === "turn/completed") {
-      this.activeTurn = undefined;
       if (!isRecord(params.turn)) throw new Error("Malformed Codex completion.");
+      if (this.activeTurn !== undefined && this.activeTurn !== params.turn.id) return;
+      this.activeTurn = undefined;
       if (this.limited) return;
       if (params.turn.status === "failed") {
         const error = isRecord(params.turn.error) ? params.turn.error.message : undefined;
@@ -586,6 +616,15 @@ export class CodexSession implements ReviewSession {
         this.limited = true;
         if (this.goalActive) await this.pauseGoal();
         this.result("error_max_turns", "Codex reached the configured app-server turn limit.");
+      } else if (
+        params.turn.status === "completed" &&
+        this.goalActive &&
+        this.input.contextDelivery?.sweeping &&
+        !this.input.isAccepted?.()
+      ) {
+        this.contextPaused = true;
+        await this.pauseGoal();
+        this.result("success");
       } else if (
         params.turn.status === "completed" &&
         this.goalActive &&
@@ -798,6 +837,15 @@ export class CodexSession implements ReviewSession {
         tool_use_result: deliveredResult,
         message: { role: "user", content: [] },
       });
+      if (
+        internal &&
+        tool === "advance_review_context" &&
+        meta.context_advance === true &&
+        !this.input.isAccepted?.()
+      ) {
+        this.contextPaused = true;
+        await this.interrupt();
+      }
     } else if (item.type === "agentMessage") {
       if (method === "item/completed")
         this.emit({
