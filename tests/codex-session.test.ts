@@ -1,6 +1,5 @@
 import type { McpToolPolicy } from "../src/lib/types.js";
 import { CodexSession } from "../src/runtime/codex-session.js";
-import { POST_COVERAGE_WRAP_UP_MS, POST_COVERAGE_WRAP_UP_ROUNDS } from "../src/runtime/agent.js";
 import { strict as assert } from "node:assert";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import { aggregateReview } from "../src/lib/aggregate.js";
@@ -40,56 +39,104 @@ import { verifyResolution } from "../src/runtime/resolution-session.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { toolResponseDocument } from "../src/runtime/review-assessment.js";
+import { jsonToolResult } from "../src/runtime/agent-review-tools.js";
 
-test("native Codex advises wrapping up on successful internal calls after coverage", async (t) => {
-  for (const trigger of ["rounds", "elapsed"]) {
-    await t.test(trigger, { timeout: 60_000 }, async (st) => {
-      await isolatedTemporaryRoot(st);
-      let now = Date.now();
-      st.mock.method(Date, "now", () => now);
-      const logs: string[] = [];
-      const emit = process.stdout.write.bind(process.stdout);
-      st.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-        logs.push(chunk.toString());
-        return true;
-      });
-      let step = 0;
-      const firstAdvisedCall = trigger === "rounds" ? POST_COVERAGE_WRAP_UP_ROUNDS + 1 : 2;
-      const fixture = await modelFixture(st, ({ body }) => {
-        const history = historyText(body);
-        const advisories = [...history.matchAll(/Wrap-up advisory:/gu)].length;
-        if (history.includes("Review submission accepted.")) {
-          assert.equal(advisories, 1);
-          return { text: "Review complete." };
-        }
-        const current = step++;
-        if (current === 0) return { tool: "read_review_briefing", args: {} };
-        if (current === 1) return { tool: "read_pr_diff", args: { remaining: true } };
-        if (current === 2 && trigger === "elapsed") now += POST_COVERAGE_WRAP_UP_MS;
-        if (current <= firstAdvisedCall) {
-          assert.equal(advisories, 0);
-          return { tool: "read_review_state", args: {} };
-        }
-        assert.equal(advisories, 1);
-        const state = historyDocuments(body).findLast(({ inspection }) => isRecord(inspection));
-        assert.deepEqual(state?.inspection, { observed: 1, missing: 0 });
-        if (current === firstAdvisedCall + 1)
-          return { tool: "read_review_state", args: { cursor: "expired" } };
-        assert.match(history, /cursor is unknown/u);
+test(
+  "real Codex counts parallel tool calls once and sees wrap-up appended after JSON",
+  { timeout: 60_000 },
+  async (t) => {
+    await isolatedTemporaryRoot(t);
+    const state = { tool: "read_review_state", args: {} };
+    const fixture = await modelFixture(t, ({ body }, index) => {
+      if (index === 0) return { tool: "read_review_briefing", args: {} };
+      if (index === 1) return { tool: "read_pr_diff", args: { remaining: true } };
+      if (index === 2) return { codexTools: Array.from({ length: 8 }, () => state) };
+      const advisories = historyDocuments(body).filter(
+        (document) => typeof document.wrapUp === "string",
+      );
+      if (index < 11) {
+        assert.deepEqual(advisories, [], `Wrap-up appeared on model response ${index}.`);
+        return state;
+      }
+      assert.match(String(advisories[0]?.wrapUp), /call submit_review now/u);
+      assert.equal(advisories.length, 1);
+      if (index === 11) {
+        const input = body.input as unknown[];
+        const lastOutput = input.findLast(
+          (item) => isRecord(item) && String(item.type).endsWith("call_output"),
+        );
+        const delivered = historyDocuments({ input: [lastOutput] });
+        assert.ok(
+          delivered.some(
+            (document) => document.briefingComplete === true && Array.isArray(document.records),
+          ),
+        );
+        assert.ok(delivered.some((document) => typeof document.wrapUp === "string"));
         return {
           tool: "submit_review",
-          args: { summary: "Reviewed.", findings: [], limitations: [] },
+          args: { summary: "Reviewed after full coverage", findings: [], limitations: [] },
         };
-      });
-      const result = await nativeReview(st, fixture.url);
-      assert.equal(result.status, "completed", result.error ?? "");
-      const events = logs.filter((line) => line.includes("session post-coverage-wrap-up"));
-      assert.equal(events.length, 1);
-      assert.ok(events[0]?.includes(JSON.stringify(trigger)));
-      assert.match(events[0] ?? "", /"post_coverage_elapsed_ms":\d+,"delivery_epoch":0/u);
-      emit(events.join(""));
+      }
+      assert.match(historyText(body), /Review submission accepted/u);
+      return { text: "Review submitted." };
     });
-  }
+    const result = await nativeReview(t, fixture.url, { maxTurns: 25 });
+    assert.equal(result.status, "completed", result.error ?? "Native Codex review failed.");
+    assert.equal(result.submission?.summary, "Reviewed after full coverage");
+  },
+);
+
+test("Codex keeps pending context across terminal tools and clears it at native boundaries", async (t) => {
+  const session = new CodexSession({
+    config: reviewConfig({ executor: "codex" }),
+    cwd: process.cwd(),
+    outputServerName: "review_output",
+    tools: [],
+    prompt: {
+      [Symbol.asyncIterator]: () => ({
+        next: () => Promise.resolve({ done: true, value: undefined }),
+      }),
+    },
+    options: {
+      hooks: {
+        PostToolBatch: [
+          {
+            hooks: [
+              () =>
+                Promise.resolve({
+                  hookSpecificOutput: {
+                    hookEventName: "PostToolBatch",
+                    additionalContext: "pending wrap-up",
+                  },
+                }),
+            ],
+          },
+        ],
+      },
+    },
+  });
+  t.after(() => session.close());
+  const queue = () => session["hooks"]("PostToolBatch", {}, "hook-fixture");
+  const read = (name = "read_review_state") =>
+    session["invoke"](
+      tool(name, "Fixture tool", {}, () => Promise.resolve(jsonToolResult({ done: true }))),
+      {},
+    );
+  await queue();
+  for (const name of ["submit_review", "advance_review_context", "finish_discovery"])
+    assert.equal((await read(name)).content.length, 1);
+  const delivered = await read();
+  assert.deepEqual(toolResponseDocument(delivered), { done: true });
+  assert.deepEqual(delivered.content.at(-1), { type: "text", text: "pending wrap-up" });
+  assert.equal((await read()).content.length, 1);
+  await queue();
+  await session["item"]("item/completed", { type: "contextCompaction" });
+  assert.equal((await read()).content.length, 1);
+  await queue();
+  await session["notify"]("turn/started", { turn: { id: "turn" } });
+  await session["notify"]("turn/completed", { turn: { id: "turn", status: "completed" } });
+  assert.equal((await read()).content.length, 1);
 });
 
 test("native reviews use runner proxies while local MCP bypasses them", async (t) => {
@@ -361,16 +408,13 @@ test(
   { timeout: 30_000 },
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
-    const mcpPath = "/unavailable/mcp";
-    const fixture = await modelFixture(t, ({ path }) => {
-      assert.equal(path, mcpPath);
-      return { error: 404 };
-    });
+    const fixture = await modelFixture(t, () => ({ error: 404 }));
     const result = await nativeReview(t, fixture.url, {
       mcpServers: {
-        unavailable: { type: "http", url: new URL(mcpPath, fixture.url).href },
+        unavailable: { type: "http", url: new URL("/unavailable/mcp", fixture.url).href },
       },
     });
+    assert.deepEqual([...new Set(fixture.requests.map(({ path }) => path))], ["/unavailable/mcp"]);
     assert.equal(result.status, "failed");
     assert.match(result.error ?? "", /MCP|unavailable/u);
     assert.equal(result.submission, undefined);

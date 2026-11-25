@@ -21,6 +21,7 @@ import {
   type CodexConfigValue,
 } from "./codex-app-server.js";
 import { startCodexMcpServer, type CodexMcpServer } from "./codex-mcp-server.js";
+import { appendCodexToolAdvisory, injectCodexContextPackets } from "./review-context-delivery.js";
 import type { ReviewSession, ReviewSessionInput } from "./review-session.js";
 import type { ReviewTool } from "./review-tool.js";
 import { codexProviderError } from "./session-recovery.js";
@@ -47,6 +48,8 @@ interface ToolDelivery {
 export class CodexSession implements ReviewSession {
   private readonly messages = new CodexSessionMessages<Message>();
   private readonly pendingDeliveries = new Map<string, ToolDelivery>();
+  private pendingAdvisory: string | undefined;
+  private toolRoundPending = false;
   private readonly failures = new Map<string, string>();
   private readonly controller = new AbortController();
   private readonly startup: Promise<void>;
@@ -450,19 +453,8 @@ export class CodexSession implements ReviewSession {
     const forked = this.input.forkFrom !== undefined;
     if (goal !== undefined && forked) await inject(review);
     await this.process.drain();
-    await delivery?.refresh();
-    const stage = () => (forked ? delivery?.stageStartupPacket() : delivery?.stage());
-    for (let packet = stage(); packet !== undefined; packet = stage()) {
-      throwIfAborted(this.controller.signal);
-      try {
-        await inject(packet.text);
-      } catch (error) {
-        if (!(error instanceof CodexRpcError)) throw error;
-        throwIfAborted(this.controller.signal);
-        delivery?.deferInFlight(packet.id);
-        break;
-      }
-    }
+    if (delivery !== undefined)
+      await injectCodexContextPackets(delivery, forked, inject, this.controller.signal);
     if (goal !== undefined) {
       this.objective = goal;
       this.goalActive = true;
@@ -511,13 +503,15 @@ export class CodexSession implements ReviewSession {
           id,
           { signal: this.controller.signal },
         );
-        if (
-          "hookSpecificOutput" in result &&
-          isRecord(result.hookSpecificOutput) &&
-          "permissionDecision" in result.hookSpecificOutput &&
-          result.hookSpecificOutput.permissionDecision === "deny"
-        )
-          return false;
+        const output = "hookSpecificOutput" in result ? result.hookSpecificOutput : undefined;
+        if (!isRecord(output)) continue;
+        if ("permissionDecision" in output && output.permissionDecision === "deny") return false;
+        if (event !== "PostToolBatch" || output.hookEventName !== "PostToolBatch") continue;
+        const advisory = output.additionalContext;
+        if (typeof advisory !== "string" || advisory.length === 0) continue;
+        if (Array.isArray(input.tool_calls) && input.tool_calls.length === 0)
+          this.pendingAdvisory = advisory;
+        else this.pendingAdvisory ??= advisory;
       }
     }
     return true;
@@ -549,12 +543,14 @@ export class CodexSession implements ReviewSession {
           isError: true,
           content: [{ type: "text", text: "Review submission recovery is exhausted." }],
         };
-    this.pendingDeliveries.set(id, { name, input: args, result });
+    const delivery = appendCodexToolAdvisory(result, definition.name, this.pendingAdvisory);
+    if (delivery !== result) this.pendingAdvisory = undefined;
+    this.pendingDeliveries.set(id, { name, input: args, result: delivery });
     if (this.input.isAccepted?.() && this.goalActive) {
       await this.rpc("thread/goal/set", { threadId: this.threadId, status: "complete" });
       this.goalActive = false;
     }
-    return { ...result, _meta: { ...result._meta, ai_pr_reviewer_call_id: id } };
+    return { ...delivery, _meta: { ...delivery._meta, ai_pr_reviewer_call_id: id } };
   }
 
   private result(
@@ -598,6 +594,8 @@ export class CodexSession implements ReviewSession {
       if (!isRecord(params.turn)) throw new Error("Malformed Codex completion.");
       if (this.activeTurn === undefined || this.activeTurn !== params.turn.id) return;
       this.activeTurn = undefined;
+      this.pendingAdvisory = undefined;
+      this.toolRoundPending = false;
       if (this.limited) return;
       if (params.turn.status === "completed") await this.input.contextDelivery?.refresh();
       if (params.turn.status === "failed") {
@@ -664,6 +662,19 @@ export class CodexSession implements ReviewSession {
           : null,
       });
     } else if (method === "thread/tokenUsage/updated") {
+      // Codex reports usage after the response's tool calls have settled.
+      if (
+        this.toolRoundPending &&
+        this.activeTurn !== undefined &&
+        this.activeTurn === params.turnId
+      ) {
+        this.toolRoundPending = false;
+        await this.hooks(
+          "PostToolBatch",
+          { hook_event_name: "PostToolBatch", tool_calls: [] },
+          this.activeTurn,
+        );
+      }
       const total =
         isRecord(params.tokenUsage) && isRecord(params.tokenUsage.total)
           ? params.tokenUsage.total
@@ -799,6 +810,8 @@ export class CodexSession implements ReviewSession {
       const name = "mcp__" + server + "__" + tool;
       const args = delivery?.input ?? (isRecord(item.arguments) ? item.arguments : {});
       const deliveredResult = { ...result, ...(delivery?.result.isError ? { isError: true } : {}) };
+      if (this.objective !== undefined && typeof turnId === "string" && turnId === this.activeTurn)
+        this.toolRoundPending = true;
       await this.hooks(
         "PostToolBatch",
         {
@@ -854,6 +867,8 @@ export class CodexSession implements ReviewSession {
           },
         });
     } else if (item.type === "contextCompaction") {
+      this.pendingAdvisory = undefined;
+      this.toolRoundPending = false;
       this.emit({
         type: "system",
         subtype: method === "item/started" ? "status" : "compact_boundary",

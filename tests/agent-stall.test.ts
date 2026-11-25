@@ -16,7 +16,6 @@ import {
   type SDKResultMessage,
   type SDKUserMessage,
 } from "./agent-test-helpers.js";
-import { POST_COVERAGE_WRAP_UP_MS, POST_COVERAGE_WRAP_UP_ROUNDS } from "../src/runtime/agent.js";
 
 interface ReviewOutputTool {
   handler(input: Record<string, unknown>): Promise<{
@@ -413,7 +412,6 @@ test("lets an accepted submission win an interrupted turn boundary", async (t) =
 test("continues unfinished turns across repeated SDK stalls", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
   const output: string[] = [];
-  const emit = process.stdout.write.bind(process.stdout);
   t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
     output.push(chunk.toString());
     return true;
@@ -500,98 +498,11 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
   assert.match(continuations[0] ?? "", /Re-read evidence only when needed/u);
   assert.match(
     continuations[1] ?? "",
-    /all required briefing pages and changed paths are already inspected. Submit now/u,
+    /all required briefing pages and changed paths are already inspected\. Call submit_review now/u,
   );
   const queued = output.filter((line) => line.includes("session continuation-queued"));
   assert.match(queued[0] ?? "", /"coverage_complete":false/u);
   assert.match(queued[1] ?? "", /"coverage_complete":true/u);
-  emit(queued.join(""));
-});
-
-test("Claude receives advisory context after coverage even for batches with no references", async (t) => {
-  for (const trigger of ["rounds", "elapsed"])
-    await t.test(trigger, async (st) => {
-      st.mock.timers.enable({ apis: ["Date"], now: 0 });
-      const logs: string[] = [];
-      const emit = process.stdout.write.bind(process.stdout);
-      st.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-        logs.push(chunk.toString());
-        return true;
-      });
-      const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
-        async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
-          const prompts = input.prompt[Symbol.asyncIterator]();
-          await prompts.next();
-          await prompts.next();
-          const tools = reviewOutputTools(input.options);
-          const hook = input.options.hooks?.PostToolBatch?.[0]?.hooks[0];
-          assert.ok(hook && tools.read_review_briefing);
-          const wrapUp = async () => {
-            const result = await hook(
-              {
-                hook_event_name: "PostToolBatch",
-                session_id: "wrap-up-fixture",
-                transcript_path: "",
-                cwd: "/workspace/repository",
-                permission_mode: "dontAsk",
-                tool_calls: [],
-              },
-              undefined,
-              { signal: new AbortController().signal },
-            );
-            assert.ok("continue" in result && result.continue);
-            const output = "hookSpecificOutput" in result ? result.hookSpecificOutput : undefined;
-            return (
-              output?.hookEventName === "PostToolBatch" &&
-              output.additionalContext?.includes('"wrapUp":') === true
-            );
-          };
-          assert.equal(await wrapUp(), false);
-          await tools.read_review_briefing.handler({});
-          if (trigger === "rounds") {
-            for (let round = 2; round <= POST_COVERAGE_WRAP_UP_ROUNDS; round++)
-              assert.equal(await wrapUp(), round === POST_COVERAGE_WRAP_UP_ROUNDS);
-          } else {
-            st.mock.timers.tick(POST_COVERAGE_WRAP_UP_MS - 1);
-            assert.equal(await wrapUp(), false);
-            st.mock.timers.tick(1);
-            assert.equal(await wrapUp(), true);
-          }
-          assert.equal(await wrapUp(), true);
-          yield { type: "system", subtype: "compact_boundary" } as SDKMessage;
-          assert.equal(await wrapUp(), false);
-          const accepted = await tools.submit_review?.handler({
-            summary: "Reviewed.",
-            findings: [],
-            limitations: [],
-          });
-          assert.match(accepted?.content[0]?.text ?? "", /Review submission accepted/u);
-          yield resultMessage(1);
-        },
-        mcpServerStatus: () => Promise.resolve([]),
-        close: () => undefined,
-      })) as unknown as AgentQuery;
-      const result = await runReviewGoal(
-        "Check advisory delivery.",
-        0,
-        goalContext,
-        [],
-        emptyConversation,
-        reviewConfig(),
-        await makeReviewDiff(st),
-        "/workspace/repository",
-        query,
-      );
-      assert.equal(result.status, "completed", result.error ?? "");
-      const advisories = logs.filter((line) => line.includes("session post-coverage-wrap-up"));
-      assert.equal(advisories.length, 1);
-      assert.ok(advisories[0]?.includes(JSON.stringify(trigger)));
-      assert.match(
-        advisories[0] ?? "",
-        /"post_coverage_rounds":\d+,"post_coverage_elapsed_ms":\d+,"delivery_epoch":0/u,
-      );
-      emit(advisories.join(""));
-    });
 });
 
 test("bounds accepted goal finalization without hiding failures", async (t) => {

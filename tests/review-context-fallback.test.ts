@@ -8,32 +8,31 @@ import test from "node:test";
 import { readPullRequestFilesFromSnapshots } from "../src/lib/git-changed-files.js";
 import { isRecord } from "../src/runtime/agent-logging.js";
 import { RepositoryFilePageReader } from "../src/runtime/agent-review-tools.js";
-import {
-  POST_COVERAGE_WRAP_UP_ROUNDS,
-  runReviewGoal,
-  runReviewGoals,
-} from "../src/runtime/agent.js";
-import { createReviewGoalsRunner, type AgentQuery } from "../src/runtime/agent-session.js";
+import { runReviewGoals } from "../src/runtime/agent.js";
 import { CodexAppServer, CodexRpcError } from "../src/runtime/codex-app-server.js";
 import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
 import { ReviewBriefingReader } from "../src/runtime/review-briefing.js";
 import {
   ReviewContextDelivery,
+  STARTUP_PRELOAD_PACKETS,
   STARTUP_PRELOAD_WIRE_BYTES,
 } from "../src/runtime/review-context-delivery.js";
 import {
-  ADVANCE_REVIEW_CONTEXT_CALL,
   REVIEW_CONTEXT_PACKET_PREFIX,
   stageReviewContext,
 } from "../src/runtime/review-context-packets.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
-import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
+import {
+  emptyConversation,
+  goalContext,
+  makeReviewDiff,
+  reviewConfig,
+} from "./agent-test-helpers.js";
 import {
   historyDocuments,
   historyText,
   isolatedTemporaryRoot,
   modelFixture,
-  toolNames,
 } from "./codex-test-helpers.js";
 import {
   commitFixtureSnapshot,
@@ -43,245 +42,38 @@ import {
 
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 
-test(
-  "Claude's post-tool hook steers to packet four and switches to paged reads after deferral",
-  { timeout: 120_000 },
-  async (t) => {
-    await isolatedTemporaryRoot(t);
-    const { root, baseSha, temporaryRoot, ...repository } = await makeReplayRepository(t);
-    await writeFile(
-      join(root, "overflow.txt"),
-      "Source spread across several packets.\n".repeat(4_500),
-    );
-    const headSha = await commitFixtureSnapshot(root, temporaryRoot, repository.headSha);
-    const context = { ...repository.context, headSha };
-    const files = await readPullRequestFilesFromSnapshots(context, root, baseSha);
-    const observed = new Set<ReviewContextDelivery>();
-    const stage = Reflect.get<ReviewContextDelivery, "stageStartupPacket">(
-      ReviewContextDelivery.prototype,
-      "stageStartupPacket",
-    );
-    t.mock.method(
-      ReviewContextDelivery.prototype,
-      "stageStartupPacket",
-      function (this: ReviewContextDelivery, maxPackets?: number, maxWireBytes?: number) {
-        observed.add(this);
-        return stage.call(this, maxPackets, maxWireBytes);
-      },
-    );
-    let stateRequested = false;
-    let deferred = false;
-    let pagedCue = false;
-    const observeClaude: AgentQuery = (input) => {
-      const options = input.options;
-      const batches = options?.hooks?.PostToolBatch;
-      const evidence = batches?.[0]?.hooks[0];
-      if (options?.forkSession !== true || evidence === undefined || batches === undefined)
-        return query(input);
-      return query({
-        ...input,
-        options: {
-          ...options,
-          hooks: {
-            ...options.hooks,
-            PostToolBatch: [
-              {
-                hooks: [
-                  async (...args) => {
-                    const result = await evidence(...args);
-                    const [event] = args;
-                    if (event.hook_event_name !== "PostToolBatch") return result;
-                    const detail =
-                      "hookSpecificOutput" in result ? result.hookSpecificOutput : undefined;
-                    const context =
-                      detail?.hookEventName === "PostToolBatch"
-                        ? (detail.additionalContext ?? "")
-                        : "";
-                    const name = event.tool_calls[0]?.tool_name;
-                    if (!deferred && name?.endsWith("__read_review_state")) {
-                      assert.match(
-                        context,
-                        /"nextCall":\{"tool":"advance_review_context","arguments":\{\}\}/u,
-                      );
-                      const delivery = [...observed].at(-1);
-                      const packet = delivery?.stage();
-                      assert.ok(delivery && packet);
-                      assert.ok(packet.id.endsWith(":4"));
-                      delivery.deferInFlight(packet.id);
-                      deferred = true;
-                    } else if (deferred && !pagedCue && name?.endsWith("__read_pr_diff")) {
-                      assert.match(
-                        context,
-                        /"nextCall":\{"tool":"read_pr_diff","arguments":\{"remaining":true\}\}/u,
-                      );
-                      pagedCue = true;
-                    }
-                    return result;
-                  },
-                ],
-              },
-              ...batches.slice(1),
-            ],
-          },
-        },
-      });
-    };
-    const upstream = await modelFixture(t, ({ body }) => {
-      const history = historyText(body);
-      if (!history.includes("STEERING_PROBE_GOAL") && !history.includes("STEERING_CONTROL_GOAL"))
-        return history.includes("Discovery change map accepted.")
-          ? { text: "Orientation complete." }
-          : {
-              tool: "finish_discovery",
-              args: { changeMap: "Inspect the changed source.", observations: [], unknowns: [] },
-            };
-      if (history.includes("Review submission accepted.")) return { text: "Review complete." };
-      if (!stateRequested) {
-        stateRequested = true;
-        return { tool: "read_review_state", args: {} };
-      }
-      if (
-        !historyDocuments(body).some(({ remaining, done }) => remaining === true && done === true)
-      )
-        return { tool: "read_pr_diff", args: { remaining: true } };
-      return {
-        tool: "submit_review",
-        args: { summary: "Reviewed.", findings: [], limitations: [] },
-      };
-    });
-    const run = await createReviewGoalsRunner(runReviewGoal, observeClaude, runSharedDiscovery)(
-      context,
-      files,
-      emptyConversation,
-      reviewConfig({
-        executor: "claude",
-        aiBaseUrl: upstream.url.replace(/\/v1$/u, ""),
-        model: "claude-sonnet-4-5",
-        parallelCount: 1,
-        maxTurns: 24,
-        reviewPrompts: ["STEERING_PROBE_GOAL", "STEERING_CONTROL_GOAL"].map((prompt) => ({
-          prompt,
-          files: [],
-        })),
-      }),
-      [[], []],
-      root,
-      undefined,
-      undefined,
-      { ...briefing, repositoryGuidance: [] },
-    );
-    assert.ok(deferred && pagedCue);
-    assert.deepEqual(
-      run.goals.map(({ status }) => status),
-      ["completed", "completed"],
-    );
-  },
-);
-
-test(
-  "native Codex resets and re-arms the wrap-up advisory after packet compaction",
-  { timeout: 120_000 },
-  async (t) => {
-    await isolatedTemporaryRoot(t);
-    const { root, baseSha, temporaryRoot, ...repository } = await makeReplayRepository(t);
-    await writeFile(
-      join(root, "overflow.txt"),
-      ("Compaction drops older raw packets. ".repeat(6) + "\n").repeat(1_650),
-    );
-    const headSha = await commitFixtureSnapshot(root, temporaryRoot, repository.headSha);
-    const context = { ...repository.context, headSha };
-    const files = await readPullRequestFilesFromSnapshots(context, root, baseSha);
-    const logs: string[] = [];
-    const emit = process.stdout.write.bind(process.stdout);
-    t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-      logs.push(chunk.toString());
-      return true;
-    });
-    let rounds = 0;
-    let recovery = 0;
-    let postRecoveryRounds = 0;
-    let compacted = false;
-    const state = { tool: "read_review_state", args: {} } as const;
-    const submit = {
-      tool: "submit_review",
-      args: { summary: "Reviewed.", findings: [], limitations: [] },
-    } as const;
-    const upstream = await modelFixture(t, ({ body }) => {
-      const history = historyText(body);
-      if (toolNames(body).length === 0) {
-        compacted = true;
-        return { text: "Continue WRAP_UP_COMPACT_PROBE. Recover the host's source coverage." };
-      }
-      const probe = history.includes("WRAP_UP_COMPACT_PROBE");
-      if (!probe && !history.includes("WRAP_UP_COMPACT_CONTROL"))
-        return history.includes("Discovery change map accepted.")
-          ? { text: "Orientation complete." }
-          : {
-              tool: "finish_discovery",
-              args: { changeMap: "Inspect review.txt.", observations: [], unknowns: [] },
-            };
-      if (history.includes("Review submission accepted.")) return { text: "Review complete." };
-      const advance = { tool: "advance_review_context", args: {} } as const;
-      const finalPacket = history.includes(String.raw`\"more\":false`);
-      if (!probe) return finalPacket ? submit : advance;
-      if (!compacted && !finalPacket) return advance;
-      const count = [...history.matchAll(/Wrap-up advisory:/gu)].length;
-      if (!compacted) {
-        if (++rounds <= POST_COVERAGE_WRAP_UP_ROUNDS + 1) return state;
-        assert.equal(count, 1);
-        if (rounds === POST_COVERAGE_WRAP_UP_ROUNDS + 2) return advance;
-        assert.match(history, /Shared context sweep ended/u);
-        return { ...state, inputTokens: 300_000 };
-      }
-      ++recovery;
-      if (recovery === 1) return state;
-      if (recovery === 2) {
-        assert.equal(count, 0, "The first internal result after compaction has no stale advisory.");
-        const after = historyDocuments(body).findLast(({ inspection }) => isRecord(inspection));
-        assert.ok(isRecord(after?.inspection) && Number(after.inspection.missing) > 0);
-        return { tool: "read_review_briefing", args: {} };
-      }
-      if (
-        !historyDocuments(body).some(({ done, remaining }) => done === true && remaining === true)
-      )
-        return { tool: "read_pr_diff", args: { remaining: true } };
-      assert.ok(++postRecoveryRounds <= POST_COVERAGE_WRAP_UP_ROUNDS + 2);
-      return count > 0 ? submit : state;
-    });
-    const run = await runReviewGoals(
-      context,
-      files,
-      emptyConversation,
-      reviewConfig({
-        executor: "codex",
-        aiBaseUrl: upstream.url,
-        model: "gpt-6.1-sol",
-        maxTurns: 50,
-        parallelCount: 1,
-        reviewPrompts: ["WRAP_UP_COMPACT_PROBE", "WRAP_UP_COMPACT_CONTROL"].map((prompt) => ({
-          prompt,
-          files: [],
-        })),
-      }),
-      [[], []],
-      root,
-      undefined,
-      undefined,
-      { ...briefing, repositoryGuidance: [] },
-    );
-    assert.ok(compacted && postRecoveryRounds > 0);
-    const advisories = logs.filter((line) => line.includes("session post-coverage-wrap-up"));
-    assert.deepEqual(
-      advisories.map((line) => line.match(/"delivery_epoch":(\d+)/u)?.[1]),
-      ["0", "1"],
-    );
-    assert.deepEqual(
-      run.goals.map(({ status }) => status),
-      ["completed", "completed"],
-    );
-    emit(advisories.join(""));
-  },
-);
+test("startup packet staging obeys count and wire limits across a partial failure", async (t) => {
+  const home = await isolatedTemporaryRoot(t);
+  const diff = await makeReviewDiff(t, "+start-up fixture data\n".repeat(7_400));
+  const reader = new ReviewBriefingReader(goalContext, [], emptyConversation, briefing);
+  const prepared = await stageReviewContext(reader, diff, goalContext.headSha);
+  const ledger = new ReviewEvidenceLedger(
+    home,
+    [],
+    { mergeBaseSha: diff.mergeBaseSha, headSha: goalContext.headSha },
+    diff.files,
+  );
+  const delivery = new ReviewContextDelivery(prepared, home, reader, ledger, () => undefined);
+  const [first, second, third] = prepared.packets;
+  assert.ok(first && second && third);
+  assert.equal(delivery.stageStartupPacket(2, first.wireBytes - 1), undefined);
+  assert.equal(delivery.stageStartupPacket(), first);
+  assert.equal(delivery.stage(), undefined);
+  assert.equal(delivery.stageStartupPacket(2, first.wireBytes + second.wireBytes - 1), undefined);
+  assert.equal(delivery.stageStartupPacket(), second);
+  assert.equal(STARTUP_PRELOAD_PACKETS, 2);
+  assert.ok(first.wireBytes + second.wireBytes <= STARTUP_PRELOAD_WIRE_BYTES);
+  delivery.deferInFlight(second.id);
+  assert.equal(delivery.stageStartupPacket(), undefined);
+  assert.equal(
+    delivery.stage(),
+    undefined,
+    "Deferring the second packet preserves the first in flight.",
+  );
+  assert.equal(delivery.hasUnstagedPackets, true);
+  await delivery.boundary();
+  assert.equal(delivery.stage(), third);
+});
 
 test("a staging read failure leaves the immutable diff readable through paged fallback", async (t) => {
   const home = await isolatedTemporaryRoot(t);
@@ -362,10 +154,7 @@ for (const executor of ["claude", "codex"] as const) {
     const delivery = new ReviewContextDelivery(staged, home, briefingReader, ledger, (event) =>
       events.push(event),
     );
-    const stagedPacket = staged.packets[0];
-    assert.ok(stagedPacket);
-    assert.equal(delivery.stageStartupPacket(2, stagedPacket.wireBytes - 1), undefined);
-    const packet = delivery.stageStartupPacket();
+    const packet = delivery.stage();
     assert.ok(packet);
     assert.equal(delivery.stage(), undefined);
     const sessionId = randomUUID();
@@ -437,9 +226,23 @@ for (const executor of ["claude", "codex"] as const) {
     assert.equal(briefingReader.complete, false);
     assert.equal(delivery.stage()?.id, packet.id);
     assert.ok(events.includes("context-packet-compacted"));
-    if (executor === "codex") await append(turnStarted);
-    await append(message("user", packet.text), message("assistant", "Replay received."));
-    if (executor === "codex") await append(successfulExchange);
+    if (executor === "codex") {
+      await append(
+        turnStarted,
+        message("user", packet.text),
+        message("assistant", "Replay received."),
+      );
+      await append(successfulExchange);
+    } else {
+      await append({ ...message("user", packet.text), uuid: randomUUID() });
+      await delivery.refresh(randomUUID());
+      assert.equal(ledger.uniqueSourceBytes, 0);
+      await delivery.refresh(sessionId);
+      assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
+      await append({ type: "attachment", sessionId });
+      await delivery.refresh();
+      assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
+    }
     await delivery.boundary();
     assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
     await append(compaction);
@@ -527,213 +330,228 @@ test(
   },
 );
 
-for (const startupFailure of [false, true])
-  test(
-    `real Codex recovers a rejected ${startupFailure ? "startup injection" : "overflow turn"} with unread paged source`,
-    { timeout: 120_000 },
-    async (t) => {
-      await isolatedTemporaryRoot(t);
-      const repository = await makeReplayRepository(t, async (root) => {
-        await writeFile(join(root, "overflow.txt"), "baseline\n");
-      });
-      await writeFile(
-        join(repository.root, "overflow.txt"),
-        `${"overflow fallback fixture ".repeat(5)}\n`.repeat(startupFailure ? 720 : 1_350),
-      );
-      const context = {
-        ...repository.context,
-        headSha: await commitFixtureSnapshot(
-          repository.root,
-          repository.temporaryRoot,
-          repository.headSha,
-        ),
-      };
-      const files = await readPullRequestFilesFromSnapshots(
-        context,
+test(
+  "real Codex recovers a rejected overflow turn with unread paged source",
+  { timeout: 120_000 },
+  async (t) => {
+    await isolatedTemporaryRoot(t);
+    const repository = await makeReplayRepository(t, async (root) => {
+      await writeFile(join(root, "overflow.txt"), "baseline\n");
+    });
+    await writeFile(
+      join(repository.root, "overflow.txt"),
+      `${"overflow fallback fixture ".repeat(5)}\n`.repeat(1_350),
+    );
+    const context = {
+      ...repository.context,
+      headSha: await commitFixtureSnapshot(
         repository.root,
-        repository.baseSha,
-      );
-      const request = Reflect.get<CodexAppServer, "request">(CodexAppServer.prototype, "request");
-      let rejectedPacket: string | undefined;
-      let earlierPacket: string | undefined;
-      let startupBytes = 0;
-      t.mock.method(
-        CodexAppServer.prototype,
-        "request",
-        function (
-          this: CodexAppServer,
-          method: string,
-          params: unknown,
-          timeout?: number,
-        ): Promise<unknown> {
-          if (rejectedPacket === undefined && isRecord(params)) {
-            const item: unknown =
-              startupFailure &&
-              method === "thread/inject_items" &&
-              Array.isArray(params.items) &&
-              isRecord(params.items[0]) &&
-              Array.isArray(params.items[0].content)
-                ? params.items[0].content[0]
-                : !startupFailure && method === "turn/start" && Array.isArray(params.input)
-                  ? params.input[0]
-                  : undefined;
-            if (
-              isRecord(item) &&
-              typeof item.text === "string" &&
-              item.text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)
-            ) {
-              const packet: unknown = JSON.parse(
-                item.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length),
-              );
-              assert.ok(isRecord(packet) && typeof packet.id === "string");
-              if (startupFailure && !packet.id.endsWith(":3")) {
-                if (packet.id.endsWith(":2")) {
-                  earlierPacket = packet.id;
-                  startupBytes += Buffer.byteLength(item.text);
-                }
-                return request.call(this, method, params, timeout);
-              }
-              assert.equal(packet.more, false);
-              if (startupFailure) startupBytes += Buffer.byteLength(item.text);
-              assert.ok(packet.id.endsWith(startupFailure ? ":3" : ":4"));
-              rejectedPacket = packet.id;
-              return request
-                .call(this, method, { ...params, threadId: randomUUID() }, timeout)
-                .catch((error: unknown) => {
-                  assert.ok(error instanceof CodexRpcError);
-                  throw error;
-                });
+        repository.temporaryRoot,
+        repository.headSha,
+      ),
+    };
+    const files = await readPullRequestFilesFromSnapshots(
+      context,
+      repository.root,
+      repository.baseSha,
+    );
+    const request = Reflect.get<CodexAppServer, "request">(CodexAppServer.prototype, "request");
+    let rejectedPacket: string | undefined;
+    let rejectedStartupPacket: string | undefined;
+    let thirdInjections = 0;
+    t.mock.method(
+      CodexAppServer.prototype,
+      "request",
+      function (
+        this: CodexAppServer,
+        method: string,
+        params: unknown,
+        timeout?: number,
+      ): Promise<unknown> {
+        if (method === "thread/inject_items" && isRecord(params) && Array.isArray(params.items)) {
+          const item: unknown = params.items[0];
+          const block: unknown =
+            isRecord(item) && Array.isArray(item.content) ? item.content[0] : undefined;
+          if (
+            isRecord(block) &&
+            typeof block.text === "string" &&
+            block.text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)
+          ) {
+            const packet: unknown = JSON.parse(
+              block.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length),
+            );
+            assert.ok(isRecord(packet) && typeof packet.id === "string");
+            if (packet.id.endsWith(":3") && ++thirdInjections === 2) {
+              rejectedStartupPacket = packet.id;
+              return request.call(this, method, { ...params, threadId: randomUUID() }, timeout);
             }
           }
-          return request.call(this, method, params, timeout);
-        },
-      );
-      const output: string[] = [];
-      const emit = process.stdout.write.bind(process.stdout);
-      t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-        output.push(chunk.toString());
-        return true;
-      });
-      let recovered = false;
-      let probe = 0;
-      let fallbackStateRequested = false;
-      const submission = {
-        tool: "submit_review",
-        args: { summary: "Reviewed.", findings: [], limitations: [] },
-      } as const;
-      const upstream = await modelFixture(t, ({ body }) => {
-        const history = historyText(body);
-        const firstGoal = history.includes("FALLBACK_SWEEP_GOAL");
-        if (!firstGoal && !history.includes("CONTROL_SWEEP_GOAL"))
-          return history.includes("Discovery change map accepted.")
-            ? { text: "Orientation complete." }
-            : {
-                tool: "finish_discovery",
-                args: { changeMap: "Inspect the overflow source.", observations: [], unknowns: [] },
-              };
-        if (history.includes("Review submission accepted.")) return { text: "Review complete." };
-        const documents = historyDocuments(body);
-        if (firstGoal && !startupFailure && rejectedPacket === undefined) {
-          if (++probe === 1) return { tool: "read_review_state", args: {} };
-          if (probe === 2) {
-            const state = documents.findLast(({ inspection }) => isRecord(inspection));
-            assert.deepEqual(
-              state?.nextCall,
-              ADVANCE_REVIEW_CONTEXT_CALL,
-              "The fresh review state steers to packet four.",
-            );
-            assert.ok(
-              Array.isArray(state.records) &&
-                state.records.some(
-                  (record: unknown) =>
-                    isRecord(record) &&
-                    record.kind === "next_call" &&
-                    record.tool === ADVANCE_REVIEW_CONTEXT_CALL.tool,
-                ),
-            );
-            return submission;
-          }
-          assert.match(
-            history.replaceAll("\\", ""),
-            /"categories":\[[^\]]*"inspection"[^\]]*\],"remainingCorrections":\d+,"nextCall":\{"tool":"advance_review_context","arguments":\{\}\}/u,
-          );
-          return { tool: "advance_review_context", args: {} };
         }
-        if (firstGoal && rejectedPacket !== undefined) {
-          assert.ok(!history.includes(rejectedPacket));
-          if (!fallbackStateRequested) {
-            fallbackStateRequested = true;
-            return { tool: "read_review_state", args: {} };
+        if (
+          method === "turn/start" &&
+          rejectedPacket === undefined &&
+          isRecord(params) &&
+          Array.isArray(params.input)
+        ) {
+          const item: unknown = params.input[0];
+          if (
+            isRecord(item) &&
+            typeof item.text === "string" &&
+            item.text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)
+          ) {
+            const packet: unknown = JSON.parse(
+              item.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length),
+            );
+            assert.ok(isRecord(packet) && typeof packet.id === "string");
+            assert.equal(packet.more, false);
+            assert.ok(packet.id.endsWith(":4"));
+            rejectedPacket = packet.id;
+            return request
+              .call(this, method, { ...params, threadId: randomUUID() }, timeout)
+              .catch((error: unknown) => {
+                assert.ok(error instanceof CodexRpcError);
+                throw error;
+              });
           }
-          const state = documents.findLast(({ inspection }) => isRecord(inspection));
-          assert.deepEqual(state?.nextCall, {
-            tool: "read_pr_diff",
-            arguments: { remaining: true },
-          });
-          recovered = documents.some(({ done, remaining }) => done === true && remaining === true);
-          if (!recovered) return { tool: "read_pr_diff", args: { remaining: true } };
-        } else if (
-          history.includes(String.raw`\"more\":true`) &&
-          !history.includes(String.raw`\"more\":false`)
-        )
-          return { tool: "advance_review_context", args: {} };
-        return submission;
-      });
-      const run = await runReviewGoals(
-        context,
-        files,
-        emptyConversation,
-        reviewConfig({
-          executor: "codex",
-          aiBaseUrl: upstream.url,
-          model: "gpt-6.1-sol",
-          parallelCount: 1,
-          maxTurns: 12,
-          reviewPrompts: ["FALLBACK_SWEEP_GOAL", "CONTROL_SWEEP_GOAL"].map((prompt) => ({
-            prompt,
-            files: [],
-          })),
-        }),
-        [[], []],
-        repository.root,
-        undefined,
-        undefined,
-        { linkedIssues: [], linkedIssueReferencesTruncated: false, repositoryGuidance: [] },
-      );
-      const rejectedId = rejectedPacket;
-      assert.ok(
-        rejectedId && recovered,
-        output
-          .filter((line) => /context-packet-|review-result/u.test(line))
-          .slice(-25)
-          .join("\n"),
-      );
-      if (startupFailure) {
-        const earlierId = earlierPacket;
-        assert.ok(earlierId && startupBytes <= STARTUP_PRELOAD_WIRE_BYTES);
-        const failedAt = output.findIndex(
-          (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedId),
+        }
+        return request.call(this, method, params, timeout);
+      },
+    );
+    const output: string[] = [];
+    t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+      output.push(chunk.toString());
+      return true;
+    });
+    let recovered = false;
+    let startupRecovered = false;
+    let overflowStep = 0;
+    let fallbackStateRead = false;
+    const readState = { tool: "read_review_state", args: {} };
+    const advance = { tool: "advance_review_context", args: {} };
+    const submit = {
+      tool: "submit_review",
+      args: { summary: "Reviewed.", findings: [], limitations: [] },
+    };
+    const advanceCall = { tool: "advance_review_context", arguments: {} };
+    const pagedCall = { tool: "read_pr_diff", arguments: { remaining: true } };
+    const upstream = await modelFixture(t, ({ body }) => {
+      const history = historyText(body);
+      const firstGoal = history.includes("FALLBACK_SWEEP_GOAL");
+      if (!firstGoal && !history.includes("CONTROL_SWEEP_GOAL"))
+        return history.includes("Discovery change map accepted.")
+          ? { text: "Orientation complete." }
+          : {
+              tool: "finish_discovery",
+              args: { changeMap: "Inspect the overflow source.", observations: [], unknowns: [] },
+            };
+      if (history.includes("Review submission accepted.")) return { text: "Review complete." };
+      const documents = historyDocuments(body);
+      if (firstGoal && rejectedPacket === undefined) {
+        const step = overflowStep++;
+        if (step === 0) return readState;
+        const state = documents.find((doc) => doc.briefingComplete === true);
+        assert.deepEqual(state?.nextCall, advanceCall);
+        assert.deepEqual((state?.records as unknown[])[0], { kind: "next_call", ...advanceCall });
+        if (step === 1) return readState;
+        assert.ok(
+          documents.some(
+            (doc) =>
+              doc.inspection !== undefined &&
+              !Array.isArray(doc.records) &&
+              JSON.stringify(doc.nextCall) === JSON.stringify(advanceCall),
+          ),
         );
-        const confirmedAt = output.findIndex(
-          (line) => line.includes("context-packet-confirmed") && line.includes(earlierId),
-        );
-        assert.ok(failedAt !== -1 && confirmedAt > failedAt);
-        assert.match(
-          output[failedAt] ?? "",
-          /"fallback":"paged tools".*"reason":"no-native-receipt"/u,
-        );
-        assert.doesNotMatch(output.join(""), /overflow fallback fixture/u);
-        emit(output[failedAt] ?? "");
-        emit(output[confirmedAt] ?? "");
+        if (step === 2) return submit;
+        const rejection = documents.find((doc) => Array.isArray(doc.categories));
+        assert.deepEqual(rejection?.nextCall, advanceCall);
       }
-      assert.ok(
-        output.some(
-          (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedId),
+      if (firstGoal && rejectedPacket !== undefined) {
+        assert.ok(!history.includes(rejectedPacket));
+        assert.ok(
+          history.includes("finish unread changed ranges with read_pr_diff remaining=true"),
+        );
+        if (!fallbackStateRead) {
+          fallbackStateRead = true;
+          return readState;
+        }
+        assert.deepEqual(
+          documents.findLast((doc) => doc.briefingComplete === true)?.nextCall,
+          pagedCall,
+        );
+        recovered = documents.some(({ done, remaining }) => done === true && remaining === true);
+        if (!recovered) return { tool: "read_pr_diff", args: { remaining: true } };
+      } else if (
+        history.includes(String.raw`\"more\":true`) &&
+        !history.includes(String.raw`\"more\":false`)
+      )
+        return advance;
+      if (!firstGoal && rejectedStartupPacket !== undefined) {
+        assert.ok(!history.includes(rejectedStartupPacket));
+        startupRecovered = documents.some(
+          ({ done, remaining }) => done === true && remaining === true,
+        );
+        if (!startupRecovered) return { tool: "read_pr_diff", args: { remaining: true } };
+      }
+      return submit;
+    });
+    const run = await runReviewGoals(
+      context,
+      files,
+      emptyConversation,
+      reviewConfig({
+        executor: "codex",
+        aiBaseUrl: upstream.url,
+        model: "gpt-6.1-sol",
+        parallelCount: 1,
+        maxTurns: 12,
+        reviewPrompts: ["FALLBACK_SWEEP_GOAL", "CONTROL_SWEEP_GOAL"].map((prompt) => ({
+          prompt,
+          files: [],
+        })),
+      }),
+      [[], []],
+      repository.root,
+      undefined,
+      undefined,
+      { linkedIssues: [], linkedIssueReferencesTruncated: false, repositoryGuidance: [] },
+    );
+    const rejectedId = rejectedPacket;
+    assert.ok(
+      rejectedId && recovered,
+      output
+        .filter((line) => /context-packet-|review-result/u.test(line))
+        .slice(-25)
+        .join("\n"),
+    );
+    assert.ok(
+      output.some(
+        (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedId),
+      ),
+    );
+    const rejectedStartupId = rejectedStartupPacket;
+    assert.ok(rejectedStartupId && startupRecovered);
+    const packetLogs = output.filter((line) => /\[goal 2\] session context-packet-/u.test(line));
+    const unconfirmed = packetLogs.findIndex(
+      (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedStartupId),
+    );
+    assert.ok(unconfirmed >= 0);
+    assert.match(
+      packetLogs[unconfirmed] ?? "",
+      /"snapshot":"[a-f0-9]{64}".*"unreadBytes":[1-9]\d*,"fallback":"paged tools","reason":"no-native-receipt"/u,
+    );
+    assert.ok(
+      packetLogs
+        .slice(unconfirmed + 1)
+        .some(
+          (line) =>
+            line.includes("context-packet-confirmed") &&
+            line.includes(rejectedStartupId.replace(/:3$/u, ":2")),
         ),
-      );
-      assert.deepEqual(
-        run.goals.map(({ status }) => status),
-        ["completed", "completed"],
-      );
-    },
-  );
+    );
+    assert.ok(!packetLogs.join("").includes("overflow fallback fixture"));
+    assert.deepEqual(
+      run.goals.map(({ status }) => status),
+      ["completed", "completed"],
+    );
+  },
+);

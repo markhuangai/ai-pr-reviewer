@@ -303,6 +303,68 @@ test("logs resolution failures and cleanup", async (t) => {
   assert.match(output.join(""), /session cleanup.*"outcome":"success"/u);
 });
 
+for (const parentCancels of [false, true]) {
+  test(`a hung resolution verifier ${parentCancels ? "honors parent cancellation during close" : "fails at its deadline with redacted diagnostics"}`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+    const output: string[] = [];
+    t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+      output.push(chunk.toString());
+      return true;
+    });
+    const ready = manualSignal<AbortSignal | undefined>();
+    const closing = manualSignal<undefined>();
+    const closed = manualSignal<undefined>();
+    const parent = new AbortController();
+    const sessionId = "12345678-1234-1234-1234-123456789abc";
+    const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+      async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+        yield { type: "system", subtype: "init", session_id: sessionId } as SDKMessage;
+        await input.prompt[Symbol.asyncIterator]().next();
+        ready.resolve(input.options.abortController?.signal);
+        await closed.promise;
+        throw new Error(`Cleanup diagnostic ${config.aiSecret}`);
+      },
+      close: () => {
+        closing.resolve(undefined);
+      },
+      interrupt: () => Promise.resolve(undefined),
+    })) as unknown as ResolutionQuery;
+    const running = verifyResolution(context, thread, config, "/workspace", query, parent);
+    const signal = await ready.promise;
+    assert.ok(signal);
+    t.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
+    assert.equal(signal.aborted, false);
+    t.mock.timers.tick(1);
+    await closing.promise;
+    const deadline = "Resolution verification exceeded its five-minute deadline.";
+    assert.equal((signal.reason as Error).message, deadline);
+    if (parentCancels) {
+      const cancellation = new CancellationError("SIGTERM");
+      const rejected = assert.rejects(running, (error: unknown) => error === cancellation);
+      parent.abort(cancellation);
+      closed.resolve(undefined);
+      await rejected;
+      assert.doesNotMatch(output.join(""), /session failure/u);
+    } else {
+      closed.resolve(undefined);
+      assert.deepEqual(await running, { status: "failed", error: deadline });
+      const lines = output.filter((line) => /\[resolution 1\] session (failure|end)/u.test(line));
+      assert.equal(lines.length, 2);
+      assert.match(
+        lines[0] ?? "",
+        /"phase":"deadline".*Resolution verification exceeded its five-minute deadline\./u,
+      );
+      assert.ok(lines.every((line) => line.includes(sessionId)));
+      assert.match(
+        lines[1] ?? "",
+        /"phase":"deadline".*"verdict_accepted":false,"repair_attempts":0,"stall_recoveries":0/u,
+      );
+      assert.match(output.join(""), /session cleanup.*Cleanup diagnostic \[REDACTED\]/u);
+      assert.ok(!output.join("").includes(config.aiSecret));
+    }
+  });
+}
+
 test("resolution verifier preserves non-high confidence verdicts for the lifecycle guard", async () => {
   const result = await verifyResolution(
     context,
@@ -375,6 +437,59 @@ test("finalizes a silent accepted resolution after its completion grace", async 
   assert.match(logs, /session submission-accepted.*"grace_ms":30000/u);
   assert.match(logs, /session submission-deadline.*"grace_ms":30000/u);
   assert.match(logs, /session verdict-finalized.*"terminal_sdk_result":false/u);
+});
+
+test("finalizes an accepted verifier just before its deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+  const ready = manualSignal<undefined>();
+  const boundary = manualSignal<undefined>();
+  let interrupts = 0;
+  let closes = 0;
+  let extraPrompt = false;
+  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
+      const messages = input.prompt[Symbol.asyncIterator]();
+      const initial = await messages.next();
+      assert.equal(initial.done, false);
+      await markReadEvidence(input.options);
+      ready.resolve(undefined);
+      await boundary.promise;
+      const accepted = await resolutionSubmitTool(input.options).handler({
+        verdict: "fixed",
+        confidence: "high",
+        rationale: "accepted before the deadline",
+      });
+      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
+      yield resolutionResult(1);
+      const next = await messages.next();
+      extraPrompt = !next.done;
+    },
+    mcpServerStatus: () => Promise.resolve([]),
+    interrupt: () => {
+      interrupts += 1;
+      return Promise.resolve(undefined);
+    },
+    close: () => {
+      closes += 1;
+    },
+  })) as unknown as ResolutionQuery;
+
+  const running = verifyResolution(context, thread, config, "/workspace", query);
+  await ready.promise;
+  t.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
+  boundary.resolve(undefined);
+  const result = await running;
+  t.mock.timers.tick(1);
+
+  assert.deepEqual(result, {
+    status: "completed",
+    verdict: "fixed",
+    confidence: "high",
+    rationale: "accepted before the deadline",
+  });
+  assert.equal(extraPrompt, false);
+  assert.equal(interrupts, 0);
+  assert.equal(closes, 1);
 });
 
 test("resolution prompt bounds large untrusted thread content", () => {
@@ -596,6 +711,17 @@ test("configures a read-only verifier and processes verifiers in bounded batches
   assert.equal(options.cwd, "/workspace");
   assert.equal(options.effort, "high");
   assert.equal(options.abortController, controller);
+  for (const effort of ["xhigh", "high", "low", undefined] as const) {
+    const configured = resolutionInternals.optionsForResolution(
+      { ...config, ...(effort === undefined ? {} : { effort }), maxTurns: 27 },
+      "/workspace",
+      controller,
+      {} as never,
+    );
+    assert.equal(configured.effort, effort);
+    assert.equal(configured.maxTurns, 27);
+    assert.match(configured.systemPrompt as string, /Batch independent reads in parallel/u);
+  }
   assert.deepEqual(options.tools, ["Read", "Glob", "Grep"]);
   assert.deepEqual(options.allowedTools, [
     "Read",
@@ -786,75 +912,4 @@ test("bounds verifier completion while preserving failures and cancellation", as
       assert.equal(closes, 1);
     });
   }
-});
-
-test("enforces the verifier deadline and gives parent cancellation precedence", async (t) => {
-  for (const effort of ["low", "high", "xhigh", undefined] as const)
-    await t.test(effort ?? "default effort", async (st) => {
-      const cancel = effort === "low";
-      st.mock.timers.enable({ apis: ["setTimeout"] });
-      const logs: string[] = [];
-      const emit = process.stdout.write.bind(process.stdout);
-      st.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-        logs.push(chunk.toString());
-        return true;
-      });
-      const ready = manualSignal<undefined>();
-      const closed = manualSignal<undefined>();
-      const parent = new AbortController();
-      const cancellation = new CancellationError("SIGTERM");
-      const secret = "fixture-deadline-secret";
-      let closes = 0;
-      const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
-        async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
-          await input.prompt[Symbol.asyncIterator]().next();
-          assert.equal(input.options.effort, effort);
-          assert.equal(input.options.maxTurns, 19);
-          assert.notEqual(input.options.abortController, parent);
-          yield { type: "system", subtype: "init", session_id: "deadline-fixture" } as SDKMessage;
-          ready.resolve(undefined);
-          await closed.promise;
-          throw new Error("Fixture reader shutdown: " + secret);
-        },
-        close: () => {
-          closes++;
-          if (cancel) parent.abort(cancellation);
-          closed.resolve(undefined);
-        },
-        interrupt: () => assert.fail("The five-minute deadline must take precedence over a stall."),
-      })) as unknown as ResolutionQuery;
-      const running = verifyResolution(
-        context,
-        thread,
-        { ...config, aiSecret: secret, ...(effort === undefined ? {} : { effort }), maxTurns: 19 },
-        "/workspace",
-        query,
-        parent,
-      );
-      const result = cancel
-        ? assert.rejects(running, (error: unknown) => error === cancellation)
-        : running;
-      await ready.promise;
-      st.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
-      assert.equal(closes, 0);
-      st.mock.timers.tick(1);
-      if (cancel) await result;
-      else {
-        assert.deepEqual(await result, {
-          status: "failed",
-          error: "Resolution verification exceeded its five-minute deadline.",
-        });
-        const [failure, end] = logs.filter((line) =>
-          /\[resolution 1\] session (failure|end)/u.test(line),
-        );
-        assert.match(failure ?? "", /"phase":"deadline".*five-minute deadline.*\[REDACTED\]/u);
-        assert.match(
-          end ?? "",
-          /"phase":"deadline","session_id":"deadline-fixture","verdict_accepted":false,"repair_attempts":0,"stall_recoveries":0/u,
-        );
-        assert.ok(!logs.join("").includes(secret));
-        emit((failure ?? "") + (end ?? ""));
-      }
-      assert.equal(closes, 1);
-    });
 });

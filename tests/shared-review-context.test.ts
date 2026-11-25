@@ -24,7 +24,12 @@ import {
 import { tool } from "../src/runtime/review-tool.js";
 import { SDK_SESSION_HEARTBEAT_MS } from "../src/runtime/session-recovery.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
-import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
+import {
+  emptyConversation,
+  goalContext,
+  makeReviewDiff,
+  reviewConfig,
+} from "./agent-test-helpers.js";
 import {
   historyDocuments,
   historyText,
@@ -49,6 +54,44 @@ const file: ChangedFile = {
 };
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 
+test("shared packets drain a multipage briefing before later diff pages", async (t) => {
+  const reader = new ReviewBriefingReader(goalContext, [file], emptyConversation, {
+    ...briefing,
+    repositoryGuidance: Array.from({ length: 8 }, (_, page) => ({
+      path: `guidance-${page}.md`,
+      revision: "head",
+      content: 'Line with "escaped" data.\n'.repeat(460),
+    })),
+  });
+  const diff = await makeReviewDiff(t, "+more changed data\n".repeat(4_500), [file.path]);
+  const { packets } = await stageReviewContext(reader, diff, goalContext.headSha);
+  const pages = packets.flatMap((packet) => packet.pages);
+  const kinds = pages.map(({ kind }) => kind);
+  assert.deepEqual(
+    packets[0]?.pages.slice(0, 2).map(({ kind }) => kind),
+    ["briefing", "diff"],
+  );
+  const count = reader.stagedPages().length;
+  assert.ok(count >= 5 && kinds.length > count + 1);
+  assert.deepEqual(
+    kinds.slice(2, count + 1),
+    Array.from({ length: count - 1 }, () => "briefing"),
+  );
+  assert.ok(kinds.slice(count + 1).every((kind) => kind === "diff"));
+  for (const [index, packet] of packets.entries()) {
+    const more = index < packets.length - 1;
+    const document: unknown = JSON.parse(packet.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
+    assert.ok(isRecord(document));
+    assert.equal(document.more, more);
+    assert.ok(packet.wireBytes <= REVIEW_CONTEXT_WIRE_BYTES);
+    assert.equal(Object.keys(document).at(-1), more ? "nextCall" : "pages");
+    assert.deepEqual(
+      document.nextCall,
+      more ? { tool: "advance_review_context", arguments: {} } : undefined,
+    );
+  }
+});
+
 function providerPacketMessages(body: Record<string, unknown>) {
   const messages = body.messages ?? body.input;
   if (!Array.isArray(messages)) return [];
@@ -58,9 +101,9 @@ function providerPacketMessages(body: Record<string, unknown>) {
     return blocks.flatMap((block) => {
       const text = isRecord(block) ? block.text : block;
       if (typeof text !== "string" || !text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)) return [];
+      const content = Array.isArray(message.content) ? [block] : text;
       assert.ok(
-        Buffer.byteLength(JSON.stringify({ role: message.role, content: [block] })) <=
-          REVIEW_CONTEXT_WIRE_BYTES,
+        Buffer.byteLength(JSON.stringify({ ...message, content })) <= REVIEW_CONTEXT_WIRE_BYTES,
       );
       const packet: unknown = JSON.parse(text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
       assert.ok(isRecord(packet) && Array.isArray(packet.pages));
@@ -99,34 +142,6 @@ function digestRanges(ranges: readonly ReviewSourceRange[]): string {
     .digest("hex");
 }
 
-test("preserves briefing order and a bounded trailing next call in shared packets", async (t) => {
-  const { root, baseSha, temporaryRoot, ...repository } = await makeReplayRepository(t);
-  await writeFile(join(root, "large.txt"), "One line of changed source.\n".repeat(2_000));
-  const headSha = await commitFixtureSnapshot(root, temporaryRoot, repository.headSha);
-  const context = { ...repository.context, headSha, body: 'Quoted " \\ '.repeat(9_000) };
-  const diff = await makeDiffFromSnapshots(root, baseSha, headSha, temporaryRoot);
-  t.after(() => diff.cleanup());
-  const reader = new ReviewBriefingReader(context, [], emptyConversation, briefing);
-  assert.ok(reader.stagedPages().length >= 5);
-  const { packets } = await stageReviewContext(reader, diff, headSha);
-  const pages = packets.flatMap((packet) => packet.pages.map(({ kind }) => kind));
-  assert.deepEqual(pages.slice(0, 2), ["briefing", "diff"]);
-  assert.equal(pages.lastIndexOf("briefing"), reader.stagedPages().length);
-  assert.ok(pages.filter((kind) => kind === "diff").length > 1);
-  for (const [index, packet] of packets.entries()) {
-    assert.ok(packet.wireBytes <= REVIEW_CONTEXT_WIRE_BYTES);
-    const document: unknown = JSON.parse(packet.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
-    assert.ok(isRecord(document));
-    const more = index + 1 < packets.length;
-    assert.equal(document.more, more);
-    assert.equal(Object.keys(document).at(-1), more ? "nextCall" : "pages");
-    assert.deepEqual(
-      document.nextCall,
-      more ? { tool: "advance_review_context", arguments: {} } : undefined,
-    );
-  }
-});
-
 for (const executor of ["claude", "codex"] as const) {
   test(
     `real ${executor} exchanges for fitting and overflow shared evidence`,
@@ -161,22 +176,18 @@ for (const executor of ["claude", "codex"] as const) {
       for (const fixtureSize of ["fitting", "startup", "overflow"] as const) {
         const overflow = fixtureSize === "overflow";
         const startup = fixtureSize === "startup";
+        if (startup || overflow)
+          await writeFile(
+            join(repository.root, "middle.txt"),
+            `${fixtureMarker}${"0123456789".repeat(18)}\n`.repeat(startup ? 460 : 770),
+          );
         if (overflow) {
           await rename(join(repository.root, "rename.txt"), join(repository.root, "renamed.txt"));
           await rm(join(repository.root, "remove.txt"));
-          await writeFile(
-            join(repository.root, "middle.txt"),
-            `${fixtureMarker}${"0123456789".repeat(18)}\n`.repeat(770),
-          );
           await writeFile(join(repository.root, "zz-late.txt"), `${lateMarker}\n`);
-        } else if (startup) {
-          await writeFile(
-            join(repository.root, "middle.txt"),
-            `${fixtureMarker}${"0123456789".repeat(18)}\n`.repeat(440),
-          );
         }
         const context =
-          overflow || startup
+          startup || overflow
             ? {
                 ...repository.context,
                 headSha: await commitFixtureSnapshot(
@@ -215,8 +226,6 @@ for (const executor of ["claude", "codex"] as const) {
           );
           const counts = labels.map(() => 0);
           const seenPackets = labels.map(() => new Set<unknown>());
-          const startupReads = labels.map(() => 0);
-          const startupResults = new Map<number, unknown[]>();
           const ranges: ReviewSourceRange[][] = labels.map(() => []);
           const upstream = await modelFixture(t, ({ body }): ModelReply => {
             const history = historyText(body);
@@ -226,9 +235,9 @@ for (const executor of ["claude", "codex"] as const) {
               if (history.includes("Discovery change map accepted."))
                 return { text: "Orientation complete." };
               assert.equal(
-                packets.length > 0,
-                candidate,
-                "Discovery starts with raw user-role evidence only in candidate mode.",
+                packets.length,
+                candidate ? 1 : 0,
+                "Discovery starts with only the first packet in candidate mode.",
               );
               if (candidate)
                 assert.deepEqual(
@@ -265,38 +274,35 @@ for (const executor of ["claude", "codex"] as const) {
                 return { tool: "read_pr_diff", args: { remaining: true } };
               }
             } else {
-              assert.ok(
-                packets.length > 0,
-                "A fitting or overflow goal must see raw evidence at activation.",
-              );
+              const packet = packets.at(-1);
+              assert.ok(packet, "Every goal must see raw evidence at activation.");
               if (startup) {
-                assert.equal(packets.map(({ id }) => String(id).at(-1)).join(""), "123");
-                const step = startupReads[index];
-                const readDiff = index % 2 === 0;
-                if (step === 0) {
-                  startupReads[index] = 1;
-                  return readDiff
+                assert.deepEqual(
+                  packets.map(({ id }) => String(id).split(":").at(-1)),
+                  ["1", "2", "3"],
+                );
+                assert.equal(packet.more, false);
+                const diff = index === 0;
+                if (!seenPackets[index]?.has(packet.id)) {
+                  seenPackets[index]?.add(packet.id);
+                  return diff
                     ? { tool: "read_pr_diff", args: { remaining: true } }
                     : { tool: "read_review_briefing", args: {} };
                 }
-                if (step === 1) {
-                  const page = historyDocuments(body).findLast(({ remaining, records }) =>
-                    readDiff ? remaining === true : Array.isArray(records),
-                  );
-                  const delivered = readDiff
-                    ? page?.byteLength
-                    : (page?.records as unknown[] | undefined)?.length;
-                  startupResults.set(index, [page?.done, delivered]);
-                  startupReads[index] = 2;
-                  return { tool: "read_review_state", args: {} };
-                }
-                const state = historyDocuments(body).findLast(({ inspection }) =>
-                  isRecord(inspection),
+                const docs = historyDocuments(body);
+                const read = docs.findLast((doc) =>
+                  diff
+                    ? doc.remaining === true
+                    : doc.totalPages !== undefined && doc.briefingComplete === undefined,
                 );
-                startupResults.get(index)?.push(state?.repeatedSourceBytes, state?.inspection);
+                assert.ok(read);
+                assert.equal(read.done, true);
+                assert.deepEqual(diff ? read.content : read.records, diff ? "" : []);
+                const state = docs.find((doc) => doc.briefingComplete === true);
+                if (state === undefined) return { tool: "read_review_state", args: {} };
+                assert.equal(state.repeatedSourceBytes, 0);
               }
-              const packet = packets.at(-1);
-              if (packet?.more === true) {
+              if (packet.more === true) {
                 counts[index] = (counts[index] ?? 0) + 1;
                 if (seenPackets[index]?.has(packet.id))
                   return { text: "Waiting for the next packet." };
@@ -348,11 +354,6 @@ for (const executor of ["claude", "codex"] as const) {
             labels.map(() => ({ status: "completed", error: undefined })),
             output.slice(-22).join("\n"),
           );
-          if (startup)
-            assert.deepEqual(
-              [...startupResults.values()],
-              labels.map(() => [true, 0, 0, { observed: files.length, missing: 0 }]),
-            );
           const digests = candidate
             ? output.flatMap((line) =>
                 [...line.matchAll(/"diffRangeDigest":"([a-f0-9]{64})"/gu)].map(
@@ -389,7 +390,11 @@ for (const executor of ["claude", "codex"] as const) {
           assert.ok(baseline !== undefined && candidate !== undefined);
           for (const [index, exchanges] of candidate.exchanges.entries())
             assert.ok(exchanges * 2 <= (baseline.exchanges[index] ?? 0), JSON.stringify(reports));
-        } else assert.deepEqual(baseline?.exchanges, startup ? [0, 0] : [0, 0, 0, 0, 0, 0]);
+        } else
+          assert.deepEqual(
+            baseline?.exchanges,
+            Array.from({ length: startup ? 2 : 6 }, () => 0),
+          );
         emit(`shared-context-benchmark ${executor} ${fixtureSize} ${JSON.stringify(reports)}\n`);
       }
     },

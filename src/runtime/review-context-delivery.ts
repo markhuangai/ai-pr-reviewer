@@ -1,5 +1,6 @@
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
-import { setTimeout as wait } from "node:timers/promises";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { CodexRpcError } from "./codex-app-server.js";
 import type { ReviewEvidenceLedger } from "./review-assessment.js";
 import type { ReviewBriefingReader } from "./review-briefing.js";
 import { ReviewContextHistory } from "./review-context-history.js";
@@ -25,7 +26,6 @@ export class ReviewContextDelivery {
   private readonly replayed = new Set<string>();
   private readonly deferred = new Set<string>();
   private refreshOperation: Promise<void> = Promise.resolve();
-  private pagedReceiptWait: Promise<void> | undefined;
   private cueSent = false;
   private packetBoundaryPending = false;
   advanceRequested = false;
@@ -98,7 +98,6 @@ export class ReviewContextDelivery {
 
   private queue(packet: ReviewContextPacket): ReviewContextPacket {
     this.inFlight.set(packet.id, packet);
-    this.pagedReceiptWait = undefined;
     this.packetBoundaryPending = true;
     const replay = this.attempted.has(packet.id) || this.everConfirmed.has(packet.id);
     if (replay) this.replayed.add(packet.id);
@@ -115,9 +114,11 @@ export class ReviewContextDelivery {
     return packet;
   }
 
-  refresh(): Promise<void> {
+  refresh(claudeToolSession?: string): Promise<void> {
     const result = this.refreshOperation.then(async () => {
-      const verified = await this.history.confirmed();
+      const verified = await this.history.confirmed(
+        this.inFlight.size > 0 ? claudeToolSession : undefined,
+      );
       const lost = new Set([...this.confirmed].filter((id) => !verified?.has(id)));
       if (lost.size > 0) {
         this.log(
@@ -165,22 +166,6 @@ export class ReviewContextDelivery {
     });
     this.refreshOperation = result.catch(() => undefined);
     return result;
-  }
-
-  async refreshBeforePagedRead(signal?: AbortSignal): Promise<void> {
-    await this.refresh();
-    if (this.inFlight.size === 0) return;
-    this.pagedReceiptWait ??= this.waitForPagedReceipt(signal);
-    await this.pagedReceiptWait;
-  }
-
-  private async waitForPagedReceipt(signal?: AbortSignal): Promise<void> {
-    // Claude can dispatch a tool while its assistant response is still being persisted.
-    const deadline = performance.now() + 250;
-    while (this.inFlight.size > 0 && performance.now() < deadline) {
-      await wait(25, undefined, { signal });
-      await this.refresh();
-    }
   }
 
   async boundary(): Promise<boolean> {
@@ -268,4 +253,38 @@ export class ReviewContextDelivery {
     ];
     return `Shared context sweep ended. Outstanding checks: ${checks.join("; ")}. Use read_review_state for exact gaps or evidence references as needed. Then call submit_review for this same goal, even when findings are empty.`;
   }
+}
+
+export async function injectCodexContextPackets(
+  delivery: ReviewContextDelivery,
+  forked: boolean,
+  inject: (text: string) => Promise<unknown>,
+  signal: AbortSignal,
+): Promise<void> {
+  await delivery.refresh();
+  const stage = () => (forked ? delivery.stageStartupPacket() : delivery.stage());
+  for (let packet = stage(); packet !== undefined; packet = stage()) {
+    try {
+      throwIfAborted(signal);
+      await inject(packet.text);
+    } catch (error) {
+      if (!(error instanceof CodexRpcError)) throw error;
+      throwIfAborted(signal);
+      delivery.deferInFlight(packet.id);
+      break;
+    }
+  }
+}
+
+export function appendCodexToolAdvisory(
+  result: CallToolResult,
+  toolName: string,
+  advisory: string | undefined,
+): CallToolResult {
+  if (
+    advisory === undefined ||
+    ["submit_review", ADVANCE_REVIEW_CONTEXT_CALL.tool, "finish_discovery"].includes(toolName)
+  )
+    return result;
+  return { ...result, content: [...result.content, { type: "text", text: advisory }] };
 }

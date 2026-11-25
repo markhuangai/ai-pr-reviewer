@@ -797,31 +797,26 @@ test("teaches the four severity definitions before review submission", () => {
   );
 
   const prompt = (queued[1] as { message: { content: string } }).message.content;
-  const codexMessages: SDKMessage[] = [];
-  agentInternals.startReviewPrompt(
-    { push: (message) => codexMessages.push(message) },
-    "Check callers.",
+  assert.match(prompt, /Batch independent reads in parallel/u);
+  assert.match(prompt, /Reuse delivered evidence/u);
+  assert.match(prompt, /locate definitions with Grep and use line-range Read/u);
+  assert.match(prompt, /Use read_repository_file for base revisions/u);
+  const codex = agentInternals.buildGoalPrompt(
+    "Check reader guidance.",
     context,
     [],
     context.baseSha,
     0,
     [],
-    0,
-    [],
-    () => undefined,
-    () => undefined,
     undefined,
-    true,
-    false,
+    undefined,
+    undefined,
     undefined,
     "codex",
   );
-  const codex = (codexMessages[1] as { message: { content: string } }).message.content;
-  for (const review of [prompt, codex])
-    assert.match(review, /Batch independent reads in parallel/u);
-  assert.match(prompt, /use Grep .* then Read only the relevant line ranges/u);
-  assert.match(prompt, /Use read_repository_file for base revisions/u);
-  assert.match(codex, /use search_repository before read_repository_file/u);
+  assert.match(codex, /Batch independent reads in parallel/u);
+  assert.match(codex, /use search_repository.*before using read_repository_file/u);
+  assert.doesNotMatch(codex, /line-range Read|use only Read, Glob, Grep/u);
   for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"])
     assert.match(prompt, new RegExp(`- ${severity}:`, "u"));
   assert.match(prompt, /Omit style preferences, nits, and informational observations/u);
