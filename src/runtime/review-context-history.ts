@@ -31,6 +31,7 @@ export class ReviewContextHistory {
   private transcript: ReviewContextTranscript | undefined;
   private lastVersion = "";
   private lastConfirmed: ReadonlySet<string> = new Set();
+  private readonly claudeToolReceipts = new Map<string, string>();
 
   constructor(
     private readonly home: string,
@@ -44,9 +45,11 @@ export class ReviewContextHistory {
     this.transcript = transcript;
   }
 
-  async confirmed(): Promise<ReadonlySet<string> | undefined> {
+  async confirmed(claudeToolSession?: string): Promise<ReadonlySet<string> | undefined> {
     const transcript = this.transcript;
     if (transcript === undefined) return undefined;
+    const claudeResponded =
+      transcript.executor === "claude" && transcript.sessionId === claudeToolSession;
     try {
       let candidate = transcript.path;
       if (candidate === undefined && /^[0-9a-f-]{36}$/iu.test(transcript.sessionId)) {
@@ -70,18 +73,22 @@ export class ReviewContextHistory {
       const info = await stat(path);
       const end = transcript.endByteOffset ?? info.size;
       const version = `${path}:${info.ino}:${end}:${info.mtimeMs}`;
-      if (version === this.lastVersion) return this.lastConfirmed;
+      if (version === this.lastVersion && !claudeResponded) return this.lastConfirmed;
       if (!info.isFile() || end <= 0 || end > info.size) return undefined;
       const confirmed = new Set<string>();
-      const pending = new Set<string>();
+      const pending = new Map<string, string | undefined>();
       const acknowledge = () => {
-        for (const id of pending) confirmed.add(id);
+        for (const id of pending.keys()) confirmed.add(id);
         pending.clear();
       };
-      const user = (content: unknown) => {
+      const user = (content: unknown, uuid?: unknown) => {
         for (const text of textBlocks(content)) {
           const id = this.byText.get(text);
-          if (id !== undefined) pending.add(id);
+          if (id === undefined) continue;
+          const messageId = typeof uuid === "string" ? uuid : undefined;
+          if (messageId !== undefined && this.claudeToolReceipts.get(id) === messageId)
+            confirmed.add(id);
+          else pending.set(id, messageId);
         }
       };
       const reset = () => {
@@ -186,7 +193,7 @@ export class ReviewContextHistory {
                 for (const item of entry.payload.replacement_history)
                   if (isRecord(item) && item.type === "message" && item.role === "user")
                     user(item.content);
-              for (const id of pending)
+              for (const id of pending.keys())
                 if (previouslyConfirmed.has(id)) {
                   confirmed.add(id);
                   pending.delete(id);
@@ -206,7 +213,7 @@ export class ReviewContextHistory {
                 entry.message.role === "user" &&
                 entry.isCompactSummary !== true
               )
-                user(entry.message.content);
+                user(entry.message.content, entry.uuid);
               if (
                 entry.type === "assistant" &&
                 entry.message.role === "assistant" &&
@@ -223,6 +230,14 @@ export class ReviewContextHistory {
       }
       if (readState.error !== undefined) throw readState.error;
       if (!correctSession) return undefined;
+      if (claudeResponded) {
+        // Claude's PreToolUse precedes the assistant transcript entry for the same response.
+        for (const [packet, messageId] of pending) {
+          if (messageId === undefined) continue;
+          this.claudeToolReceipts.set(packet, messageId);
+          confirmed.add(packet);
+        }
+      }
       this.lastVersion = version;
       this.lastConfirmed = confirmed;
       return confirmed;

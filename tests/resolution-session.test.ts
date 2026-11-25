@@ -9,6 +9,7 @@ import {
 } from "./agent-test-helpers.js";
 import {
   runResolutionVerifiers,
+  RESOLUTION_DEADLINE_MS,
   resolutionInternals,
   verifyResolution,
   type ResolutionQuery,
@@ -16,6 +17,7 @@ import {
 import type { ReviewLifecycleThreadRecord } from "../src/lib/github-review-lifecycle.js";
 import type {
   SDKActiveGoalMessage,
+  SDKMessage,
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -71,11 +73,6 @@ function resolutionSubmitTool(options: Options): {
   const submit = output.instance._registeredTools.submit_resolution;
   assert.ok(submit);
   return submit;
-}
-
-function resolutionMessageText(message: SDKUserMessage): string {
-  const content = message.message.content;
-  return typeof content === "string" ? content : JSON.stringify(content);
 }
 
 const context: PullRequestContext = {
@@ -306,6 +303,68 @@ test("logs resolution failures and cleanup", async (t) => {
   assert.match(output.join(""), /session cleanup.*"outcome":"success"/u);
 });
 
+for (const parentCancels of [false, true]) {
+  test(`a hung resolution verifier ${parentCancels ? "honors parent cancellation during close" : "fails at its deadline with redacted diagnostics"}`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
+    const output: string[] = [];
+    t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+      output.push(chunk.toString());
+      return true;
+    });
+    const ready = manualSignal<AbortSignal | undefined>();
+    const closing = manualSignal<undefined>();
+    const closed = manualSignal<undefined>();
+    const parent = new AbortController();
+    const sessionId = "12345678-1234-1234-1234-123456789abc";
+    const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+      async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+        yield { type: "system", subtype: "init", session_id: sessionId } as SDKMessage;
+        await input.prompt[Symbol.asyncIterator]().next();
+        ready.resolve(input.options.abortController?.signal);
+        await closed.promise;
+        throw new Error(`Cleanup diagnostic ${config.aiSecret}`);
+      },
+      close: () => {
+        closing.resolve(undefined);
+      },
+      interrupt: () => Promise.resolve(undefined),
+    })) as unknown as ResolutionQuery;
+    const running = verifyResolution(context, thread, config, "/workspace", query, parent);
+    const signal = await ready.promise;
+    assert.ok(signal);
+    t.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
+    assert.equal(signal.aborted, false);
+    t.mock.timers.tick(1);
+    await closing.promise;
+    const deadline = "Resolution verification exceeded its five-minute deadline.";
+    assert.equal((signal.reason as Error).message, deadline);
+    if (parentCancels) {
+      const cancellation = new CancellationError("SIGTERM");
+      const rejected = assert.rejects(running, (error: unknown) => error === cancellation);
+      parent.abort(cancellation);
+      closed.resolve(undefined);
+      await rejected;
+      assert.doesNotMatch(output.join(""), /session failure/u);
+    } else {
+      closed.resolve(undefined);
+      assert.deepEqual(await running, { status: "failed", error: deadline });
+      const lines = output.filter((line) => /\[resolution 1\] session (failure|end)/u.test(line));
+      assert.equal(lines.length, 2);
+      assert.match(
+        lines[0] ?? "",
+        /"phase":"deadline".*Resolution verification exceeded its five-minute deadline\./u,
+      );
+      assert.ok(lines.every((line) => line.includes(sessionId)));
+      assert.match(
+        lines[1] ?? "",
+        /"phase":"deadline".*"verdict_accepted":false,"repair_attempts":0,"stall_recoveries":0/u,
+      );
+      assert.match(output.join(""), /session cleanup.*Cleanup diagnostic \[REDACTED\]/u);
+      assert.ok(!output.join("").includes(config.aiSecret));
+    }
+  });
+}
+
 test("resolution verifier preserves non-high confidence verdicts for the lifecycle guard", async () => {
   const result = await verifyResolution(
     context,
@@ -380,7 +439,7 @@ test("finalizes a silent accepted resolution after its completion grace", async 
   assert.match(logs, /session verdict-finalized.*"terminal_sdk_result":false/u);
 });
 
-test("lets an accepted verdict win an interrupted verifier boundary", async (t) => {
+test("finalizes an accepted verifier just before its deadline", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
   const ready = manualSignal<undefined>();
   const boundary = manualSignal<undefined>();
@@ -398,17 +457,16 @@ test("lets an accepted verdict win an interrupted verifier boundary", async (t) 
       const accepted = await resolutionSubmitTool(input.options).handler({
         verdict: "fixed",
         confidence: "high",
-        rationale: "accepted during interrupt",
+        rationale: "accepted before the deadline",
       });
       assert.equal(accepted.content[0]?.text, "Resolution accepted.");
-      yield resolutionResult(1, "error_during_execution");
+      yield resolutionResult(1);
       const next = await messages.next();
       extraPrompt = !next.done;
     },
     mcpServerStatus: () => Promise.resolve([]),
     interrupt: () => {
       interrupts += 1;
-      boundary.resolve(undefined);
       return Promise.resolve(undefined);
     },
     close: () => {
@@ -418,97 +476,20 @@ test("lets an accepted verdict win an interrupted verifier boundary", async (t) 
 
   const running = verifyResolution(context, thread, config, "/workspace", query);
   await ready.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
+  t.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
+  boundary.resolve(undefined);
   const result = await running;
+  t.mock.timers.tick(1);
 
   assert.deepEqual(result, {
     status: "completed",
     verdict: "fixed",
     confidence: "high",
-    rationale: "accepted during interrupt",
+    rationale: "accepted before the deadline",
   });
   assert.equal(extraPrompt, false);
-  assert.equal(interrupts, 1);
+  assert.equal(interrupts, 0);
   assert.equal(closes, 1);
-});
-
-test("continues resolution verification across repeated SDK stalls", async (t) => {
-  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
-  const output: string[] = [];
-  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-    output.push(chunk.toString());
-    return true;
-  });
-  const ready = [manualSignal<undefined>(), manualSignal<undefined>()];
-  const boundaries = [manualSignal<undefined>(), manualSignal<undefined>()];
-  const continuations: string[] = [];
-  let interrupts = 0;
-  let closes = 0;
-  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
-    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
-      const messages = input.prompt[Symbol.asyncIterator]();
-      const initial = await messages.next();
-      assert.equal(initial.done, false);
-      await markReadEvidence(input.options);
-      ready[0]?.resolve(undefined);
-      for (let index = 0; index < boundaries.length; index += 1) {
-        const boundary = boundaries[index];
-        assert.ok(boundary);
-        await boundary.promise;
-        yield resolutionResult(index + 1, "error_during_execution");
-        const continuation = await messages.next();
-        assert.equal(continuation.done, false);
-        continuations.push(resolutionMessageText(continuation.value));
-        if (index + 1 < boundaries.length) ready[index + 1]?.resolve(undefined);
-      }
-      const accepted = await resolutionSubmitTool(input.options).handler({
-        verdict: "fixed",
-        confidence: "high",
-        rationale: "recovered verifier",
-      });
-      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
-      yield resolutionResult(3);
-      assert.equal((await messages.next()).done, true);
-    },
-    mcpServerStatus: () => Promise.resolve([]),
-    interrupt: () => {
-      const call = interrupts;
-      interrupts += 1;
-      if (call === 0) return Promise.reject(new Error("resolution interrupt unavailable"));
-      const boundary = boundaries[call - 1];
-      boundary?.resolve(undefined);
-      return Promise.resolve(undefined);
-    },
-    close: () => {
-      closes += 1;
-    },
-  })) as unknown as ResolutionQuery;
-
-  const running = verifyResolution(context, thread, config, "/workspace", query);
-  await ready[0]?.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  for (let index = 0; index < 4; index += 1) await Promise.resolve();
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  await ready[1]?.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  const result = await running;
-
-  assert.deepEqual(result, {
-    status: "completed",
-    verdict: "fixed",
-    confidence: "high",
-    rationale: "recovered verifier",
-  });
-  assert.equal(interrupts, 3);
-  assert.equal(closes, 1);
-  assert.equal(continuations.length, 2);
-  assert.equal(
-    continuations.every((message) => message.includes("Continue the same resolution verification")),
-    true,
-  );
-  assert.match(output.join(""), /interrupt-failed.*resolution interrupt unavailable/u);
-  assert.match(output.join(""), /interrupted-turn-boundary/u);
-  assert.match(output.join(""), /session end/u);
 });
 
 test("resolution prompt bounds large untrusted thread content", () => {
@@ -730,6 +711,17 @@ test("configures a read-only verifier and processes verifiers in bounded batches
   assert.equal(options.cwd, "/workspace");
   assert.equal(options.effort, "high");
   assert.equal(options.abortController, controller);
+  for (const effort of ["xhigh", "high", "low", undefined] as const) {
+    const configured = resolutionInternals.optionsForResolution(
+      { ...config, ...(effort === undefined ? {} : { effort }), maxTurns: 27 },
+      "/workspace",
+      controller,
+      {} as never,
+    );
+    assert.equal(configured.effort, effort);
+    assert.equal(configured.maxTurns, 27);
+    assert.match(configured.systemPrompt as string, /Batch independent reads in parallel/u);
+  }
   assert.deepEqual(options.tools, ["Read", "Glob", "Grep"]);
   assert.deepEqual(options.allowedTools, [
     "Read",

@@ -43,6 +43,7 @@ export type ModelReply =
       readonly inputTokens?: number;
       readonly cachedInputTokens?: number;
     }
+  | { readonly codexTools: readonly ModelToolCall[] }
   | { readonly text: string; readonly inputTokens?: number; readonly cachedInputTokens?: number }
   | { readonly error: number; readonly message?: string }
   | { readonly disconnect: true }
@@ -106,7 +107,10 @@ export function historyDocuments(body: Record<string, unknown>): Record<string, 
       if (
         Array.isArray(value.records) ||
         typeof value.done === "boolean" ||
-        typeof value.references === "string"
+        typeof value.references === "string" ||
+        typeof value.wrapUp === "string" ||
+        (isRecord(value.nextCall) &&
+          (isRecord(value.inspection) || Array.isArray(value.categories)))
       )
         documents.push(value);
       for (const child of Object.values(value)) visit(child);
@@ -125,6 +129,19 @@ function respond(
   >,
 ): void {
   const availableTools = wireTools(body);
+  if ("codexTools" in reply) {
+    const calls = reply.codexTools.map(({ tool, args }) => {
+      const exposed = availableTools.find((item) => item.name.endsWith("__" + tool));
+      assert.ok(exposed?.codeMode, "The real Codex request must expose " + tool + " to code mode.");
+      return `tools.${exposed.name}(${JSON.stringify(args)})`;
+    });
+    respond(response, body, {
+      tool: "exec",
+      args: {},
+      input: `text(JSON.stringify(await Promise.all([${calls.join(", ")}])));`,
+    });
+    return;
+  }
   const tool =
     "tool" in reply
       ? availableTools.find(

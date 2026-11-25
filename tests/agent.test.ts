@@ -11,6 +11,7 @@ import {
   makeReviewDiff,
   mkdir,
   mkdtemp,
+  observedReviewOutputTools,
   readdir,
   reviewConfig,
   rm,
@@ -26,6 +27,135 @@ import {
   type SDKUserMessage,
   writeFile,
 } from "./agent-test-helpers.js";
+import { POST_COVERAGE_WRAP_UP_MS, POST_COVERAGE_WRAP_UP_ROUNDS } from "../src/runtime/agent.js";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
+test("advises full-coverage reviews once per epoch and rearms after compaction", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const logs: string[] = [];
+  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+    logs.push(chunk.toString());
+    return true;
+  });
+  const changedFile = {
+    path: "src/change.ts",
+    status: "modified",
+    additions: 1,
+    deletions: 0,
+    changes: 1,
+    addedLines: new Set([1]),
+  };
+  const query = (({
+    prompt,
+    options,
+  }: {
+    prompt: AsyncIterable<SDKUserMessage>;
+    options: Options;
+  }) => ({
+    async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+      const messages = prompt[Symbol.asyncIterator]();
+      await messages.next();
+      await messages.next();
+      const hook = options.hooks?.PostToolBatch?.[0]?.hooks[0];
+      const tools = observedReviewOutputTools(options);
+      const state = observedReviewOutputTools({ ...options, hooks: {} }).read_review_state;
+      assert.ok(
+        hook && state && tools.read_review_briefing && tools.read_pr_diff && tools.submit_review,
+      );
+      let call = 0;
+      const round = async () => {
+        const result = await hook(
+          {
+            hook_event_name: "PostToolBatch",
+            session_id: "pacing",
+            transcript_path: "",
+            cwd: "/workspace/repository",
+            permission_mode: "dontAsk",
+            tool_calls: [
+              {
+                tool_name: "mcp__review_output__read_review_state",
+                tool_input: {},
+                tool_use_id: `pacing-${++call}`,
+                tool_response: await state.handler({}),
+              },
+            ],
+          },
+          undefined,
+          { signal: new AbortController().signal },
+        );
+        assert.deepEqual("continue" in result ? result.continue : undefined, true);
+        assert.equal("decision" in result, false);
+        return "hookSpecificOutput" in result &&
+          result.hookSpecificOutput?.hookEventName === "PostToolBatch"
+          ? result.hookSpecificOutput.additionalContext
+          : undefined;
+      };
+      t.mock.timers.tick(POST_COVERAGE_WRAP_UP_MS);
+      assert.equal(await round(), undefined);
+      await tools.read_review_briefing.handler({});
+      await tools.read_pr_diff.handler({ remaining: true });
+      for (let index = 1; index < POST_COVERAGE_WRAP_UP_ROUNDS; index++)
+        assert.equal(await round(), undefined);
+      assert.match((await round()) ?? "", /"wrapUp".*call submit_review now/u);
+      assert.equal(await round(), undefined);
+      yield {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 0 },
+      } as SDKMessage;
+      assert.equal(await round(), undefined);
+      t.mock.timers.tick(POST_COVERAGE_WRAP_UP_MS - 1);
+      assert.equal(await round(), undefined);
+      t.mock.timers.tick(1);
+      assert.match((await round()) ?? "", /"wrapUp".*call submit_review now/u);
+      assert.equal(await round(), undefined);
+      assert.equal(
+        (await tools.submit_review.handler({ summary: "Reviewed", findings: [], limitations: [] }))
+          .isError,
+        undefined,
+      );
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 1,
+        modelUsage: {},
+      } as SDKResultMessage;
+    },
+    close: () => undefined,
+    mcpServerStatus: () => Promise.resolve([]),
+  })) as unknown as AgentQuery;
+  const result = await runReviewGoal(
+    "Inspect pacing.",
+    0,
+    goalContext,
+    [changedFile],
+    emptyConversation,
+    reviewConfig({ maxTurns: 40 }),
+    await makeReviewDiff(t),
+    "/workspace/repository",
+    query,
+  );
+  assert.equal(result.status, "completed");
+  const wrapUps = logs.filter((line) => /\[goal 1\] session post-coverage-wrap-up/u.test(line));
+  assert.deepEqual(
+    wrapUps.map((line: string): unknown => JSON.parse(line.split("details: ")[1] ?? "")),
+    [
+      {
+        trigger: "rounds",
+        post_coverage_rounds: 8,
+        post_coverage_elapsed_ms: 0,
+        delivery_epoch: 0,
+      },
+      {
+        trigger: "elapsed",
+        post_coverage_rounds: 2,
+        post_coverage_elapsed_ms: 480_000,
+        delivery_epoch: 1,
+      },
+    ],
+  );
+});
 
 test("runs a complete SDK review turn through the real diff and submission tools", async (t) => {
   const diff = await makeReviewDiff(t, "diff --git a/credential.go b/credential.go\n+changed\n", [

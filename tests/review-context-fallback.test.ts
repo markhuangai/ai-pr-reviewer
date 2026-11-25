@@ -12,13 +12,22 @@ import { runReviewGoals } from "../src/runtime/agent.js";
 import { CodexAppServer, CodexRpcError } from "../src/runtime/codex-app-server.js";
 import { ReviewEvidenceLedger } from "../src/runtime/review-assessment.js";
 import { ReviewBriefingReader } from "../src/runtime/review-briefing.js";
-import { ReviewContextDelivery } from "../src/runtime/review-context-delivery.js";
+import {
+  ReviewContextDelivery,
+  STARTUP_PRELOAD_PACKETS,
+  STARTUP_PRELOAD_WIRE_BYTES,
+} from "../src/runtime/review-context-delivery.js";
 import {
   REVIEW_CONTEXT_PACKET_PREFIX,
   stageReviewContext,
 } from "../src/runtime/review-context-packets.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
-import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
+import {
+  emptyConversation,
+  goalContext,
+  makeReviewDiff,
+  reviewConfig,
+} from "./agent-test-helpers.js";
 import {
   historyDocuments,
   historyText,
@@ -32,6 +41,39 @@ import {
 } from "./git-test-helpers.js";
 
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
+
+test("startup packet staging obeys count and wire limits across a partial failure", async (t) => {
+  const home = await isolatedTemporaryRoot(t);
+  const diff = await makeReviewDiff(t, "+start-up fixture data\n".repeat(7_400));
+  const reader = new ReviewBriefingReader(goalContext, [], emptyConversation, briefing);
+  const prepared = await stageReviewContext(reader, diff, goalContext.headSha);
+  const ledger = new ReviewEvidenceLedger(
+    home,
+    [],
+    { mergeBaseSha: diff.mergeBaseSha, headSha: goalContext.headSha },
+    diff.files,
+  );
+  const delivery = new ReviewContextDelivery(prepared, home, reader, ledger, () => undefined);
+  const [first, second, third] = prepared.packets;
+  assert.ok(first && second && third);
+  assert.equal(delivery.stageStartupPacket(2, first.wireBytes - 1), undefined);
+  assert.equal(delivery.stageStartupPacket(), first);
+  assert.equal(delivery.stage(), undefined);
+  assert.equal(delivery.stageStartupPacket(2, first.wireBytes + second.wireBytes - 1), undefined);
+  assert.equal(delivery.stageStartupPacket(), second);
+  assert.equal(STARTUP_PRELOAD_PACKETS, 2);
+  assert.ok(first.wireBytes + second.wireBytes <= STARTUP_PRELOAD_WIRE_BYTES);
+  delivery.deferInFlight(second.id);
+  assert.equal(delivery.stageStartupPacket(), undefined);
+  assert.equal(
+    delivery.stage(),
+    undefined,
+    "Deferring the second packet preserves the first in flight.",
+  );
+  assert.equal(delivery.hasUnstagedPackets, true);
+  await delivery.boundary();
+  assert.equal(delivery.stage(), third);
+});
 
 test("a staging read failure leaves the immutable diff readable through paged fallback", async (t) => {
   const home = await isolatedTemporaryRoot(t);
@@ -184,9 +226,23 @@ for (const executor of ["claude", "codex"] as const) {
     assert.equal(briefingReader.complete, false);
     assert.equal(delivery.stage()?.id, packet.id);
     assert.ok(events.includes("context-packet-compacted"));
-    if (executor === "codex") await append(turnStarted);
-    await append(message("user", packet.text), message("assistant", "Replay received."));
-    if (executor === "codex") await append(successfulExchange);
+    if (executor === "codex") {
+      await append(
+        turnStarted,
+        message("user", packet.text),
+        message("assistant", "Replay received."),
+      );
+      await append(successfulExchange);
+    } else {
+      await append({ ...message("user", packet.text), uuid: randomUUID() });
+      await delivery.refresh(randomUUID());
+      assert.equal(ledger.uniqueSourceBytes, 0);
+      await delivery.refresh(sessionId);
+      assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
+      await append({ type: "attachment", sessionId });
+      await delivery.refresh();
+      assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
+    }
     await delivery.boundary();
     assert.equal(ledger.uniqueSourceBytes, packet.sourceBytes);
     await append(compaction);
@@ -284,7 +340,7 @@ test(
     });
     await writeFile(
       join(repository.root, "overflow.txt"),
-      `${"overflow fallback fixture ".repeat(5)}\n`.repeat(900),
+      `${"overflow fallback fixture ".repeat(5)}\n`.repeat(1_350),
     );
     const context = {
       ...repository.context,
@@ -301,6 +357,8 @@ test(
     );
     const request = Reflect.get<CodexAppServer, "request">(CodexAppServer.prototype, "request");
     let rejectedPacket: string | undefined;
+    let rejectedStartupPacket: string | undefined;
+    let thirdInjections = 0;
     t.mock.method(
       CodexAppServer.prototype,
       "request",
@@ -310,6 +368,25 @@ test(
         params: unknown,
         timeout?: number,
       ): Promise<unknown> {
+        if (method === "thread/inject_items" && isRecord(params) && Array.isArray(params.items)) {
+          const item: unknown = params.items[0];
+          const block: unknown =
+            isRecord(item) && Array.isArray(item.content) ? item.content[0] : undefined;
+          if (
+            isRecord(block) &&
+            typeof block.text === "string" &&
+            block.text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)
+          ) {
+            const packet: unknown = JSON.parse(
+              block.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length),
+            );
+            assert.ok(isRecord(packet) && typeof packet.id === "string");
+            if (packet.id.endsWith(":3") && ++thirdInjections === 2) {
+              rejectedStartupPacket = packet.id;
+              return request.call(this, method, { ...params, threadId: randomUUID() }, timeout);
+            }
+          }
+        }
         if (
           method === "turn/start" &&
           rejectedPacket === undefined &&
@@ -327,6 +404,7 @@ test(
             );
             assert.ok(isRecord(packet) && typeof packet.id === "string");
             assert.equal(packet.more, false);
+            assert.ok(packet.id.endsWith(":4"));
             rejectedPacket = packet.id;
             return request
               .call(this, method, { ...params, threadId: randomUUID() }, timeout)
@@ -345,6 +423,17 @@ test(
       return true;
     });
     let recovered = false;
+    let startupRecovered = false;
+    let overflowStep = 0;
+    let fallbackStateRead = false;
+    const readState = { tool: "read_review_state", args: {} };
+    const advance = { tool: "advance_review_context", args: {} };
+    const submit = {
+      tool: "submit_review",
+      args: { summary: "Reviewed.", findings: [], limitations: [] },
+    };
+    const advanceCall = { tool: "advance_review_context", arguments: {} };
+    const pagedCall = { tool: "read_pr_diff", arguments: { remaining: true } };
     const upstream = await modelFixture(t, ({ body }) => {
       const history = historyText(body);
       const firstGoal = history.includes("FALLBACK_SWEEP_GOAL");
@@ -356,24 +445,54 @@ test(
               args: { changeMap: "Inspect the overflow source.", observations: [], unknowns: [] },
             };
       if (history.includes("Review submission accepted.")) return { text: "Review complete." };
+      const documents = historyDocuments(body);
+      if (firstGoal && rejectedPacket === undefined) {
+        const step = overflowStep++;
+        if (step === 0) return readState;
+        const state = documents.find((doc) => doc.briefingComplete === true);
+        assert.deepEqual(state?.nextCall, advanceCall);
+        assert.deepEqual((state?.records as unknown[])[0], { kind: "next_call", ...advanceCall });
+        if (step === 1) return readState;
+        assert.ok(
+          documents.some(
+            (doc) =>
+              doc.inspection !== undefined &&
+              !Array.isArray(doc.records) &&
+              JSON.stringify(doc.nextCall) === JSON.stringify(advanceCall),
+          ),
+        );
+        if (step === 2) return submit;
+        const rejection = documents.find((doc) => Array.isArray(doc.categories));
+        assert.deepEqual(rejection?.nextCall, advanceCall);
+      }
       if (firstGoal && rejectedPacket !== undefined) {
         assert.ok(!history.includes(rejectedPacket));
         assert.ok(
           history.includes("finish unread changed ranges with read_pr_diff remaining=true"),
         );
-        recovered = historyDocuments(body).some(
-          ({ done, remaining }) => done === true && remaining === true,
+        if (!fallbackStateRead) {
+          fallbackStateRead = true;
+          return readState;
+        }
+        assert.deepEqual(
+          documents.findLast((doc) => doc.briefingComplete === true)?.nextCall,
+          pagedCall,
         );
+        recovered = documents.some(({ done, remaining }) => done === true && remaining === true);
         if (!recovered) return { tool: "read_pr_diff", args: { remaining: true } };
       } else if (
         history.includes(String.raw`\"more\":true`) &&
         !history.includes(String.raw`\"more\":false`)
       )
-        return { tool: "advance_review_context", args: {} };
-      return {
-        tool: "submit_review",
-        args: { summary: "Reviewed.", findings: [], limitations: [] },
-      };
+        return advance;
+      if (!firstGoal && rejectedStartupPacket !== undefined) {
+        assert.ok(!history.includes(rejectedStartupPacket));
+        startupRecovered = documents.some(
+          ({ done, remaining }) => done === true && remaining === true,
+        );
+        if (!startupRecovered) return { tool: "read_pr_diff", args: { remaining: true } };
+      }
+      return submit;
     });
     const run = await runReviewGoals(
       context,
@@ -409,6 +528,27 @@ test(
         (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedId),
       ),
     );
+    const rejectedStartupId = rejectedStartupPacket;
+    assert.ok(rejectedStartupId && startupRecovered);
+    const packetLogs = output.filter((line) => /\[goal 2\] session context-packet-/u.test(line));
+    const unconfirmed = packetLogs.findIndex(
+      (line) => line.includes("context-packet-unconfirmed") && line.includes(rejectedStartupId),
+    );
+    assert.ok(unconfirmed >= 0);
+    assert.match(
+      packetLogs[unconfirmed] ?? "",
+      /"snapshot":"[a-f0-9]{64}".*"unreadBytes":[1-9]\d*,"fallback":"paged tools","reason":"no-native-receipt"/u,
+    );
+    assert.ok(
+      packetLogs
+        .slice(unconfirmed + 1)
+        .some(
+          (line) =>
+            line.includes("context-packet-confirmed") &&
+            line.includes(rejectedStartupId.replace(/:3$/u, ":2")),
+        ),
+    );
+    assert.ok(!packetLogs.join("").includes("overflow fallback fixture"));
     assert.deepEqual(
       run.goals.map(({ status }) => status),
       ["completed", "completed"],

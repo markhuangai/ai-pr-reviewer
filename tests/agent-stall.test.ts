@@ -429,7 +429,6 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
       const messages = input.prompt[Symbol.asyncIterator]();
       assert.equal((await messages.next()).done, false);
       assert.equal((await messages.next()).done, false);
-      await completeReviewContext(input.options);
       ready[0]?.resolve(undefined);
       for (let index = 0; index < boundaries.length; index += 1) {
         const boundary = boundaries[index];
@@ -439,7 +438,10 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
         const continuation = await messages.next();
         assert.equal(continuation.done, false);
         continuations.push(userMessageText(continuation.value));
-        if (index + 1 < boundaries.length) ready[index + 1]?.resolve(undefined);
+        if (index + 1 < boundaries.length) {
+          await completeReviewContext(input.options);
+          ready[index + 1]?.resolve(undefined);
+        }
       }
       const submit = reviewOutputTools(input.options).submit_review;
       assert.ok(submit);
@@ -493,6 +495,14 @@ test("continues unfinished turns across repeated SDK stalls", async (t) => {
     true,
   );
   assert.match(output.join(""), /interrupted-turn-boundary/u);
+  assert.match(continuations[0] ?? "", /Re-read evidence only when needed/u);
+  assert.match(
+    continuations[1] ?? "",
+    /all required briefing pages and changed paths are already inspected\. Call submit_review now/u,
+  );
+  const queued = output.filter((line) => line.includes("session continuation-queued"));
+  assert.match(queued[0] ?? "", /"coverage_complete":false/u);
+  assert.match(queued[1] ?? "", /"coverage_complete":true/u);
 });
 
 test("bounds accepted goal finalization without hiding failures", async (t) => {

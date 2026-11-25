@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ADVANCE_REVIEW_CONTEXT_CALL } from "./review-context-packets.js";
 import { validAddedLineLocation } from "../lib/git-changed-files.js";
 import type { SDKMessage, SDKActiveGoalMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -228,7 +229,12 @@ export class ReviewSubmissionRecovery {
 
 const findingShape = {
   ...findingEvidenceShape,
-  title: z.string().trim().min(1).max(MAX_FINDING_TITLE_LENGTH),
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_FINDING_TITLE_LENGTH)
+    .describe(`Short finding title (<=${MAX_FINDING_TITLE_LENGTH} chars).`),
   severity: z
     .enum(SEVERITY_VALUES)
     .describe(
@@ -239,13 +245,17 @@ const findingShape = {
     .trim()
     .min(1)
     .max(MAX_FINDING_PROSE_LENGTH)
-    .describe("One or two direct sentences explaining the concrete impact."),
+    .describe(
+      `One or two direct sentences explaining the concrete impact (<=${MAX_FINDING_PROSE_LENGTH} chars).`,
+    ),
   fix: z
     .string()
     .trim()
     .min(1)
     .max(MAX_FINDING_PROSE_LENGTH)
-    .describe("One or two direct sentences explaining how to fix the defect."),
+    .describe(
+      `One or two direct sentences explaining how to fix the defect (<=${MAX_FINDING_PROSE_LENGTH} chars).`,
+    ),
   endLine: z.number().int().min(1).max(1_000_000).optional(),
   confidence: z.enum(["high", "medium", "low"]).optional(),
 } as const;
@@ -526,6 +536,7 @@ export function reviewSubmissionRejectionResult(
   files: readonly ChangedFile[],
   remainingCorrections: number,
   remainingInspectionCycles?: number,
+  hasPendingContextPackets = false,
 ): CallToolResult {
   const gaps: unknown[] = [];
   for (const gap of validationGaps) {
@@ -539,6 +550,8 @@ export function reviewSubmissionRejectionResult(
     if (gaps.length >= 12 || Buffer.byteLength(JSON.stringify([...gaps, record])) > 8_000) break;
     gaps.push(record);
   }
+  const needsBriefing = validationGaps.some((gap) => gap.category === "briefing");
+  const needsInspection = validationGaps.some((gap) => gap.category === "inspection");
   return {
     ...jsonToolResult({
       message: investigationOnly(validationGaps.map((gap) => gap.category))
@@ -548,14 +561,17 @@ export function reviewSubmissionRejectionResult(
       omittedGaps: validationGaps.length - gaps.length,
       categories: [...new Set(validationGaps.map((gap) => gap.category))],
       remainingCorrections,
-      nextCall: validationGaps.some((gap) => gap.category === "briefing")
-        ? { tool: "read_review_briefing", arguments: {} }
-        : validationGaps.some((gap) => gap.category === "inspection")
-          ? { tool: "read_pr_diff", arguments: { remaining: true } }
-          : (validationGaps.find((gap) => gap.nextCall !== undefined)?.nextCall ?? {
-              tool: "read_review_state",
-              arguments: {},
-            }),
+      nextCall:
+        hasPendingContextPackets && (needsBriefing || needsInspection)
+          ? ADVANCE_REVIEW_CONTEXT_CALL
+          : needsBriefing
+            ? { tool: "read_review_briefing", arguments: {} }
+            : needsInspection
+              ? { tool: "read_pr_diff", arguments: { remaining: true } }
+              : (validationGaps.find((gap) => gap.nextCall !== undefined)?.nextCall ?? {
+                  tool: "read_review_state",
+                  arguments: {},
+                }),
       ...(remainingInspectionCycles === undefined ? {} : { remainingInspectionCycles }),
     }),
     isError: true,

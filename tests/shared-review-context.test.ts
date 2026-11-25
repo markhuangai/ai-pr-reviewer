@@ -15,14 +15,21 @@ import { mergeDeliveredRanges } from "../src/runtime/agent-review-tools.js";
 import { createDeferred, createReviewGoalsRunner } from "../src/runtime/agent-session.js";
 import { runReviewGoal, runReviewGoals } from "../src/runtime/agent.js";
 import { startCodexMcpServer } from "../src/runtime/codex-mcp-server.js";
+import { ReviewBriefingReader } from "../src/runtime/review-briefing.js";
 import {
   REVIEW_CONTEXT_PACKET_PREFIX,
   REVIEW_CONTEXT_WIRE_BYTES,
+  stageReviewContext,
 } from "../src/runtime/review-context-packets.js";
 import { tool } from "../src/runtime/review-tool.js";
 import { SDK_SESSION_HEARTBEAT_MS } from "../src/runtime/session-recovery.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
-import { emptyConversation, reviewConfig } from "./agent-test-helpers.js";
+import {
+  emptyConversation,
+  goalContext,
+  makeReviewDiff,
+  reviewConfig,
+} from "./agent-test-helpers.js";
 import {
   historyDocuments,
   historyText,
@@ -47,6 +54,44 @@ const file: ChangedFile = {
 };
 const briefing = { linkedIssues: [], linkedIssueReferencesTruncated: false };
 
+test("shared packets drain a multipage briefing before later diff pages", async (t) => {
+  const reader = new ReviewBriefingReader(goalContext, [file], emptyConversation, {
+    ...briefing,
+    repositoryGuidance: Array.from({ length: 8 }, (_, page) => ({
+      path: `guidance-${page}.md`,
+      revision: "head",
+      content: 'Line with "escaped" data.\n'.repeat(460),
+    })),
+  });
+  const diff = await makeReviewDiff(t, "+more changed data\n".repeat(4_500), [file.path]);
+  const { packets } = await stageReviewContext(reader, diff, goalContext.headSha);
+  const pages = packets.flatMap((packet) => packet.pages);
+  const kinds = pages.map(({ kind }) => kind);
+  assert.deepEqual(
+    packets[0]?.pages.slice(0, 2).map(({ kind }) => kind),
+    ["briefing", "diff"],
+  );
+  const count = reader.stagedPages().length;
+  assert.ok(count >= 5 && kinds.length > count + 1);
+  assert.deepEqual(
+    kinds.slice(2, count + 1),
+    Array.from({ length: count - 1 }, () => "briefing"),
+  );
+  assert.ok(kinds.slice(count + 1).every((kind) => kind === "diff"));
+  for (const [index, packet] of packets.entries()) {
+    const more = index < packets.length - 1;
+    const document: unknown = JSON.parse(packet.text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
+    assert.ok(isRecord(document));
+    assert.equal(document.more, more);
+    assert.ok(packet.wireBytes <= REVIEW_CONTEXT_WIRE_BYTES);
+    assert.equal(Object.keys(document).at(-1), more ? "nextCall" : "pages");
+    assert.deepEqual(
+      document.nextCall,
+      more ? { tool: "advance_review_context", arguments: {} } : undefined,
+    );
+  }
+});
+
 function providerPacketMessages(body: Record<string, unknown>) {
   const messages = body.messages ?? body.input;
   if (!Array.isArray(messages)) return [];
@@ -56,7 +101,10 @@ function providerPacketMessages(body: Record<string, unknown>) {
     return blocks.flatMap((block) => {
       const text = isRecord(block) ? block.text : block;
       if (typeof text !== "string" || !text.startsWith(REVIEW_CONTEXT_PACKET_PREFIX)) return [];
-      assert.ok(Buffer.byteLength(JSON.stringify(message)) <= REVIEW_CONTEXT_WIRE_BYTES);
+      const content = Array.isArray(message.content) ? [block] : text;
+      assert.ok(
+        Buffer.byteLength(JSON.stringify({ ...message, content })) <= REVIEW_CONTEXT_WIRE_BYTES,
+      );
       const packet: unknown = JSON.parse(text.slice(REVIEW_CONTEXT_PACKET_PREFIX.length));
       assert.ok(isRecord(packet) && Array.isArray(packet.pages));
       assert.ok(packet.pages.length <= 4);
@@ -125,27 +173,30 @@ for (const executor of ["claude", "codex"] as const) {
                 runReviewGoals: typeof runReviewGoals;
               }
             ).runReviewGoals;
-      for (const fixtureSize of ["fitting", "overflow"] as const) {
+      for (const fixtureSize of ["fitting", "startup", "overflow"] as const) {
         const overflow = fixtureSize === "overflow";
+        const startup = fixtureSize === "startup";
+        if (startup || overflow)
+          await writeFile(
+            join(repository.root, "middle.txt"),
+            `${fixtureMarker}${"0123456789".repeat(18)}\n`.repeat(startup ? 460 : 770),
+          );
         if (overflow) {
           await rename(join(repository.root, "rename.txt"), join(repository.root, "renamed.txt"));
           await rm(join(repository.root, "remove.txt"));
-          await writeFile(
-            join(repository.root, "middle.txt"),
-            `${fixtureMarker}${"0123456789".repeat(18)}\n`.repeat(770),
-          );
           await writeFile(join(repository.root, "zz-late.txt"), `${lateMarker}\n`);
         }
-        const context = overflow
-          ? {
-              ...repository.context,
-              headSha: await commitFixtureSnapshot(
-                repository.root,
-                repository.temporaryRoot,
-                repository.headSha,
-              ),
-            }
-          : repository.context;
+        const context =
+          startup || overflow
+            ? {
+                ...repository.context,
+                headSha: await commitFixtureSnapshot(
+                  repository.root,
+                  repository.temporaryRoot,
+                  repository.headSha,
+                ),
+              }
+            : repository.context;
         const files = await readPullRequestFilesFromSnapshots(
           context,
           repository.root,
@@ -169,7 +220,10 @@ for (const executor of ["claude", "codex"] as const) {
         }[] = [];
         for (const candidate of overflow ? [false, true] : [true]) {
           output.length = 0;
-          const labels = Array.from({ length: 6 }, (_, index) => `SWEEP_GOAL_${index + 1}`);
+          const labels = Array.from(
+            { length: startup ? 2 : 6 },
+            (_, index) => `SWEEP_GOAL_${index + 1}`,
+          );
           const counts = labels.map(() => 0);
           const seenPackets = labels.map(() => new Set<unknown>());
           const ranges: ReviewSourceRange[][] = labels.map(() => []);
@@ -181,9 +235,9 @@ for (const executor of ["claude", "codex"] as const) {
               if (history.includes("Discovery change map accepted."))
                 return { text: "Orientation complete." };
               assert.equal(
-                packets.length > 0,
-                candidate,
-                "Discovery starts with raw user-role evidence only in candidate mode.",
+                packets.length,
+                candidate ? 1 : 0,
+                "Discovery starts with only the first packet in candidate mode.",
               );
               if (candidate)
                 assert.deepEqual(
@@ -220,12 +274,35 @@ for (const executor of ["claude", "codex"] as const) {
                 return { tool: "read_pr_diff", args: { remaining: true } };
               }
             } else {
-              assert.ok(
-                packets.length > 0,
-                "A fitting or overflow goal must see raw evidence at activation.",
-              );
               const packet = packets.at(-1);
-              if (packet?.more === true) {
+              assert.ok(packet, "Every goal must see raw evidence at activation.");
+              if (startup) {
+                assert.deepEqual(
+                  packets.map(({ id }) => String(id).split(":").at(-1)),
+                  ["1", "2", "3"],
+                );
+                assert.equal(packet.more, false);
+                const diff = index === 0;
+                if (!seenPackets[index]?.has(packet.id)) {
+                  seenPackets[index]?.add(packet.id);
+                  return diff
+                    ? { tool: "read_pr_diff", args: { remaining: true } }
+                    : { tool: "read_review_briefing", args: {} };
+                }
+                const docs = historyDocuments(body);
+                const read = docs.findLast((doc) =>
+                  diff
+                    ? doc.remaining === true
+                    : doc.totalPages !== undefined && doc.briefingComplete === undefined,
+                );
+                assert.ok(read);
+                assert.equal(read.done, true);
+                assert.deepEqual(diff ? read.content : read.records, diff ? "" : []);
+                const state = docs.find((doc) => doc.briefingComplete === true);
+                if (state === undefined) return { tool: "read_review_state", args: {} };
+                assert.equal(state.repeatedSourceBytes, 0);
+              }
+              if (packet.more === true) {
                 counts[index] = (counts[index] ?? 0) + 1;
                 if (seenPackets[index]?.has(packet.id))
                   return { text: "Waiting for the next packet." };
@@ -313,7 +390,11 @@ for (const executor of ["claude", "codex"] as const) {
           assert.ok(baseline !== undefined && candidate !== undefined);
           for (const [index, exchanges] of candidate.exchanges.entries())
             assert.ok(exchanges * 2 <= (baseline.exchanges[index] ?? 0), JSON.stringify(reports));
-        } else assert.deepEqual(baseline?.exchanges, [0, 0, 0, 0, 0, 0]);
+        } else
+          assert.deepEqual(
+            baseline?.exchanges,
+            Array.from({ length: startup ? 2 : 6 }, () => 0),
+          );
         emit(`shared-context-benchmark ${executor} ${fixtureSize} ${JSON.stringify(reports)}\n`);
       }
     },

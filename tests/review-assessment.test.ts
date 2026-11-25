@@ -24,6 +24,13 @@ import { ReviewSubmissionRecovery } from "../src/runtime/review-submission.js";
 import { createReviewStateTool } from "../src/runtime/review-context-tools.js";
 import { MODEL_TOOL_RESULT_BYTES } from "../src/runtime/agent-review-tools.js";
 
+test("advertises finding field length limits in the submission schema", () => {
+  const { title, why, fix } = submissionSchema.shape.findings.element.shape;
+  assert.match(title.description ?? "", /<=120 chars/u);
+  assert.match(why.description ?? "", /<=500 chars/u);
+  assert.match(fix.description ?? "", /<=500 chars/u);
+});
+
 const changedFile: ChangedFile = {
   path: "src/change.ts",
   status: "modified",

@@ -37,6 +37,8 @@ export function createReviewGoalTools({
   isReviewActive,
   recovery,
   onSnapshot,
+  beforeRead,
+  hasPendingContextPackets,
 }: {
   context: PullRequestContext;
   files: readonly ChangedFile[];
@@ -51,6 +53,8 @@ export function createReviewGoalTools({
   isReviewActive: () => boolean;
   recovery: ReviewSubmissionRecovery;
   onSnapshot: (details: Readonly<Record<string, unknown>>) => void;
+  beforeRead?: () => Promise<void>;
+  hasPendingContextPackets?: () => boolean;
 }) {
   const discussionQueryCursors = new Map<string, string>();
   const queryReaderDiscussionKeys = new Map<string, string>();
@@ -90,6 +94,7 @@ export function createReviewGoalTools({
     isActive: isReviewActive,
     signal,
     briefingReader,
+    beforeRead,
     conversationReader: new PullRequestConversationReader(conversation),
     contextReaders,
     onConversationComplete: () => {
@@ -116,6 +121,8 @@ export function createReviewGoalTools({
     recovery,
     diff,
     onSnapshot,
+    beforeRead,
+    hasPendingContextPackets,
     gaps: () => (recovery.submissionAttempts === 0 ? [] : submissionGaps(recovery.latestInput)),
   });
   const { diffTool, repositoryFileTool } = createReviewSourceTools({
@@ -126,6 +133,7 @@ export function createReviewGoalTools({
     queryReaders,
     repositorySnapshot,
     ledger: evidenceLedger,
+    beforeRead,
   });
   const discussionThreadTool = createReviewThreadTool({
     isActive: isReviewActive,

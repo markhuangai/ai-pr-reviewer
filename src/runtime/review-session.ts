@@ -55,10 +55,12 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
           const ready = await Promise.race([forkReady.promise, wait(3_000, true, { ref: false })]);
           if (!ready || activationClosed()) return;
           await delivery.refresh();
-          if (activationClosed()) return;
-          const packet = delivery.stage();
-          if (packet !== undefined)
+          for (;;) {
+            if (activationClosed()) return;
+            const packet = delivery.stageStartupPacket();
+            if (packet === undefined) break;
             yield { ...makeUserMessage(packet.text), client_composed: true, shouldQuery: false };
+          }
           continue;
         }
         const packet = delivery?.stage();
@@ -98,21 +100,22 @@ export function createReviewSession(query: AgentQuery, input: ReviewSessionInput
                 ...(input.options.hooks?.PreToolUse ?? []),
                 {
                   hooks: [
-                    () =>
-                      Promise.resolve(
-                        responseIds.size <= input.config.maxTurns
-                          ? {}
-                          : {
-                              continue: false,
-                              stopReason: "The configured native turn limit was reached.",
-                              hookSpecificOutput: {
-                                hookEventName: "PreToolUse",
-                                permissionDecision: "deny",
-                                permissionDecisionReason:
-                                  "The configured native turn limit was reached.",
-                              },
-                            },
-                      ),
+                    async (event) => {
+                      if (responseIds.size > input.config.maxTurns)
+                        return {
+                          continue: false,
+                          stopReason: "The configured native turn limit was reached.",
+                          hookSpecificOutput: {
+                            hookEventName: "PreToolUse",
+                            permissionDecision: "deny",
+                            permissionDecisionReason:
+                              "The configured native turn limit was reached.",
+                          },
+                        };
+                      if (event.hook_event_name === "PreToolUse" && event.agent_id === undefined)
+                        await delivery.refresh(event.session_id);
+                      return {};
+                    },
                   ],
                 },
               ],

@@ -70,6 +70,7 @@ import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snaps
 import { createReviewDiagnostics } from "./review-diagnostics.js";
 import { tool } from "./review-tool.js";
 import { ReviewContextDelivery } from "./review-context-delivery.js";
+import { ADVANCE_REVIEW_CONTEXT_CALL } from "./review-context-packets.js";
 import { createReviewSession, createReviewMcpServers } from "./review-session.js";
 import { SessionRunner, createDeferred, makeUserMessage } from "./session-runner.js";
 import {
@@ -82,6 +83,9 @@ import {
   type SharedReviewSeed,
 } from "./shared-discovery.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
+export const POST_COVERAGE_WRAP_UP_ROUNDS = 8;
+export const POST_COVERAGE_WRAP_UP_MS = 8 * 60 * 1_000;
+
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -183,6 +187,46 @@ export async function runReviewGoal(
       lifecycle.sessionId !== undefined ||
       evidenceLedger.issued.size > sharedSeed.evidence.references.length,
   });
+  let coverageCompletedAt: number | undefined;
+  let coverageCompletedThisRound = false;
+  let postCoverageToolRounds = 0;
+  let postCoverageEpoch = 0;
+  let wrapUpSent = false;
+  const resetPostCoverage = (): void => {
+    coverageCompletedAt = undefined;
+    coverageCompletedThisRound = false;
+    postCoverageToolRounds = 0;
+    wrapUpSent = false;
+  };
+  const postCoverageWrapUp = (coverageComplete: boolean, roundComplete: boolean) => {
+    // Compaction restarts pacing even when all verified packet receipts survive it.
+    const deliveryEpoch = evidenceLedger.deliveryEpoch + lifecycle.compactionBoundaries;
+    if (postCoverageEpoch !== deliveryEpoch) {
+      postCoverageEpoch = deliveryEpoch;
+      resetPostCoverage();
+    }
+    if (!reviewPromptActive || submission !== undefined || !coverageComplete || wrapUpSent)
+      return undefined;
+    const now = Date.now();
+    if (coverageCompletedAt === undefined) {
+      coverageCompletedAt = now;
+      coverageCompletedThisRound = true;
+    }
+    if (!roundComplete) return undefined;
+    if (!coverageCompletedThisRound) postCoverageToolRounds++;
+    coverageCompletedThisRound = false;
+    const elapsedMs = now - coverageCompletedAt;
+    const roundsReached = postCoverageToolRounds >= POST_COVERAGE_WRAP_UP_ROUNDS;
+    if (!roundsReached && elapsedMs < POST_COVERAGE_WRAP_UP_MS) return undefined;
+    wrapUpSent = true;
+    writeMonitorEvent("post-coverage-wrap-up", {
+      trigger: roundsReached ? "rounds" : "elapsed",
+      post_coverage_rounds: postCoverageToolRounds,
+      post_coverage_elapsed_ms: elapsedMs,
+      delivery_epoch: deliveryEpoch,
+    });
+    return "All required briefing pages and changed paths are already inspected. Finish any required evidence and discussion checks, then call submit_review now with the supported findings.";
+  };
   const evidenceHook: HookCallback = async (input) => {
     if (input.hook_event_name === "PostToolUse" && input.tool_name === "Read") {
       evidenceLedger.observeNativeRead(input);
@@ -201,18 +245,35 @@ export async function runReviewGoal(
       recovery.observeUse(call.tool_use_id, call.tool_input);
       observeRejection(call.tool_use_id, call.tool_response);
     }
-    if (references.length === 0) return Promise.resolve({ continue: true });
+    const briefingComplete = briefingReader.complete;
+    const inspectionComplete = evidenceLedger.inspection.missingPaths.length === 0;
+    const coverageComplete = briefingComplete && inspectionComplete;
+    const advanceContext = !coverageComplete && delivery?.hasUnstagedPackets === true;
+    const codexRoundBoundary = config.executor === "codex" && input.tool_calls.length === 0;
+    const wrapUp = postCoverageWrapUp(
+      coverageComplete,
+      config.executor !== "codex" || codexRoundBoundary,
+    );
+    if (
+      references.length === 0 &&
+      wrapUp === undefined &&
+      (coverageComplete || delivery === undefined || codexRoundBoundary)
+    )
+      return Promise.resolve({ continue: true });
     return Promise.resolve({
       continue: true,
       hookSpecificOutput: {
         hookEventName: "PostToolBatch",
         additionalContext: `${evidenceLedger.renderReferences(references)}\n${JSON.stringify({
           ...deliveredInspection,
-          ...(!briefingReader.complete
-            ? { nextCall: { tool: "read_review_briefing", arguments: {} } }
-            : evidenceLedger.inspection.missingPaths.length > 0
-              ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
-              : {}),
+          ...(advanceContext
+            ? { nextCall: ADVANCE_REVIEW_CONTEXT_CALL }
+            : !briefingComplete
+              ? { nextCall: { tool: "read_review_briefing", arguments: {} } }
+              : !inspectionComplete
+                ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
+                : {}),
+          ...(wrapUp === undefined ? {} : { wrapUp }),
         })}`,
       },
     });
@@ -273,6 +334,7 @@ export async function runReviewGoal(
             writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
           () => {
+            resetPostCoverage();
             runner.rebaseProgress();
           },
         );
@@ -293,6 +355,12 @@ export async function runReviewGoal(
     signal,
     isReviewActive,
     recovery,
+    ...(delivery === undefined
+      ? {}
+      : {
+          beforeRead: () => delivery.refresh(),
+          hasPendingContextPackets: () => delivery.hasUnstagedPackets,
+        }),
     onSnapshot: (details) => {
       logDiagnostic("recovery-decision", details);
     },
@@ -330,6 +398,7 @@ export async function runReviewGoal(
             files,
             budget.remainingCorrections,
             budget.remainingInspectionCycles,
+            delivery?.hasUnstagedPackets,
           ),
         );
       }
@@ -628,6 +697,7 @@ export async function runReviewGoal(
       config.interactWithPullRequest,
       sharedSeed !== undefined,
       sharedContext === undefined ? undefined : sharedSeed?.changeMap,
+      config.executor,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -696,14 +766,19 @@ export async function runReviewGoal(
           );
         }
         runner.phase = "waiting-for-continuation-result";
+        const coverageComplete =
+          briefingReader.complete && evidenceLedger.inspection.missingPaths.length === 0;
         queueMessage(
-          "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+          coverageComplete
+            ? "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. The host confirms that all required briefing pages and changed paths are already inspected. Call submit_review now using the evidence already gathered."
+            : "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
           `stall-continuation-${runner.recoveryCount}`,
         );
         writeMonitorEvent("continuation-queued", {
           recovery: runner.recoveryCount,
           interrupted_result_subtype: result.subtype,
           repair_attempts: recovery.repairAttempts,
+          coverage_complete: coverageComplete,
         });
         continue;
       }

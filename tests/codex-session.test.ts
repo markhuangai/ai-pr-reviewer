@@ -39,6 +39,105 @@ import { verifyResolution } from "../src/runtime/resolution-session.js";
 import { prepareContextFiles } from "../src/lib/context-files.js";
 import { runSharedDiscovery } from "../src/runtime/shared-discovery.js";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { toolResponseDocument } from "../src/runtime/review-assessment.js";
+import { jsonToolResult } from "../src/runtime/agent-review-tools.js";
+
+test(
+  "real Codex counts parallel tool calls once and sees wrap-up appended after JSON",
+  { timeout: 60_000 },
+  async (t) => {
+    await isolatedTemporaryRoot(t);
+    const state = { tool: "read_review_state", args: {} };
+    const fixture = await modelFixture(t, ({ body }, index) => {
+      if (index === 0) return { tool: "read_review_briefing", args: {} };
+      if (index === 1) return { tool: "read_pr_diff", args: { remaining: true } };
+      if (index === 2) return { codexTools: Array.from({ length: 8 }, () => state) };
+      const advisories = historyDocuments(body).filter(
+        (document) => typeof document.wrapUp === "string",
+      );
+      if (index < 11) {
+        assert.deepEqual(advisories, [], `Wrap-up appeared on model response ${index}.`);
+        return state;
+      }
+      assert.match(String(advisories[0]?.wrapUp), /call submit_review now/u);
+      assert.equal(advisories.length, 1);
+      if (index === 11) {
+        const input = body.input as unknown[];
+        const lastOutput = input.findLast(
+          (item) => isRecord(item) && String(item.type).endsWith("call_output"),
+        );
+        const delivered = historyDocuments({ input: [lastOutput] });
+        assert.ok(
+          delivered.some(
+            (document) => document.briefingComplete === true && Array.isArray(document.records),
+          ),
+        );
+        assert.ok(delivered.some((document) => typeof document.wrapUp === "string"));
+        return {
+          tool: "submit_review",
+          args: { summary: "Reviewed after full coverage", findings: [], limitations: [] },
+        };
+      }
+      assert.match(historyText(body), /Review submission accepted/u);
+      return { text: "Review submitted." };
+    });
+    const result = await nativeReview(t, fixture.url, { maxTurns: 25 });
+    assert.equal(result.status, "completed", result.error ?? "Native Codex review failed.");
+    assert.equal(result.submission?.summary, "Reviewed after full coverage");
+  },
+);
+
+test("Codex keeps pending context across terminal tools and clears it at native boundaries", async (t) => {
+  const session = new CodexSession({
+    config: reviewConfig({ executor: "codex" }),
+    cwd: process.cwd(),
+    outputServerName: "review_output",
+    tools: [],
+    prompt: {
+      [Symbol.asyncIterator]: () => ({
+        next: () => Promise.resolve({ done: true, value: undefined }),
+      }),
+    },
+    options: {
+      hooks: {
+        PostToolBatch: [
+          {
+            hooks: [
+              () =>
+                Promise.resolve({
+                  hookSpecificOutput: {
+                    hookEventName: "PostToolBatch",
+                    additionalContext: "pending wrap-up",
+                  },
+                }),
+            ],
+          },
+        ],
+      },
+    },
+  });
+  t.after(() => session.close());
+  const queue = () => session["hooks"]("PostToolBatch", {}, "hook-fixture");
+  const read = (name = "read_review_state") =>
+    session["invoke"](
+      tool(name, "Fixture tool", {}, () => Promise.resolve(jsonToolResult({ done: true }))),
+      {},
+    );
+  await queue();
+  for (const name of ["submit_review", "advance_review_context", "finish_discovery"])
+    assert.equal((await read(name)).content.length, 1);
+  const delivered = await read();
+  assert.deepEqual(toolResponseDocument(delivered), { done: true });
+  assert.deepEqual(delivered.content.at(-1), { type: "text", text: "pending wrap-up" });
+  assert.equal((await read()).content.length, 1);
+  await queue();
+  await session["item"]("item/completed", { type: "contextCompaction" });
+  assert.equal((await read()).content.length, 1);
+  await queue();
+  await session["notify"]("turn/started", { turn: { id: "turn" } });
+  await session["notify"]("turn/completed", { turn: { id: "turn", status: "completed" } });
+  assert.equal((await read()).content.length, 1);
+});
 
 test("native reviews use runner proxies while local MCP bypasses them", async (t) => {
   for (const name of ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) {
@@ -309,12 +408,13 @@ test(
   { timeout: 30_000 },
   async (t) => {
     const temporary = await isolatedTemporaryRoot(t);
-    const fixture = await modelFixture(t, completeReviewScript());
+    const fixture = await modelFixture(t, () => ({ error: 404 }));
     const result = await nativeReview(t, fixture.url, {
       mcpServers: {
-        unavailable: { type: "http", url: "http://127.0.0.1:1/mcp" },
+        unavailable: { type: "http", url: new URL("/unavailable/mcp", fixture.url).href },
       },
     });
+    assert.deepEqual([...new Set(fixture.requests.map(({ path }) => path))], ["/unavailable/mcp"]);
     assert.equal(result.status, "failed");
     assert.match(result.error ?? "", /MCP|unavailable/u);
     assert.equal(result.submission, undefined);
