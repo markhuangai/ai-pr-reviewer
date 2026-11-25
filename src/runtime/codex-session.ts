@@ -442,30 +442,25 @@ export class CodexSession implements ReviewSession {
             .map((server) => server.name + ": " + (server.error ?? server.status))
             .join("; "),
       );
-    if (goal !== undefined && this.input.forkFrom !== undefined)
-      await this.rpc("thread/inject_items", {
+    const inject = (text: string) =>
+      this.rpc("thread/inject_items", {
         threadId: this.threadId,
-        items: [{ type: "message", role: "user", content: [{ type: "input_text", text: review }] }],
+        items: [{ type: "message", role: "user", content: [{ type: "input_text", text }] }],
       });
+    const forked = this.input.forkFrom !== undefined;
+    if (goal !== undefined && forked) await inject(review);
     await this.process.drain();
     await delivery?.refresh();
-    const activation = delivery?.stage();
-    if (activation !== undefined) {
+    const stage = () => (forked ? delivery?.stageStartupPacket() : delivery?.stage());
+    for (let packet = stage(); packet !== undefined; packet = stage()) {
+      throwIfAborted(this.controller.signal);
       try {
-        await this.rpc("thread/inject_items", {
-          threadId: this.threadId,
-          items: [
-            {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: activation.text }],
-            },
-          ],
-        });
+        await inject(packet.text);
       } catch (error) {
         if (!(error instanceof CodexRpcError)) throw error;
         throwIfAborted(this.controller.signal);
-        await delivery?.boundary();
+        delivery?.deferInFlight(packet.id);
+        break;
       }
     }
     if (goal !== undefined) {

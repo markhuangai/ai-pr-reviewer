@@ -24,6 +24,7 @@ import {
   type ReviewValidationGap,
 } from "./review-assessment.js";
 import type { ReviewSubmissionRecovery } from "./review-submission.js";
+import { ADVANCE_REVIEW_CONTEXT_CALL } from "./review-context-packets.js";
 import type {
   RepositoryQuerySource,
   RepositorySnapshot,
@@ -314,6 +315,7 @@ export function createReviewSourceTools({
   queryReaders,
   repositorySnapshot,
   ledger,
+  beforeRead,
 }: {
   signal: AbortSignal | undefined;
   isActive: () => boolean;
@@ -322,11 +324,13 @@ export function createReviewSourceTools({
   queryReaders: ReviewQueryReaderStore;
   repositorySnapshot: RepositorySnapshot;
   ledger: ReviewEvidenceLedger;
+  beforeRead?: (() => Promise<void>) | undefined;
 }) {
   const emitted: ReviewSourceRange[] = [];
   let deliveryEpoch = ledger.deliveryEpoch;
   let automaticRead: Promise<void> = Promise.resolve();
   const readRemaining = async (): Promise<CallToolResult> => {
+    await beforeRead?.();
     throwIfAborted(signal);
     if (deliveryEpoch !== ledger.deliveryEpoch) {
       emitted.length = 0;
@@ -464,6 +468,8 @@ export function createReviewStateTool({
   gaps,
   diff,
   onSnapshot,
+  beforeRead,
+  hasPendingContextPackets,
 }: {
   signal: AbortSignal | undefined;
   isActive: () => boolean;
@@ -477,6 +483,8 @@ export function createReviewStateTool({
   gaps: () => readonly ReviewValidationGap[];
   diff?: PullRequestDiffArtifact;
   onSnapshot?: (details: Readonly<Record<string, unknown>>) => void;
+  beforeRead?: (() => Promise<void>) | undefined;
+  hasPendingContextPackets?: (() => boolean) | undefined;
 }) {
   const snapshots = new Map<
     string,
@@ -494,7 +502,7 @@ export function createReviewStateTool({
       cursor: z.string().min(1).max(100).optional(),
     },
     ({ paths, cursor }): Promise<CallToolResult> =>
-      Promise.resolve().then(() => {
+      Promise.resolve().then(async () => {
         throwIfAborted(signal);
         if (!isActive()) return failure("Wait for the full review prompt before reading.");
         const selection = [...new Set(paths ?? [])].sort();
@@ -518,14 +526,21 @@ export function createReviewStateTool({
             );
           return jsonToolResult(snapshot.pages[page - 1]);
         }
+        await beforeRead?.();
+        throwIfAborted(signal);
         const selected = (path: string): boolean =>
           selection.length === 0 || selection.includes(path);
         const inspection = reviewInspection(files, ledger.issued);
         const missing = inspection.missingPaths.filter(selected);
+        const briefingDone = briefingComplete();
+        const advanceContext =
+          selection.length === 0 &&
+          (!briefingDone || missing.length > 0) &&
+          hasPendingContextPackets?.();
         const header = {
           mergeBaseSha,
           headSha,
-          briefingComplete: briefingComplete(),
+          briefingComplete: briefingDone,
           inspection: {
             observed: inspection.observedPaths.length,
             missing: inspection.missingPaths.length,
@@ -541,12 +556,15 @@ export function createReviewStateTool({
           maxRecoveryCycles: recovery.maxCycles,
           uniqueSourceBytes: ledger.uniqueSourceBytes,
           repeatedSourceBytes: ledger.repeatedSourceBytes,
-          ...(selection.length === 0 && missing.length > 0 && diff !== undefined
-            ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
-            : {}),
+          ...(advanceContext
+            ? { nextCall: ADVANCE_REVIEW_CONTEXT_CALL }
+            : selection.length === 0 && missing.length > 0 && diff !== undefined
+              ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
+              : {}),
         };
         const records: Record<string, unknown>[] = [];
-        if (!header.briefingComplete)
+        if (advanceContext) records.push({ kind: "next_call", ...ADVANCE_REVIEW_CONTEXT_CALL });
+        else if (!briefingDone)
           records.push({ kind: "next_call", tool: "read_review_briefing", arguments: {} });
         const continuing = new Set<string>();
         const calls = readers.continuations(selection);
@@ -744,6 +762,7 @@ export function createReviewContextTools({
   onConversationComplete,
   onDiscussionPage,
   onContextPage,
+  beforeRead,
 }: {
   isActive: () => boolean;
   signal: AbortSignal | undefined;
@@ -753,6 +772,7 @@ export function createReviewContextTools({
   onConversationComplete: () => void;
   onDiscussionPage?: (page: number) => void;
   onContextPage?: () => void;
+  beforeRead?: (() => Promise<void>) | undefined;
 }) {
   const conversationTool = tool(
     "read_pr_conversation",
@@ -776,14 +796,16 @@ export function createReviewContextTools({
     "read_review_briefing",
     "Read the next unread bounded briefing page, or reread a one-based page. totalPages is stable; done=true means every page has been delivered.",
     { page: z.number().int().positive().optional() },
-    ({ page }): Promise<CallToolResult> => {
+    async ({ page }): Promise<CallToolResult> => {
       throwIfAborted(signal);
       if (!isActive()) {
-        return Promise.resolve({
+        return {
           content: [{ type: "text", text: "Wait for the full review prompt before reading." }],
-        });
+        };
       }
-      return Promise.resolve(jsonToolResult(briefingReader.readNext(page)));
+      await beforeRead?.();
+      throwIfAborted(signal);
+      return jsonToolResult(briefingReader.readNext(page));
     },
     { alwaysLoad: true },
   );

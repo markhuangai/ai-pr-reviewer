@@ -68,8 +68,9 @@ import {
 import { createReviewGoalTools } from "./review-goal-tools.js";
 import { RepositorySnapshot, repositoryGuidanceForRun } from "./repository-snapshot.js";
 import { createReviewDiagnostics } from "./review-diagnostics.js";
-import { tool } from "./review-tool.js";
+import { tool, type ReviewTool } from "./review-tool.js";
 import { ReviewContextDelivery } from "./review-context-delivery.js";
+import { ADVANCE_REVIEW_CONTEXT_CALL } from "./review-context-packets.js";
 import { createReviewSession, createReviewMcpServers } from "./review-session.js";
 import { SessionRunner, createDeferred, makeUserMessage } from "./session-runner.js";
 import {
@@ -82,6 +83,11 @@ import {
   type SharedReviewSeed,
 } from "./shared-discovery.js";
 export { agentInternals, type AgentQuery } from "./agent-session.js";
+export const POST_COVERAGE_WRAP_UP_ROUNDS = 8;
+export const POST_COVERAGE_WRAP_UP_MS = 8 * 60 * 1_000;
+const POST_COVERAGE_ADVISORY =
+  "All required briefing pages and changed paths are already inspected. Use the evidence you have to submit_review now with verified findings, or an empty findings list.";
+
 export async function runReviewGoal(
   goal: string,
   goalIndex: number,
@@ -158,6 +164,37 @@ export async function runReviewGoal(
   const evidenceLedger = new ReviewEvidenceLedger(cwd, files, reviewSnapshot, diff.files);
   if (sharedSeed !== undefined && sharedContext === undefined)
     evidenceLedger.inherit(sharedSeed.evidence);
+  const coverageComplete = () =>
+    briefingReader.complete && evidenceLedger.inspection.missingPaths.length === 0;
+  let wrapUpEpoch = evidenceLedger.deliveryEpoch;
+  let wrapUpLoggedEpoch: number | undefined;
+  let postCoverageToolRounds = 0;
+  let coverageCompletedAt: number | undefined;
+  const resetPostCoverageWrapUp = (): void => {
+    wrapUpEpoch = evidenceLedger.deliveryEpoch;
+    postCoverageToolRounds = 0;
+    coverageCompletedAt = undefined;
+  };
+  const evaluatePostCoverageWrapUp = (incrementRound: boolean): string | undefined => {
+    if (wrapUpEpoch !== evidenceLedger.deliveryEpoch) resetPostCoverageWrapUp();
+    if (!reviewPromptActive || submission !== undefined || !coverageComplete()) return undefined;
+    const now = Date.now();
+    coverageCompletedAt ??= now;
+    if (incrementRound) postCoverageToolRounds++;
+    const elapsed = now - coverageCompletedAt;
+    const reachedRounds = postCoverageToolRounds >= POST_COVERAGE_WRAP_UP_ROUNDS;
+    if (!reachedRounds && elapsed < POST_COVERAGE_WRAP_UP_MS) return undefined;
+    if (wrapUpLoggedEpoch !== wrapUpEpoch) {
+      wrapUpLoggedEpoch = wrapUpEpoch;
+      writeMonitorEvent("post-coverage-wrap-up", {
+        trigger: reachedRounds ? "rounds" : "elapsed",
+        post_coverage_rounds: postCoverageToolRounds,
+        post_coverage_elapsed_ms: elapsed,
+        delivery_epoch: wrapUpEpoch,
+      });
+    }
+    return POST_COVERAGE_ADVISORY;
+  };
   let firstSubmissionMs: number | undefined;
   const {
     inspectionDetails,
@@ -201,18 +238,24 @@ export async function runReviewGoal(
       recovery.observeUse(call.tool_use_id, call.tool_input);
       observeRejection(call.tool_use_id, call.tool_response);
     }
-    if (references.length === 0) return Promise.resolve({ continue: true });
+    const advanceContext = !coverageComplete() && delivery?.hasUnstagedPackets === true;
+    const wrapUp = evaluatePostCoverageWrapUp(true);
+    if (references.length === 0 && !advanceContext && wrapUp === undefined)
+      return Promise.resolve({ continue: true });
     return Promise.resolve({
       continue: true,
       hookSpecificOutput: {
         hookEventName: "PostToolBatch",
         additionalContext: `${evidenceLedger.renderReferences(references)}\n${JSON.stringify({
           ...deliveredInspection,
-          ...(!briefingReader.complete
-            ? { nextCall: { tool: "read_review_briefing", arguments: {} } }
-            : evidenceLedger.inspection.missingPaths.length > 0
-              ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
-              : {}),
+          ...(advanceContext
+            ? { nextCall: ADVANCE_REVIEW_CONTEXT_CALL }
+            : !briefingReader.complete
+              ? { nextCall: { tool: "read_review_briefing", arguments: {} } }
+              : evidenceLedger.inspection.missingPaths.length > 0
+                ? { nextCall: { tool: "read_pr_diff", arguments: { remaining: true } } }
+                : {}),
+          ...(wrapUp === undefined ? {} : { wrapUp }),
         })}`,
       },
     });
@@ -273,6 +316,7 @@ export async function runReviewGoal(
             writeAgentMonitorEvent(goalIndex, event, details, logSecrets);
           },
           () => {
+            resetPostCoverageWrapUp();
             runner.rebaseProgress();
           },
         );
@@ -293,6 +337,15 @@ export async function runReviewGoal(
     signal,
     isReviewActive,
     recovery,
+    ...(delivery === undefined
+      ? {}
+      : {
+          beforeRead: () =>
+            config.executor === "codex"
+              ? delivery.refresh()
+              : delivery.refreshBeforePagedRead(signal),
+          hasPendingContextPackets: () => delivery.hasUnstagedPackets,
+        }),
     onSnapshot: (details) => {
       logDiagnostic("recovery-decision", details);
     },
@@ -330,6 +383,7 @@ export async function runReviewGoal(
             files,
             budget.remainingCorrections,
             budget.remainingInspectionCycles,
+            delivery?.hasUnstagedPackets,
           ),
         );
       }
@@ -359,11 +413,26 @@ export async function runReviewGoal(
     { alwaysLoad: true },
   );
   const outputServerName = "review_output";
+  const withCodexWrapUp = (definition: ReviewTool): ReviewTool => ({
+    ...definition,
+    handler: async (args) => {
+      const result = await definition.handler(args);
+      if (result.isError === true) return result;
+      const advisory = evaluatePostCoverageWrapUp(false);
+      if (advisory === undefined) return result;
+      return {
+        ...result,
+        content: [...result.content, { type: "text", text: "Wrap-up advisory: " + advisory }],
+      };
+    },
+  });
+  const { tools, repositoryTools } = goalTools;
+  const codex = config.executor === "codex";
   const reviewTools = [
-    ...goalTools.tools,
+    ...(codex ? tools.map(withCodexWrapUp) : tools),
     ...(advanceContextTool === undefined ? [] : [advanceContextTool]),
     outputTool,
-    ...goalTools.repositoryTools,
+    ...(codex ? repositoryTools.map(withCodexWrapUp) : repositoryTools),
   ];
   const mcpServers = createReviewMcpServers(
     config,
@@ -496,6 +565,8 @@ export async function runReviewGoal(
                 },
           );
         });
+        if (message.type === "system" && message.subtype === "compact_boundary")
+          resetPostCoverageWrapUp();
         if (isReviewActive()) recovery.observeMessage(message, observeRejection);
         if (message.type !== "result") return;
         if (
@@ -628,6 +699,7 @@ export async function runReviewGoal(
       config.interactWithPullRequest,
       sharedSeed !== undefined,
       sharedContext === undefined ? undefined : sharedSeed?.changeMap,
+      config.executor,
     );
     logAgentEventSafely(goalIndex, logSecrets, (write) => {
       writeAgentLifecycleLog(
@@ -696,14 +768,20 @@ export async function runReviewGoal(
           );
         }
         runner.phase = "waiting-for-continuation-result";
+        const inspected = coverageComplete();
+        const next = inspected
+          ? "The host confirms all required briefing pages and changed paths are already inspected. Submit now through submit_review using the evidence already collected."
+          : "Re-read evidence only when needed, then submit exactly once through the required output tool.";
         queueMessage(
-          "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. Re-read evidence only when needed, then submit exactly once through the required output tool.",
+          "The previous turn was interrupted because it stopped making progress. Continue the same goal from the current session state. " +
+            next,
           `stall-continuation-${runner.recoveryCount}`,
         );
         writeMonitorEvent("continuation-queued", {
           recovery: runner.recoveryCount,
           interrupted_result_subtype: result.subtype,
           repair_attempts: recovery.repairAttempts,
+          coverage_complete: inspected,
         });
         continue;
       }

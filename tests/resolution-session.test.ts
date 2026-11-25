@@ -9,6 +9,7 @@ import {
 } from "./agent-test-helpers.js";
 import {
   runResolutionVerifiers,
+  RESOLUTION_DEADLINE_MS,
   resolutionInternals,
   verifyResolution,
   type ResolutionQuery,
@@ -16,6 +17,7 @@ import {
 import type { ReviewLifecycleThreadRecord } from "../src/lib/github-review-lifecycle.js";
 import type {
   SDKActiveGoalMessage,
+  SDKMessage,
   SDKResultMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -71,11 +73,6 @@ function resolutionSubmitTool(options: Options): {
   const submit = output.instance._registeredTools.submit_resolution;
   assert.ok(submit);
   return submit;
-}
-
-function resolutionMessageText(message: SDKUserMessage): string {
-  const content = message.message.content;
-  return typeof content === "string" ? content : JSON.stringify(content);
 }
 
 const context: PullRequestContext = {
@@ -378,137 +375,6 @@ test("finalizes a silent accepted resolution after its completion grace", async 
   assert.match(logs, /session submission-accepted.*"grace_ms":30000/u);
   assert.match(logs, /session submission-deadline.*"grace_ms":30000/u);
   assert.match(logs, /session verdict-finalized.*"terminal_sdk_result":false/u);
-});
-
-test("lets an accepted verdict win an interrupted verifier boundary", async (t) => {
-  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
-  const ready = manualSignal<undefined>();
-  const boundary = manualSignal<undefined>();
-  let interrupts = 0;
-  let closes = 0;
-  let extraPrompt = false;
-  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
-    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
-      const messages = input.prompt[Symbol.asyncIterator]();
-      const initial = await messages.next();
-      assert.equal(initial.done, false);
-      await markReadEvidence(input.options);
-      ready.resolve(undefined);
-      await boundary.promise;
-      const accepted = await resolutionSubmitTool(input.options).handler({
-        verdict: "fixed",
-        confidence: "high",
-        rationale: "accepted during interrupt",
-      });
-      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
-      yield resolutionResult(1, "error_during_execution");
-      const next = await messages.next();
-      extraPrompt = !next.done;
-    },
-    mcpServerStatus: () => Promise.resolve([]),
-    interrupt: () => {
-      interrupts += 1;
-      boundary.resolve(undefined);
-      return Promise.resolve(undefined);
-    },
-    close: () => {
-      closes += 1;
-    },
-  })) as unknown as ResolutionQuery;
-
-  const running = verifyResolution(context, thread, config, "/workspace", query);
-  await ready.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  const result = await running;
-
-  assert.deepEqual(result, {
-    status: "completed",
-    verdict: "fixed",
-    confidence: "high",
-    rationale: "accepted during interrupt",
-  });
-  assert.equal(extraPrompt, false);
-  assert.equal(interrupts, 1);
-  assert.equal(closes, 1);
-});
-
-test("continues resolution verification across repeated SDK stalls", async (t) => {
-  t.mock.timers.enable({ apis: ["Date", "setInterval", "setTimeout"], now: 0 });
-  const output: string[] = [];
-  t.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
-    output.push(chunk.toString());
-    return true;
-  });
-  const ready = [manualSignal<undefined>(), manualSignal<undefined>()];
-  const boundaries = [manualSignal<undefined>(), manualSignal<undefined>()];
-  const continuations: string[] = [];
-  let interrupts = 0;
-  let closes = 0;
-  const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
-    async *[Symbol.asyncIterator](): AsyncGenerator<SDKResultMessage> {
-      const messages = input.prompt[Symbol.asyncIterator]();
-      const initial = await messages.next();
-      assert.equal(initial.done, false);
-      await markReadEvidence(input.options);
-      ready[0]?.resolve(undefined);
-      for (let index = 0; index < boundaries.length; index += 1) {
-        const boundary = boundaries[index];
-        assert.ok(boundary);
-        await boundary.promise;
-        yield resolutionResult(index + 1, "error_during_execution");
-        const continuation = await messages.next();
-        assert.equal(continuation.done, false);
-        continuations.push(resolutionMessageText(continuation.value));
-        if (index + 1 < boundaries.length) ready[index + 1]?.resolve(undefined);
-      }
-      const accepted = await resolutionSubmitTool(input.options).handler({
-        verdict: "fixed",
-        confidence: "high",
-        rationale: "recovered verifier",
-      });
-      assert.equal(accepted.content[0]?.text, "Resolution accepted.");
-      yield resolutionResult(3);
-      assert.equal((await messages.next()).done, true);
-    },
-    mcpServerStatus: () => Promise.resolve([]),
-    interrupt: () => {
-      const call = interrupts;
-      interrupts += 1;
-      if (call === 0) return Promise.reject(new Error("resolution interrupt unavailable"));
-      const boundary = boundaries[call - 1];
-      boundary?.resolve(undefined);
-      return Promise.resolve(undefined);
-    },
-    close: () => {
-      closes += 1;
-    },
-  })) as unknown as ResolutionQuery;
-
-  const running = verifyResolution(context, thread, config, "/workspace", query);
-  await ready[0]?.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  for (let index = 0; index < 4; index += 1) await Promise.resolve();
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  await ready[1]?.promise;
-  t.mock.timers.tick(agentInternals.SDK_SESSION_STALL_MS);
-  const result = await running;
-
-  assert.deepEqual(result, {
-    status: "completed",
-    verdict: "fixed",
-    confidence: "high",
-    rationale: "recovered verifier",
-  });
-  assert.equal(interrupts, 3);
-  assert.equal(closes, 1);
-  assert.equal(continuations.length, 2);
-  assert.equal(
-    continuations.every((message) => message.includes("Continue the same resolution verification")),
-    true,
-  );
-  assert.match(output.join(""), /interrupt-failed.*resolution interrupt unavailable/u);
-  assert.match(output.join(""), /interrupted-turn-boundary/u);
-  assert.match(output.join(""), /session end/u);
 });
 
 test("resolution prompt bounds large untrusted thread content", () => {
@@ -920,4 +786,75 @@ test("bounds verifier completion while preserving failures and cancellation", as
       assert.equal(closes, 1);
     });
   }
+});
+
+test("enforces the verifier deadline and gives parent cancellation precedence", async (t) => {
+  for (const effort of ["low", "high", "xhigh", undefined] as const)
+    await t.test(effort ?? "default effort", async (st) => {
+      const cancel = effort === "low";
+      st.mock.timers.enable({ apis: ["setTimeout"] });
+      const logs: string[] = [];
+      const emit = process.stdout.write.bind(process.stdout);
+      st.mock.method(process.stdout, "write", (chunk: string | Uint8Array) => {
+        logs.push(chunk.toString());
+        return true;
+      });
+      const ready = manualSignal<undefined>();
+      const closed = manualSignal<undefined>();
+      const parent = new AbortController();
+      const cancellation = new CancellationError("SIGTERM");
+      const secret = "fixture-deadline-secret";
+      let closes = 0;
+      const query = ((input: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => ({
+        async *[Symbol.asyncIterator](): AsyncGenerator<SDKMessage> {
+          await input.prompt[Symbol.asyncIterator]().next();
+          assert.equal(input.options.effort, effort);
+          assert.equal(input.options.maxTurns, 19);
+          assert.notEqual(input.options.abortController, parent);
+          yield { type: "system", subtype: "init", session_id: "deadline-fixture" } as SDKMessage;
+          ready.resolve(undefined);
+          await closed.promise;
+          throw new Error("Fixture reader shutdown: " + secret);
+        },
+        close: () => {
+          closes++;
+          if (cancel) parent.abort(cancellation);
+          closed.resolve(undefined);
+        },
+        interrupt: () => assert.fail("The five-minute deadline must take precedence over a stall."),
+      })) as unknown as ResolutionQuery;
+      const running = verifyResolution(
+        context,
+        thread,
+        { ...config, aiSecret: secret, ...(effort === undefined ? {} : { effort }), maxTurns: 19 },
+        "/workspace",
+        query,
+        parent,
+      );
+      const result = cancel
+        ? assert.rejects(running, (error: unknown) => error === cancellation)
+        : running;
+      await ready.promise;
+      st.mock.timers.tick(RESOLUTION_DEADLINE_MS - 1);
+      assert.equal(closes, 0);
+      st.mock.timers.tick(1);
+      if (cancel) await result;
+      else {
+        assert.deepEqual(await result, {
+          status: "failed",
+          error: "Resolution verification exceeded its five-minute deadline.",
+        });
+        const [failure, end] = logs.filter((line) =>
+          /\[resolution 1\] session (failure|end)/u.test(line),
+        );
+        assert.match(failure ?? "", /"phase":"deadline".*five-minute deadline.*\[REDACTED\]/u);
+        assert.match(
+          end ?? "",
+          /"phase":"deadline","session_id":"deadline-fixture","verdict_accepted":false,"repair_attempts":0,"stall_recoveries":0/u,
+        );
+        assert.ok(!logs.join("").includes(secret));
+        emit((failure ?? "") + (end ?? ""));
+      }
+      assert.equal(closes, 1);
+    });
 });

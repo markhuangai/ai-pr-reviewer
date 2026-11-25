@@ -17,6 +17,7 @@ import {
   reviewInspection,
   reviewAssessmentInternals,
   reviewEvidenceResultSchema,
+  toolResponseDocument,
 } from "../src/runtime/review-assessment.js";
 
 import { submissionSchema, reviewSubmissionGaps } from "../src/runtime/review-submission.js";
@@ -32,6 +33,16 @@ const changedFile: ChangedFile = {
   changes: 1,
   addedLines: new Set([1]),
 };
+
+test("a plain-text advisory leaves a structured tool payload intact", () => {
+  const content = { type: "text", text: '{"records":[],"done":true}' };
+  const advisory = { type: "text", text: "Wrap-up advisory: submit_review now." };
+  assert.deepEqual(toolResponseDocument([content, advisory]), { records: [], done: true });
+  assert.equal(
+    toolResponseDocument([{ ...content, text: "Plain response." }, advisory]),
+    undefined,
+  );
+});
 
 const finding: ReviewFinding = {
   title: "Unchecked result",

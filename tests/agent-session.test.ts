@@ -797,6 +797,31 @@ test("teaches the four severity definitions before review submission", () => {
   );
 
   const prompt = (queued[1] as { message: { content: string } }).message.content;
+  const codexMessages: SDKMessage[] = [];
+  agentInternals.startReviewPrompt(
+    { push: (message) => codexMessages.push(message) },
+    "Check callers.",
+    context,
+    [],
+    context.baseSha,
+    0,
+    [],
+    0,
+    [],
+    () => undefined,
+    () => undefined,
+    undefined,
+    true,
+    false,
+    undefined,
+    "codex",
+  );
+  const codex = (codexMessages[1] as { message: { content: string } }).message.content;
+  for (const review of [prompt, codex])
+    assert.match(review, /Batch independent reads in parallel/u);
+  assert.match(prompt, /use Grep .* then Read only the relevant line ranges/u);
+  assert.match(prompt, /Use read_repository_file for base revisions/u);
+  assert.match(codex, /use search_repository before read_repository_file/u);
   for (const severity of ["CRITICAL", "HIGH", "MODERATE", "LOW"])
     assert.match(prompt, new RegExp(`- ${severity}:`, "u"));
   assert.match(prompt, /Omit style preferences, nits, and informational observations/u);

@@ -1,19 +1,31 @@
 import { throwIfAborted } from "../lib/bootstrap/cancellation.js";
+import { setTimeout as wait } from "node:timers/promises";
 import type { ReviewEvidenceLedger } from "./review-assessment.js";
 import type { ReviewBriefingReader } from "./review-briefing.js";
 import { ReviewContextHistory } from "./review-context-history.js";
-import type { ReviewContextPacket, SharedReviewContext } from "./review-context-packets.js";
+import {
+  ADVANCE_REVIEW_CONTEXT_CALL,
+  REVIEW_CONTEXT_WIRE_BYTES,
+  type ReviewContextPacket,
+  type SharedReviewContext,
+} from "./review-context-packets.js";
 import { tool } from "./review-tool.js";
+
+export const STARTUP_PRELOAD_PACKETS = 2;
+export const STARTUP_PRELOAD_WIRE_BYTES = STARTUP_PRELOAD_PACKETS * REVIEW_CONTEXT_WIRE_BYTES;
 
 export class ReviewContextDelivery {
   readonly history: ReviewContextHistory;
   private readonly confirmed = new Set<string>();
   private readonly everConfirmed = new Set<string>();
-  private inFlight: ReviewContextPacket | undefined;
+  private readonly inFlight = new Map<string, ReviewContextPacket>();
+  private startupPackets = 0;
+  private startupWireBytes = 0;
   private readonly attempted = new Set<string>();
   private readonly replayed = new Set<string>();
   private readonly deferred = new Set<string>();
   private refreshOperation: Promise<void> = Promise.resolve();
+  private pagedReceiptWait: Promise<void> | undefined;
   private cueSent = false;
   private packetBoundaryPending = false;
   advanceRequested = false;
@@ -37,7 +49,11 @@ export class ReviewContextDelivery {
   }
 
   get sweeping(): boolean {
-    return this.inFlight !== undefined || this.pending;
+    return this.inFlight.size > 0 || this.pending;
+  }
+
+  get hasUnstagedPackets(): boolean {
+    return this.nextUnstagedPacket() !== undefined;
   }
 
   get needsBoundary(): boolean {
@@ -45,12 +61,44 @@ export class ReviewContextDelivery {
   }
 
   stage(): ReviewContextPacket | undefined {
-    if (this.inFlight !== undefined) return undefined;
-    const packet = this.prepared.packets.find(
-      ({ id }) => !this.confirmed.has(id) && !this.deferred.has(id),
-    );
+    if (this.inFlight.size > 0) return undefined;
+    const packet = this.nextUnstagedPacket();
     if (packet === undefined) return undefined;
-    this.inFlight = packet;
+    return this.queue(packet);
+  }
+
+  stageStartupPacket(
+    maxPackets = STARTUP_PRELOAD_PACKETS,
+    maxWireBytes = STARTUP_PRELOAD_WIRE_BYTES,
+  ): ReviewContextPacket | undefined {
+    if (this.startupPackets >= Math.min(maxPackets, STARTUP_PRELOAD_PACKETS)) return undefined;
+    const packet = this.nextUnstagedPacket();
+    if (
+      packet === undefined ||
+      this.startupWireBytes + packet.wireBytes > Math.min(maxWireBytes, STARTUP_PRELOAD_WIRE_BYTES)
+    )
+      return undefined;
+    this.startupPackets++;
+    this.startupWireBytes += packet.wireBytes;
+    return this.queue(packet);
+  }
+
+  deferInFlight(packetId: string, reason = "no-native-receipt"): void {
+    const packet = this.inFlight.get(packetId);
+    if (packet === undefined) return;
+    this.inFlight.delete(packetId);
+    this.defer(packet, reason);
+  }
+
+  private nextUnstagedPacket(): ReviewContextPacket | undefined {
+    return this.prepared.packets.find(
+      ({ id }) => !this.confirmed.has(id) && !this.deferred.has(id) && !this.inFlight.has(id),
+    );
+  }
+
+  private queue(packet: ReviewContextPacket): ReviewContextPacket {
+    this.inFlight.set(packet.id, packet);
+    this.pagedReceiptWait = undefined;
     this.packetBoundaryPending = true;
     const replay = this.attempted.has(packet.id) || this.everConfirmed.has(packet.id);
     if (replay) this.replayed.add(packet.id);
@@ -96,7 +144,7 @@ export class ReviewContextDelivery {
           if (page.kind === "briefing") this.briefing.confirmPage(page.page.page);
         this.confirmed.add(packet.id);
         this.deferred.delete(packet.id);
-        if (this.inFlight?.id === packet.id) this.inFlight = undefined;
+        this.inFlight.delete(packet.id);
         const confirmedBytes = this.ledger.uniqueSourceBytes - before;
         const repeatedBytes = this.everConfirmed.has(packet.id)
           ? packet.sourceBytes
@@ -119,14 +167,26 @@ export class ReviewContextDelivery {
     return result;
   }
 
+  async refreshBeforePagedRead(signal?: AbortSignal): Promise<void> {
+    await this.refresh();
+    if (this.inFlight.size === 0) return;
+    this.pagedReceiptWait ??= this.waitForPagedReceipt(signal);
+    await this.pagedReceiptWait;
+  }
+
+  private async waitForPagedReceipt(signal?: AbortSignal): Promise<void> {
+    // Claude can dispatch a tool while its assistant response is still being persisted.
+    const deadline = performance.now() + 250;
+    while (this.inFlight.size > 0 && performance.now() < deadline) {
+      await wait(25, undefined, { signal });
+      await this.refresh();
+    }
+  }
+
   async boundary(): Promise<boolean> {
     const wasSweeping = this.needsBoundary;
     await this.refresh();
-    const packet = this.inFlight;
-    if (packet !== undefined) {
-      this.inFlight = undefined;
-      this.defer(packet, "no-native-receipt");
-    }
+    for (const id of this.inFlight.keys()) this.deferInFlight(id);
     const continueSweep = wasSweeping || this.needsBoundary;
     this.packetBoundaryPending = false;
     return continueSweep;
@@ -166,7 +226,7 @@ export class ReviewContextDelivery {
 
   advanceTool(isActive: () => boolean, signal?: AbortSignal) {
     return tool(
-      "advance_review_context",
+      ADVANCE_REVIEW_CONTEXT_CALL.tool,
       "Confirm you have considered the current shared packet and ask the host to continue the same review with the next unread packet. Do not combine with other calls. When the sweep ends, complete outstanding checks and call submit_review.",
       {},
       async () => {

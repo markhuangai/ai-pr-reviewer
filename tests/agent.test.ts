@@ -27,6 +27,13 @@ import {
   writeFile,
 } from "./agent-test-helpers.js";
 
+test("advertises finding length limits in the submission tool schema", () => {
+  const shape = agentInternals.submissionSchema.shape.findings.element.shape;
+  assert.match(shape.title.description ?? "", /<=120 chars/u);
+  assert.match(shape.why.description ?? "", /<=500 chars/u);
+  assert.match(shape.fix.description ?? "", /<=500 chars/u);
+});
+
 test("runs a complete SDK review turn through the real diff and submission tools", async (t) => {
   const diff = await makeReviewDiff(t, "diff --git a/credential.go b/credential.go\n+changed\n", [
     "credential.go",

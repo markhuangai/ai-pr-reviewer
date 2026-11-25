@@ -247,8 +247,8 @@ test("six isolated goals finish a 101-file deletion-heavy sweep within the confi
       calls += 1;
       assert.equal(rejected.isError, true);
       assert.deepEqual(protocolDocument(rejected).nextCall, {
-        tool: "read_pr_diff",
-        arguments: { remaining: true },
+        tool: "advance_review_context",
+        arguments: {},
       });
       let done = false;
       let automaticCalls = 0;
