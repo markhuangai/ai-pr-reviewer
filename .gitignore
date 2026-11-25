@@ -6,3 +6,4 @@ build-replay
 coverage
 release
 .runtime-cache
+.agents
